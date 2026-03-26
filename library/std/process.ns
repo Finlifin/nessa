@@ -1,0 +1,12 @@
+// std.process — process control
+//
+// These functions are backed by VM intrinsics.
+//
+
+// exit(code: i64) -> !
+//   Terminate the process with the given exit code.
+//   'intrinsic Exit
+
+// panic(message: str) -> !
+//   Abort execution with a panic message.
+//   'intrinsic Panic

@@ -1,0 +1,25 @@
+[package]
+name = "nessa-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# All engine crates
+ast = { path = "../ast" }
+lexer = { path = "../lexer" }
+parser = { path = "../parser" }
+diagnostic = { path = "../diagnostic" }
+resolution = { path = "../resolution" }
+nir = { path = "../nir" }
+codegen = { path = "../codegen" }
+nsbc = { path = "../nsbc" }
+nsbc_io = { path = "../nsbc_io" }
+runtime = { path = "../runtime" }
+initialization = { path = "../initialization" }
+interpreter = { path = "../interpreter" }
+driver = { path = "../driver" }
+gc = { path = "../gc" }
+type_pool = { path = "../type_pool" }
+str_interner = { path = "../str_interner" }
+
+rustc_span = { workspace = true }

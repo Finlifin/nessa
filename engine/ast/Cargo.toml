@@ -1,0 +1,8 @@
+[package]
+name = "ast"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustc_span = { workspace = true }
+str_interner = { path = "../str_interner" }

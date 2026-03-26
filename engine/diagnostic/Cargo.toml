@@ -1,0 +1,8 @@
+[package]
+name = "diagnostic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ariadne = { workspace = true }
+rustc_span = { workspace = true }

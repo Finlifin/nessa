@@ -1,0 +1,24 @@
+// std.prelude — automatically imported symbols
+//
+// The prelude re-exports the most commonly used functions and types so that
+// user code does not need explicit `use` statements for everyday operations.
+//
+// Currently all intrinsic functions are registered in the root scope by the
+// compiler (see resolution::Resolver::register_intrinsic_functions), so this
+// file serves as documentation and a future hook for the module system.
+
+// ── I/O ────────────────────────────────────────────────────────────────────
+// print(value)       — print a value to stdout (no trailing newline)
+// println(value)     — print a value to stdout followed by a newline
+
+// ── Conversions ────────────────────────────────────────────────────────────
+// to_i64(value)      — convert a value to i64
+// to_f64(value)      — convert a value to f64
+// to_string(value)   — convert a value to string
+
+// ── Introspection ──────────────────────────────────────────────────────────
+// type_of(value)     — get the runtime type tag of a value
+
+// ── Process ────────────────────────────────────────────────────────────────
+// exit(code)         — terminate the process with exit code
+// panic(message)     — abort with a panic message

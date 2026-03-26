@@ -1,0 +1,36 @@
+enum Color {
+  red,
+  green,
+  blue
+}
+
+
+fn foo() -> (i8, i8, i8, i8) {
+  (1, 2, 3, 4, bool)
+}
+
+fn main() {
+  let c = Color.green;
+  let i = index(6);
+  print(i);
+}
+
+enum SomeErr {
+  NotImplemented,
+}
+
+fn bar() -> !SomeErr Unit {
+  error SomeErr.NotImplemented
+}
+
+fn baz() -> !SomeErr Unit {
+  error SomeErr.NotImplemented;
+}
+
+fn index(c: Color) -> i32 {
+  c match {
+    Color.red => 0
+    Color.green => 1
+    _ => 2
+  }
+}

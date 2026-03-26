@@ -1,0 +1,8 @@
+[package]
+name = "gc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+type_pool = { path = "../type_pool" }
+mmtk = "0.32.0"

@@ -1,0 +1,34 @@
+// std.math — mathematical functions
+//
+// These functions are backed by VM intrinsics.
+// When the module system is wired up, user code will write:
+//
+//     use std.math.{abs, sin, cos, sqrt, pow, log}
+//
+
+// abs(x: number) -> number
+//   'intrinsic Abs
+
+// sin(x: f64) -> f64
+//   'intrinsic Sin
+
+// cos(x: f64) -> f64
+//   'intrinsic Cos
+
+// sqrt(x: f64) -> f64
+//   'intrinsic Sqrt
+
+// floor(x: f64) -> f64
+//   'intrinsic Floor
+
+// ceil(x: f64) -> f64
+//   'intrinsic Ceil
+
+// round(x: f64) -> f64
+//   'intrinsic Round
+
+// pow(base: f64, exp: f64) -> f64
+//   'intrinsic Pow
+
+// log(x: f64) -> f64
+//   'intrinsic Log

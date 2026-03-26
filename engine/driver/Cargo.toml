@@ -1,0 +1,20 @@
+[package]
+name = "driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ast = { path = "../ast" }
+lexer = { path = "../lexer" }
+parser = { path = "../parser" }
+resolution = { path = "../resolution" }
+nir = { path = "../nir" }
+codegen = { path = "../codegen" }
+nsbc_io = { path = "../nsbc_io" }
+nsbc = { path = "../nsbc" }
+initialization = { path = "../initialization" }
+interpreter = { path = "../interpreter" }
+diagnostic = { path = "../diagnostic" }
+runtime = { path = "../runtime" }
+str_interner = { path = "../str_interner" }
+rustc_span = "0.1.2"

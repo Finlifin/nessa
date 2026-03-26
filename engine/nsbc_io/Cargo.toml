@@ -1,0 +1,8 @@
+[package]
+name = "nsbc_io"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nsbc = { path = "../nsbc" }
+str_interner = { path = "../str_interner" }

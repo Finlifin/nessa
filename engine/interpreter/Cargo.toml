@@ -1,0 +1,13 @@
+[package]
+name = "interpreter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+type_pool = { path = "../type_pool" }
+nsbc = { path = "../nsbc" }
+gc = { path = "../gc" }
+runtime = { path = "../runtime" }
+scheduler = { path = "../scheduler" }
+stack_pool = { path = "../stack_pool" }
+str_interner = { path = "../str_interner" }

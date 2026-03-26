@@ -1,0 +1,11 @@
+enum Color { red, green, blue }
+
+fn main() {
+  let c = Color.blue;
+  let x = c match {
+    Color.red => 10
+    Color.green => 20
+    _ => 30
+  };
+  print(x);
+}

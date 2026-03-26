@@ -1,0 +1,7 @@
+[workspace]
+members = ["engine/*"]
+resolver = "2"
+
+[workspace.dependencies]
+rustc_span = "0.1.2"
+ariadne = { version = "0.5.1", features = ["auto-color"] }

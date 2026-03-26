@@ -1,0 +1,12 @@
+// std.string — string operations
+//
+// These functions are backed by VM intrinsics.
+//
+
+// str_len(s: str) -> i64
+//   Return the byte length of a string.
+//   'intrinsic StrLen
+
+// str_concat(a: str, b: str) -> str
+//   Concatenate two strings.
+//   'intrinsic StrConcat

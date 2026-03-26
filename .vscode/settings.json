@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "cargo test": true,
+        "cargo build": true,
+        "./target/debug/nessa": true,
+        "cargo fetch": true
+    }
+}

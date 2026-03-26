@@ -1,0 +1,9 @@
+fn some(...args: List) {
+    for i in args {
+        print(i);
+    }
+}
+
+fn main() {
+    some(1, 2, 3);
+}

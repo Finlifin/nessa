@@ -1,0 +1,15 @@
+// std.io — input/output primitives
+//
+// These functions are backed by VM intrinsics (IntrinsicFn::Print, PrintLn).
+// When the module system is wired up, user code will write:
+//
+//     use std.io.{print, println}
+//
+
+// print(value: any) -> unit
+//   Write the string representation of `value` to stdout.
+//   'intrinsic Print
+
+// println(value: any) -> unit
+//   Write the string representation of `value` to stdout, followed by '\n'.
+//   'intrinsic PrintLn
