@@ -176,6 +176,9 @@ pub struct ResolvedAst {
     pub intrinsic_fns: HashMap<SymbolId, IntrinsicFn>,
     /// Maps enum variant SymbolId → variant index (0-based).
     pub enum_variant_indices: HashMap<SymbolId, u32>,
+    /// Maps Projection AST node → field index in the struct type.
+    /// Populated during type resolution when the LHS is a known struct type.
+    pub node_field_indices: HashMap<NodeIndex, u32>,
 }
 
 // ---------------------------------------------------------------------------

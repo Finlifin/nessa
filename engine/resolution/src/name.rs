@@ -113,6 +113,26 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         NodeKind::Projection => resolve_projection(r, ast, node_idx),
         NodeKind::PropertyPattern => resolve_property_pattern(r, ast, node_idx),
 
+        // ── Struct / enum construction: TypeName { field: val, ... }
+        NodeKind::ExtendedCall => {
+            let children = ast.fixed_children(node_idx);
+            // children[0] = type name (e.g. `Student`) — resolve as a type symbol
+            resolve_names(r, ast, children[0]);
+            // multi = Property nodes (field: value) or plain expression args
+            for &arg in ast.multi_children(node_idx) {
+                if ast.node(arg).kind == NodeKind::Property {
+                    // Property: [0] = field name (NOT a variable — skip it)
+                    //           [1] = value expression — resolve normally
+                    let prop_children = ast.fixed_children(arg);
+                    if prop_children.len() > 1 {
+                        resolve_names(r, ast, prop_children[1]);
+                    }
+                } else {
+                    resolve_names(r, ast, arg);
+                }
+            }
+        }
+
         // ── Default: recurse ───────────────────────────────────────
         _ => resolve_children(r, ast, node_idx),
     }

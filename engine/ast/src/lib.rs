@@ -50,6 +50,10 @@ pub enum NodeKind {
     /// children: (none)
     Str,
 
+    /// Interpolated string: `"hello, {name}!"`
+    /// children: multi = alternating Str (literal segments) and expr nodes
+    FStringConcat,
+
     /// `character`
     /// children: (none)
     Char,
@@ -711,7 +715,7 @@ impl NodeKind {
 
             // Multi only
             ListOf | Tuple | Object | Block | FileScope | PatternList | PatternTuple
-            | PatternRecord | WhenStatement | FnType | EffectType => MultiChildren,
+            | PatternRecord | WhenStatement | FnType | EffectType | FStringConcat => MultiChildren,
 
             // 1 + multi
             UseStatement | PathProjectionMulti | StructDef | EnumDef | ImplDef | DeriveDef

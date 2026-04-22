@@ -64,6 +64,18 @@ pub enum TokenKind {
     RealSci, // 1.23e-4
     Char,    // 'a' or '\n'
 
+    // -- F-string (interpolated string) tokens --
+    /// Opening `"` of an interpolated string.
+    FStringStart,
+    /// Literal text segment inside an interpolated string (content, no quotes).
+    FStringLiteral,
+    /// `{` that begins an interpolated expression inside a string.
+    FStringExprStart,
+    /// `}` that ends an interpolated expression inside a string.
+    FStringExprEnd,
+    /// Closing `"` of an interpolated string.
+    FStringEnd,
+
     // -- Keywords --
     Underscore,  // _
     KwAnd,       // and
@@ -261,6 +273,11 @@ impl TokenKind {
             Self::Real => "<real_literal>",
             Self::RealSci => "<real_sci>",
             Self::Char => "<char_literal>",
+            Self::FStringStart => "<fstring_start>",
+            Self::FStringLiteral => "<fstring_literal>",
+            Self::FStringExprStart => "{",
+            Self::FStringExprEnd => "}",
+            Self::FStringEnd => "<fstring_end>",
         }
     }
 
@@ -276,6 +293,7 @@ impl TokenKind {
                 | Self::Outdent
                 | Self::Eof
                 | Self::String
+                | Self::FStringEnd
                 | Self::Integer
                 | Self::IntBin
                 | Self::IntOct

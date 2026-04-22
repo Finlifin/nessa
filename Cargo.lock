@@ -412,6 +412,7 @@ dependencies = [
  "runtime",
  "rustc_span",
  "str_interner",
+ "type_pool",
 ]
 
 [[package]]

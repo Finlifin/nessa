@@ -41,6 +41,29 @@ impl Vm {
         self.bytecode.add_function(code)
     }
 
+    /// Allocate a heap string and return its TaggedValue.
+    /// The string bytes are laid out as: [len:u64][...UTF-8 bytes...].
+    pub fn alloc_string(&mut self, s: &str) -> TaggedValue {
+        let bytes = s.as_bytes();
+        let payload_bytes = 8 + bytes.len();
+        let payload_words = ((payload_bytes + 7) / 8) as u16;
+        let str_type = self.type_pool.intrinsic(Intrinsic::Str);
+        match self.heap.alloc_object(str_type, payload_words) {
+            Some(ptr) => unsafe {
+                // Write length prefix.
+                *(ptr.as_ptr() as *mut u64) = bytes.len() as u64;
+                // Write UTF-8 bytes after the length.
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    ptr.as_ptr().add(8),
+                    bytes.len(),
+                );
+                TaggedValue::from_heap_ptr(ptr.as_ptr())
+            },
+            None => TaggedValue::UNIT,
+        }
+    }
+
     /// Spawn a root task that starts executing the given function.
     pub fn spawn_root(&mut self, func_id: FuncId) -> TaskId {
         self.scheduler.spawn(func_id, None)
@@ -392,13 +415,31 @@ impl Vm {
 
             // ── Memory access (I-type) ────────────────────────────
             Opcode::LoadField => {
-                // TODO: heap object field access
-                let (dst, _obj, _imm) = i_fields(&instr);
-                task!().registers.set(dst, TaggedValue::UNIT);
+                let (dst, obj_reg, imm) = i_fields(&instr);
+                let field_idx = imm as usize;
+                let t = task!();
+                let obj = t.registers.get(obj_reg);
+                if let Some(ptr) = obj.as_heap_ptr() {
+                    let raw = unsafe { *((ptr as *const u8).add(field_idx * 8) as *const u64) };
+                    t.registers.set(dst, TaggedValue::from_raw(raw));
+                } else {
+                    t.registers.set(dst, TaggedValue::UNIT);
+                }
                 DispatchResult::Continue
             }
             Opcode::StoreField => {
-                // TODO: heap object field write
+                // store_field(obj, field_idx, val) encodes as i_type(StoreField, val, obj, field_idx)
+                // i_fields returns (dst=val_reg, src=obj_reg, imm=field_idx)
+                let (val_reg, obj_reg, imm) = i_fields(&instr);
+                let field_idx = imm as usize;
+                let t = task!();
+                let obj = t.registers.get(obj_reg);
+                let val = t.registers.get(val_reg);
+                if let Some(ptr) = obj.as_heap_ptr() {
+                    unsafe {
+                        *((ptr as *mut u8).add(field_idx * 8) as *mut u64) = val.raw();
+                    }
+                }
                 DispatchResult::Continue
             }
             Opcode::LoadIndex => {
@@ -793,9 +834,13 @@ impl Vm {
                 t.registers.set(Reg(0), TaggedValue::from_i64(0));
                 DispatchResult::Continue
             }
-            "show" => {
-                // Derived show: produce "TypeName(field1, field2...)". Stub for now.
-                t.registers.set(Reg(0), TaggedValue::UNIT);
+            "to_string" => {
+                // Derived to_string (Display): produce "TypeName { field: val, ... }".
+                drop(t);
+                let s = self.derived_struct_to_string(receiver, recv_type);
+                let result = self.alloc_string(&s);
+                let t = self.scheduler.get_task_mut(task_id).unwrap();
+                t.registers.set(Reg(0), result);
                 DispatchResult::Continue
             }
             _ => DispatchResult::Error(VmError::MethodNotFound),
@@ -887,6 +932,30 @@ impl Vm {
         }
     }
 
+    /// Produce a human-readable string for a struct value (derived Display).
+    /// Format: "TypeName { field1: val1, field2: val2 }"
+    fn derived_struct_to_string(&self, val: TaggedValue, type_idx: TypeIndex) -> String {
+        use type_pool::TypeKind;
+        let info = self.type_pool.get(type_idx);
+        if let TypeKind::Struct { name, fields, .. } = &info.kind {
+            let type_name = str_interner::get(*name);
+            let ptr = match val.as_heap_ptr() {
+                Some(p) => p,
+                None => return format!("{} {{ <null> }}", type_name),
+            };
+            let mut parts: Vec<String> = Vec::with_capacity(fields.len());
+            for field in fields {
+                let offset = field.offset as usize;
+                let fval = TaggedValue::from_raw(unsafe { *(ptr.add(offset) as *const u64) });
+                let field_name = str_interner::get(field.name);
+                parts.push(format!("{}: {}", field_name, format_tagged_value(fval)));
+            }
+            format!("{} {{ {} }}", type_name, parts.join(", "))
+        } else {
+            format_tagged_value(val)
+        }
+    }
+
     /// Dispatch an intrinsic function call.
     /// Arguments are in r0..rN by calling convention. Result goes into r0.
     fn dispatch_intrinsic(&mut self, task_id: TaskId, ifn: IntrinsicFn) -> DispatchResult {
@@ -941,10 +1010,11 @@ impl Vm {
                 DispatchResult::Continue
             }
             IntrinsicFn::ToString => {
-                // TODO: allocate string on heap
                 let val = t.registers.get(Reg(0));
-                let _s = format_tagged_value(val);
-                t.registers.set(Reg(0), TaggedValue::UNIT);
+                drop(t);
+                let s = format_tagged_value(val);
+                let result = self.alloc_string(&s);
+                self.scheduler.get_task_mut(task_id).unwrap().registers.set(Reg(0), result);
                 DispatchResult::Continue
             }
             IntrinsicFn::Abs => {
@@ -1015,13 +1085,33 @@ impl Vm {
                 DispatchResult::Continue
             }
             IntrinsicFn::StrLen => {
-                // TODO: proper string length
-                t.registers.set(Reg(0), TaggedValue::from_i64(0));
+                let val = t.registers.get(Reg(0));
+                let len: i64 = if let Some(ptr) = val.as_heap_ptr() {
+                    (unsafe { *(ptr as *const u64) }) as i64
+                } else {
+                    0
+                };
+                t.registers.set(Reg(0), TaggedValue::from_i64(len));
                 DispatchResult::Continue
             }
             IntrinsicFn::StrConcat => {
-                // TODO: proper string concatenation
-                t.registers.set(Reg(0), TaggedValue::UNIT);
+                let a = t.registers.get(Reg(0));
+                let b = t.registers.get(Reg(1));
+                let mut bytes: Vec<u8> = Vec::new();
+                if let Some(ptr) = a.as_heap_ptr() {
+                    let len = (unsafe { *(ptr as *const u64) }) as usize;
+                    let data = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
+                    bytes.extend_from_slice(data);
+                }
+                if let Some(ptr) = b.as_heap_ptr() {
+                    let len = (unsafe { *(ptr as *const u64) }) as usize;
+                    let data = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
+                    bytes.extend_from_slice(data);
+                }
+                drop(t);
+                let s = String::from_utf8_lossy(&bytes).into_owned();
+                let result = self.alloc_string(&s);
+                self.scheduler.get_task_mut(task_id).unwrap().registers.set(Reg(0), result);
                 DispatchResult::Continue
             }
             IntrinsicFn::Exit => {
@@ -1198,6 +1288,20 @@ fn format_tagged_value(val: TaggedValue) -> String {
     } else if let Some(v) = val.as_char() {
         v.to_string()
     } else if val.is_heap() {
+        // Try to read as a heap string: layout is [len:u64][...UTF-8 bytes...]
+        if let Some(ptr) = val.as_heap_ptr() {
+            // Safety: ptr is a valid payload pointer from our allocator.
+            let len = unsafe { *(ptr as *const u64) } as usize;
+            // Sanity check: len must be small enough to read safely.
+            if len <= 4096 {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts((ptr as *const u8).add(8), len)
+                };
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    return s.to_string();
+                }
+            }
+        }
         format!("<object@{:#x}>", val.raw())
     } else {
         format!("<value:{:#018x}>", val.raw())

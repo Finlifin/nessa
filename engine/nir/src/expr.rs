@@ -30,6 +30,7 @@ pub(crate) fn lower_expr(
         NodeKind::Real => lower_real_literal(node),
         NodeKind::Bool => lower_bool_literal(node),
         NodeKind::Str => lower_str_literal(node),
+        NodeKind::FStringConcat => lower_fstring_concat(resolved, ast, node_idx, builder, block),
         NodeKind::Char => lower_char_literal(node),
         NodeKind::Null => NirValue::Null,
         NodeKind::Unit => NirValue::Unit,
@@ -75,6 +76,9 @@ pub(crate) fn lower_expr(
 
         // ── Call ───────────────────────────────────────────────────
         NodeKind::Call => lower_call(resolved, ast, node_idx, builder, block),
+
+        // ── Struct / enum construction: TypeName { field: val, ... }
+        NodeKind::ExtendedCall => lower_extended_call(resolved, ast, node_idx, builder, block),
 
         // ── Projection (field access / enum variant construction) ──
         NodeKind::Projection => lower_projection(resolved, ast, node_idx, builder, block),
@@ -187,6 +191,66 @@ fn lower_str_literal(node: &ast::Node) -> NirValue {
     }
 }
 
+/// Lower an f-string (FStringConcat) node.
+///
+/// Strategy:
+///   - `Str` parts → lowered as string constants (already have type String)
+///   - non-`Str` parts → call `to_string()` method on the value
+///   - chain all parts with `StrConcat` intrinsic calls left-to-right
+///   - if there are zero parts, produce an empty string constant
+fn lower_fstring_concat(
+    resolved: &ResolvedAst,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    use nsbc::IntrinsicFn;
+
+    let parts = ast.multi_children(node_idx);
+    if parts.is_empty() {
+        // Empty string constant.
+        let empty_id = str_interner::intern("\"\"");
+        return NirValue::ConstStr(empty_id);
+    }
+
+    // Lower each part to a String-typed NirValue.
+    let to_string_name = str_interner::intern("to_string");
+    let mut string_vals: Vec<NirValue> = Vec::with_capacity(parts.len());
+
+    for &part in parts {
+        if part.is_null() {
+            continue;
+        }
+        let part_node = ast.node(part);
+        if part_node.kind == NodeKind::Str {
+            // Literal segment — already a String constant.
+            string_vals.push(lower_str_literal(part_node));
+        } else {
+            // Interpolated expression — lower then call to_string().
+            let val = lower_expr(resolved, part, builder, block);
+            let local = builder.alloc_local();
+            builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                local,
+                NirExpr::MethodCall(val, to_string_name, Vec::new()),
+            ));
+            string_vals.push(NirValue::Local(local));
+        }
+    }
+
+    // Fold left with StrConcat: result = concat(concat(a, b), c) ...
+    let mut acc = string_vals[0].clone();
+    for part_val in string_vals.into_iter().skip(1) {
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::CallIntrinsic(IntrinsicFn::StrConcat, vec![acc, part_val]),
+        ));
+        acc = NirValue::Local(local);
+    }
+    acc
+}
+
 fn lower_char_literal(node: &ast::Node) -> NirValue {
     if has_str_id(node) {
         NirValue::ConstStr(node.str_id)
@@ -277,19 +341,17 @@ fn lower_comparison(
     // For == and !=, check for Eq trait impl.
     // For <, <=, >, >=, check for Ord trait impl.
     let trait_dispatch = match kind {
-        NodeKind::BoolEq | NodeKind::BoolNotEq => {
-            lhs_ti.and_then(|ti| {
-                if resolved.type_pool.has_trait_impl(ti, wk.eq) {
-                    Some((ti, wk.eq, "eq"))
-                } else if resolved.type_pool.has_trait_impl(ti, wk.partial_eq) {
-                    Some((ti, wk.partial_eq, "eq"))
-                } else {
-                    None
-                }
-            })
-        }
-        NodeKind::BoolLt | NodeKind::BoolLtEq | NodeKind::BoolGt | NodeKind::BoolGtEq => {
-            lhs_ti.and_then(|ti| {
+        NodeKind::BoolEq | NodeKind::BoolNotEq => lhs_ti.and_then(|ti| {
+            if resolved.type_pool.has_trait_impl(ti, wk.eq) {
+                Some((ti, wk.eq, "eq"))
+            } else if resolved.type_pool.has_trait_impl(ti, wk.partial_eq) {
+                Some((ti, wk.partial_eq, "eq"))
+            } else {
+                None
+            }
+        }),
+        NodeKind::BoolLt | NodeKind::BoolLtEq | NodeKind::BoolGt | NodeKind::BoolGtEq => lhs_ti
+            .and_then(|ti| {
                 if resolved.type_pool.has_trait_impl(ti, wk.ord) {
                     Some((ti, wk.ord, "cmp"))
                 } else if resolved.type_pool.has_trait_impl(ti, wk.partial_ord) {
@@ -297,8 +359,7 @@ fn lower_comparison(
                 } else {
                     None
                 }
-            })
-        }
+            }),
         _ => None,
     };
 
@@ -345,10 +406,9 @@ fn lower_comparison(
                     NodeKind::BoolGtEq => BinOp::Ge,
                     _ => unreachable!(),
                 };
-                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
-                    local,
-                    NirExpr::BinOp(op, cmp_val, zero),
-                ));
+                builder.blocks[block.0 as usize]
+                    .stmts
+                    .push(NirStmt::Assign(local, NirExpr::BinOp(op, cmp_val, zero)));
             }
             _ => unreachable!(),
         }
@@ -417,6 +477,54 @@ fn lower_unary(
     builder.blocks[block.0 as usize]
         .stmts
         .push(NirStmt::Assign(local, NirExpr::UnaryOp(op, inner)));
+    NirValue::Local(local)
+}
+
+// ---------------------------------------------------------------------------
+// Extended call (struct construction): TypeName { field: val, ... }
+// ---------------------------------------------------------------------------
+
+fn lower_extended_call(
+    resolved: &ResolvedAst,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    let children = ast.fixed_children(node_idx);
+    let callee = children[0];
+
+    // Get the struct TypeIndex from the callee's symbol.
+    let type_idx = resolved
+        .node_symbols
+        .get(&callee)
+        .map(|&sym_id| resolved.symbols[sym_id.0 as usize].type_index)
+        .unwrap_or(type_pool::TypeIndex::INVALID);
+
+    // Lower each property value in source order.
+    // For now, assume fields appear in declaration order (matching the struct).
+    let field_vals: Vec<NirValue> = ast
+        .multi_children(node_idx)
+        .iter()
+        .map(|&arg| {
+            if ast.node(arg).kind == NodeKind::Property {
+                let prop_children = ast.fixed_children(arg);
+                if prop_children.len() > 1 {
+                    lower_expr(resolved, prop_children[1], builder, block)
+                } else {
+                    NirValue::Unit
+                }
+            } else {
+                lower_expr(resolved, arg, builder, block)
+            }
+        })
+        .collect();
+
+    let local = builder.alloc_local();
+    builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+        local,
+        NirExpr::NewObject(type_idx, field_vals),
+    ));
     NirValue::Local(local)
 }
 
@@ -593,6 +701,17 @@ fn lower_projection(
 
     // Fallback: regular field access / method call.
     let object = lower_expr(resolved, children[0], builder, block);
+
+    // If type resolution populated a field index for this projection, emit FieldAccess.
+    if let Some(&field_idx) = resolved.node_field_indices.get(&node_idx) {
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::FieldAccess(object, field_idx),
+        ));
+        return NirValue::Local(local);
+    }
+
     let field_name = ast.node(member_node).str_id;
     let local = builder.alloc_local();
     builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(

@@ -36,6 +36,8 @@ pub(crate) struct Resolver<'a> {
     pub(crate) intrinsic_fns: HashMap<SymbolId, IntrinsicFn>,
     /// Maps enum variant SymbolId → variant index (0-based).
     pub(crate) enum_variant_indices: HashMap<SymbolId, u32>,
+    /// Maps Projection node → field index (populated in type resolution).
+    pub(crate) node_field_indices: HashMap<NodeIndex, u32>,
     next_symbol_id: u32,
     pub(crate) current_scope: ScopeId,
 }
@@ -62,6 +64,7 @@ impl<'a> Resolver<'a> {
             diag_ctx,
             intrinsic_fns: HashMap::new(),
             enum_variant_indices: HashMap::new(),
+            node_field_indices: HashMap::new(),
             next_symbol_id: 0,
             current_scope: ScopeId::ROOT,
         };
@@ -170,6 +173,7 @@ impl<'a> Resolver<'a> {
             diagnostics: self.diagnostics,
             intrinsic_fns: self.intrinsic_fns,
             enum_variant_indices: self.enum_variant_indices,
+            node_field_indices: self.node_field_indices,
         }
     }
 

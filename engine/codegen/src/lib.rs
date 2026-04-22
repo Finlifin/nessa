@@ -56,17 +56,26 @@ struct Emitter {
     fixups: Vec<(usize, BlockId)>,
     safepoint_pcs: Vec<u32>,
     constants: Vec<Constant>,
+    /// Base index into the global constant pool for this function's constants.
+    const_base: u32,
 }
 
 impl Emitter {
-    fn new() -> Self {
+    fn new(const_base: u32) -> Self {
         Self {
             instructions: Vec::new(),
             block_offsets: Vec::new(),
             fixups: Vec::new(),
             safepoint_pcs: Vec::new(),
             constants: Vec::new(),
+            const_base,
         }
+    }
+
+    fn add_constant(&mut self, c: Constant) -> u32 {
+        let global_idx = self.const_base + self.constants.len() as u32;
+        self.constants.push(c);
+        global_idx
     }
 
     fn emit(&mut self, instr: Instruction) {
@@ -80,12 +89,6 @@ impl Emitter {
     fn emit_safepoint(&mut self) {
         self.safepoint_pcs.push(self.current_pc());
         self.emit(Instruction::safepoint());
-    }
-
-    fn _add_constant(&mut self, c: Constant) -> u32 {
-        let idx = self.constants.len() as u32;
-        self.constants.push(c);
-        idx
     }
 }
 
@@ -119,7 +122,7 @@ impl Codegen {
 
     fn compile_function(&mut self, func: &NirFunction) -> CompiledFunction {
         let mut regalloc = RegAlloc::new(func.local_count);
-        let mut emitter = Emitter::new();
+        let mut emitter = Emitter::new(self.output_constants.len() as u32);
 
         // Pre-assign registers for parameters.
         for (i, param) in func.params.iter().enumerate() {
@@ -446,9 +449,16 @@ impl Codegen {
                 // Store float as its bit pattern in an immediate.
                 emitter.emit(Instruction::load_imm(dst, v.to_bits()));
             }
-            NirValue::ConstStr(_str_id) => {
-                // TODO: load string constant from constant pool.
-                emitter.emit(Instruction::load_null(dst));
+            NirValue::ConstStr(str_id) => {
+                // Strip surrounding quotes and process escape sequences.
+                let raw = str_interner::get(*str_id);
+                let content = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+                    process_string_escapes(&raw[1..raw.len() - 1])
+                } else {
+                    raw.to_string()
+                };
+                let global_idx = emitter.add_constant(Constant::Str(content));
+                emitter.emit(Instruction::load_const(dst, global_idx));
             }
         }
     }
@@ -476,6 +486,48 @@ impl Default for Codegen {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Process Nessa string escape sequences: \n \t \r \\ \" \' \xHH \uHHHH.
+fn process_string_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('\'') => out.push('\''),
+                Some('x') => {
+                    let h1 = chars.next().unwrap_or('0');
+                    let h2 = chars.next().unwrap_or('0');
+                    let hex = format!("{}{}", h1, h2);
+                    if let Ok(v) = u8::from_str_radix(&hex, 16) {
+                        out.push(v as char);
+                    }
+                }
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(v) {
+                            out.push(ch);
+                        }
+                    }
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Compile a NIR module into bytecode.

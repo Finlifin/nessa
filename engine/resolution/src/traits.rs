@@ -533,7 +533,7 @@ fn generate_derive_methods(
         });
     } else if trait_type == wk.display {
         methods.push(MethodSlot {
-            name: str_interner::intern("show"),
+            name: str_interner::intern("to_string"),
             func_id: DERIVE_FUNC_ID,
             trait_impl: Some(trait_type),
             visible_scope: None,

@@ -296,6 +296,8 @@ fn try_prefix_expr(p: &mut Parser, option: ExprOption) -> ParseResult {
         | TokenKind::KwNull
         | TokenKind::Underscore => basic::try_atomic(p),
 
+        TokenKind::FStringStart => try_fstring(p),
+
         TokenKind::LParen => try_unit_or_paren_or_tuple(p),
         TokenKind::LBracket => try_list(p),
         TokenKind::LBrace => try_object(p),
@@ -1276,4 +1278,64 @@ fn maybe_wrap_tacit_lambda(p: &mut Parser, arg: NodeIndex) -> NodeIndex {
         .add_child(NULL) // return type
         .add_multi_children(&params)
         .build()
+}
+
+// ---------------------------------------------------------------------------
+// F-string (interpolated string) parser
+// ---------------------------------------------------------------------------
+//
+// Token stream from lexer:
+//   FStringStart  FStringLiteral?  (FStringExprStart  <expr tokens>  FStringExprEnd  FStringLiteral?)*  FStringEnd
+//
+// We build a `FStringConcat` node whose multi-children are alternating
+// `Str` nodes (literal text segments) and arbitrary expression nodes.
+
+fn try_fstring(p: &mut Parser) -> ParseResult {
+    let span = p.current_span();
+    // Consume FStringStart
+    p.expect_token(TokenKind::FStringStart)?;
+
+    let mut parts: Vec<NodeIndex> = Vec::new();
+
+    loop {
+        let tok = p.peek_token();
+        match tok.kind {
+            TokenKind::FStringEnd => {
+                p.next_token();
+                break;
+            }
+            TokenKind::FStringLiteral => {
+                // Intern the raw text of this segment (no surrounding quotes).
+                let seg_span = p.current_span();
+                let raw = p.next_token_text().to_owned();
+                p.next_token(); // consume FStringLiteral
+                let str_id = str_interner::intern(&raw);
+                let seg = p.ast().builder(NodeKind::Str, seg_span).set_str_id(str_id).build();
+                parts.push(seg);
+            }
+            TokenKind::FStringExprStart => {
+                p.next_token(); // consume `{`
+                // Parse the inner expression.
+                let expr = try_expr(p)?;
+                parts.push(expr);
+                p.expect_token(TokenKind::FStringExprEnd)?;
+            }
+            TokenKind::Eof => {
+                let span = p.next_token_span();
+                p.err(ParseErrorKind::UnexpectedToken, span, "unterminated f-string")?;
+                unreachable!()
+            }
+            _ => {
+                let span = p.next_token_span();
+                p.err(ParseErrorKind::UnexpectedToken, span, "unexpected token in f-string")?;
+                unreachable!()
+            }
+        }
+    }
+
+    // Build FStringConcat with all parts as multi-children.
+    Ok(p.ast()
+        .builder(NodeKind::FStringConcat, span)
+        .add_multi_children(&parts)
+        .build())
 }

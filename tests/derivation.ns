@@ -1,0 +1,14 @@
+struct Student {
+    name: String,
+    age: u32,
+}
+
+derive Display, PartialEq, Eq, Hash for Student
+
+fn main() {
+    let student = Student {
+        name: "Alice",
+        age: 20,
+    }
+    println("{student}")
+}

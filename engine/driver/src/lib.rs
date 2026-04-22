@@ -19,6 +19,7 @@ pub struct CompileResult {
     pub codegen_output: CodegenOutput,
     pub diagnostics: Vec<diagnostic::Diagnostic>,
     pub has_errors: bool,
+    pub type_pool: type_pool::TypePool,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,7 @@ impl Driver {
 
         CompileResult {
             codegen_output,
+            type_pool: resolved.type_pool,
             diagnostics: resolved.diagnostics,
             has_errors,
         }
@@ -104,6 +106,9 @@ impl Driver {
         // Initialize the engine.
         let mut engine = Engine::with_defaults();
 
+        // Install the fully-resolved type pool (includes user-defined types).
+        engine.vm_mut().type_pool = result.type_pool;
+
         // Load compiled functions into the VM.
         let main_str_id = str_interner::intern("main");
         let mut entry_func_id = None;
@@ -119,6 +124,18 @@ impl Driver {
             if func.name == main_str_id {
                 entry_func_id = Some(fid);
             }
+        }
+
+        // Pre-allocate constant pool entries (strings become heap objects).
+        for constant in &result.codegen_output.constants {
+            let tv = match constant {
+                nsbc::Constant::Int(v) => runtime::TaggedValue::from_i64(*v),
+                nsbc::Constant::UInt(v) => runtime::TaggedValue::from_u64(*v),
+                nsbc::Constant::Float(v) => runtime::TaggedValue::from_f64(*v),
+                nsbc::Constant::Str(s) => engine.vm_mut().alloc_string(s),
+                nsbc::Constant::BigInt(_) => runtime::TaggedValue::UNIT,
+            };
+            engine.vm_mut().constants.push(tv);
         }
 
         // If there are no functions to run, return unit.

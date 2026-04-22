@@ -103,6 +103,13 @@ fn resolve_types_expected(
         NodeKind::Int => Some(contextual_int_type(&r.type_pool, expected)),
         NodeKind::Real => Some(contextual_float_type(&r.type_pool, expected)),
         NodeKind::Str => Some(Intrinsic::Str.type_index()),
+        NodeKind::FStringConcat => {
+            // Resolve all children (literal segments + interpolated expressions).
+            for &child in ast.multi_children(node_idx) {
+                resolve_types(r, ast, child);
+            }
+            Some(Intrinsic::Str.type_index())
+        }
         NodeKind::Char => Some(Intrinsic::Char.type_index()),
         NodeKind::Bool => Some(Intrinsic::Bool.type_index()),
         NodeKind::Null | NodeKind::Unit => Some(Intrinsic::Unit.type_index()),
@@ -234,6 +241,84 @@ fn resolve_types_expected(
             // children[1] = value expression — resolve with expected type
             resolve_types_expected(r, ast, children[1], expected);
             r.node_types.get(&children[1]).copied()
+        }
+
+        // ── Struct construction: TypeName { field: val, ... } ──────
+        NodeKind::ExtendedCall => {
+            let children = ast.fixed_children(node_idx);
+            let callee = children[0];
+            // Resolve callee type (should be a struct/enum type symbol).
+            resolve_types(r, ast, callee);
+            let struct_ti = r.node_types.get(&callee).copied().or_else(|| {
+                r.node_symbols
+                    .get(&callee)
+                    .map(|&sym_id| r.symbols[sym_id.0 as usize].type_index)
+            });
+            // Resolve each property value (skip field name keys).
+            for &arg in ast.multi_children(node_idx) {
+                if ast.node(arg).kind == NodeKind::Property {
+                    let prop_children = ast.fixed_children(arg);
+                    if prop_children.len() > 1 {
+                        resolve_types(r, ast, prop_children[1]);
+                    }
+                } else {
+                    resolve_types(r, ast, arg);
+                }
+            }
+            struct_ti
+        }
+
+        // ── Struct definition — populate FieldInfo in the type pool ─
+        NodeKind::StructDef => {
+            let children = ast.fixed_children(node_idx);
+            let name_node = children[0];
+            // Get the already-registered struct TypeIndex from the symbol.
+            let type_idx = r
+                .node_symbols
+                .get(&name_node)
+                .map(|&sym_id| r.symbols[sym_id.0 as usize].type_index)
+                .unwrap_or(TypeIndex::INVALID);
+            // Collect fields in declaration order.
+            let fields: Vec<(str_interner::StrId, type_pool::TypeIndex, NodeIndex)> = ast
+                .multi_children(node_idx)
+                .iter()
+                .filter(|&&m| ast.node(m).kind == NodeKind::StructField)
+                .map(|&field_node| {
+                    let fc = ast.fixed_children(field_node);
+                    let field_name = ast.node(fc[0]).str_id;
+                    let type_node = fc[1];
+                    resolve_types(r, ast, type_node);
+                    let field_ti =
+                        resolve_type_expr(r, ast, type_node).unwrap_or(TypeIndex::INVALID);
+                    (field_name, field_ti, field_node)
+                })
+                .collect();
+            // Populate the struct's FieldInfo in the type pool.
+            if type_idx != TypeIndex::INVALID {
+                let field_infos: Vec<type_pool::FieldInfo> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(name, ty, _))| type_pool::FieldInfo {
+                        name,
+                        ty,
+                        has_default: false,
+                        offset: (i * 8) as u32,
+                    })
+                    .collect();
+                if let TypeKind::Struct {
+                    fields: ref mut f, ..
+                } = r.type_pool.get_mut(type_idx).kind
+                {
+                    *f = field_infos;
+                }
+            }
+            // Also resolve non-field members (methods, etc.)
+            for &member in ast.multi_children(node_idx) {
+                if ast.node(member).kind != NodeKind::StructField {
+                    resolve_types(r, ast, member);
+                }
+            }
+            None
         }
 
         // ── Default: recurse ───────────────────────────────────────
@@ -856,13 +941,27 @@ fn resolve_projection_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) ->
         if let Some(&sym_id) = r.node_symbols.get(&member_node) {
             let sym = &r.symbols[sym_id.0 as usize];
             if sym.kind == SymbolKind::EnumVariant {
-                // Walk up to find the enum type.
-                // The variant's def_node is inside an EnumDef; find the parent enum's type.
-                // For now, fall through — the enum type is on the LHS.
                 return r.node_types.get(&children[0]).copied();
             }
         }
     }
+
+    // Try struct field access: look up field by name in the LHS struct type.
+    let lhs_type = r.node_types.get(&children[0]).copied();
+    if let Some(lhs_ti) = lhs_type {
+        if let type_pool::TypeKind::Struct { fields, .. } = &r.type_pool.get(lhs_ti).kind.clone() {
+            if !member_node.is_null() {
+                let field_name = ast.node(member_node).str_id;
+                for (idx, field) in fields.iter().enumerate() {
+                    if field.name == field_name {
+                        r.node_field_indices.insert(node_idx, idx as u32);
+                        return Some(field.ty);
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 
