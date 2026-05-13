@@ -7,6 +7,7 @@
 | 文档 | 内容 |
 |------|------|
 | [architecture.md](architecture.md) | 系统总体架构、编译管线、运行时架构、Crate 组织 |
+| [compiler-interview-feature-guide.md](compiler-interview-feature-guide.md) | 面向编译岗位面试的语言特性讲解顺序与回答模板 |
 | [runtime-representation/](runtime-representation/) | Tagged Pointer、堆对象布局、值的运行时表示 |
 | [memory-management/](memory-management/) | MMTK + LXR GC、Task Stack Pool、外部对象管理 |
 | [nessa-bytecode/](nessa-bytecode/) | 64-bit 指令集设计、NSBC Archive 格式、Safe Point |
