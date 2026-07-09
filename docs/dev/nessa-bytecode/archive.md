@@ -41,7 +41,7 @@ NSBC Archive (`.nsbc`) 是 Nessa 的编译产物文件。一个包 (package) 编
 ```
 FileHeader (60 bytes):
   magic:          [4 bytes]   "NSBC"                            → 魔数
-  version:        [4 bytes]   major.minor.patch (u16.u16.u16+pad) → archive 格式版本
+  version:        [4 bytes]   u32（当前 = 2，32-bit 指令编码） → archive 格式版本
   checksum:       [32 bytes]  SHA-256 of (header 以外所有数据)    → 完整性校验
   target_arch:    [2 bytes]   0=Any 1=X86_64 2=ARM64 3=RV64     → 目标架构
   target_os:      [2 bytes]   0=Any 1=Linux 2=Darwin 3=Win      → 目标 OS
@@ -98,8 +98,8 @@ CODE Section:
     flags:           [2 bytes]  u16  → bit0=has_variadic, bit1=is_closure
 
   Data:
-    [函数 0 的 64-bit 指令序列]
-    [函数 1 的 64-bit 指令序列]
+    [函数 0 的 32-bit 指令序列]
+    [函数 1 的 32-bit 指令序列]
     ...
 ```
 

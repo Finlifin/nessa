@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 // ---------------------------------------------------------------------------
 
 pub const MAGIC: &[u8; 4] = b"NSBC";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Size of the file header in bytes.
 pub const FILE_HEADER_SIZE: usize = 60;

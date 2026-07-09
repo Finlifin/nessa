@@ -219,10 +219,10 @@ impl std::fmt::Debug for TaggedValue {
 }
 
 // ---------------------------------------------------------------------------
-// RegisterFile — the 20 GP registers per task
+// RegisterFile — the 32 GP registers per task
 // ---------------------------------------------------------------------------
 
-pub const GP_REGISTER_COUNT: usize = 20;
+pub const GP_REGISTER_COUNT: usize = 32;
 
 /// The register file for a single task / call frame.
 #[derive(Clone)]
@@ -361,7 +361,7 @@ pub struct BytecodeStore {
 
 pub struct FunctionCode {
     pub func_id: FuncId,
-    pub instructions: Vec<u64>, // encoded 64-bit instruction words
+    pub instructions: Vec<u32>, // encoded 32-bit instruction words
     pub register_count: u8,
     pub param_count: u8,
     pub is_closure: bool,

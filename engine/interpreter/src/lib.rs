@@ -1,5 +1,5 @@
 use gc::{GC_FLAGS, GcConfig, Heap, NessaSlot, ObjectHeader};
-use nsbc::{FuncId, Instruction, InstructionData, IntrinsicFn, Opcode, Reg};
+use nsbc::{AddrMode, FuncId, Instruction, InstructionData, IntrinsicFn, Opcode, Reg};
 use runtime::{
     BytecodeStore, CallFrame, ClosureEnv, ConstantPool, EffectHandler, FunctionCode, GlobalTable,
     TaggedValue, TaskId, TaskStatus,
@@ -53,11 +53,7 @@ impl Vm {
                 // Write length prefix.
                 *(ptr.as_ptr() as *mut u64) = bytes.len() as u64;
                 // Write UTF-8 bytes after the length.
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    ptr.as_ptr().add(8),
-                    bytes.len(),
-                );
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().add(8), bytes.len());
                 TaggedValue::from_heap_ptr(ptr.as_ptr())
             },
             None => TaggedValue::UNIT,
@@ -361,43 +357,65 @@ impl Vm {
                 DispatchResult::Continue
             }
 
-            // ── Constants & types (I-type) ────────────────────────
-            Opcode::LoadImm => {
-                let (dst, _, imm) = i_fields(&instr);
-                let t = task!();
-                t.registers.set(dst, TaggedValue::from_i64(imm as i64));
+            // ── Constants & types (A-type) ────────────────────────
+            Opcode::Load => {
+                let (dst, base, imm12) = a_fields(&instr);
+                let val = match instr.amode {
+                    AddrMode::Imm => {
+                        // Sign-extend 12-bit immediate to i64.
+                        TaggedValue::from_i64(Instruction::sext_imm12(imm12) as i64)
+                    }
+                    AddrMode::Const => self.constants.get(imm12 as u32),
+                    AddrMode::RegOff => {
+                        let t = task!();
+                        let base_val = t.registers.get(base);
+                        let off = Instruction::sext_imm12(imm12) as i64;
+                        if let Some(n) = base_val.as_i64() {
+                            TaggedValue::from_i64(n.wrapping_add(off))
+                        } else if let Some(n) = base_val.as_u64() {
+                            TaggedValue::from_u64(n.wrapping_add(off as u64))
+                        } else {
+                            TaggedValue::UNIT
+                        }
+                    }
+                    AddrMode::Reserved => {
+                        return DispatchResult::Error(VmError::InvalidInstruction(instr.encode()));
+                    }
+                };
+                task!().registers.set(dst, val);
                 DispatchResult::Continue
             }
-            Opcode::LoadConst => {
-                let (dst, _, imm) = i_fields(&instr);
-                let val = self.constants.get(imm as u32);
+            Opcode::LoadConstWide => {
+                let (dst, base, imm12) = a_fields(&instr);
+                let idx = Instruction::wide_const_index(base, imm12);
+                let val = self.constants.get(idx);
                 task!().registers.set(dst, val);
                 DispatchResult::Continue
             }
             Opcode::LoadUnit => {
-                let (dst, _, _) = i_fields(&instr);
+                let (dst, _, _) = a_fields(&instr);
                 task!().registers.set(dst, TaggedValue::UNIT);
                 DispatchResult::Continue
             }
             Opcode::LoadTrue => {
-                let (dst, _, _) = i_fields(&instr);
+                let (dst, _, _) = a_fields(&instr);
                 task!().registers.set(dst, TaggedValue::TRUE);
                 DispatchResult::Continue
             }
             Opcode::LoadFalse => {
-                let (dst, _, _) = i_fields(&instr);
+                let (dst, _, _) = a_fields(&instr);
                 task!().registers.set(dst, TaggedValue::FALSE);
                 DispatchResult::Continue
             }
             Opcode::LoadNull => {
-                let (dst, _, _) = i_fields(&instr);
+                let (dst, _, _) = a_fields(&instr);
                 task!().registers.set(dst, TaggedValue::NULL);
                 DispatchResult::Continue
             }
             Opcode::TypeCheck => {
                 // dst = (src is type_idx)
-                let (dst, src, imm) = i_fields(&instr);
-                let _type_idx = TypeIndex::from_raw(imm as u32);
+                let (dst, src, imm12) = a_fields(&instr);
+                let _type_idx = TypeIndex::from_raw(imm12 as u32);
                 // TODO: runtime type check against type pool
                 let t = task!();
                 let _val = t.registers.get(src);
@@ -405,7 +423,7 @@ impl Vm {
                 DispatchResult::Continue
             }
             Opcode::TypeCast | Opcode::TypeCastSafe => {
-                let (dst, src, _imm) = i_fields(&instr);
+                let (dst, src, _imm12) = a_fields(&instr);
                 let t = task!();
                 let val = t.registers.get(src);
                 // TODO: actual type cast with check
@@ -413,10 +431,10 @@ impl Vm {
                 DispatchResult::Continue
             }
 
-            // ── Memory access (I-type) ────────────────────────────
+            // ── Memory access (A-type) ────────────────────────────
             Opcode::LoadField => {
-                let (dst, obj_reg, imm) = i_fields(&instr);
-                let field_idx = imm as usize;
+                let (dst, obj_reg, imm12) = a_fields(&instr);
+                let field_idx = imm12 as usize;
                 let t = task!();
                 let obj = t.registers.get(obj_reg);
                 if let Some(ptr) = obj.as_heap_ptr() {
@@ -428,10 +446,9 @@ impl Vm {
                 DispatchResult::Continue
             }
             Opcode::StoreField => {
-                // store_field(obj, field_idx, val) encodes as i_type(StoreField, val, obj, field_idx)
-                // i_fields returns (dst=val_reg, src=obj_reg, imm=field_idx)
-                let (val_reg, obj_reg, imm) = i_fields(&instr);
-                let field_idx = imm as usize;
+                // store_field(obj, field_idx, val) encodes as a_type(StoreField, val, obj, field_idx)
+                let (val_reg, obj_reg, imm12) = a_fields(&instr);
+                let field_idx = imm12 as usize;
                 let t = task!();
                 let obj = t.registers.get(obj_reg);
                 let val = t.registers.get(val_reg);
@@ -443,27 +460,43 @@ impl Vm {
                 DispatchResult::Continue
             }
             Opcode::LoadIndex => {
-                let (dst, _obj, _imm) = i_fields(&instr);
+                let (dst, _obj, _imm12) = a_fields(&instr);
                 task!().registers.set(dst, TaggedValue::UNIT);
                 DispatchResult::Continue
             }
             Opcode::StoreIndex => DispatchResult::Continue,
-            Opcode::LoadGlobal => {
-                let (dst, _, imm) = i_fields(&instr);
-                let val = self.globals.get(imm as u32);
+            Opcode::LoadGlobal | Opcode::LoadGlobalWide => {
+                let (dst, base, imm12) = a_fields(&instr);
+                let gidx = if instr.opcode == Opcode::LoadGlobalWide {
+                    Instruction::wide_const_index(base, imm12)
+                } else {
+                    imm12 as u32
+                };
+                let val = self.globals.get(gidx);
                 task!().registers.set(dst, val);
                 DispatchResult::Continue
             }
-            Opcode::StoreGlobal => {
-                let (_dst, src, imm) = i_fields(&instr);
-                // StoreGlobal: src register value → global[imm]
-                let val = task!().registers.get(src);
-                self.globals.set(imm as u32, val);
+            Opcode::StoreGlobal | Opcode::StoreGlobalWide => {
+                let (val_reg, base, imm12) = a_fields(&instr);
+                let gidx = if instr.opcode == Opcode::StoreGlobalWide {
+                    Instruction::wide_const_index(base, imm12)
+                } else {
+                    // Narrow: value in base (src), index in imm12; val_reg unused.
+                    // Keep compatibility with store_global encoding: a_type(dst=0, base=src, imm=gidx)
+                    // Prefer value from base for narrow StoreGlobal.
+                    imm12 as u32
+                };
+                let val = if instr.opcode == Opcode::StoreGlobalWide {
+                    task!().registers.get(val_reg)
+                } else {
+                    task!().registers.get(base)
+                };
+                self.globals.set(gidx, val);
                 DispatchResult::Continue
             }
             Opcode::LoadCapture => {
-                let (dst, _, imm) = i_fields(&instr);
-                let capture_idx = imm as u32;
+                let (dst, _, imm12) = a_fields(&instr);
+                let capture_idx = imm12 as u32;
                 // Find the closure env from the most recent closure call frame
                 let t = task!();
                 let env = t
@@ -481,10 +514,10 @@ impl Vm {
                 DispatchResult::Continue
             }
 
-            // ── Object creation (I-type) ──────────────────────────
+            // ── Object creation (A-type) ──────────────────────────
             Opcode::NewObject => {
-                let (dst, _, imm) = i_fields(&instr);
-                let type_idx = TypeIndex::from_raw(imm as u32);
+                let (dst, _, imm12) = a_fields(&instr);
+                let type_idx = TypeIndex::from_raw(imm12 as u32);
                 // Allocate a heap object with space for fields.
                 // For now, allocate 8 fields worth of space (64 bytes).
                 match self.heap.alloc_object(type_idx, 8) {
@@ -500,48 +533,43 @@ impl Vm {
             }
             Opcode::NewList => {
                 // TODO: allocate list
-                let (dst, _, _) = i_fields(&instr);
+                let (dst, _, _) = a_fields(&instr);
                 task!().registers.set(dst, TaggedValue::UNIT);
                 DispatchResult::Continue
             }
             Opcode::NewMap => {
-                let (dst, _, _) = i_fields(&instr);
+                let (dst, _, _) = a_fields(&instr);
                 task!().registers.set(dst, TaggedValue::UNIT);
                 DispatchResult::Continue
             }
             Opcode::NewClosure => {
-                let (dst, src, imm) = i_fields(&instr);
-                let func_id = FuncId(imm as u32);
-                let capture_count = src.0 as u16;
-                let payload_words = ClosureEnv::payload_words(capture_count);
-                let closure_type = Intrinsic::Closure.type_index();
-
-                match self.heap.alloc_object(closure_type, payload_words) {
-                    Some(ptr) => {
-                        // Collect captured values from r0..r(capture_count-1)
-                        let t = task!();
-                        let mut captures = Vec::with_capacity(capture_count as usize);
-                        for i in 0..capture_count {
-                            captures.push(t.registers.get(Reg(i as u8)));
-                        }
-                        unsafe {
-                            ClosureEnv::write(ptr.as_ptr(), func_id, &captures);
-                        }
-                        let val = unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) };
-                        t.registers.set(dst, val);
-                    }
+                let (dst, base, imm12) = a_fields(&instr);
+                let func_id = FuncId(imm12 as u32);
+                let capture_count = base.0 as u16;
+                self.exec_new_closure(task_id, dst, func_id, capture_count)
+            }
+            Opcode::NewClosureWide => {
+                let (dst, base, imm12) = a_fields(&instr);
+                let capture_count = base.0 as u16;
+                let const_idx = imm12 as u32;
+                let func_id = match self.constants.get(const_idx).as_u64() {
+                    Some(id) => FuncId(id as u32),
                     None => {
-                        return DispatchResult::Error(VmError::OutOfMemory);
+                        // Also try as i64
+                        match self.constants.get(const_idx).as_i64() {
+                            Some(id) => FuncId(id as u32),
+                            None => return DispatchResult::Error(VmError::TypeError),
+                        }
                     }
-                }
-                DispatchResult::Continue
+                };
+                self.exec_new_closure(task_id, dst, func_id, capture_count)
             }
 
             // ── Control flow (J-type) ─────────────────────────────
-            Opcode::Jmp => {
+            Opcode::Jmp | Opcode::JmpFar => {
                 let (_, offset) = j_fields(&instr);
                 let t = task!();
-                t.pc = ((t.pc as i64) + offset - 1) as u32; // -1 because we pre-incremented
+                t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
                 DispatchResult::Continue
             }
             Opcode::JmpIf => {
@@ -549,7 +577,7 @@ impl Vm {
                 let t = task!();
                 let val = t.registers.get(cond);
                 if is_truthy(val) {
-                    t.pc = ((t.pc as i64) + offset - 1) as u32;
+                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
                 }
                 DispatchResult::Continue
             }
@@ -558,7 +586,7 @@ impl Vm {
                 let t = task!();
                 let val = t.registers.get(cond);
                 if !is_truthy(val) {
-                    t.pc = ((t.pc as i64) + offset - 1) as u32;
+                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
                 }
                 DispatchResult::Continue
             }
@@ -567,7 +595,7 @@ impl Vm {
                 let t = task!();
                 let val = t.registers.get(cond);
                 if val.is_null() {
-                    t.pc = ((t.pc as i64) + offset - 1) as u32;
+                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
                 }
                 DispatchResult::Continue
             }
@@ -576,159 +604,95 @@ impl Vm {
                 let t = task!();
                 let val = t.registers.get(cond);
                 if !val.is_null() {
-                    t.pc = ((t.pc as i64) + offset - 1) as u32;
+                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
                 }
                 DispatchResult::Continue
             }
 
-            // ── Calls (J-type) ────────────────────────────────────
+            // ── Calls (C-type) ────────────────────────────────────
             Opcode::Call => {
-                let (_cond_reg, offset) = j_fields(&instr);
-                let raw = offset as u64;
-                let target_func_id = FuncId((raw >> 8) as u32);
-                let arg_count = (raw & 0xFF) as u8;
-                let _ = arg_count; // args are in r0..r(arg_count-1)
-
-                let t = task!();
-                // Save current frame.
-                let frame = CallFrame {
-                    return_pc: t.pc,
-                    func_id: t.current_func,
-                    saved_regs: Vec::new(), // TODO: callee-save convention
-                    evidence: Vec::new(),
-                    closure_env: None,
-                };
-                t.call_stack.push(frame);
-                t.current_func = target_func_id;
-                t.pc = 0;
-                DispatchResult::Continue
+                let payload = c_payload(&instr);
+                let (arg_count, func_id_raw) = Instruction::c_arg_count_func_id(payload);
+                let _ = arg_count;
+                self.push_call_frame(task_id, FuncId(func_id_raw), None)
+            }
+            Opcode::CallFar => {
+                let payload = c_payload(&instr);
+                let (arg_count, const_idx) = Instruction::c_arg_count_func_id(payload);
+                let _ = arg_count;
+                let tv = self.constants.get(const_idx);
+                let func_id_raw = tv
+                    .as_u64()
+                    .or_else(|| tv.as_i64().map(|v| v as u64))
+                    .unwrap_or(0);
+                self.push_call_frame(task_id, FuncId(func_id_raw as u32), None)
             }
             Opcode::CallIndirect => {
-                let (closure_reg, arg_count_raw) = j_fields(&instr);
-                let arg_count = arg_count_raw as u8;
+                let payload = c_payload(&instr);
+                let (arg_count, closure_reg) = Instruction::c_call_indirect(payload);
                 let closure_val = task!().registers.get(closure_reg);
 
-                // The closure must be a heap object
-                let payload = match closure_val.as_heap_ptr() {
+                let payload_ptr = match closure_val.as_heap_ptr() {
                     Some(p) => p,
                     None => return DispatchResult::Error(VmError::TypeError),
                 };
 
-                let func_id = unsafe { ClosureEnv::func_id(payload) };
-                let capture_count = unsafe { ClosureEnv::capture_count(payload) };
+                let func_id = unsafe { ClosureEnv::func_id(payload_ptr) };
+                let capture_count = unsafe { ClosureEnv::capture_count(payload_ptr) };
 
-                // Shift explicit args (in r0..r(arg_count-1)) to make room for captures.
-                // Lambda params: captures first (r0..r(capture_count-1)), then user args.
                 let t = task!();
-                // Read explicit args first
                 let mut explicit_args = Vec::with_capacity(arg_count as usize);
                 for i in 0..arg_count {
                     explicit_args.push(t.registers.get(Reg(i)));
                 }
-                // Place captures in r0..r(capture_count-1)
                 for i in 0..capture_count {
-                    let cap = unsafe { ClosureEnv::get_capture(payload, i) };
+                    let cap = unsafe { ClosureEnv::get_capture(payload_ptr, i) };
                     t.registers.set(Reg(i as u8), cap);
                 }
-                // Place explicit args after captures
                 for (i, arg) in explicit_args.into_iter().enumerate() {
                     t.registers.set(Reg((capture_count as u8) + (i as u8)), arg);
                 }
 
-                // Push call frame
-                let frame = CallFrame {
-                    return_pc: t.pc,
-                    func_id: t.current_func,
-                    saved_regs: Vec::new(),
-                    evidence: Vec::new(),
-                    closure_env: Some(closure_val),
-                };
-                t.call_stack.push(frame);
-                t.current_func = func_id;
-                t.pc = 0;
-                DispatchResult::Continue
+                self.push_call_frame(task_id, func_id, Some(closure_val))
             }
             Opcode::CallMethod => {
-                let (recv_reg, payload_raw) = j_fields(&instr);
-                let payload = payload_raw as u64;
-                let method_str_id = StrId::from_raw((payload >> 8) as u32);
-                let arg_count = (payload & 0xFF) as u8;
-
-                let receiver = task!().registers.get(recv_reg);
-
-                // Determine the receiver's TypeIndex.
-                let recv_type = value_type_index(receiver);
-
-                // Look up the method in the type's method table.
-                if let Some(slot) = self.type_pool.find_method(recv_type, method_str_id) {
-                    // Check for compiler-derived (synthesized) methods.
-                    if slot.func_id == type_pool::DERIVE_FUNC_ID {
-                        let result = self.dispatch_derived_method(
-                            task_id,
-                            receiver,
-                            recv_type,
-                            method_str_id,
-                            arg_count,
-                        );
-                        return result;
-                    }
-
-                    let target_func_id = FuncId(slot.func_id);
-                    let t = task!();
-                    // Push call frame.
-                    let frame = CallFrame {
-                        return_pc: t.pc,
-                        func_id: t.current_func,
-                        saved_regs: Vec::new(),
-                        evidence: Vec::new(),
-                        closure_env: None,
-                    };
-                    t.call_stack.push(frame);
-                    // Place receiver as first argument (self) by shifting args.
-                    // Read explicit args first.
-                    let mut explicit_args = Vec::with_capacity(arg_count as usize);
-                    for i in 0..arg_count {
-                        explicit_args.push(t.registers.get(Reg(i)));
-                    }
-                    // r0 = receiver (self), r1..rN = args
-                    t.registers.set(Reg(0), receiver);
-                    for (i, arg) in explicit_args.into_iter().enumerate() {
-                        t.registers.set(Reg((i + 1) as u8), arg);
-                    }
-                    t.current_func = target_func_id;
-                    t.pc = 0;
-                    DispatchResult::Continue
-                } else {
-                    DispatchResult::Error(VmError::MethodNotFound)
-                }
+                let payload = c_payload(&instr);
+                let (arg_count, recv_reg, method_id) = Instruction::c_call_method(payload);
+                self.exec_call_method(task_id, recv_reg, StrId::from_raw(method_id), arg_count)
+            }
+            Opcode::CallMethodFar => {
+                let payload = c_payload(&instr);
+                let (arg_count, recv_reg, const_idx) = Instruction::c_call_method(payload);
+                let tv = self.constants.get(const_idx);
+                let method_id = tv
+                    .as_u64()
+                    .or_else(|| tv.as_i64().map(|v| v as u64))
+                    .unwrap_or(0) as u32;
+                self.exec_call_method(task_id, recv_reg, StrId::from_raw(method_id), arg_count)
             }
             Opcode::CallWasm => {
                 // TODO: WASM FFI call
                 DispatchResult::Continue
             }
             Opcode::TailCall => {
-                let (_cond_reg, offset) = j_fields(&instr);
-                let raw = offset as u64;
-                let target_func_id = FuncId((raw >> 8) as u32);
+                let payload = c_payload(&instr);
+                let (_arg_count, func_id_raw) = Instruction::c_arg_count_func_id(payload);
                 let t = task!();
-                // Tail call: don't push frame, just replace current function.
-                t.current_func = target_func_id;
+                t.current_func = FuncId(func_id_raw);
                 t.pc = 0;
                 DispatchResult::Continue
             }
             Opcode::CallIntrinsic => {
-                let (_cond_reg, offset) = j_fields(&instr);
-                let raw = offset as u64;
-                let intrinsic_id = (raw >> 8) as u16;
-                let arg_count = (raw & 0xFF) as u8;
+                let payload = c_payload(&instr);
+                let (arg_count, intrinsic_id) = Instruction::c_arg_count_func_id(payload);
                 let _ = arg_count;
-                match IntrinsicFn::from_u16(intrinsic_id) {
+                match IntrinsicFn::from_u16(intrinsic_id as u16) {
                     Some(ifn) => self.dispatch_intrinsic(task_id, ifn),
                     None => DispatchResult::Error(VmError::InvalidInstruction(instr.encode())),
                 }
             }
             Opcode::Return => {
-                let (src_reg, _) = j_fields(&instr);
+                let src_reg = Instruction::c_return_reg(c_payload(&instr));
                 let val = task!().registers.get(src_reg);
                 DispatchResult::Return(val)
             }
@@ -744,10 +708,25 @@ impl Vm {
                 DispatchResult::Continue
             }
             Opcode::PushHandler => {
-                // payload encodes: effect_type(32) | handler_func(24)
+                // payload: effect_type(11) | handler_func(11)
                 let payload = e_payload(&instr);
-                let effect_type = TypeIndex::from_raw((payload >> 24) as u32);
-                let handler_func = FuncId((payload & 0xFF_FFFF) as u32);
+                let effect_type = TypeIndex::from_raw((payload >> 11) & 0x7FF);
+                let handler_func = FuncId(payload & 0x7FF);
+                let t = task!();
+                t.handler_stack.push(EffectHandler {
+                    effect_type,
+                    handler_func,
+                    is_async: false,
+                });
+                DispatchResult::Continue
+            }
+            Opcode::PushHandlerWide => {
+                let payload = e_payload(&instr);
+                let const_idx = payload & 0x3FFFFF;
+                let tv = self.constants.get(const_idx);
+                let packed = tv.as_u64().unwrap_or(0);
+                let effect_type = TypeIndex::from_raw((packed >> 32) as u32);
+                let handler_func = FuncId(packed as u32);
                 let t = task!();
                 t.handler_stack.push(EffectHandler {
                     effect_type,
@@ -785,6 +764,101 @@ impl Vm {
                 DispatchResult::Continue
             }
             Opcode::Nop => DispatchResult::Continue,
+        }
+    }
+
+    /// Save callee-saved regs and transfer control to `target`.
+    fn push_call_frame(
+        &mut self,
+        task_id: TaskId,
+        target: FuncId,
+        closure_env: Option<TaggedValue>,
+    ) -> DispatchResult {
+        let t = self.scheduler.get_task_mut(task_id).unwrap();
+        let mut saved = Vec::with_capacity(Reg::CALLEE_SAVED.len());
+        for &r in Reg::CALLEE_SAVED {
+            saved.push((Reg(r), t.registers.get(Reg(r))));
+        }
+        let frame = CallFrame {
+            return_pc: t.pc,
+            func_id: t.current_func,
+            saved_regs: saved,
+            evidence: Vec::new(),
+            closure_env,
+        };
+        t.call_stack.push(frame);
+        t.current_func = target;
+        t.pc = 0;
+        DispatchResult::Continue
+    }
+
+    fn exec_call_method(
+        &mut self,
+        task_id: TaskId,
+        recv_reg: Reg,
+        method_str_id: StrId,
+        arg_count: u8,
+    ) -> DispatchResult {
+        let receiver = self
+            .scheduler
+            .get_task_mut(task_id)
+            .unwrap()
+            .registers
+            .get(recv_reg);
+        let recv_type = value_type_index(receiver);
+
+        if let Some(slot) = self.type_pool.find_method(recv_type, method_str_id) {
+            if slot.func_id == type_pool::DERIVE_FUNC_ID {
+                return self.dispatch_derived_method(
+                    task_id,
+                    receiver,
+                    recv_type,
+                    method_str_id,
+                    arg_count,
+                );
+            }
+
+            let target_func_id = FuncId(slot.func_id);
+            let t = self.scheduler.get_task_mut(task_id).unwrap();
+            let mut explicit_args = Vec::with_capacity(arg_count as usize);
+            for i in 0..arg_count {
+                explicit_args.push(t.registers.get(Reg(i)));
+            }
+            t.registers.set(Reg(0), receiver);
+            for (i, arg) in explicit_args.into_iter().enumerate() {
+                t.registers.set(Reg((i + 1) as u8), arg);
+            }
+            self.push_call_frame(task_id, target_func_id, None)
+        } else {
+            DispatchResult::Error(VmError::MethodNotFound)
+        }
+    }
+
+    fn exec_new_closure(
+        &mut self,
+        task_id: TaskId,
+        dst: Reg,
+        func_id: FuncId,
+        capture_count: u16,
+    ) -> DispatchResult {
+        let payload_words = ClosureEnv::payload_words(capture_count);
+        let closure_type = Intrinsic::Closure.type_index();
+
+        match self.heap.alloc_object(closure_type, payload_words) {
+            Some(ptr) => {
+                let t = self.scheduler.get_task_mut(task_id).unwrap();
+                let mut captures = Vec::with_capacity(capture_count as usize);
+                for i in 0..capture_count {
+                    captures.push(t.registers.get(Reg(i as u8)));
+                }
+                unsafe {
+                    ClosureEnv::write(ptr.as_ptr(), func_id, &captures);
+                }
+                let val = unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) };
+                t.registers.set(dst, val);
+                DispatchResult::Continue
+            }
+            None => DispatchResult::Error(VmError::OutOfMemory),
         }
     }
 
@@ -1014,7 +1088,11 @@ impl Vm {
                 drop(t);
                 let s = format_tagged_value(val);
                 let result = self.alloc_string(&s);
-                self.scheduler.get_task_mut(task_id).unwrap().registers.set(Reg(0), result);
+                self.scheduler
+                    .get_task_mut(task_id)
+                    .unwrap()
+                    .registers
+                    .set(Reg(0), result);
                 DispatchResult::Continue
             }
             IntrinsicFn::Abs => {
@@ -1100,18 +1178,24 @@ impl Vm {
                 let mut bytes: Vec<u8> = Vec::new();
                 if let Some(ptr) = a.as_heap_ptr() {
                     let len = (unsafe { *(ptr as *const u64) }) as usize;
-                    let data = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
+                    let data =
+                        unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
                     bytes.extend_from_slice(data);
                 }
                 if let Some(ptr) = b.as_heap_ptr() {
                     let len = (unsafe { *(ptr as *const u64) }) as usize;
-                    let data = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
+                    let data =
+                        unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
                     bytes.extend_from_slice(data);
                 }
                 drop(t);
                 let s = String::from_utf8_lossy(&bytes).into_owned();
                 let result = self.alloc_string(&s);
-                self.scheduler.get_task_mut(task_id).unwrap().registers.set(Reg(0), result);
+                self.scheduler
+                    .get_task_mut(task_id)
+                    .unwrap()
+                    .registers
+                    .set(Reg(0), result);
                 DispatchResult::Continue
             }
             IntrinsicFn::Exit => {
@@ -1139,21 +1223,28 @@ fn r_regs(instr: &Instruction) -> (Reg, Reg, Reg) {
     }
 }
 
-fn i_fields(instr: &Instruction) -> (Reg, Reg, u64) {
+fn a_fields(instr: &Instruction) -> (Reg, Reg, u16) {
     match instr.data {
-        InstructionData::I { dst, src, imm } => (dst, src, imm),
-        _ => unreachable!("expected I-type"),
+        InstructionData::A { dst, base, imm12 } => (dst, base, imm12),
+        _ => unreachable!("expected A-type"),
     }
 }
 
-fn j_fields(instr: &Instruction) -> (Reg, i64) {
+fn j_fields(instr: &Instruction) -> (Reg, i32) {
     match instr.data {
         InstructionData::J { cond, offset } => (cond, offset),
         _ => unreachable!("expected J-type"),
     }
 }
 
-fn e_payload(instr: &Instruction) -> u64 {
+fn c_payload(instr: &Instruction) -> u32 {
+    match instr.data {
+        InstructionData::C { payload } => payload,
+        _ => unreachable!("expected C-type"),
+    }
+}
+
+fn e_payload(instr: &Instruction) -> u32 {
     match instr.data {
         InstructionData::E { payload } => payload,
         _ => unreachable!("expected E-type"),
@@ -1259,7 +1350,7 @@ pub enum VmResult {
 /// VM runtime errors.
 #[derive(Debug)]
 pub enum VmError {
-    InvalidInstruction(u64),
+    InvalidInstruction(u32),
     InvalidTask,
     OutOfMemory,
     TypeError,
@@ -1294,9 +1385,7 @@ fn format_tagged_value(val: TaggedValue) -> String {
             let len = unsafe { *(ptr as *const u64) } as usize;
             // Sanity check: len must be small enough to read safely.
             if len <= 4096 {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts((ptr as *const u8).add(8), len)
-                };
+                let bytes = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
                 if let Ok(s) = std::str::from_utf8(bytes) {
                     return s.to_string();
                 }
@@ -1412,7 +1501,7 @@ mod tests {
         )
     }
 
-    fn encode_instrs(instrs: &[Instruction]) -> Vec<u64> {
+    fn encode_instrs(instrs: &[Instruction]) -> Vec<u32> {
         instrs.iter().map(|i| i.encode()).collect()
     }
 
@@ -1548,8 +1637,20 @@ mod tests {
         let gidx = vm.globals.alloc(TaggedValue::UNIT);
         let code = encode_instrs(&[
             Instruction::load_imm(Reg(0), 99),
-            Instruction::i_type(Opcode::StoreGlobal, Reg(0), Reg(0), gidx as u64),
-            Instruction::i_type(Opcode::LoadGlobal, Reg(1), Reg(0), gidx as u64),
+            Instruction::a_type(
+                Opcode::StoreGlobal,
+                AddrMode::Imm,
+                Reg(0),
+                Reg(0),
+                gidx as u16,
+            ),
+            Instruction::a_type(
+                Opcode::LoadGlobal,
+                AddrMode::Imm,
+                Reg(1),
+                Reg(0),
+                gidx as u16,
+            ),
             Instruction::ret(Reg(1)),
         ]);
         vm.add_function(FunctionCode {

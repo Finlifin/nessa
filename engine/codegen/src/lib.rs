@@ -5,23 +5,33 @@ use nir::{
 use nsbc::{CodegenOutput, CompiledFunction, Constant, FuncId, Instruction, Opcode, Reg};
 
 // ---------------------------------------------------------------------------
-// Register allocator — simple linear scan
+// Register allocator — ARM-inspired ABI partitions
 // ---------------------------------------------------------------------------
 
-const MAX_REGS: u8 = 20;
+/// Prefer caller-saved temps r8–r15, then callee-saved r19–r28.
+const ALLOC_ORDER: &[u8] = &[
+    8, 9, 10, 11, 12, 13, 14, 15, // caller-saved temps
+    19, 20, 21, 22, 23, 24, 25, 26, 27, 28, // callee-saved
+    0, 1, 2, 3, 4, 5, 6, 7, // arg/result regs (last resort for locals)
+];
+
+const SCRATCH: Reg = Reg(Reg::SCRATCH0); // r16
 
 struct RegAlloc {
     /// Maps NirLocal → register number.
     local_to_reg: Vec<Option<u8>>,
-    /// Next free register.
-    next_reg: u8,
+    /// Next index into ALLOC_ORDER.
+    next_slot: usize,
+    /// Highest register number assigned + 1.
+    max_reg: u8,
 }
 
 impl RegAlloc {
     fn new(local_count: u32) -> Self {
         Self {
             local_to_reg: vec![None; local_count as usize],
-            next_reg: 0,
+            next_slot: 0,
+            max_reg: 0,
         }
     }
 
@@ -29,9 +39,10 @@ impl RegAlloc {
         if let Some(r) = self.local_to_reg[local.0 as usize] {
             return Reg(r);
         }
-        let r = self.next_reg % MAX_REGS;
-        self.next_reg = self.next_reg.wrapping_add(1);
+        let r = ALLOC_ORDER[self.next_slot % ALLOC_ORDER.len()];
+        self.next_slot = self.next_slot.wrapping_add(1);
         self.local_to_reg[local.0 as usize] = Some(r);
+        self.max_reg = self.max_reg.max(r + 1);
         Reg(r)
     }
 
@@ -40,7 +51,7 @@ impl RegAlloc {
     }
 
     fn max_used(&self) -> u8 {
-        self.next_reg.min(MAX_REGS)
+        self.max_reg.max(1)
     }
 }
 
@@ -49,7 +60,7 @@ impl RegAlloc {
 // ---------------------------------------------------------------------------
 
 struct Emitter {
-    instructions: Vec<u64>,
+    instructions: Vec<u32>,
     /// Maps BlockId → instruction offset.
     block_offsets: Vec<u32>,
     /// Pending fixups: (instruction_index, target_block).
@@ -149,7 +160,7 @@ impl Codegen {
             let source_pc = (*instr_idx + 1) as i64; // PC after the jump instruction
             // VM jump semantics use `pc = pc + offset - 1` after pre-increment,
             // so codegen stores a +1-biased relative offset.
-            let offset = target_pc - source_pc + 1;
+            let offset = (target_pc - source_pc + 1) as i32;
 
             // Re-encode the jump instruction with the correct offset.
             let old_word = emitter.instructions[*instr_idx];
@@ -159,7 +170,11 @@ impl Codegen {
                     nsbc::InstructionData::J { cond, .. } => cond,
                     _ => Reg(0),
                 };
-                let new_instr = Instruction::j_type(old_instr.opcode, cond_reg, offset);
+                let new_instr = if (-(1 << 16)..(1 << 16)).contains(&offset) {
+                    Instruction::j_type(old_instr.opcode, cond_reg, offset)
+                } else {
+                    Instruction::jmp_far(offset)
+                };
                 emitter.instructions[*instr_idx] = new_instr.encode();
             }
         }
@@ -263,12 +278,12 @@ impl Codegen {
                 }
             }
             NirExpr::Call(func_id, args) => {
-                // Place args in r0..rN.
+                // Place args in r0..rN (up to 8 arg regs).
                 for (i, arg) in args.iter().enumerate() {
                     let r = Reg(i as u8);
                     self.load_value(arg, r, emitter, regalloc);
                 }
-                emitter.emit(Instruction::call(func_id.0, args.len() as u8));
+                self.emit_call(emitter, func_id.0, args.len() as u8);
                 // Result is in r0.
                 if dst.0 != 0 {
                     emitter.emit(Instruction::mov(dst, Reg(0)));
@@ -295,11 +310,7 @@ impl Codegen {
                 // Load receiver into a register outside the arg range.
                 let recv_reg = Reg(args.len() as u8);
                 self.load_value(receiver, recv_reg, emitter, regalloc);
-                emitter.emit(Instruction::call_method(
-                    recv_reg,
-                    method.as_u32(),
-                    args.len() as u8,
-                ));
+                self.emit_call_method(emitter, recv_reg, method.as_u32(), args.len() as u8);
                 // Result is in r0.
                 if dst.0 != 0 {
                     emitter.emit(Instruction::mov(dst, Reg(0)));
@@ -312,11 +323,13 @@ impl Codegen {
             NirExpr::IndexAccess(obj, idx) => {
                 let obj_reg = self.value_to_reg(obj, emitter, regalloc);
                 let idx_reg = self.value_to_reg(idx, emitter, regalloc);
-                emitter.emit(Instruction::i_type(
+                // Index register encoded in imm12 (independent opcode, not amode).
+                emitter.emit(Instruction::a_type(
                     Opcode::LoadIndex,
+                    nsbc::AddrMode::Imm,
                     dst,
                     obj_reg,
-                    idx_reg.0 as u64,
+                    idx_reg.0 as u16,
                 ));
             }
             NirExpr::NewObject(type_idx, fields) => {
@@ -332,11 +345,7 @@ impl Codegen {
                     let r = Reg(i as u8);
                     self.load_value(cap, r, emitter, regalloc);
                 }
-                emitter.emit(Instruction::new_closure(
-                    dst,
-                    func_id.0,
-                    captures.len() as u8,
-                ));
+                self.emit_new_closure(emitter, dst, func_id.0, captures.len() as u8);
             }
             NirExpr::CallIndirect(callee, args) => {
                 // Load the closure value first, before args clobber r0..rN-1.
@@ -355,22 +364,101 @@ impl Codegen {
             }
             NirExpr::TypeCheck(val, type_idx) => {
                 let src = self.value_to_reg(val, emitter, regalloc);
-                emitter.emit(Instruction::i_type(
+                let idx = type_idx.as_u32();
+                debug_assert!(idx < (1 << 12));
+                emitter.emit(Instruction::a_type(
                     Opcode::TypeCheck,
+                    nsbc::AddrMode::Imm,
                     dst,
                     src,
-                    type_idx.as_u32() as u64,
+                    idx as u16,
                 ));
             }
             NirExpr::TypeCast(val, type_idx) => {
                 let src = self.value_to_reg(val, emitter, regalloc);
-                emitter.emit(Instruction::i_type(
+                let idx = type_idx.as_u32();
+                debug_assert!(idx < (1 << 12));
+                emitter.emit(Instruction::a_type(
                     Opcode::TypeCast,
+                    nsbc::AddrMode::Imm,
                     dst,
                     src,
-                    type_idx.as_u32() as u64,
+                    idx as u16,
                 ));
             }
+        }
+    }
+
+    fn emit_call(&self, emitter: &mut Emitter, func_id: u32, arg_count: u8) {
+        if func_id < (1 << 14) {
+            emitter.emit(Instruction::call(func_id, arg_count));
+        } else {
+            let idx = emitter.add_constant(Constant::UInt(func_id as u64));
+            debug_assert!(idx < (1 << 14));
+            emitter.emit(Instruction::call_far(idx as u16, arg_count));
+        }
+    }
+
+    fn emit_call_method(
+        &self,
+        emitter: &mut Emitter,
+        recv: Reg,
+        method_str_id: u32,
+        arg_count: u8,
+    ) {
+        if method_str_id < (1 << 12) && arg_count < 32 {
+            emitter.emit(Instruction::call_method(recv, method_str_id, arg_count));
+        } else {
+            let idx = emitter.add_constant(Constant::UInt(method_str_id as u64));
+            debug_assert!(idx < (1 << 12));
+            emitter.emit(Instruction::call_method_far(recv, idx as u16, arg_count));
+        }
+    }
+
+    fn emit_new_closure(&self, emitter: &mut Emitter, dst: Reg, func_id: u32, capture_count: u8) {
+        if func_id < (1 << 12) {
+            emitter.emit(Instruction::new_closure(dst, func_id, capture_count));
+        } else {
+            let idx = emitter.add_constant(Constant::UInt(func_id as u64));
+            debug_assert!(idx < (1 << 12));
+            emitter.emit(Instruction::new_closure_wide(
+                dst,
+                idx as u16,
+                capture_count,
+            ));
+        }
+    }
+
+    fn emit_load_const(&self, emitter: &mut Emitter, dst: Reg, global_idx: u32) {
+        if global_idx < (1 << 12) {
+            emitter.emit(Instruction::load_const(dst, global_idx as u16));
+        } else {
+            // 19-bit wide index
+            debug_assert!(global_idx < (1 << 19));
+            emitter.emit(Instruction::load_const_wide(dst, global_idx));
+        }
+    }
+
+    /// Emit Load with Imm if value fits in signed 12-bit; otherwise pool + Const.
+    fn emit_load_integer(&self, emitter: &mut Emitter, dst: Reg, bits: u64, signed: bool) {
+        let as_i64 = if signed {
+            bits as i64
+        } else {
+            bits as i64 // only used when bits < 2^63 practically for small immediates
+        };
+        let fits_imm = if signed {
+            (-2048..2048).contains(&as_i64)
+        } else {
+            bits < 2048 // unsigned must fit without setting sign bit of imm12
+        };
+        if fits_imm {
+            emitter.emit(Instruction::load_imm(dst, (bits as u16) & 0xFFF));
+        } else if signed {
+            let idx = emitter.add_constant(Constant::Int(bits as i64));
+            self.emit_load_const(emitter, dst, idx);
+        } else {
+            let idx = emitter.add_constant(Constant::UInt(bits));
+            self.emit_load_const(emitter, dst, idx);
         }
     }
 
@@ -427,10 +515,10 @@ impl Codegen {
                 }
             }
             NirValue::ConstInt(v) => {
-                emitter.emit(Instruction::load_imm(dst, *v as u64));
+                self.emit_load_integer(emitter, dst, *v as u64, true);
             }
             NirValue::ConstUInt(v) => {
-                emitter.emit(Instruction::load_imm(dst, *v));
+                self.emit_load_integer(emitter, dst, *v, false);
             }
             NirValue::ConstBool(b) => {
                 if *b {
@@ -446,8 +534,8 @@ impl Codegen {
                 emitter.emit(Instruction::load_null(dst));
             }
             NirValue::ConstFloat(v) => {
-                // Store float as its bit pattern in an immediate.
-                emitter.emit(Instruction::load_imm(dst, v.to_bits()));
+                let idx = emitter.add_constant(Constant::Float(*v));
+                self.emit_load_const(emitter, dst, idx);
             }
             NirValue::ConstStr(str_id) => {
                 // Strip surrounding quotes and process escape sequences.
@@ -458,7 +546,7 @@ impl Codegen {
                     raw.to_string()
                 };
                 let global_idx = emitter.add_constant(Constant::Str(content));
-                emitter.emit(Instruction::load_const(dst, global_idx));
+                self.emit_load_const(emitter, dst, global_idx);
             }
         }
     }
@@ -473,10 +561,8 @@ impl Codegen {
         match val {
             NirValue::Local(local) => regalloc.get(*local),
             _ => {
-                // Use a scratch register.
-                let scratch = Reg(19); // r19 as scratch
-                self.load_value(val, scratch, emitter, regalloc);
-                scratch
+                self.load_value(val, SCRATCH, emitter, regalloc);
+                SCRATCH
             }
         }
     }

@@ -13,7 +13,7 @@ pub mod archive;
 
 // Re-export instruction-level types at crate root for convenience.
 pub use crate::instruction::{
-    Constant, Format, FuncHeader, FuncId, Instruction, InstructionData,
+    AddrMode, Constant, Format, FuncHeader, FuncId, Instruction, InstructionData,
     IntrinsicFn, Opcode, Reg,
 };
 
@@ -32,7 +32,7 @@ pub use crate::archive::{
 pub struct CompiledFunction {
     pub func_id: FuncId,
     pub name: str_interner::StrId,
-    pub instructions: Vec<u64>,
+    pub instructions: Vec<u32>,
     pub register_count: u8,
     pub param_count: u8,
     pub is_closure: bool,
@@ -55,8 +55,8 @@ pub struct CodegenOutput {
 pub struct BytecodeStore {
     /// Function headers, indexed by FuncId.
     headers: Vec<FuncHeader>,
-    /// Raw 64-bit instruction words per function, indexed by FuncId.
-    code: Vec<Vec<u64>>,
+    /// Raw 32-bit instruction words per function, indexed by FuncId.
+    code: Vec<Vec<u32>>,
     /// Global constant pool.
     constants: Vec<Constant>,
 }
@@ -108,7 +108,7 @@ impl BytecodeStore {
     }
 
     /// Get the instruction words for a function.
-    pub fn instructions(&self, id: FuncId) -> Option<&[u64]> {
+    pub fn instructions(&self, id: FuncId) -> Option<&[u32]> {
         self.code.get(id.0 as usize).map(|v| v.as_slice())
     }
 
