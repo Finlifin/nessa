@@ -856,18 +856,18 @@ min_nessa_version = "1.0.0"
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 14.2 Intrinsic 注入机制
+### 14.2 Builtin 注入机制
 
-内建类型并非语言层特殊存在，而是通过 intrinsic 机制在 std 中定义的普通类型：
+内建类型并非语言层特殊存在，而是通过 builtin 机制在 std 中定义的普通类型：
 
 ```nessa
--- core.builtin 中:
-pub typealias u32 = .u32'intrinsic
-pub typealias f64 = .f64'intrinsic
-pub typealias bool = .bool'intrinsic
-pub typealias String = .String'intrinsic
+-- std.builtin 中:
+pub typealias u32 = .u32'builtin
+pub typealias f64 = .f64'builtin
+pub typealias bool = .bool'builtin
+pub typealias String = .String'builtin
 
--- 通过 impl 注入方法（与用户类型一致）:
+-- 通过 impl 注入方法（与用户类型一致；仅特权包可对 builtin 类型 impl）:
 impl u32 {
     pub const MAX: u32 = 0xFFFFFFFF
     pub const MIN: u32 = 0
@@ -875,14 +875,14 @@ impl u32 {
     pub fn checked_add(self, other: u32) -> ?u32 { ... }
 }
 
--- intrinsic 函数:
-pub const sin: fn(f64) -> f64 = .sin'intrinsic
-pub const cos: fn(f64) -> f64 = .cos'intrinsic
+-- builtin 函数:
+pub const sin: fn(f64) -> f64 = .sin'builtin
+pub const cos: fn(f64) -> f64 = .cos'builtin
 ```
 
-`'intrinsic` view 操作仅在 `std` 包内允许，用户代码无法直接使用。
-引擎在初始化 TypePool 时，预注册这些 intrinsic 的 TypeIndex，
-std 编译时通过 `'intrinsic` view 将 symbol 映射到引擎内部实现。
+`'builtin` view 操作仅在 `std` / `core` / `alloc` 等特权包内允许，用户代码无法直接使用。
+引擎在初始化 TypePool 时预注册这些类型的 TypeIndex，并注册 builtin 函数实现；
+std 编译时通过 `'builtin` view 将 symbol 映射到引擎内部实现（`CallBuiltin`）。
 
 ### 14.3 Prelude
 
@@ -890,17 +890,10 @@ std 编译时通过 `'intrinsic` view 将 symbol 映射到引擎内部实现。
 
 ```nessa
 -- std.prelude（隐式导入）:
-pub use core.builtin.{
+pub use .builtin.{
     u8, u16, u32, u64, u128, usize,
     i8, i16, i32, i64, i128, isize,
     f32, f64, bool, char, String, Unit, Any, NoReturn,
 }
-pub use core.ops.{Add, Sub, Mul, Div, Eq, Ord, Show}
-pub use core.iter.{Iter, IntoIter}
-pub use core.option.*
-pub use core.result.*
-pub use alloc.list.List
-pub use alloc.map.Map
-pub use alloc.set.Set
-pub use std.io.{print, println}
+pub use .io.{print, println}
 ```

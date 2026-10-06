@@ -289,13 +289,13 @@ impl Codegen {
                     emitter.emit(Instruction::mov(dst, Reg(0)));
                 }
             }
-            NirExpr::CallIntrinsic(intrinsic_fn, args) => {
+            NirExpr::CallBuiltin(builtin_id, args) => {
                 // Place args in r0..rN.
                 for (i, arg) in args.iter().enumerate() {
                     let r = Reg(i as u8);
                     self.load_value(arg, r, emitter, regalloc);
                 }
-                emitter.emit(Instruction::call_intrinsic(*intrinsic_fn, args.len() as u8));
+                emitter.emit(Instruction::call_builtin(*builtin_id, args.len() as u8));
                 // Result is in r0.
                 if dst.0 != 0 {
                     emitter.emit(Instruction::mov(dst, Reg(0)));

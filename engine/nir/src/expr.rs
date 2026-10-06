@@ -205,7 +205,7 @@ fn lower_fstring_concat(
     builder: &mut FunctionBuilder,
     block: &mut BlockId,
 ) -> NirValue {
-    use nsbc::IntrinsicFn;
+    use runtime::ids;
 
     let parts = ast.multi_children(node_idx);
     if parts.is_empty() {
@@ -238,13 +238,13 @@ fn lower_fstring_concat(
         }
     }
 
-    // Fold left with StrConcat: result = concat(concat(a, b), c) ...
+    // Fold left with str_concat: result = concat(concat(a, b), c) ...
     let mut acc = string_vals[0].clone();
     for part_val in string_vals.into_iter().skip(1) {
         let local = builder.alloc_local();
         builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
             local,
-            NirExpr::CallIntrinsic(IntrinsicFn::StrConcat, vec![acc, part_val]),
+            NirExpr::CallBuiltin(ids::STR_CONCAT, vec![acc, part_val]),
         ));
         acc = NirValue::Local(local);
     }
@@ -547,16 +547,16 @@ fn lower_call(
         .map(|&arg| lower_expr(resolved, arg, builder, block))
         .collect();
 
-    // Check if the callee is an intrinsic function.
+    // Check if the callee is a builtin function.
     let callee_node = children[0];
     if !callee_node.is_null() {
         if let Some(&sym_id) = resolved.node_symbols.get(&callee_node) {
-            // Check if this symbol is an intrinsic function.
-            if let Some(&intrinsic) = resolved.intrinsic_fns.get(&sym_id) {
+            // Check if this symbol is a builtin function.
+            if let Some(&builtin_id) = resolved.builtin_fns.get(&sym_id) {
                 let local = builder.alloc_local();
                 builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
                     local,
-                    NirExpr::CallIntrinsic(intrinsic, args),
+                    NirExpr::CallBuiltin(builtin_id, args),
                 ));
                 return NirValue::Local(local);
             }

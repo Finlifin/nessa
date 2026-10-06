@@ -13,8 +13,7 @@ pub mod archive;
 
 // Re-export instruction-level types at crate root for convenience.
 pub use crate::instruction::{
-    AddrMode, Constant, Format, FuncHeader, FuncId, Instruction, InstructionData,
-    IntrinsicFn, Opcode, Reg,
+    AddrMode, Constant, Format, FuncHeader, FuncId, Instruction, InstructionData, Opcode, Reg,
 };
 
 // Re-export archive format types at crate root.

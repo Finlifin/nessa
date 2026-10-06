@@ -856,6 +856,10 @@ impl<'src> Lexer<'src> {
 
     /// `'` has been seen.  Decide if it's a quote token, a character literal,
     /// or macro content (`'{ ... }`).
+    ///
+    /// Parallel to `.` (always Dot for projection): `'` is the view operator
+    /// token whenever the following text is not a char literal (`'x'` / `'\n'`).
+    /// That lets Pratt parse `expr ' id` the same way as `expr . id`.
     fn lex_quote_or_char_or_macro(&mut self, start: Index) -> Token {
         self.cursor += 1; // consume opening '
 
@@ -872,8 +876,48 @@ impl<'src> Lexer<'src> {
                 self.token(TokenKind::Quote, start, start + 1)
             }
             Some(b'{') => self.lex_macro_content(start),
-            Some(_) => self.lex_char_after_quote(start),
+            Some(_) => {
+                if self.looks_like_char_literal() {
+                    self.lex_char_after_quote(start)
+                } else {
+                    // View operator: leave the following identifier for the next token.
+                    self.token(TokenKind::Quote, start, start + 1)
+                }
+            }
             None => self.token(TokenKind::Quote, start, self.pos()),
+        }
+    }
+
+    /// True when the bytes after the opening `'` form a char literal attempt
+    /// (`'x'`, `'\n'`, or an incomplete `'x` at EOF) rather than a view op (`'id`).
+    fn looks_like_char_literal(&self) -> bool {
+        let s = &self.src[self.cursor..];
+        if s.is_empty() {
+            return false;
+        }
+        if s.as_bytes()[0] == b'\\' {
+            // Escape forms: \n \t \r \\ \' \"  then closing '
+            let rest = &s[1..];
+            if rest.is_empty() {
+                return true; // incomplete escape → char error path
+            }
+            let b = rest.as_bytes()[0];
+            if matches!(b, b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') {
+                return true; // complete or missing closer — char path handles both
+            }
+            if b == b'x' || b == b'u' {
+                return true;
+            }
+            return false;
+        }
+        let mut chars = s.chars();
+        let Some(_) = chars.next() else {
+            return false;
+        };
+        match chars.next() {
+            Some('\'') => true, // `'x'`
+            None => true,       // `'x` at EOF — unterminated char
+            Some(_) => false,   // `'id…` — view operator (like `.` before an id)
         }
     }
 

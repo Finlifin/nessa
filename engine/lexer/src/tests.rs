@@ -429,9 +429,22 @@ fn test_unterminated_char() {
 
 #[test]
 fn test_char_too_long() {
-    let (k, e) = lex("'ab'");
-    assert_eq!(k[0], TokenKind::Invalid);
-    assert_eq!(e[0].kind, LexErrorKind::InvalidCharLiteral);
+    // `'ab'` is not a char literal; `'` is the view operator, then `ab`, then `'`.
+    let k = kinds_ok("'ab'");
+    assert_eq!(k[0], TokenKind::Quote);
+    assert_eq!(k[1], TokenKind::Id);
+}
+
+#[test]
+fn test_view_quote_without_space() {
+    let k = kinds_ok(".print'builtin");
+    assert!(k.contains(&TokenKind::Dot));
+    assert!(k.contains(&TokenKind::Quote));
+    assert_eq!(
+        k.iter().filter(|&&t| t == TokenKind::Id).count(),
+        2,
+        "expected print and builtin ids, got {k:?}"
+    );
 }
 
 // =========================================================================

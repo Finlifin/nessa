@@ -1066,6 +1066,7 @@ dependencies = [
  "diagnostic",
  "nsbc",
  "resolution",
+ "runtime",
  "rustc_span",
  "str_interner",
  "type_pool",
@@ -1359,7 +1360,10 @@ version = "0.1.0"
 dependencies = [
  "ast",
  "diagnostic",
+ "lexer",
  "nsbc",
+ "parser",
+ "runtime",
  "rustc_span",
  "str_interner",
  "type_pool",

@@ -25,7 +25,7 @@ nessa 的所有类型构成一个格 (lattice)：
 ## 本章内容
 
 ### 基础类型
-- [内建类型](builtin-types.md)：intrinsic 类型的定义方式
+- [内建类型](builtin-types.md)：builtin 类型的定义方式
 - [数据类型 — struct](data-types/struct.md)
 - [数据类型 — enum](data-types/enum.md)
 - [数据类型 — tuple](data-types/tuple.md)

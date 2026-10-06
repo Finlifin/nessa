@@ -1,0 +1,29 @@
+-- std.builtin — bind engine builtin types via `'builtin` views.
+--
+-- Only privileged packages may use `'builtin`. User code should import these
+-- aliases (via prelude) rather than taking the view directly.
+
+pub typealias u8 = .u8'builtin
+pub typealias u16 = .u16'builtin
+pub typealias u32 = .u32'builtin
+pub typealias u64 = .u64'builtin
+pub typealias u128 = .u128'builtin
+pub typealias usize = .usize'builtin
+
+pub typealias i8 = .i8'builtin
+pub typealias i16 = .i16'builtin
+pub typealias i32 = .i32'builtin
+pub typealias i64 = .i64'builtin
+pub typealias i128 = .i128'builtin
+pub typealias isize = .isize'builtin
+
+pub typealias f32 = .f32'builtin
+pub typealias f64 = .f64'builtin
+
+pub typealias bool = .bool'builtin
+pub typealias char = .char'builtin
+pub typealias String = .String'builtin
+pub typealias Unit = .Unit'builtin
+pub typealias Any = .Any'builtin
+pub typealias NoReturn = .NoReturn'builtin
+pub typealias Type = .Type'builtin

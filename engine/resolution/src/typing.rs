@@ -363,6 +363,16 @@ fn resolve_type_expr(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) -> Option
             }
             None
         }
+        // `.Name'builtin` type view
+        NodeKind::View => {
+            if let Some(&sym_id) = r.node_symbols.get(&node_idx) {
+                let sym = &r.symbols[sym_id.0 as usize];
+                if sym.kind == SymbolKind::Type && sym.type_index != TypeIndex::INVALID {
+                    return Some(sym.type_index);
+                }
+            }
+            None
+        }
         NodeKind::OptionalType => {
             let children = ast.fixed_children(node_idx);
             resolve_type_expr(r, ast, children[0])
@@ -842,8 +852,8 @@ fn resolve_call_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) -> Optio
     // Infer return type from callee.
     if let Some(&callee_sym) = r.node_symbols.get(&callee) {
         let sym = &r.symbols[callee_sym.0 as usize];
-        if let SymbolKind::IntrinsicFunction(ifn) = sym.kind {
-            return Some(intrinsic_return_type(ifn));
+        if let SymbolKind::BuiltinFunction(id) = sym.kind {
+            return Some(builtin_return_type(id));
         }
         let ti = sym.type_index;
         if ti != TypeIndex::INVALID {
@@ -877,27 +887,26 @@ fn callee_display_name(_r: &Resolver, ast: &Ast, callee: NodeIndex) -> String {
     "<callee>".to_string()
 }
 
-/// Return type for well-known intrinsic functions.
-fn intrinsic_return_type(ifn: nsbc::IntrinsicFn) -> TypeIndex {
-    use nsbc::IntrinsicFn;
-    match ifn {
-        IntrinsicFn::Print | IntrinsicFn::PrintLn | IntrinsicFn::Exit | IntrinsicFn::Panic => {
+/// Approximate return type for known builtins (dynamic; std wrappers refine).
+fn builtin_return_type(id: runtime::BuiltinFnId) -> TypeIndex {
+    use runtime::ids;
+    match id {
+        ids::PRINT | ids::PRINTLN | ids::EXIT | ids::PANIC | ids::LIST_INIT => {
             Intrinsic::Unit.type_index()
         }
-        IntrinsicFn::TypeOf | IntrinsicFn::ToString | IntrinsicFn::StrConcat => {
-            Intrinsic::Str.type_index()
-        }
-        IntrinsicFn::ToI64 | IntrinsicFn::StrLen => Intrinsic::I64.type_index(),
-        IntrinsicFn::ToF64
-        | IntrinsicFn::Abs
-        | IntrinsicFn::Sin
-        | IntrinsicFn::Cos
-        | IntrinsicFn::Sqrt
-        | IntrinsicFn::Floor
-        | IntrinsicFn::Ceil
-        | IntrinsicFn::Round
-        | IntrinsicFn::Pow
-        | IntrinsicFn::Log => Intrinsic::F64.type_index(),
+        ids::TYPE_OF | ids::TO_STRING | ids::STR_CONCAT => Intrinsic::Str.type_index(),
+        ids::TO_I64 | ids::STR_LEN => Intrinsic::I64.type_index(),
+        ids::TO_F64
+        | ids::ABS
+        | ids::SIN
+        | ids::COS
+        | ids::SQRT
+        | ids::FLOOR
+        | ids::CEIL
+        | ids::ROUND
+        | ids::POW
+        | ids::LOG => Intrinsic::F64.type_index(),
+        _ => Intrinsic::Any.type_index(),
     }
 }
 

@@ -2,6 +2,13 @@ use nsbc::{FuncId, Reg};
 use stack_pool::StackHandle;
 use type_pool::TypeIndex;
 
+pub mod builtin;
+pub use builtin::{
+    catalog_lookup, catalog_register_intrinsic_types, catalog_register_type, lookup_builtin_fn_id,
+    lookup_builtin_fn_meta, BuiltinCatalog, BuiltinFnId, BuiltinFnMeta, BuiltinKind, BUILTIN_FN_META,
+};
+pub use builtin::ids;
+
 // ---------------------------------------------------------------------------
 // TaggedValue — the universal 64-bit runtime value
 // ---------------------------------------------------------------------------

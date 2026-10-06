@@ -79,6 +79,15 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         NodeKind::ImplDef | NodeKind::ImplTraitDef => resolve_impl(r, ast, node_idx),
         NodeKind::ExtendDef | NodeKind::ExtendTraitDef => resolve_extend(r, ast, node_idx),
 
+        // ── Typealias ──────────────────────────────────────────────
+        NodeKind::Typealias => resolve_typealias(r, ast, node_idx),
+
+        // ── View (e.g. `.print'builtin`) ───────────────────────────
+        NodeKind::View => resolve_view(r, ast, node_idx),
+
+        // ── Symbol literal `.id` — name is not a scope lookup ──────
+        NodeKind::Symbol => {}
+
         // ── Derive ─────────────────────────────────────────────────
         NodeKind::DeriveDef => resolve_derive(r, ast, node_idx),
 
@@ -220,6 +229,12 @@ fn forward_declare_one(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                 r.define_symbol(name_str, SymbolKind::Module, node_idx, Visibility::Package);
             r.symbol_mut(sym_id).type_index = type_idx;
         }
+        NodeKind::Typealias => {
+            let children = ast.fixed_children(node_idx);
+            let name_str = ast.node(children[0]).str_id;
+            // Target filled in during type resolution / resolve_typealias.
+            let _ = r.define_symbol(name_str, SymbolKind::Type, node_idx, Visibility::Package);
+        }
         NodeKind::PubDef => {
             // Unwrap visibility wrapper and forward-declare the inner definition.
             let children = ast.fixed_children(node_idx);
@@ -269,6 +284,24 @@ fn resolve_let_or_const(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex, kind: 
         resolve_names(r, ast, children[1]);
     }
     resolve_pattern(r, ast, children[0], kind);
+
+    // If `const name = .foo'builtin`, promote the binding to BuiltinFunction
+    // so calls lower to CallBuiltin.
+    if kind == NodeKind::ConstDecl && children.len() > 2 {
+        let pat = children[0];
+        let rhs = children[2];
+        if !pat.is_null()
+            && !rhs.is_null()
+            && ast.node(pat).kind == NodeKind::Id
+            && let Some(&rhs_sym) = r.node_symbols.get(&rhs)
+            && let Some(&builtin_id) = r.builtin_fns.get(&rhs_sym)
+            && let Some(&pat_sym) = r.node_symbols.get(&pat)
+        {
+            r.symbol_mut(pat_sym).kind = SymbolKind::BuiltinFunction(builtin_id);
+            r.builtin_fns.insert(pat_sym, builtin_id);
+        }
+    }
+
     if children.len() > 3 {
         resolve_names(r, ast, children[3]);
     }
@@ -570,10 +603,20 @@ fn resolve_module_def(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
 fn resolve_impl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     // ImplDef:      [0] type_expr            multi: members
     // ImplTraitDef: [0] trait_expr [1] type   multi: members
-    r.push_scope(node_idx, None);
+
+    // Resolve type exprs first so we can gate impls on builtin types.
     for &child in ast.fixed_children(node_idx) {
         resolve_names(r, ast, child);
     }
+
+    let implementor_node = match ast.node(node_idx).kind {
+        NodeKind::ImplDef => ast.fixed_children(node_idx)[0],
+        NodeKind::ImplTraitDef => ast.fixed_children(node_idx)[1],
+        _ => NodeIndex::NULL,
+    };
+    check_builtin_impl_allowed(r, ast, node_idx, implementor_node);
+
+    r.push_scope(node_idx, None);
     for &member in ast.multi_children(node_idx) {
         resolve_names(r, ast, member);
     }
@@ -582,14 +625,171 @@ fn resolve_impl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
 
 fn resolve_extend(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     // Same structure as impl.
-    r.push_scope(node_idx, None);
     for &child in ast.fixed_children(node_idx) {
         resolve_names(r, ast, child);
     }
+    let implementor_node = match ast.node(node_idx).kind {
+        NodeKind::ExtendDef => ast.fixed_children(node_idx)[0],
+        NodeKind::ExtendTraitDef => ast.fixed_children(node_idx)[1],
+        _ => NodeIndex::NULL,
+    };
+    check_builtin_impl_allowed(r, ast, node_idx, implementor_node);
+
+    r.push_scope(node_idx, None);
     for &member in ast.multi_children(node_idx) {
         resolve_names(r, ast, member);
     }
     r.pop_scope();
+}
+
+/// Only privileged packages may `impl` / `extend` builtin (intrinsic) types.
+fn check_builtin_impl_allowed(
+    r: &mut Resolver,
+    ast: &Ast,
+    impl_node: NodeIndex,
+    type_node: NodeIndex,
+) {
+    if r.options.builtin_access || type_node.is_null() {
+        return;
+    }
+    let Some(ti) = type_index_of_expr(r, type_node) else {
+        return;
+    };
+    if r.type_pool.as_intrinsic(ti).is_some() {
+        let span = ast.node(impl_node).span;
+        r.diag_ctx
+            .error("cannot implement methods on a builtin type outside a privileged package (std/core/alloc)".to_string())
+            .with_primary_span(span)
+            .emit(r.diag_ctx);
+    }
+}
+
+fn type_index_of_expr(r: &Resolver, node: NodeIndex) -> Option<type_pool::TypeIndex> {
+    if let Some(&sym_id) = r.node_symbols.get(&node) {
+        let sym = &r.symbols[sym_id.0 as usize];
+        if sym.type_index != type_pool::TypeIndex::INVALID {
+            return Some(sym.type_index);
+        }
+    }
+    None
+}
+
+/// `typealias Name = type_expr`
+fn resolve_typealias(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    let children = ast.fixed_children(node_idx);
+    // [0] name  [1] type expr
+    if children.len() < 2 {
+        return;
+    }
+    let name_node = children[0];
+    let type_expr = children[1];
+    resolve_names(r, ast, type_expr);
+
+    let name_str = ast.node(name_node).str_id;
+    let sym_id = if let Some(existing) = r.lookup_current_scope(name_str) {
+        existing
+    } else {
+        r.define_symbol(name_str, SymbolKind::Type, node_idx, Visibility::Package)
+    };
+    r.node_symbols.insert(name_node, sym_id);
+    r.node_symbols.insert(node_idx, sym_id);
+
+    // Resolve target type now if possible (View / Id already bound).
+    if let Some(target) = resolve_typealias_target(r, ast, type_expr) {
+        let alias_ti = r.register_type(TypeKind::Typealias {
+            name: name_str,
+            target,
+        });
+        r.symbol_mut(sym_id).type_index = alias_ti;
+    }
+}
+
+fn resolve_typealias_target(
+    r: &Resolver,
+    ast: &Ast,
+    type_expr: NodeIndex,
+) -> Option<type_pool::TypeIndex> {
+    if type_expr.is_null() {
+        return None;
+    }
+    // Prefer symbol binding from View / Id.
+    if let Some(&sym_id) = r.node_symbols.get(&type_expr) {
+        let sym = &r.symbols[sym_id.0 as usize];
+        if sym.kind == SymbolKind::Type && sym.type_index != type_pool::TypeIndex::INVALID {
+            return Some(sym.type_index);
+        }
+    }
+    // Fallback: named Id lookup.
+    if ast.node(type_expr).kind == NodeKind::Id {
+        if let Some(&sym_id) = r.node_symbols.get(&type_expr) {
+            let ti = r.symbols[sym_id.0 as usize].type_index;
+            if ti != type_pool::TypeIndex::INVALID {
+                return Some(ti);
+            }
+        }
+    }
+    let _ = ast;
+    None
+}
+
+/// `expr ' view_name` — currently only `'builtin` is handled.
+fn resolve_view(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    let children = ast.fixed_children(node_idx);
+    if children.len() < 2 {
+        return;
+    }
+    let object = children[0];
+    let view_id_node = children[1];
+    resolve_names(r, ast, object);
+
+    let view_name = str_interner::get(ast.node(view_id_node).str_id);
+    if view_name != "builtin" {
+        // Other views (`'type`, …) are not resolved here yet.
+        return;
+    }
+
+    if !r.options.builtin_access {
+        let span = ast.node(node_idx).span;
+        r.diag_ctx
+            .error(
+                "`\'builtin` view is only allowed in privileged packages (std/core/alloc)"
+                    .to_string(),
+            )
+            .with_primary_span(span)
+            .emit(r.diag_ctx);
+        return;
+    }
+
+    if object.is_null() || ast.node(object).kind != NodeKind::Symbol {
+        let span = ast.node(node_idx).span;
+        r.diag_ctx
+            .error(
+                "`\'builtin` requires a symbol literal on the left (e.g. `.print\'builtin`)"
+                    .to_string(),
+            )
+            .with_primary_span(span)
+            .emit(r.diag_ctx);
+        return;
+    }
+
+    // Symbol: [0] id — name lives on the child Id node.
+    let sym_children = ast.fixed_children(object);
+    if sym_children.is_empty() || sym_children[0].is_null() {
+        return;
+    }
+    let symbol_name = str_interner::get(ast.node(sym_children[0]).str_id);
+    match r.resolve_builtin_view(node_idx, &symbol_name) {
+        Some(sym_id) => {
+            r.node_symbols.insert(node_idx, sym_id);
+        }
+        None => {
+            let span = ast.node(node_idx).span;
+            r.diag_ctx
+                .error(format!("unknown builtin `{symbol_name}`"))
+                .with_primary_span(span)
+                .emit(r.diag_ctx);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -667,3 +667,47 @@ fn main() {
         result.diagnostics,
     );
 }
+
+// ===========================================================================
+// Builtin / CallBuiltin
+// ===========================================================================
+
+#[test]
+fn print_compiles_via_root_builtin() {
+    let src = "fn main() { print(42); }";
+    let result = compile(src);
+    assert!(
+        !result.has_errors,
+        "print should compile via root builtins: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn privileged_builtin_view_compiles() {
+    let src = "\
+const print2 = .print'builtin
+fn main() { print2(1); }
+";
+    let (tokens, lex_errors) = tokenize(src);
+    assert!(lex_errors.is_empty());
+    let sm = SourceMap::new(FilePathMapping::empty());
+    let sf = sm.new_source_file(FileName::Custom("test".into()), src.to_string());
+    let diag = DiagnosticContext::new(&sm);
+    let parser = Parser::new(&tokens, src, &diag, sf.start_pos);
+    let ast = parser.parse();
+    let resolved = resolution::resolve_with_options(
+        ast,
+        &diag,
+        resolution::ResolveOptions::for_builtin_package(),
+    );
+    assert!(
+        resolved
+            .diagnostics
+            .iter()
+            .all(|d| d.level != diagnostic::Level::Error),
+        "privileged 'builtin should resolve: {:?}",
+        resolved.diagnostics
+    );
+    assert!(!resolved.builtin_fns.is_empty());
+}

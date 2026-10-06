@@ -7,6 +7,8 @@ use stack_pool::StackPool;
 use std::sync::Arc;
 use type_pool::TypePool;
 
+pub mod builtin_fns;
+
 // ---------------------------------------------------------------------------
 // EngineConfig — configuration for engine startup
 // ---------------------------------------------------------------------------
@@ -43,7 +45,7 @@ pub struct Engine {
 impl Engine {
     /// Initialize a new engine with the given configuration.
     pub fn new(config: EngineConfig) -> Self {
-        // Create TypePool with all 21 intrinsic types pre-registered.
+        // Create TypePool with all intrinsic types pre-registered.
         let type_pool = TypePool::with_intrinsics();
 
         // Create the shared task stack pool.
@@ -57,7 +59,10 @@ impl Engine {
         }
 
         // Create the VM with MMTk-backed GC and shared stack pool.
-        let vm = Vm::new(type_pool, &config.gc, Arc::clone(&stack_pool));
+        let mut vm = Vm::new(type_pool, &config.gc, Arc::clone(&stack_pool));
+
+        // Register all native builtins (fn pointers + type catalog names).
+        builtin_fns::register_all(&mut vm);
 
         Self {
             vm,

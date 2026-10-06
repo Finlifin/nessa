@@ -1,24 +1,16 @@
-// std.prelude — automatically imported symbols
-//
-// The prelude re-exports the most commonly used functions and types so that
-// user code does not need explicit `use` statements for everyday operations.
-//
-// Currently all intrinsic functions are registered in the root scope by the
-// compiler (see resolution::Resolver::register_intrinsic_functions), so this
-// file serves as documentation and a future hook for the module system.
-
-// ── I/O ────────────────────────────────────────────────────────────────────
-// print(value)       — print a value to stdout (no trailing newline)
-// println(value)     — print a value to stdout followed by a newline
-
-// ── Conversions ────────────────────────────────────────────────────────────
-// to_i64(value)      — convert a value to i64
-// to_f64(value)      — convert a value to f64
-// to_string(value)   — convert a value to string
-
-// ── Introspection ──────────────────────────────────────────────────────────
-// type_of(value)     — get the runtime type tag of a value
-
-// ── Process ────────────────────────────────────────────────────────────────
-// exit(code)         — terminate the process with exit code
-// panic(message)     — abort with a panic message
+-- std.prelude — symbols intended for implicit import into every file.
+--
+-- When the module system auto-imports this file, it should re-export:
+--
+--   pub use .builtin.{
+--       u8, u16, u32, u64, u128, usize,
+--       i8, i16, i32, i64, i128, isize,
+--       f32, f64, bool, char, String, Unit, Any, NoReturn,
+--   }
+--   pub use .io.{print, println, type_of, to_i64, to_f64, to_string}
+--   pub use .math.{abs, sin, cos, sqrt, floor, ceil, round, pow, log}
+--   pub use .string.{str_len, str_concat}
+--   pub use .process.{exit, panic}
+--
+-- Until then, script mode exposes builtin function names in the root scope
+-- (`ResolveOptions::expose_root_builtins`), and types remain root-registered.

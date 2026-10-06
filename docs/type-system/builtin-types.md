@@ -1,22 +1,22 @@
 # 内建类型 (Builtin Types)
 
-## Intrinsic 机制
+## Builtin 机制
 
-nessa 的内建类型（如 `u32`、`f64`、`bool`、`String` 等）并非语言层面的特殊存在，而是通过 intrinsic 机制在标准库中定义的普通类型。
+nessa 的内建类型（如 `u32`、`f64`、`bool`、`String` 等）并非语言层面的特殊存在，而是通过 builtin 机制在标准库中定义的普通类型。
 
-访问 intrinsic 的唯一方式是对一个 symbol 字面量取 intrinsic view，使用 `'intrinsic` 语法。这种操作**仅在 `std` 包中允许**，用户代码无法直接使用。
+访问 builtin 的唯一方式是对一个 symbol 字面量取 builtin view，使用 `'builtin` 语法。这种操作**仅在 `std`（及 `core` / `alloc`）等特权包中允许**，用户代码无法直接使用。
 
 ```nessa
 -- std.builtin 中的定义方式
-pub typealias u32 = .u32'intrinsic
-pub typealias f64 = .f64'intrinsic
-pub typealias bool = .bool'intrinsic
-pub typealias String = .String'intrinsic
+pub typealias u32 = .u32'builtin
+pub typealias f64 = .f64'builtin
+pub typealias bool = .bool'builtin
+pub typealias String = .String'builtin
 ```
 
 ## 通过 impl 注入方法与常量
 
-内建类型定义后，通过 `impl` 块向其关联作用域注入方法和常量，与用户自定义类型完全一致：
+内建类型定义后，通过 `impl` 块向其关联作用域注入方法和常量，与用户自定义类型完全一致。**只有特权包可以对 builtin 类型做 `impl`。**
 
 ```nessa
 impl u32 {
@@ -28,23 +28,24 @@ impl u32 {
 }
 ```
 
-## Intrinsic 函数
+## Builtin 函数
 
-除了类型，标准库中的内建函数也通过 intrinsic view 获取：
+标准库中的内建函数通过同一 `'builtin` view 绑定，再由带类型的 `const` / `fn` 包装：
 
 ```nessa
 -- std.math
-pub const sin: fn(f64) -> f64 = .sin'intrinsic
-pub const cos: fn(f64) -> f64 = .cos'intrinsic
-pub const sqrt: fn(f64) -> f64 = .sqrt'intrinsic
+pub const sin: fn(f64) -> f64 = .sin'builtin
+pub const cos: fn(f64) -> f64 = .cos'builtin
+pub const sqrt: fn(f64) -> f64 = .sqrt'builtin
 ```
+
+引擎侧通过 `CallBuiltin` 与共享的 `BuiltinCatalog` 分发；注册时不附带静态类型，动态检查在 builtin 实现内完成。
 
 ## 设计意图
 
-这种设计使得：
-- 内建类型与用户定义类型在语言层面没有本质区别，都遵循相同的类型系统规则
-- 标准库是可审查的——所有内建类型的公开接口都在 `std` 源码中可见
-- intrinsic 的使用被严格限制在 `std` 包内，防止用户代码依赖不稳定的底层实现
+- 内建类型与用户定义类型在语言层面没有本质区别
+- 标准库可审查——公开接口都在 `std` 源码中可见
+- `'builtin` 被严格限制在特权包内，防止用户依赖不稳定底层实现
 
 ## 常见内建类型一览
 

@@ -1,14 +1,14 @@
 use ast::{Ast, NodeIndex};
 use diagnostic::{Diagnostic, DiagnosticContext};
-use nsbc::IntrinsicFn;
+use runtime::{catalog_lookup, BuiltinFnId, BuiltinKind, BUILTIN_FN_META};
 use str_interner::StrId;
 use type_pool::{TypeId, TypeIndex, TypeInfo, TypeKind, TypePool};
 
 use std::collections::HashMap;
 
 use crate::{
-    EffectInfo, NodeSymbolMap, NodeTypeMap, ResolvedAst, Scope, ScopeId, Symbol, SymbolId,
-    SymbolKind, TraitInfo, Visibility,
+    EffectInfo, NodeSymbolMap, NodeTypeMap, ResolveOptions, ResolvedAst, Scope, ScopeId, Symbol,
+    SymbolId, SymbolKind, TraitInfo, Visibility,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,8 +32,9 @@ pub(crate) struct Resolver<'a> {
     pub(crate) traits: Vec<TraitInfo>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) diag_ctx: &'a DiagnosticContext<'a>,
-    /// Maps SymbolId → IntrinsicFn for pre-registered intrinsic functions.
-    pub(crate) intrinsic_fns: HashMap<SymbolId, IntrinsicFn>,
+    pub(crate) options: ResolveOptions,
+    /// Maps SymbolId → BuiltinFnId for builtin function symbols.
+    pub(crate) builtin_fns: HashMap<SymbolId, BuiltinFnId>,
     /// Maps enum variant SymbolId → variant index (0-based).
     pub(crate) enum_variant_indices: HashMap<SymbolId, u32>,
     /// Maps Projection node → field index (populated in type resolution).
@@ -43,7 +44,7 @@ pub(crate) struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
-    pub(crate) fn new(diag_ctx: &'a DiagnosticContext<'a>) -> Self {
+    pub(crate) fn new(diag_ctx: &'a DiagnosticContext<'a>, options: ResolveOptions) -> Self {
         let root_scope = Scope {
             id: ScopeId::ROOT,
             parent: None,
@@ -62,62 +63,48 @@ impl<'a> Resolver<'a> {
             traits: Vec::new(),
             diagnostics: Vec::new(),
             diag_ctx,
-            intrinsic_fns: HashMap::new(),
+            options,
+            builtin_fns: HashMap::new(),
             enum_variant_indices: HashMap::new(),
             node_field_indices: HashMap::new(),
             next_symbol_id: 0,
             current_scope: ScopeId::ROOT,
         };
-        resolver.register_intrinsic_functions();
+        if resolver.options.expose_root_builtins {
+            resolver.register_root_builtin_fns();
+        }
         resolver.register_builtin_types();
         resolver
     }
 
-    /// Pre-register all intrinsic functions as symbols in the root scope.
-    fn register_intrinsic_functions(&mut self) {
-        for &ifn in IntrinsicFn::ALL {
-            let name = str_interner::intern(ifn.name());
+    /// Pre-register builtin functions as root-scope symbols (script mode).
+    fn register_root_builtin_fns(&mut self) {
+        for meta in BUILTIN_FN_META {
+            let name = str_interner::intern(meta.name);
             let sym_id = self.define_symbol(
                 name,
-                SymbolKind::IntrinsicFunction(ifn),
+                SymbolKind::BuiltinFunction(meta.id),
                 NodeIndex::NULL,
                 Visibility::Public,
             );
-            self.intrinsic_fns.insert(sym_id, ifn);
+            self.builtin_fns.insert(sym_id, meta.id);
         }
     }
 
     /// Pre-register all intrinsic type names in the root scope.
     fn register_builtin_types(&mut self) {
         use type_pool::Intrinsic;
-        for &intr in &[
-            Intrinsic::U8,
-            Intrinsic::U16,
-            Intrinsic::U32,
-            Intrinsic::U64,
-            Intrinsic::U128,
-            Intrinsic::Usize,
-            Intrinsic::I8,
-            Intrinsic::I16,
-            Intrinsic::I32,
-            Intrinsic::I64,
-            Intrinsic::I128,
-            Intrinsic::Isize,
-            Intrinsic::F32,
-            Intrinsic::F64,
-            Intrinsic::Bool,
-            Intrinsic::Char,
-            Intrinsic::Str,
-            Intrinsic::Unit,
-            Intrinsic::Any,
-            Intrinsic::NoReturn,
-            Intrinsic::Type,
-        ] {
+        for &intr in Intrinsic::ALL {
+            if matches!(intr, Intrinsic::Closure) {
+                continue;
+            }
             let name = str_interner::intern(intr.name());
             let sym_id =
                 self.define_symbol(name, SymbolKind::Type, NodeIndex::NULL, Visibility::Public);
             self.symbol_mut(sym_id).type_index = intr.type_index();
         }
+        // Also ensure catalog has type entries for `'builtin` type views.
+        runtime::catalog_register_intrinsic_types(&self.type_pool);
         self.register_well_known_traits();
     }
 
@@ -171,7 +158,7 @@ impl<'a> Resolver<'a> {
             effects: self.effects,
             traits: self.traits,
             diagnostics: self.diagnostics,
-            intrinsic_fns: self.intrinsic_fns,
+            builtin_fns: self.builtin_fns,
             enum_variant_indices: self.enum_variant_indices,
             node_field_indices: self.node_field_indices,
         }
@@ -233,15 +220,36 @@ impl<'a> Resolver<'a> {
         id
     }
 
+    /// Allocate a symbol that is not inserted into any scope binding table.
+    /// Used for `'builtin` view results.
+    pub(crate) fn alloc_unbound_symbol(
+        &mut self,
+        name: StrId,
+        kind: SymbolKind,
+        def_node: NodeIndex,
+    ) -> SymbolId {
+        let id = SymbolId(self.next_symbol_id);
+        self.next_symbol_id += 1;
+        self.symbols.push(Symbol {
+            id,
+            name,
+            kind,
+            scope: self.current_scope,
+            type_index: TypeIndex::INVALID,
+            visibility: Visibility::Private,
+            def_node,
+        });
+        id
+    }
+
     /// Look up a name in the current scope chain (walks up to root).
     pub(crate) fn lookup(&self, name: StrId) -> Option<SymbolId> {
         let mut scope_id = self.current_scope;
         loop {
-            let scope = &self.scopes[scope_id.0 as usize];
-            if let Some(&sym_id) = scope.bindings.get(&name) {
+            if let Some(&sym_id) = self.scopes[scope_id.0 as usize].bindings.get(&name) {
                 return Some(sym_id);
             }
-            match scope.parent {
+            match self.scopes[scope_id.0 as usize].parent {
                 Some(parent) => scope_id = parent,
                 None => return None,
             }
@@ -270,14 +278,10 @@ impl<'a> Resolver<'a> {
         scope.bindings.get(&name).copied()
     }
 
-    /// Get a mutable reference to a symbol by id.
     pub(crate) fn symbol_mut(&mut self, id: SymbolId) -> &mut Symbol {
         &mut self.symbols[id.0 as usize]
     }
 
-    // ─── Type registration ─────────────────────────────────────────
-
-    /// Register a new type in the type pool and return its index.
     pub(crate) fn register_type(&mut self, kind: TypeKind) -> TypeIndex {
         self.type_pool.register(TypeInfo {
             kind,
@@ -287,5 +291,32 @@ impl<'a> Resolver<'a> {
         })
     }
 
-    // ─── Diagnostics ───────────────────────────────────────────────
+    /// Resolve a `'builtin` view against the shared catalog.
+    pub(crate) fn resolve_builtin_view(
+        &mut self,
+        view_node: NodeIndex,
+        symbol_name: &str,
+    ) -> Option<SymbolId> {
+        match catalog_lookup(symbol_name) {
+            Some(BuiltinKind::Fn(id)) => {
+                let name = str_interner::intern(symbol_name);
+                let sym_id = self.alloc_unbound_symbol(
+                    name,
+                    SymbolKind::BuiltinFunction(id),
+                    view_node,
+                );
+                self.builtin_fns.insert(sym_id, id);
+                Some(sym_id)
+            }
+            Some(BuiltinKind::Type(ti)) => {
+                let name = str_interner::intern(symbol_name);
+                let sym_id =
+                    self.alloc_unbound_symbol(name, SymbolKind::Type, view_node);
+                self.symbol_mut(sym_id).type_index = ti;
+                Some(sym_id)
+            }
+            Some(BuiltinKind::Effect(_)) => None,
+            None => None,
+        }
+    }
 }

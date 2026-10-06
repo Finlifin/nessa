@@ -1,14 +1,19 @@
 use gc::{GC_FLAGS, GcConfig, Heap, NessaSlot, ObjectHeader};
-use nsbc::{AddrMode, FuncId, Instruction, InstructionData, IntrinsicFn, Opcode, Reg};
+use nsbc::{AddrMode, FuncId, Instruction, InstructionData, Opcode, Reg};
 use runtime::{
-    BytecodeStore, CallFrame, ClosureEnv, ConstantPool, EffectHandler, FunctionCode, GlobalTable,
-    TaggedValue, TaskId, TaskStatus,
+    BuiltinFnId, BytecodeStore, CallFrame, ClosureEnv, ConstantPool, EffectHandler, FunctionCode,
+    GlobalTable, TaggedValue, TaskId, TaskStatus,
 };
 use scheduler::Scheduler;
 use stack_pool::StackPool;
 use std::sync::Arc;
 use str_interner::StrId;
 use type_pool::{Intrinsic, TypeIndex, TypePool};
+
+mod builtin_ctx;
+pub use builtin_ctx::{
+    format_tagged_value, BuiltinCtx, BuiltinFn, BuiltinFnTable, BuiltinOutcome,
+};
 
 // ---------------------------------------------------------------------------
 // VM — the top-level virtual machine
@@ -22,6 +27,7 @@ pub struct Vm {
     pub type_pool: TypePool,
     pub heap: Heap,
     pub scheduler: Scheduler,
+    pub builtins: BuiltinFnTable,
 }
 
 impl Vm {
@@ -33,7 +39,13 @@ impl Vm {
             type_pool,
             heap: gc::gc_init(gc_config),
             scheduler: Scheduler::with_stack_pool(stack_pool),
+            builtins: BuiltinFnTable::new(),
         }
+    }
+
+    /// Register a native builtin implementation.
+    pub fn register_builtin(&mut self, id: BuiltinFnId, f: BuiltinFn) {
+        self.builtins.register(id, f);
     }
 
     /// Add a compiled function to the VM.
@@ -682,14 +694,10 @@ impl Vm {
                 t.pc = 0;
                 DispatchResult::Continue
             }
-            Opcode::CallIntrinsic => {
+            Opcode::CallBuiltin => {
                 let payload = c_payload(&instr);
-                let (arg_count, intrinsic_id) = Instruction::c_arg_count_func_id(payload);
-                let _ = arg_count;
-                match IntrinsicFn::from_u16(intrinsic_id as u16) {
-                    Some(ifn) => self.dispatch_intrinsic(task_id, ifn),
-                    None => DispatchResult::Error(VmError::InvalidInstruction(instr.encode())),
-                }
+                let (arg_count, builtin_id) = Instruction::c_arg_count_func_id(payload);
+                self.dispatch_builtin(task_id, builtin_id, arg_count)
             }
             Opcode::Return => {
                 let src_reg = Instruction::c_return_reg(c_payload(&instr));
@@ -1030,182 +1038,27 @@ impl Vm {
         }
     }
 
-    /// Dispatch an intrinsic function call.
+    /// Dispatch a builtin function call.
     /// Arguments are in r0..rN by calling convention. Result goes into r0.
-    fn dispatch_intrinsic(&mut self, task_id: TaskId, ifn: IntrinsicFn) -> DispatchResult {
-        let t = self.scheduler.get_task_mut(task_id).unwrap();
-        match ifn {
-            IntrinsicFn::Print => {
-                let val = t.registers.get(Reg(0));
-                let formatted = format_tagged_value(val);
-                use std::io::Write;
-                let _ = write!(std::io::stdout(), "{}", formatted);
-                let _ = std::io::stdout().flush();
-                t.registers.set(Reg(0), TaggedValue::UNIT);
-                DispatchResult::Continue
+    fn dispatch_builtin(
+        &mut self,
+        task_id: TaskId,
+        builtin_id: u32,
+        arg_count: u8,
+    ) -> DispatchResult {
+        let Some(f) = self.builtins.get(builtin_id) else {
+            return DispatchResult::Error(VmError::UnknownBuiltin(builtin_id));
+        };
+        let mut ctx = BuiltinCtx::new(self, task_id, arg_count);
+        if let Err(e) = f(&mut ctx) {
+            return DispatchResult::Error(e);
+        }
+        match ctx.take_outcome() {
+            BuiltinOutcome::Continue => DispatchResult::Continue,
+            BuiltinOutcome::Exit(code) => {
+                std::process::exit(code);
             }
-            IntrinsicFn::PrintLn => {
-                let val = t.registers.get(Reg(0));
-                println!("{}", format_tagged_value(val));
-                t.registers.set(Reg(0), TaggedValue::UNIT);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::TypeOf => {
-                // TODO: return actual type descriptor
-                t.registers.set(Reg(0), TaggedValue::UNIT);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::ToI64 => {
-                let val = t.registers.get(Reg(0));
-                let result = if let Some(v) = val.as_i64() {
-                    TaggedValue::from_i64(v)
-                } else if let Some(v) = val.as_u64() {
-                    TaggedValue::from_i64(v as i64)
-                } else if let Some(v) = val.as_f64() {
-                    TaggedValue::from_i64(v as i64)
-                } else {
-                    TaggedValue::from_i64(0)
-                };
-                t.registers.set(Reg(0), result);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::ToF64 => {
-                let val = t.registers.get(Reg(0));
-                let result = if let Some(v) = val.as_f64() {
-                    TaggedValue::from_f64(v)
-                } else if let Some(v) = val.as_i64() {
-                    TaggedValue::from_f64(v as f64)
-                } else if let Some(v) = val.as_u64() {
-                    TaggedValue::from_f64(v as f64)
-                } else {
-                    TaggedValue::from_f64(0.0)
-                };
-                t.registers.set(Reg(0), result);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::ToString => {
-                let val = t.registers.get(Reg(0));
-                drop(t);
-                let s = format_tagged_value(val);
-                let result = self.alloc_string(&s);
-                self.scheduler
-                    .get_task_mut(task_id)
-                    .unwrap()
-                    .registers
-                    .set(Reg(0), result);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Abs => {
-                let val = t.registers.get(Reg(0));
-                let result = if let Some(v) = val.as_i64() {
-                    TaggedValue::from_i64(v.wrapping_abs())
-                } else if let Some(v) = val.as_f64() {
-                    TaggedValue::from_f64(v.abs())
-                } else {
-                    TaggedValue::UNIT
-                };
-                t.registers.set(Reg(0), result);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Sin => {
-                let val = t.registers.get(Reg(0));
-                let r = val.as_f64().map(|v| v.sin()).unwrap_or(0.0);
-                t.registers.set(Reg(0), TaggedValue::from_f64(r));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Cos => {
-                let val = t.registers.get(Reg(0));
-                let r = val.as_f64().map(|v| v.cos()).unwrap_or(0.0);
-                t.registers.set(Reg(0), TaggedValue::from_f64(r));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Sqrt => {
-                let val = t.registers.get(Reg(0));
-                let r = val.as_f64().map(|v| v.sqrt()).unwrap_or(0.0);
-                t.registers.set(Reg(0), TaggedValue::from_f64(r));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Floor => {
-                let val = t.registers.get(Reg(0));
-                let r = val.as_f64().map(|v| v.floor()).unwrap_or(0.0);
-                t.registers.set(Reg(0), TaggedValue::from_f64(r));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Ceil => {
-                let val = t.registers.get(Reg(0));
-                let r = val.as_f64().map(|v| v.ceil()).unwrap_or(0.0);
-                t.registers.set(Reg(0), TaggedValue::from_f64(r));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Round => {
-                let val = t.registers.get(Reg(0));
-                let r = val.as_f64().map(|v| v.round()).unwrap_or(0.0);
-                t.registers.set(Reg(0), TaggedValue::from_f64(r));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Pow => {
-                let base = t.registers.get(Reg(0));
-                let exp = t.registers.get(Reg(1));
-                let r = match (base.as_f64(), exp.as_f64()) {
-                    (Some(b), Some(e)) => TaggedValue::from_f64(b.powf(e)),
-                    _ => match (base.as_i64(), exp.as_i64()) {
-                        (Some(b), Some(e)) => TaggedValue::from_i64(b.wrapping_pow(e as u32)),
-                        _ => TaggedValue::UNIT,
-                    },
-                };
-                t.registers.set(Reg(0), r);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Log => {
-                let val = t.registers.get(Reg(0));
-                let r = val.as_f64().map(|v| v.ln()).unwrap_or(0.0);
-                t.registers.set(Reg(0), TaggedValue::from_f64(r));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::StrLen => {
-                let val = t.registers.get(Reg(0));
-                let len: i64 = if let Some(ptr) = val.as_heap_ptr() {
-                    (unsafe { *(ptr as *const u64) }) as i64
-                } else {
-                    0
-                };
-                t.registers.set(Reg(0), TaggedValue::from_i64(len));
-                DispatchResult::Continue
-            }
-            IntrinsicFn::StrConcat => {
-                let a = t.registers.get(Reg(0));
-                let b = t.registers.get(Reg(1));
-                let mut bytes: Vec<u8> = Vec::new();
-                if let Some(ptr) = a.as_heap_ptr() {
-                    let len = (unsafe { *(ptr as *const u64) }) as usize;
-                    let data =
-                        unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
-                    bytes.extend_from_slice(data);
-                }
-                if let Some(ptr) = b.as_heap_ptr() {
-                    let len = (unsafe { *(ptr as *const u64) }) as usize;
-                    let data =
-                        unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
-                    bytes.extend_from_slice(data);
-                }
-                drop(t);
-                let s = String::from_utf8_lossy(&bytes).into_owned();
-                let result = self.alloc_string(&s);
-                self.scheduler
-                    .get_task_mut(task_id)
-                    .unwrap()
-                    .registers
-                    .set(Reg(0), result);
-                DispatchResult::Continue
-            }
-            IntrinsicFn::Exit => {
-                let code = t.registers.get(Reg(0)).as_i64().unwrap_or(0);
-                std::process::exit(code as i32);
-            }
-            IntrinsicFn::Panic => {
-                let msg = format_tagged_value(t.registers.get(Reg(0)));
-                DispatchResult::Error(VmError::Panic(msg))
-            }
+            BuiltinOutcome::Panic(msg) => DispatchResult::Error(VmError::Panic(msg)),
         }
     }
 }
@@ -1354,47 +1207,10 @@ pub enum VmError {
     InvalidTask,
     OutOfMemory,
     TypeError,
+    ArityError { expected: u8, got: u8 },
+    UnknownBuiltin(u32),
     MethodNotFound,
     Panic(String),
-}
-
-// ---------------------------------------------------------------------------
-// Value formatting for intrinsics
-// ---------------------------------------------------------------------------
-
-/// Format a TaggedValue for display (used by print/println intrinsics).
-fn format_tagged_value(val: TaggedValue) -> String {
-    if val.is_null() {
-        "null".to_string()
-    } else if val.is_unit() {
-        "()".to_string()
-    } else if let Some(v) = val.as_i64() {
-        v.to_string()
-    } else if let Some(v) = val.as_u64() {
-        v.to_string()
-    } else if let Some(v) = val.as_f64() {
-        format!("{v}")
-    } else if let Some(v) = val.as_bool() {
-        v.to_string()
-    } else if let Some(v) = val.as_char() {
-        v.to_string()
-    } else if val.is_heap() {
-        // Try to read as a heap string: layout is [len:u64][...UTF-8 bytes...]
-        if let Some(ptr) = val.as_heap_ptr() {
-            // Safety: ptr is a valid payload pointer from our allocator.
-            let len = unsafe { *(ptr as *const u64) } as usize;
-            // Sanity check: len must be small enough to read safely.
-            if len <= 4096 {
-                let bytes = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
-                if let Ok(s) = std::str::from_utf8(bytes) {
-                    return s.to_string();
-                }
-            }
-        }
-        format!("<object@{:#x}>", val.raw())
-    } else {
-        format!("<value:{:#018x}>", val.raw())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,5 +1512,39 @@ mod tests {
             .registers
             .get(Reg(0));
         assert_eq!(val.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn call_builtin_to_i64() {
+        let mut vm = make_vm();
+        // Register only to_i64 for this unit test.
+        vm.register_builtin(runtime::ids::TO_I64, |ctx| {
+            let v = ctx.arg(0)?;
+            let i = v.as_i64().ok_or(VmError::TypeError)?;
+            ctx.return_i64(i);
+            Ok(())
+        });
+        let code = encode_instrs(&[
+            Instruction::load_imm(Reg(0), 7),
+            Instruction::call_builtin(runtime::ids::TO_I64, 1),
+            Instruction::ret(Reg(0)),
+        ]);
+        vm.add_function(FunctionCode {
+            func_id: FuncId(0),
+            instructions: code,
+            register_count: 1,
+            param_count: 0,
+            is_closure: false,
+        });
+        let task_id = vm.spawn_root(FuncId(0));
+        let result = vm.run();
+        assert!(matches!(result, VmResult::Finished));
+        let val = vm
+            .scheduler
+            .get_task(task_id)
+            .unwrap()
+            .registers
+            .get(Reg(0));
+        assert_eq!(val.as_i64(), Some(7));
     }
 }

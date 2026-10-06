@@ -151,6 +151,32 @@ pub enum Intrinsic {
 impl Intrinsic {
     pub const COUNT: usize = Self::Closure as usize + 1;
 
+    /// All intrinsic variants in discriminant order.
+    pub const ALL: &'static [Intrinsic] = &[
+        Self::U8,
+        Self::U16,
+        Self::U32,
+        Self::U64,
+        Self::U128,
+        Self::Usize,
+        Self::I8,
+        Self::I16,
+        Self::I32,
+        Self::I64,
+        Self::I128,
+        Self::Isize,
+        Self::F32,
+        Self::F64,
+        Self::Bool,
+        Self::Char,
+        Self::Str,
+        Self::Unit,
+        Self::Any,
+        Self::NoReturn,
+        Self::Type,
+        Self::Closure,
+    ];
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::U8 => "u8",
@@ -191,31 +217,6 @@ impl Intrinsic {
     pub const fn type_index(self) -> TypeIndex {
         TypeIndex(self as u32)
     }
-
-    const ALL: [Intrinsic; Self::COUNT] = [
-        Self::U8,
-        Self::U16,
-        Self::U32,
-        Self::U64,
-        Self::U128,
-        Self::Usize,
-        Self::I8,
-        Self::I16,
-        Self::I32,
-        Self::I64,
-        Self::I128,
-        Self::Isize,
-        Self::F32,
-        Self::F64,
-        Self::Bool,
-        Self::Char,
-        Self::Str,
-        Self::Unit,
-        Self::Any,
-        Self::NoReturn,
-        Self::Type,
-        Self::Closure,
-    ];
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +427,7 @@ impl TypePool {
     /// Register intrinsic types at well-known indices 0..Intrinsic::COUNT.
     fn register_intrinsics(&mut self) {
         debug_assert!(self.types.is_empty(), "intrinsics must be first");
-        for &intr in &Intrinsic::ALL {
+        for &intr in Intrinsic::ALL {
             let (size, align) = intrinsic_layout(intr);
             let type_id = intrinsic_type_id(intr);
             let info = TypeInfo {

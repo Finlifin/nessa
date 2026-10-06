@@ -9,123 +9,6 @@
 use type_pool::TypeIndex;
 
 // ---------------------------------------------------------------------------
-// IntrinsicFn — native functions known to the VM
-// ---------------------------------------------------------------------------
-
-/// Intrinsic functions implemented natively by the VM.
-///
-/// These are the primitive operations that cannot be implemented in nessa
-/// source code.  User-facing names are defined in the `std` package via the
-/// `'intrinsic` mechanism; the compiler emits [`Opcode::CallIntrinsic`]
-/// instructions referencing these variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u16)]
-pub enum IntrinsicFn {
-    // ── I/O ────────────────────────────────────────────────────────
-    /// Print a value to stdout (no trailing newline).
-    Print = 0,
-    /// Print a value to stdout followed by a newline.
-    PrintLn = 1,
-
-    // ── Type introspection ─────────────────────────────────────────
-    /// Get the runtime type of a value.
-    TypeOf = 2,
-
-    // ── Numeric conversions ────────────────────────────────────────
-    /// Convert to i64.
-    ToI64 = 3,
-    /// Convert to f64.
-    ToF64 = 4,
-    /// Convert to string.
-    ToString = 5,
-
-    // ── Math ───────────────────────────────────────────────────────
-    Abs = 10,
-    Sin = 11,
-    Cos = 12,
-    Sqrt = 13,
-    Floor = 14,
-    Ceil = 15,
-    Round = 16,
-    Pow = 17,
-    Log = 18,
-
-    // ── String ─────────────────────────────────────────────────────
-    StrLen = 30,
-    StrConcat = 31,
-
-    // ── Process ────────────────────────────────────────────────────
-    /// Terminate the process.
-    Exit = 50,
-    /// Panic with a message.
-    Panic = 51,
-}
-
-impl IntrinsicFn {
-    /// Create from a raw u16.  Returns `None` for unknown values.
-    pub fn from_u16(v: u16) -> Option<Self> {
-        match v {
-            0 => Some(Self::Print),
-            1 => Some(Self::PrintLn),
-            2 => Some(Self::TypeOf),
-            3 => Some(Self::ToI64),
-            4 => Some(Self::ToF64),
-            5 => Some(Self::ToString),
-            10 => Some(Self::Abs),
-            11 => Some(Self::Sin),
-            12 => Some(Self::Cos),
-            13 => Some(Self::Sqrt),
-            14 => Some(Self::Floor),
-            15 => Some(Self::Ceil),
-            16 => Some(Self::Round),
-            17 => Some(Self::Pow),
-            18 => Some(Self::Log),
-            30 => Some(Self::StrLen),
-            31 => Some(Self::StrConcat),
-            50 => Some(Self::Exit),
-            51 => Some(Self::Panic),
-            _ => None,
-        }
-    }
-
-    /// The user-facing name of this intrinsic (as used in `std`).
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Print => "print",
-            Self::PrintLn => "println",
-            Self::TypeOf => "type_of",
-            Self::ToI64 => "to_i64",
-            Self::ToF64 => "to_f64",
-            Self::ToString => "to_string",
-            Self::Abs => "abs",
-            Self::Sin => "sin",
-            Self::Cos => "cos",
-            Self::Sqrt => "sqrt",
-            Self::Floor => "floor",
-            Self::Ceil => "ceil",
-            Self::Round => "round",
-            Self::Pow => "pow",
-            Self::Log => "log",
-            Self::StrLen => "str_len",
-            Self::StrConcat => "str_concat",
-            Self::Exit => "exit",
-            Self::Panic => "panic",
-        }
-    }
-
-    /// All defined intrinsic functions.
-    pub const ALL: &'static [IntrinsicFn] = &[
-        Self::Print, Self::PrintLn,
-        Self::TypeOf,
-        Self::ToI64, Self::ToF64, Self::ToString,
-        Self::Abs, Self::Sin, Self::Cos, Self::Sqrt,
-        Self::Floor, Self::Ceil, Self::Round, Self::Pow, Self::Log,
-        Self::StrLen, Self::StrConcat,
-        Self::Exit, Self::Panic,
-    ];
-}
-
-// ---------------------------------------------------------------------------
 // Register and FuncId newtypes
 // ---------------------------------------------------------------------------
 
@@ -280,7 +163,8 @@ pub enum Opcode {
     CallMethod    = 0x8A,
     CallWasm      = 0x8B,
     TailCall      = 0x8C,
-    CallIntrinsic = 0x8D,
+    /// Call a registered builtin by [`runtime::BuiltinFnId`](id).
+    CallBuiltin   = 0x8D,
     ReturnUnit    = 0x8E,
     Return        = 0x8F,
     /// Far call: func_id from const pool index in imm12, arg_count in high bits.
@@ -636,9 +520,9 @@ impl Instruction {
         Self::c_type(Opcode::CallFar, payload)
     }
 
-    pub fn call_intrinsic(intrinsic: IntrinsicFn, arg_count: u8) -> Self {
-        let payload = ((arg_count as u32) << 14) | ((intrinsic as u32) & 0x3FFF);
-        Self::c_type(Opcode::CallIntrinsic, payload)
+    pub fn call_builtin(builtin_id: u32, arg_count: u8) -> Self {
+        let payload = ((arg_count as u32) << 14) | (builtin_id & 0x3FFF);
+        Self::c_type(Opcode::CallBuiltin, payload)
     }
 
     pub fn ret(src: Reg) -> Self {

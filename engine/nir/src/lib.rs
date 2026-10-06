@@ -3,7 +3,8 @@ mod expr;
 mod lowering;
 mod stmt;
 
-use nsbc::{FuncId, IntrinsicFn};
+use nsbc::FuncId;
+use runtime::BuiltinFnId;
 use resolution::ResolvedAst;
 use str_interner::StrId;
 use type_pool::TypeIndex;
@@ -92,8 +93,8 @@ pub enum NirExpr {
     UnaryOp(UnaryOp, NirValue),
     /// Function call.
     Call(FuncId, Vec<NirValue>),
-    /// Intrinsic function call (native VM implementation).
-    CallIntrinsic(IntrinsicFn, Vec<NirValue>),
+    /// Builtin function call (native VM implementation via CallBuiltin).
+    CallBuiltin(BuiltinFnId, Vec<NirValue>),
     /// Method call: receiver, method name, args.
     MethodCall(NirValue, StrId, Vec<NirValue>),
     /// Field access: object, field index.

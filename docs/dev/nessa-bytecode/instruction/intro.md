@@ -107,7 +107,7 @@
 | 0x8A | CALL_METHOD | call r[s].method(args...) | 方法调用（method_id:12） |
 | 0x8B | CALL_WASM | call wasm_func(args...) | WASM 函数调用 |
 | 0x8C | TAIL_CALL | goto func_id(args...) | 尾调用 |
-| 0x8D | CALL_INTRINSIC | call intrinsic(args...) | 内建函数 |
+| 0x8D | CALL_BUILTIN | call builtin(args...) | 注册的 builtin 函数 |
 | 0x8E | RETURN_UNIT | return Unit | 返回 Unit |
 | 0x8F | RETURN | return r[s] | 函数返回 |
 | 0x90 | CALL_FAR | call via const pool | 大 func_id |

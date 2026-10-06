@@ -44,7 +44,7 @@
 │        Any(19), NoReturn(20), Type(21)                           │
 │                                                                  │
 │    - 构建 TypeIndex → TypeID 映射                                 │
-│    - 这些 TypeIndex 在 std 编译时通过 'intrinsic 视图引用         │
+│    - 这些 TypeIndex 在 std 编译时通过 'builtin 视图引用           │
 │                                                                  │
 │           ▼                                                      │
 │                                                                  │

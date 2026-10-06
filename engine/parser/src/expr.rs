@@ -337,7 +337,7 @@ fn try_post_expr(
         TokenKind::LParen => parse_call_expr(p, left),
         TokenKind::LBrace => parse_extended_call_expr(p, left, option),
         TokenKind::Dot => parse_dot_expr(p, left),
-        TokenKind::Quote => parse_view_expr(p, left),
+        TokenKind::Quote => parse_quote_expr(p, left),
         TokenKind::Hash => parse_effect_handling_expr(p, left),
         TokenKind::Bang => parse_error_handling_expr(p, left),
         TokenKind::Question => parse_option_propagation_expr(p, left),
@@ -416,6 +416,13 @@ fn parse_dot_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     result
 }
 
+/// `expr ' id` — view, same shape as projection (`expr . id`).
+fn parse_quote_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
+    let _g = p.enter();
+    p.expect_token(TokenKind::Quote)?;
+    parse_view_expr(p, left)
+}
+
 fn parse_handler_apply_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     p.expect_token(TokenKind::KwUse)?;
     p.expect_token(TokenKind::LParen)?;
@@ -458,25 +465,24 @@ fn parse_projection_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
         .build())
 }
 
+/// After `'`, parse the view name id (operator already consumed by [`parse_quote_expr`]).
 fn parse_view_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
-    let _g = p.enter();
-    p.expect_token(TokenKind::Quote)?;
     let id = basic::try_id(p)?;
     if id.is_null() {
-        let _ = p.err(
+        let _ = p.err_with_label(
             ParseErrorKind::InvalidSyntax,
             p.next_token_span(),
             "Expected identifier after `'` in view expression",
+            p.next_token_span(),
+            format!("found `{}`", p.peek_token().kind.lexeme()),
         );
     }
     let span = p.current_span();
-    let idx = p
-        .ast()
+    Ok(p.ast()
         .builder(NodeKind::View, span)
         .add_child(left)
         .add_child(id)
-        .build();
-    Ok(idx)
+        .build())
 }
 
 fn parse_type_cast_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
