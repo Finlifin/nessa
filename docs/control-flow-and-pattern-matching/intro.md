@@ -210,6 +210,11 @@ x match {
 }
 ```
 
+否定完整子模式，包括它内部的 guard：`not (E.some(x) if x > 0)`。
+这里的 x 仅供内部 guard 使用，不进入 arm body。需要整个输入时写
+`not E.none as whole`，它等价于 `(not E.none) as whole`。
+`not` 同样可用于 `matches` 和 `for`；`for` 跳过未匹配的元素。
+
 ### as 绑定
 
 在匹配的同时绑定整个值到一个变量：
@@ -229,6 +234,11 @@ list match {
     [] => default(),
 }
 ```
+
+List 模式支持一个具名 rest，也可以写 `[...prefix,last]` 或
+`[first,...middle,last]`。固定元素为 Any，rest 为独立 List。匹配开始时
+浅复制槽位，guard 修改原列表不会改变当前匹配结果；元素对象仍共享。
+下一分支会读取原列表当前状态。详细规则见[模式语法](../grammar/patterns.md)。
 
 ## 守卫与约束
 
@@ -252,6 +262,12 @@ pair match {
     _ => "other",
 }
 ```
+
+约束按顺序执行，左侧失败时不会求右侧表达式。左右侧模式的绑定都可供后续
+guard 和分支体读取，例如 `(a,b) and a+b is total => total`。
+`(a,b) and a+1 is c and c+1 is d` 可继续约束新结果；同一路径不能重复绑定
+同一个名称。`p and e is q as computed` 绑定计算结果，为原始输入命名则写
+`(p and e is q) as whole`。这套规则也适用于 `matches` 和 `for`。
 
 ## Optional / Error 模式
 

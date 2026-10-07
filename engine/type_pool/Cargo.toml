@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 str_interner = { path = "../str_interner" }
+sha2 = "0.10"
+semver = "1.0"

@@ -1,5 +1,45 @@
 use str_interner::StrId;
 
+mod access;
+mod associated;
+mod associated_defaults;
+mod collections;
+mod dispatch;
+mod errors;
+mod functions;
+pub use errors::{ErrorDomain, ErrorShape, ErrorTypeError};
+mod identity;
+mod identity_encoding;
+#[cfg(test)]
+mod identity_tests;
+mod iteration_step;
+mod native_derived;
+mod numeric;
+mod signatures;
+mod snapshot;
+mod traits;
+
+pub use access::{MethodAccess, MethodAccessError, ScopeContext};
+pub use associated::AssociatedTypeBinding;
+pub use associated_defaults::{AssociatedTypeDefault, AssociatedTypeExpr};
+pub use collections::{
+    CollectionRole, LIST_BUFFER_TYPE_ID, LIST_TYPE_ID, MAP_BUFFER_TYPE_ID, MAP_TYPE_ID,
+};
+pub use dispatch::{TraitDispatchSchema, TraitMethodDescriptor, TraitMethodKey, TraitProofError};
+pub use functions::DerivedMethodError;
+pub use identity::{
+    IdentityPathSegment, NominalTypeProvenance, PackageTypeContext, TypeIdentityError,
+    TypeIdentityInput,
+};
+pub use iteration_step::{ITERATION_DONE_TAG, ITERATION_YIELDED_TAG};
+pub use native_derived::{NativeDerivedError, NativeDerivedMethod};
+pub use signatures::{
+    TraitAssociatedPath, TraitMethodSignature, TraitParameterKind, TraitSignatureError,
+    TraitTypeStep,
+};
+pub use snapshot::{SnapshotError, TypePoolSnapshot};
+pub use traits::TraitLookupError;
+
 /// Sentinel func_id indicating a compiler-derived (synthesized) method.
 /// Used by `derive Eq, Ord, ...` — the interpreter generates the
 /// implementation on the fly when it encounters this marker.
@@ -54,7 +94,7 @@ impl WellKnownTraits {
 
 /// A compact handle representing a registered type. The inner `u32` is the
 /// index into `TypePool::types`.  Stored inside heap object headers at runtime.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeIndex(u32);
 
 impl TypeIndex {
@@ -146,10 +186,11 @@ pub enum Intrinsic {
     Type,
     // Runtime-managed
     Closure,
+    Continuation,
 }
 
 impl Intrinsic {
-    pub const COUNT: usize = Self::Closure as usize + 1;
+    pub const COUNT: usize = Self::Continuation as usize + 1;
 
     /// All intrinsic variants in discriminant order.
     pub const ALL: &'static [Intrinsic] = &[
@@ -175,6 +216,7 @@ impl Intrinsic {
         Self::NoReturn,
         Self::Type,
         Self::Closure,
+        Self::Continuation,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -201,6 +243,7 @@ impl Intrinsic {
             Self::NoReturn => "NoReturn",
             Self::Type => "Type",
             Self::Closure => "Closure",
+            Self::Continuation => "Continuation",
         }
     }
 
@@ -278,6 +321,11 @@ pub enum TypeKind {
     /// Module (`mod`) — no instances, just a namespace.
     Module { name: StrId },
 
+    /// Abstract associated type binder; never a runtime value type.
+    AssociatedType { trait_owner: TypeIndex, name: StrId },
+    /// Compiler-only tagged result before Item/Self specialization; never an object layout.
+    IterationStepTemplate { item: TypeIndex },
+
     /// A trait definition type.
     Trait {
         name: StrId,
@@ -341,6 +389,8 @@ pub struct TypeInfo {
 /// Identifies a method attached to a type (via impl / extend).
 #[derive(Debug, Clone)]
 pub struct MethodSlot {
+    /// Declaration visibility, independent of the lexical `extend` restriction.
+    pub access: MethodAccess,
     pub name: StrId,
     /// Index of the function in the bytecode store.
     pub func_id: u32,
@@ -358,6 +408,8 @@ pub struct MethodSlot {
 
 #[derive(Debug, Clone)]
 pub struct TraitImplRecord {
+    /// Independent lexical identity of an extension implementation.
+    pub visible_scope: Option<u32>,
     pub trait_type: TypeIndex,
     pub implementor: TypeIndex,
     pub methods: Vec<MethodSlot>,
@@ -372,6 +424,8 @@ pub struct TraitImplRecord {
 /// (including inherited methods from parent traits).
 #[derive(Debug, Clone)]
 pub struct VTable {
+    /// Must exactly match the corresponding trait implementation scope.
+    pub visible_scope: Option<u32>,
     /// The trait this vtable is for.
     pub trait_type: TypeIndex,
     /// The concrete type that implements the trait.
@@ -390,16 +444,30 @@ pub struct VTable {
 pub struct TypePool {
     /// All registered type descriptors, indexed by `TypeIndex`.
     types: Vec<TypeInfo>,
+    /// Indices created by structural interning. Raw registrations may represent
+    /// nominal declarations even when their descriptor resembles a signature.
+    structural_types: Vec<TypeIndex>,
     /// TypeId → TypeIndex reverse lookup.
     id_to_index: std::collections::HashMap<TypeId, TypeIndex>,
     /// Per-type method tables.
     methods: Vec<Vec<MethodSlot>>,
+    /// Archive-local lexical scopes and package identities.
+    scopes: Vec<ScopeContext>,
+    scope_packages: std::collections::HashSet<u32>,
     /// Trait implementation records.
     trait_impls: Vec<TraitImplRecord>,
     /// Virtual method tables for trait dynamic dispatch.
     vtables: Vec<VTable>,
+    trait_schemas: Vec<TraitDispatchSchema>,
+    associated_bindings: Vec<AssociatedTypeBinding>,
+    associated_defaults: Vec<AssociatedTypeDefault>,
     /// Well-known trait type indices.
     pub well_known: WellKnownTraits,
+    /// Canonical null-only type, initialized after the intrinsic trait prefix.
+    null_type: TypeIndex,
+    identity_input: Option<TypeIdentityInput>,
+    identity_dirty: std::sync::atomic::AtomicBool,
+    identity_known: [TypeIndex; 8],
 }
 
 impl TypePool {
@@ -407,11 +475,21 @@ impl TypePool {
     pub fn new() -> Self {
         Self {
             types: Vec::new(),
+            structural_types: Vec::new(),
             id_to_index: std::collections::HashMap::new(),
             methods: Vec::new(),
+            scopes: Vec::new(),
+            scope_packages: std::collections::HashSet::new(),
             trait_impls: Vec::new(),
             vtables: Vec::new(),
+            trait_schemas: Vec::new(),
+            associated_bindings: Vec::new(),
+            associated_defaults: Vec::new(),
             well_known: WellKnownTraits::UNINITIALIZED,
+            null_type: TypeIndex::INVALID,
+            identity_input: None,
+            identity_dirty: std::sync::atomic::AtomicBool::new(false),
+            identity_known: [TypeIndex::INVALID; 8],
         }
     }
 
@@ -419,6 +497,7 @@ impl TypePool {
     pub fn with_intrinsics() -> Self {
         let mut pool = Self::new();
         pool.register_intrinsics();
+        pool.register_collection_roles();
         pool
     }
 
@@ -440,6 +519,9 @@ impl TypePool {
             debug_assert_eq!(idx.as_u32(), intr as u32);
         }
         self.register_well_known_traits();
+        self.null_type = self.intern_structural(TypeKind::Optional {
+            inner: Intrinsic::NoReturn.type_index(),
+        });
     }
 
     /// Register well-known trait types immediately after intrinsics.
@@ -453,28 +535,28 @@ impl TypePool {
         let iterator_name = str_interner::intern("Iterator");
         let into_iterator_name = str_interner::intern("IntoIterator");
 
-        let mk = |pool: &mut Self, name: StrId| -> TypeIndex {
+        let mk = |pool: &mut Self, name: StrId, ordinal: u64| -> TypeIndex {
             pool.push(TypeInfo {
                 kind: TypeKind::Trait {
                     name,
                     parents: Vec::new(),
                     assoc_types: Vec::new(),
                 },
-                type_id: TypeId(0x4E45_5353_5452_4954, name.as_u32() as u64),
+                type_id: identity::bootstrap_id(ordinal),
                 size: 0,
                 align: 0,
             })
         };
 
         self.well_known = WellKnownTraits {
-            display: mk(self, display_name),
-            hash: mk(self, hash_name),
-            eq: mk(self, eq_name),
-            ord: mk(self, ord_name),
-            partial_eq: mk(self, partial_eq_name),
-            partial_ord: mk(self, partial_ord_name),
-            iterator: mk(self, iterator_name),
-            into_iterator: mk(self, into_iterator_name),
+            display: mk(self, display_name, 1),
+            hash: mk(self, hash_name, 2),
+            eq: mk(self, eq_name, 3),
+            ord: mk(self, ord_name, 4),
+            partial_eq: mk(self, partial_eq_name, 5),
+            partial_ord: mk(self, partial_ord_name, 6),
+            iterator: mk(self, iterator_name, 7),
+            into_iterator: mk(self, into_iterator_name, 8),
         };
     }
 
@@ -483,9 +565,198 @@ impl TypePool {
         self.push(info)
     }
 
+    /// Reuse structural types by shape, resolving valid alias references first.
+    /// Nominal kinds always receive a fresh index. Named effect declarations
+    /// must use `register`: their operation identity is distinct from a signature.
+    /// Invalid references are retained for later validation, never dereferenced.
+    pub fn intern_structural(&mut self, kind: TypeKind) -> TypeIndex {
+        let kind = self.normalize_structural(kind);
+        let structural = matches!(
+            kind,
+            TypeKind::IterationStepTemplate { .. }
+                | TypeKind::Tuple { .. }
+                | TypeKind::Function { .. }
+                | TypeKind::Effect { .. }
+                | TypeKind::Optional { .. }
+                | TypeKind::ErrorQualified { .. }
+                | TypeKind::EffectQualified { .. }
+        );
+        if structural {
+            let discriminant = std::mem::discriminant(&kind);
+            if let Some(index) = self.structural_types.iter().copied().find(|index| {
+                let info = &self.types[index.as_u32() as usize];
+                std::mem::discriminant(&info.kind) == discriminant
+                    && same_structural_shape(&self.normalize_structural(info.kind.clone()), &kind)
+            }) {
+                return index;
+            }
+        }
+        let index = self.register(TypeInfo {
+            kind,
+            // Stable identities require package identity, version and layout.
+            // Structural interning must not invent a substitute persistent ID.
+            type_id: TypeId::ZERO,
+            size: 0,
+            align: 0,
+        });
+        if structural {
+            self.structural_types.push(index);
+        }
+        index
+    }
+
+    fn normalize_structural(&self, mut kind: TypeKind) -> TypeKind {
+        let step = iteration_step::step_payload(&kind).is_some();
+        let normalize = |ty: &mut TypeIndex| {
+            *ty = self.canonical_type(*ty).unwrap_or(*ty);
+        };
+        match &mut kind {
+            TypeKind::IterationStepTemplate { item } => normalize(item),
+            TypeKind::Enum { variants, .. } if step => normalize(&mut variants[1].fields[0].ty),
+            TypeKind::Tuple { elements } => elements.iter_mut().for_each(normalize),
+            TypeKind::Function { params, ret } | TypeKind::Effect { params, ret, .. } => {
+                params.iter_mut().for_each(normalize);
+                normalize(ret);
+            }
+            TypeKind::Optional { inner } => normalize(inner),
+            TypeKind::ErrorQualified { errors, inner } => {
+                errors.iter_mut().for_each(normalize);
+                errors.sort_unstable_by_key(|ty| ty.as_u32());
+                errors.dedup();
+                normalize(inner);
+            }
+            TypeKind::EffectQualified { effects, inner } => {
+                effects.iter_mut().for_each(normalize);
+                effects.sort_unstable_by_key(|ty| ty.as_u32());
+                effects.dedup();
+                normalize(inner);
+            }
+            _ => {}
+        }
+        kind
+    }
+
+    /// Follow aliases with checked indices and a bound that rejects cycles.
+    pub fn canonical_type(&self, mut ty: TypeIndex) -> Option<TypeIndex> {
+        for _ in 0..self.types.len() {
+            match &self.types.get(ty.as_u32() as usize)?.kind {
+                TypeKind::Typealias { target, .. } => ty = *target,
+                _ => return Some(ty),
+            }
+        }
+        None
+    }
+
+    /// The `?NoReturn` descriptor for null. Returns INVALID on an empty pool
+    /// that has not initialized its standard intrinsic prefix.
+    pub fn null_type(&self) -> TypeIndex {
+        self.null_type
+    }
+
+    /// Display a type using its canonical alias target. Invalid indices or
+    /// recursive structural descriptors, or nesting beyond 256 levels, return
+    /// None. Nominal names must have
+    /// been interned by registration; archive loading validates them separately.
+    pub fn display_name(&self, ty: TypeIndex) -> Option<String> {
+        self.display_name_inner(ty, &mut Vec::new())
+    }
+
+    fn display_name_inner(&self, ty: TypeIndex, active: &mut Vec<TypeIndex>) -> Option<String> {
+        let ty = self.canonical_type(ty)?;
+        if active.len() >= 256 || active.contains(&ty) {
+            return None;
+        }
+        active.push(ty);
+        let name = match &self.types.get(ty.as_u32() as usize)?.kind {
+            TypeKind::IterationStepTemplate { item } => Some(format!(
+                "IterationStep({})",
+                self.display_name_inner(*item, active)?
+            )),
+            TypeKind::Enum { .. } if self.structural_types.contains(&ty) => {
+                let item = self.checked_iteration_step_item(ty).ok()??;
+                Some(format!(
+                    "IterationStep({})",
+                    self.display_name_inner(item, active)?
+                ))
+            }
+            TypeKind::Intrinsic(kind) => Some(kind.name().to_owned()),
+            TypeKind::Struct { name, .. }
+            | TypeKind::Enum { name, .. }
+            | TypeKind::Newtype { name, .. }
+            | TypeKind::Module { name }
+            | TypeKind::Trait { name, .. } => Some(str_interner::get(*name)),
+            TypeKind::Tuple { elements } => {
+                let names = self.display_names(elements, active)?;
+                Some(format!("({})", names.join(", ")))
+            }
+            TypeKind::Function { params, ret } => {
+                let names = self.display_names(params, active)?;
+                let result = self.display_name_inner(*ret, active)?;
+                Some(format!("fn({}) -> {result}", names.join(", ")))
+            }
+            TypeKind::Effect {
+                params,
+                ret,
+                is_async,
+            } => {
+                let names = self.display_names(params, active)?;
+                let result = self.display_name_inner(*ret, active)?;
+                let prefix = if *is_async { "async effect" } else { "effect" };
+                Some(format!("{prefix}({}) -> {result}", names.join(", ")))
+            }
+            TypeKind::Optional { inner } => {
+                Some(format!("?{}", self.display_name_inner(*inner, active)?))
+            }
+            TypeKind::ErrorQualified { errors, inner } => {
+                self.display_qualified("!", errors, *inner, active)
+            }
+            TypeKind::EffectQualified { effects, inner } => {
+                self.display_qualified("#", effects, *inner, active)
+            }
+            TypeKind::AssociatedType { trait_owner, name } => Some(format!(
+                "{}.{}",
+                self.display_name_inner(*trait_owner, active)?,
+                str_interner::get(*name)
+            )),
+            TypeKind::Typealias { .. } => None,
+        };
+        active.pop();
+        name
+    }
+
+    fn display_names(
+        &self,
+        types: &[TypeIndex],
+        active: &mut Vec<TypeIndex>,
+    ) -> Option<Vec<String>> {
+        types
+            .iter()
+            .map(|&ty| self.display_name_inner(ty, active))
+            .collect()
+    }
+
+    fn display_qualified(
+        &self,
+        prefix: &str,
+        members: &[TypeIndex],
+        inner: TypeIndex,
+        active: &mut Vec<TypeIndex>,
+    ) -> Option<String> {
+        let members = self.display_names(members, active)?;
+        let inner = self.display_name_inner(inner, active)?;
+        if members.len() == 1 {
+            Some(format!("{prefix}{} {inner}", members[0]))
+        } else {
+            Some(format!("{prefix}[{}] {inner}", members.join(", ")))
+        }
+    }
+
     fn push(&mut self, info: TypeInfo) -> TypeIndex {
         let idx = TypeIndex(self.types.len() as u32);
-        self.id_to_index.insert(info.type_id, idx);
+        if info.type_id != TypeId::ZERO {
+            self.id_to_index.insert(info.type_id, idx);
+        }
+        self.invalidate_type_identities();
         self.types.push(info);
         self.methods.push(Vec::new());
         idx
@@ -515,16 +786,28 @@ impl TypePool {
         self.trait_impls.push(record);
     }
 
-    /// Find the impl record for `ty` implementing `trait_ty`.
+    /// Find only a global implementation, preserving transparent type aliases.
     pub fn find_trait_impl(&self, ty: TypeIndex, trait_ty: TypeIndex) -> Option<&TraitImplRecord> {
-        self.trait_impls
-            .iter()
-            .find(|r| r.implementor == ty && r.trait_type == trait_ty)
+        let ty = self.canonical_type(ty)?;
+        let trait_ty = self.canonical_type(trait_ty)?;
+        let mut records = self.trait_impls.iter().filter(|record| {
+            record.visible_scope.is_none()
+                && self.canonical_type(record.implementor) == Some(ty)
+                && self.canonical_type(record.trait_type) == Some(trait_ty)
+        });
+        let result = records.next()?;
+        records.next().is_none().then_some(result)
     }
 
-    /// All trait impls for a given type.
+    /// Global trait implementations for a canonical type. Metadata consumers
+    /// that need scoped records can use `trait_impls_snapshot` explicitly.
     pub fn trait_impls_of(&self, ty: TypeIndex) -> impl Iterator<Item = &TraitImplRecord> {
-        self.trait_impls.iter().filter(move |r| r.implementor == ty)
+        let owner = self.canonical_type(ty);
+        self.trait_impls.iter().filter(move |record| {
+            record.visible_scope.is_none()
+                && owner.is_some()
+                && self.canonical_type(record.implementor) == owner
+        })
     }
 
     /// Check if a type has a specific trait implementation.
@@ -550,16 +833,27 @@ impl TypePool {
         self.vtables.push(vtable);
     }
 
-    /// Look up the vtable for a concrete type implementing a trait.
+    /// Look up only a global vtable. Scoped extensions require an explicit caller.
     pub fn find_vtable(&self, implementor: TypeIndex, trait_type: TypeIndex) -> Option<&VTable> {
-        self.vtables
-            .iter()
-            .find(|v| v.implementor == implementor && v.trait_type == trait_type)
+        let implementor = self.canonical_type(implementor)?;
+        let trait_type = self.canonical_type(trait_type)?;
+        let mut tables = self.vtables.iter().filter(|table| {
+            table.visible_scope.is_none()
+                && self.canonical_type(table.implementor) == Some(implementor)
+                && self.canonical_type(table.trait_type) == Some(trait_type)
+        });
+        let result = tables.next()?;
+        tables.next().is_none().then_some(result)
     }
 
     /// Snapshot of all trait impl records (for vtable construction).
     pub fn trait_impls_snapshot(&self) -> &[TraitImplRecord] {
         &self.trait_impls
+    }
+
+    /// Borrow the complete dispatch table registry without copying descriptors.
+    pub fn vtables_snapshot(&self) -> &[VTable] {
+        &self.vtables
     }
 
     // -- Queries -------------------------------------------------------------
@@ -571,12 +865,23 @@ impl TypePool {
 
     /// Look up type info mutably by index.
     pub fn get_mut(&mut self, idx: TypeIndex) -> &mut TypeInfo {
+        self.invalidate_type_identities();
         &mut self.types[idx.as_u32() as usize]
     }
 
     /// Look up a type by its 128-bit TypeId.
     pub fn lookup_by_id(&self, id: TypeId) -> Option<TypeIndex> {
-        self.id_to_index.get(&id).copied()
+        if id == TypeId::ZERO {
+            return None;
+        }
+        if self.identities_need_validation() && self.validate_type_identities().is_err() {
+            return None;
+        }
+        self.id_to_index.get(&id).copied().filter(|&ty| {
+            self.types
+                .get(ty.as_u32() as usize)
+                .is_some_and(|info| info.type_id == id)
+        })
     }
 
     /// Total number of registered types.
@@ -598,75 +903,20 @@ impl TypePool {
 
     /// Is `sub` a subtype of `sup` in the type lattice?
     pub fn is_subtype(&self, sub: TypeIndex, sup: TypeIndex) -> bool {
-        if sub == sup {
-            return true;
-        }
-        if sup == Intrinsic::Any.type_index() {
-            return true;
-        }
-        if sub == Intrinsic::NoReturn.type_index() {
-            return true;
-        }
-        if let TypeKind::Typealias { target, .. } = &self.get(sub).kind {
-            return self.is_subtype(*target, sup);
-        }
-        if let TypeKind::Typealias { target, .. } = &self.get(sup).kind {
-            return self.is_subtype(sub, *target);
-        }
-        // Numeric widening: narrower integer/float promotes to wider.
-        if let Some(lifted) = self.numeric_lift(sub, sup) {
-            if lifted == sup {
-                return true;
-            }
-        }
-        // ErrorQualified: !E T — both T and !E T are subtypes of !E T.
-        if let TypeKind::ErrorQualified { errors, inner } = &self.get(sup).kind {
-            let inner = *inner;
-            let errors = errors.clone();
-            // The inner (success) type is a subtype of !E T.
-            if self.is_subtype(sub, inner) {
-                return true;
-            }
-            // Another !E' T' is a subtype if inner matches and errors are a subset.
-            if let TypeKind::ErrorQualified {
-                errors: sub_errors,
-                inner: sub_inner,
-            } = &self.get(sub).kind
-            {
-                let sub_inner = *sub_inner;
-                let sub_errors = sub_errors.clone();
-                if self.is_subtype(sub_inner, inner)
-                    && sub_errors
-                        .iter()
-                        .all(|se| errors.iter().any(|e| self.is_subtype(*se, *e)))
-                {
-                    return true;
-                }
-            }
-        }
-        // Trait subtyping: a concrete type is a subtype of a trait type
-        // if it implements that trait.  Also handles trait inheritance:
-        // trait Bird(Animal) → Bird is a subtype of Animal.
-        if matches!(self.get(sup).kind, TypeKind::Trait { .. }) {
-            // Concrete type implements the trait.
-            if self.has_trait_impl(sub, sup) {
-                return true;
-            }
-            // Sub-trait: check if sub is a trait whose parents include sup.
-            if let TypeKind::Trait { parents, .. } = &self.get(sub).kind {
-                let parents = parents.clone();
-                for parent in &parents {
-                    if self.is_subtype(*parent, sup) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        self.is_subtype_bounded(sub, sup, 256)
+    }
+
+    fn is_subtype_bounded(&self, sub: TypeIndex, sup: TypeIndex, remaining: usize) -> bool {
+        // The legacy boolean API treats invalid descriptors as unrelated types.
+        self.subtype_with_scope(sub, sup, remaining, None)
+            .unwrap_or(false)
     }
 
     /// Are two types gradually consistent (for gradual typing with Any)?
     pub fn is_gradually_consistent(&self, a: TypeIndex, b: TypeIndex) -> bool {
+        let (Some(a), Some(b)) = (self.canonical_type(a), self.canonical_type(b)) else {
+            return false;
+        };
         if a == b {
             return true;
         }
@@ -677,6 +927,21 @@ impl TypePool {
         let a_info = self.get(a);
         let b_info = self.get(b);
         match (&a_info.kind, &b_info.kind) {
+            (
+                TypeKind::ErrorQualified {
+                    errors: ae,
+                    inner: ai,
+                },
+                TypeKind::ErrorQualified {
+                    errors: be,
+                    inner: bi,
+                },
+            ) if ae.contains(&any_idx) || be.contains(&any_idx) => {
+                *ai == Intrinsic::NoReturn.type_index()
+                    || *bi == Intrinsic::NoReturn.type_index()
+                    || self.is_gradually_consistent(*ai, *bi)
+                    || self.is_subtype(*ai, *bi)
+            }
             (TypeKind::Optional { inner: ai }, TypeKind::Optional { inner: bi }) => {
                 self.is_gradually_consistent(*ai, *bi)
             }
@@ -711,26 +976,12 @@ impl TypePool {
     // -- Numeric lifting queries ---------------------------------------------
 
     /// Determine the wider numeric type when two numeric types meet in a
-    /// binary expression.  Returns `None` if either is non-numeric.
+    /// binary expression. Returns None for non-numeric operands or integer
+    /// ranges that have no common fixed-width integer type (u128 with signed).
     pub fn numeric_lift(&self, a: TypeIndex, b: TypeIndex) -> Option<TypeIndex> {
         let a_intr = self.as_intrinsic(a)?;
         let b_intr = self.as_intrinsic(b)?;
-        if !a_intr.is_numeric() || !b_intr.is_numeric() {
-            return None;
-        }
-        let a_is_float = matches!(a_intr, Intrinsic::F32 | Intrinsic::F64);
-        let b_is_float = matches!(b_intr, Intrinsic::F32 | Intrinsic::F64);
-        if a_is_float || b_is_float {
-            if a_intr == Intrinsic::F64 || b_intr == Intrinsic::F64 {
-                return Some(Intrinsic::F64.type_index());
-            }
-            return Some(Intrinsic::F32.type_index());
-        }
-        if (a_intr as u8) >= (b_intr as u8) {
-            Some(a)
-        } else {
-            Some(b)
-        }
+        numeric::lift(a_intr, b_intr).map(Intrinsic::type_index)
     }
 
     /// If the type at `idx` is an intrinsic, return which one.
@@ -751,6 +1002,61 @@ impl TypePool {
                 _ => return cur,
             }
         }
+    }
+}
+
+/// Nominal type definitions never compare equal through this shape predicate.
+fn same_structural_shape(left: &TypeKind, right: &TypeKind) -> bool {
+    match (left, right) {
+        (
+            TypeKind::IterationStepTemplate { item: left },
+            TypeKind::IterationStepTemplate { item: right },
+        ) => left == right,
+        (TypeKind::Tuple { elements: left }, TypeKind::Tuple { elements: right }) => left == right,
+        (
+            TypeKind::Function {
+                params: left,
+                ret: left_ret,
+            },
+            TypeKind::Function {
+                params: right,
+                ret: right_ret,
+            },
+        ) => left == right && left_ret == right_ret,
+        (
+            TypeKind::Effect {
+                params: left,
+                ret: left_ret,
+                is_async: left_async,
+            },
+            TypeKind::Effect {
+                params: right,
+                ret: right_ret,
+                is_async: right_async,
+            },
+        ) => left == right && left_ret == right_ret && left_async == right_async,
+        (TypeKind::Optional { inner: left }, TypeKind::Optional { inner: right }) => left == right,
+        (
+            TypeKind::ErrorQualified {
+                errors: left,
+                inner: left_inner,
+            },
+            TypeKind::ErrorQualified {
+                errors: right,
+                inner: right_inner,
+            },
+        ) => left == right && left_inner == right_inner,
+        (
+            TypeKind::EffectQualified {
+                effects: left,
+                inner: left_inner,
+            },
+            TypeKind::EffectQualified {
+                effects: right,
+                inner: right_inner,
+            },
+        ) => left == right && left_inner == right_inner,
+        _ => false,
     }
 }
 
@@ -779,7 +1085,7 @@ const fn intrinsic_layout(intr: Intrinsic) -> (u32, u32) {
         Intrinsic::Any => (0, 8),
         Intrinsic::NoReturn => (0, 1),
         Intrinsic::Type => (0, 8),
-        Intrinsic::Closure => (0, 8), // variable-size heap object, pointer-aligned
+        Intrinsic::Closure | Intrinsic::Continuation => (0, 8), // runtime-managed heap objects
     }
 }
 
@@ -799,8 +1105,11 @@ mod tests {
     #[test]
     fn intrinsics_populated() {
         let pool = TypePool::with_intrinsics();
-        // Intrinsics + 8 well-known traits
-        assert_eq!(pool.len(), Intrinsic::COUNT + WellKnownTraits::NAMES.len());
+        // Intrinsics, well-known traits, null, and two collection role pairs.
+        assert_eq!(
+            pool.len(),
+            Intrinsic::COUNT + WellKnownTraits::NAMES.len() + 5
+        );
         assert_eq!(
             pool.intrinsic(Intrinsic::U32).as_u32(),
             Intrinsic::U32 as u32
@@ -870,8 +1179,234 @@ mod tests {
         let idx = pool.register(info);
         assert_eq!(
             idx.as_u32(),
-            (Intrinsic::COUNT + WellKnownTraits::NAMES.len()) as u32
+            (Intrinsic::COUNT + WellKnownTraits::NAMES.len() + 5) as u32
         );
         assert!(matches!(pool.get(idx).kind, TypeKind::Struct { .. }));
+    }
+
+    fn alias(pool: &mut TypePool, name: &str, target: TypeIndex) -> TypeIndex {
+        pool.register(TypeInfo {
+            kind: TypeKind::Typealias {
+                name: str_interner::intern(name),
+                target,
+            },
+            type_id: TypeId::ZERO,
+            size: 0,
+            align: 0,
+        })
+    }
+
+    #[test]
+    fn optional_subtyping_lifts_inner_and_null_with_transparent_aliases() {
+        let mut pool = TypePool::with_intrinsics();
+        let integer = Intrinsic::I64.type_index();
+        let inner_alias = alias(&mut pool, "Count", integer);
+        let optional = pool.intern_structural(TypeKind::Optional { inner: inner_alias });
+        let optional_alias = alias(&mut pool, "MaybeCount", optional);
+        assert!(pool.is_subtype(integer, optional_alias));
+        assert!(pool.is_subtype(inner_alias, optional_alias));
+        assert!(pool.is_subtype(pool.null_type(), optional_alias));
+        assert!(!pool.is_subtype(optional_alias, integer));
+        assert!(!pool.is_subtype(Intrinsic::Bool.type_index(), optional_alias));
+        let narrow = pool.intern_structural(TypeKind::Optional {
+            inner: Intrinsic::I32.type_index(),
+        });
+        assert!(pool.is_subtype(narrow, optional_alias));
+        assert!(!pool.is_subtype(optional_alias, narrow));
+        let cycle = pool.intern_structural(TypeKind::Optional {
+            inner: Intrinsic::Bool.type_index(),
+        });
+        pool.get_mut(cycle).kind = TypeKind::Optional { inner: cycle };
+        assert!(!pool.is_subtype(integer, cycle));
+    }
+
+    #[test]
+    fn structural_types_share_alias_canonical_shapes() {
+        let mut pool = TypePool::with_intrinsics();
+        let integer = Intrinsic::I64.type_index();
+        let first_alias = alias(&mut pool, "Count", integer);
+        let second_alias = alias(&mut pool, "Total", first_alias);
+        let optional = pool.intern_structural(TypeKind::Optional { inner: integer });
+        assert_eq!(
+            optional,
+            pool.intern_structural(TypeKind::Optional {
+                inner: second_alias
+            })
+        );
+        assert_eq!(pool.canonical_type(second_alias), Some(integer));
+        assert_eq!(pool.display_name(second_alias).as_deref(), Some("i64"));
+        assert_eq!(pool.display_name(optional).as_deref(), Some("?i64"));
+        let function = pool.intern_structural(TypeKind::Function {
+            params: vec![integer, optional],
+            ret: integer,
+        });
+        assert_eq!(
+            function,
+            pool.intern_structural(TypeKind::Function {
+                params: vec![second_alias, optional],
+                ret: first_alias,
+            })
+        );
+        assert_eq!(
+            pool.display_name(function).as_deref(),
+            Some("fn(i64, ?i64) -> i64")
+        );
+        let tuple = pool.intern_structural(TypeKind::Tuple {
+            elements: vec![first_alias, optional],
+        });
+        assert_eq!(
+            tuple,
+            pool.intern_structural(TypeKind::Tuple {
+                elements: vec![integer, optional]
+            })
+        );
+        assert_eq!(pool.display_name(tuple).as_deref(), Some("(i64, ?i64)"));
+    }
+
+    #[test]
+    fn qualified_sets_ignore_order_duplicates_and_aliases() {
+        let mut pool = TypePool::with_intrinsics();
+        let integer = Intrinsic::I64.type_index();
+        let boolean = Intrinsic::Bool.type_index();
+        let integer_alias = alias(&mut pool, "Value", integer);
+        let first = pool.intern_structural(TypeKind::ErrorQualified {
+            errors: vec![boolean, integer_alias, boolean],
+            inner: integer_alias,
+        });
+        let second = pool.intern_structural(TypeKind::ErrorQualified {
+            errors: vec![integer, boolean],
+            inner: integer,
+        });
+        assert_eq!(first, second);
+        assert_eq!(
+            pool.display_name(first).as_deref(),
+            Some("![i64, bool] i64")
+        );
+        let first = pool.intern_structural(TypeKind::EffectQualified {
+            effects: vec![boolean, integer_alias, boolean],
+            inner: integer_alias,
+        });
+        let second = pool.intern_structural(TypeKind::EffectQualified {
+            effects: vec![integer, boolean],
+            inner: integer,
+        });
+        assert_eq!(first, second);
+        assert_eq!(
+            pool.display_name(first).as_deref(),
+            Some("#[i64, bool] i64")
+        );
+    }
+
+    #[test]
+    fn effect_signatures_reuse_shapes_but_keep_async_distinct() {
+        let mut pool = TypePool::with_intrinsics();
+        let integer = Intrinsic::I64.type_index();
+        let signature = TypeKind::Effect {
+            params: vec![integer],
+            ret: integer,
+            is_async: false,
+        };
+        let first = pool.intern_structural(signature.clone());
+        assert_eq!(first, pool.intern_structural(signature));
+        let asynchronous = pool.intern_structural(TypeKind::Effect {
+            params: vec![integer],
+            ret: integer,
+            is_async: true,
+        });
+        assert_ne!(first, asynchronous);
+        assert_eq!(
+            pool.display_name(asynchronous).as_deref(),
+            Some("async effect(i64) -> i64")
+        );
+    }
+
+    #[test]
+    fn effect_signature_interning_does_not_reuse_a_named_operation() {
+        let mut pool = TypePool::with_intrinsics();
+        let kind = TypeKind::Effect {
+            params: vec![Intrinsic::I64.type_index()],
+            ret: Intrinsic::Unit.type_index(),
+            is_async: false,
+        };
+        let operation = pool.register(TypeInfo {
+            kind: kind.clone(),
+            type_id: TypeId::ZERO,
+            size: 0,
+            align: 0,
+        });
+        let signature = pool.intern_structural(kind.clone());
+        assert_ne!(operation, signature);
+        assert_eq!(signature, pool.intern_structural(kind));
+    }
+
+    #[test]
+    fn nominal_types_are_distinct_even_with_identical_names_and_layouts() {
+        let mut pool = TypePool::with_intrinsics();
+        let kind = TypeKind::Struct {
+            name: str_interner::intern("Point"),
+            fields: vec![],
+        };
+        let first = pool.intern_structural(kind.clone());
+        let second = pool.intern_structural(kind);
+        assert_ne!(first, second);
+        assert_eq!(pool.display_name(first).as_deref(), Some("Point"));
+        let kind = TypeKind::Newtype {
+            name: str_interner::intern("Count"),
+            inner: Intrinsic::I64.type_index(),
+        };
+        let first = pool.intern_structural(kind.clone());
+        let second = pool.intern_structural(kind);
+        assert_ne!(first, second);
+        assert_eq!(pool.canonical_type(first), Some(first));
+    }
+
+    #[test]
+    fn null_type_is_a_stable_optional_noreturn_descriptor() {
+        let mut pool = TypePool::with_intrinsics();
+        let null = pool.null_type();
+        assert_eq!(
+            null,
+            pool.intern_structural(TypeKind::Optional {
+                inner: Intrinsic::NoReturn.type_index()
+            })
+        );
+        assert_eq!(pool.display_name(null).as_deref(), Some("?NoReturn"));
+        assert_ne!(null, Intrinsic::Unit.type_index());
+        assert_eq!(TypePool::new().null_type(), TypeIndex::INVALID);
+    }
+
+    #[test]
+    fn invalid_references_and_cycles_are_checked_without_panicking() {
+        let mut pool = TypePool::with_intrinsics();
+        assert_eq!(pool.canonical_type(TypeIndex::INVALID), None);
+        assert_eq!(pool.display_name(TypeIndex::INVALID), None);
+        let invalid = pool.intern_structural(TypeKind::Optional {
+            inner: TypeIndex::INVALID,
+        });
+        assert!(matches!(
+            pool.get(invalid).kind,
+            TypeKind::Optional {
+                inner: TypeIndex::INVALID
+            }
+        ));
+        assert_eq!(pool.display_name(invalid), None);
+        let cycle_index = TypeIndex::from_raw(pool.len() as u32);
+        let cycle = alias(&mut pool, "Cycle", cycle_index);
+        assert_eq!(pool.canonical_type(cycle), None);
+        assert_eq!(pool.display_name(cycle), None);
+        let nested = pool.intern_structural(TypeKind::Tuple {
+            elements: vec![cycle],
+        });
+        assert_eq!(pool.display_name(nested), None);
+        let recursive = TypeIndex::from_raw(pool.len() as u32);
+        pool.register(TypeInfo {
+            kind: TypeKind::Tuple {
+                elements: vec![recursive],
+            },
+            type_id: TypeId::ZERO,
+            size: 0,
+            align: 0,
+        });
+        assert_eq!(pool.display_name(recursive), None);
     }
 }

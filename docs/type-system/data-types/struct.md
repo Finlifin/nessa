@@ -33,6 +33,12 @@ let cfg = Config { host: "0.0.0.0" }
 -- port 和 max_connections 使用默认值
 ```
 
+构造中的显式字段按源码顺序求值并保存，然后按字段声明顺序装载。
+省略的默认字段在显式字段之后按声明顺序求值；已显式提供的字段不执行默认表达式。
+默认名称在结构体声明作用域解析，可访问关联常量、全局值和 helper。
+当前不支持默认值引用未构造实例的其他字段，或跨默认表达式边界的 return/resume；
+这些情况产生编译诊断。默认表达式内部自己的局部变量、循环和嵌套函数正常使用。
+
 ## 构造与解构
 
 ```nessa
@@ -90,5 +96,5 @@ pub struct Connection {
 
 ```ebnf
 struct_def -> struct id { (struct_field | statement)* }
-struct_field -> id : expr (= expr)?
+struct_field -> (pub | private)? id : expr (= expr)?
 ```

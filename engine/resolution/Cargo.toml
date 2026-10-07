@@ -11,7 +11,9 @@ type_pool = { path = "../type_pool" }
 diagnostic = { path = "../diagnostic" }
 str_interner = { path = "../str_interner" }
 rustc_span = "0.1.2"
+lexer = { path = "../lexer" }
+pkg_manager = { path = "../pkg_manager" }
+sha2 = "0.10"
 
 [dev-dependencies]
-lexer = { path = "../lexer" }
 parser = { path = "../parser" }

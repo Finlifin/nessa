@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-driver = { path = "../driver" }
+lexer = { path = "../lexer" }
+semver = "1.0"
+sha2 = "0.10"
+toml = "0.8"

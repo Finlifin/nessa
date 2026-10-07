@@ -1,90 +1,29 @@
 //! Package manager — manifest parsing (`package.toml`), module discovery,
 //! and dependency resolution.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-// ---------------------------------------------------------------------------
-// Version
-// ---------------------------------------------------------------------------
+mod error;
+mod identity;
+mod lock;
+mod manifest;
+mod resolver;
+mod source;
+mod version;
 
-/// A semantic version.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Version {
-    pub major: u32,
-    pub minor: u32,
-    pub patch: u32,
-}
+#[cfg(test)]
+mod foundation_tests;
 
-impl Version {
-    pub fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self { major, minor, patch }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        let parts: Vec<&str> = s.split('.').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-        Some(Self {
-            major: parts[0].parse().ok()?,
-            minor: parts[1].parse().ok()?,
-            patch: parts[2].parse().ok()?,
-        })
-    }
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// VersionConstraint
-// ---------------------------------------------------------------------------
-
-/// A version constraint for dependency resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionConstraint {
-    /// Exact match: "1.2.3"
-    Exact(Version),
-    /// Compatible updates: "^1.2.0" means >=1.2.0, <2.0.0
-    Caret(Version),
-    /// Patch-level updates: "~1.2.0" means >=1.2.0, <1.3.0
-    Tilde(Version),
-}
-
-impl VersionConstraint {
-    pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim();
-        if let Some(rest) = s.strip_prefix('^') {
-            Some(Self::Caret(Version::parse(rest)?))
-        } else if let Some(rest) = s.strip_prefix('~') {
-            Some(Self::Tilde(Version::parse(rest)?))
-        } else {
-            Some(Self::Exact(Version::parse(s)?))
-        }
-    }
-
-    pub fn matches(&self, v: &Version) -> bool {
-        match self {
-            Self::Exact(req) => v == req,
-            Self::Caret(req) => {
-                v.major == req.major
-                    && (v.major > 0
-                        && (v.minor > req.minor
-                            || (v.minor == req.minor && v.patch >= req.patch)))
-                    || v == req
-            }
-            Self::Tilde(req) => {
-                v.major == req.major
-                    && v.minor == req.minor
-                    && v.patch >= req.patch
-            }
-        }
-    }
-}
+pub use error::PackageError;
+pub use identity::PackageIdentity;
+pub use manifest::ManifestDocument;
+pub use resolver::{PackageResolver, ResolvedPackageGraph, ResolvedPackages};
+pub use source::{
+    ModuleSources, PackageSourceError, PackageSources, SourceFile, SourceLoadLimits,
+    discover_modules, discover_modules_with_limits, load_package_sources,
+    load_package_sources_with_limits,
+};
+pub use version::{Version, VersionConstraint};
 
 // ---------------------------------------------------------------------------
 // PackageType
@@ -99,13 +38,28 @@ pub enum PackageType {
 }
 
 impl PackageType {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub(crate) fn entry_file(self) -> &'static str {
+        match self {
+            Self::Exe => "src/main.ns",
+            Self::Lib | Self::Tmp => "src/lib.ns",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "exe" => Some(Self::Exe),
             "lib" => Some(Self::Lib),
             "tmp" => Some(Self::Tmp),
             _ => None,
         }
+    }
+}
+
+impl std::str::FromStr for PackageType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or(())
     }
 }
 
@@ -126,10 +80,7 @@ pub struct PackageManifest {
 impl PackageManifest {
     /// The entry file for this package.
     pub fn entry_file(&self) -> &str {
-        match self.package_type {
-            PackageType::Exe => "src/main.ns",
-            PackageType::Lib | PackageType::Tmp => "src/lib.ns",
-        }
+        self.package_type.entry_file()
     }
 
     /// Full qualified package identifier: domain/name
@@ -151,7 +102,7 @@ pub struct Dependency {
 // ---------------------------------------------------------------------------
 
 /// A discovered module in the file system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredModule {
     /// Module path segments (e.g. ["net", "http"]).
     pub path: Vec<String>,
@@ -159,145 +110,6 @@ pub struct DiscoveredModule {
     pub file_path: PathBuf,
     /// Child modules.
     pub children: Vec<DiscoveredModule>,
-}
-
-/// Discover modules under a `src/` directory.
-pub fn discover_modules(src_dir: &Path) -> Vec<DiscoveredModule> {
-    let mut modules = Vec::new();
-    if !src_dir.is_dir() {
-        return modules;
-    }
-    discover_recursive(src_dir, &[], &mut modules);
-    modules
-}
-
-fn discover_recursive(
-    dir: &Path,
-    prefix: &[String],
-    modules: &mut Vec<DiscoveredModule>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-
-        if path.is_file() && name_str.ends_with(".ns") {
-            let mod_name = name_str.trim_end_matches(".ns").to_string();
-            // Skip entry files.
-            if mod_name == "main" || mod_name == "lib" || mod_name == "mod" {
-                continue;
-            }
-            let mut mod_path = prefix.to_vec();
-            mod_path.push(mod_name);
-            modules.push(DiscoveredModule {
-                path: mod_path,
-                file_path: path,
-                children: Vec::new(),
-            });
-        } else if path.is_dir() {
-            let mod_name = name_str.to_string();
-            let mod_entry = path.join("mod.ns");
-            if mod_entry.exists() {
-                let mut mod_path = prefix.to_vec();
-                mod_path.push(mod_name);
-                let mut children = Vec::new();
-                discover_recursive(&path, &mod_path, &mut children);
-                modules.push(DiscoveredModule {
-                    path: mod_path,
-                    file_path: mod_entry,
-                    children,
-                });
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PackageResolver — simple dependency resolution
-// ---------------------------------------------------------------------------
-
-/// A resolved dependency graph.
-#[derive(Debug)]
-pub struct ResolvedPackages {
-    /// Packages in dependency order (leaves first).
-    pub packages: Vec<PackageManifest>,
-}
-
-/// Simple package resolver.
-pub struct PackageResolver {
-    /// Known packages: qualified_name → available versions.
-    registry: HashMap<String, Vec<PackageManifest>>,
-}
-
-impl PackageResolver {
-    pub fn new() -> Self {
-        Self {
-            registry: HashMap::new(),
-        }
-    }
-
-    /// Register a package as available.
-    pub fn register(&mut self, manifest: PackageManifest) {
-        let key = manifest.qualified_name();
-        self.registry.entry(key).or_default().push(manifest);
-    }
-
-    /// Resolve dependencies for a root package.
-    pub fn resolve(&self, root: &PackageManifest) -> Result<ResolvedPackages, String> {
-        let mut resolved = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        self.resolve_inner(root, &mut resolved, &mut visited)?;
-        Ok(ResolvedPackages { packages: resolved })
-    }
-
-    fn resolve_inner(
-        &self,
-        pkg: &PackageManifest,
-        resolved: &mut Vec<PackageManifest>,
-        visited: &mut std::collections::HashSet<String>,
-    ) -> Result<(), String> {
-        let qn = pkg.qualified_name();
-        if visited.contains(&qn) {
-            return Ok(());
-        }
-        visited.insert(qn);
-
-        for dep in &pkg.dependencies {
-            let dep_qn = format!("{}/{}", dep.domain, dep.name);
-            let versions = self
-                .registry
-                .get(&dep_qn)
-                .ok_or_else(|| format!("package not found: {dep_qn}"))?;
-
-            let matched = versions
-                .iter()
-                .find(|v| dep.constraint.matches(&v.version))
-                .ok_or_else(|| {
-                    format!(
-                        "no matching version for {dep_qn} (constraint: {:?})",
-                        dep.constraint
-                    )
-                })?;
-
-            self.resolve_inner(matched, resolved, visited)?;
-        }
-
-        resolved.push(pkg.clone());
-        Ok(())
-    }
-}
-
-impl Default for PackageResolver {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // ---------------------------------------------------------------------------

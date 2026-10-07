@@ -18,14 +18,109 @@ pub fn try_pub_def(p: &mut Parser) -> ParseResult {
     try_modifier_def(p, TokenKind::KwPub, NodeKind::PubDef)
 }
 
-/// `global <def>`
-pub fn try_global_def(p: &mut Parser) -> ParseResult {
-    try_modifier_def(p, TokenKind::KwGlobal, NodeKind::GlobalDecl)
+pub fn try_private_def(p: &mut Parser) -> ParseResult {
+    try_modifier_def(p, TokenKind::KwPrivate, NodeKind::PrivateDef)
 }
 
-/// `assoc <def>`
+/// `global name: Type = value`, retaining the modifier around a value declaration.
+pub fn try_global_def(p: &mut Parser) -> ParseResult {
+    let _guard = p.enter();
+    if !p.eat_token(TokenKind::KwGlobal) {
+        return Ok(NULL);
+    }
+    let name = basic::try_id(p)?;
+    if name.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected global variable name",
+        );
+        return Ok(NULL);
+    }
+    p.expect_token(TokenKind::Colon)?;
+    let ty = expr::try_expr_without_extended_call(p)?;
+    if ty.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected global variable type",
+        );
+    }
+    p.expect_token(TokenKind::Eq)?;
+    let value = expr::try_expr(p)?;
+    if value.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected global initializer",
+        );
+    }
+    let span = p.current_span();
+    let declaration = p
+        .ast()
+        .builder(NodeKind::VarDecl, span)
+        .add_child(name)
+        .add_child(ty)
+        .add_child(value)
+        .build();
+    Ok(p.ast()
+        .builder(NodeKind::GlobalDecl, span)
+        .add_child(declaration)
+        .build())
+}
+
+/// `assoc name: type = value`, or the existing `assoc <def>` form.
 pub fn try_assoc_def(p: &mut Parser) -> ParseResult {
-    try_modifier_def(p, TokenKind::KwAssoc, NodeKind::AssocDecl)
+    let _guard = p.enter();
+    if !p.eat_token(TokenKind::KwAssoc) {
+        return Ok(NULL);
+    }
+    let inner = if p.peek(&[TokenKind::Id]) {
+        let name = basic::try_id(p)?;
+        p.expect_token(TokenKind::Colon)?;
+        let ty = expr::try_expr_without_extended_call(p)?;
+        if ty.is_null() {
+            p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected associated declaration type",
+            )?;
+            return Ok(NULL);
+        }
+        p.expect_token(TokenKind::Eq)?;
+        let value = expr::try_expr(p)?;
+        if value.is_null() {
+            p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected associated declaration value",
+            )?;
+            return Ok(NULL);
+        }
+        let span = p.current_span();
+        p.ast()
+            .builder(NodeKind::AssocBinding, span)
+            .add_child(name)
+            .add_child(ty)
+            .add_child(value)
+            .build()
+    } else {
+        let definition = statement::try_definition_or_statement(p)?;
+        if definition.is_null() {
+            p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected associated declaration or definition",
+            )?;
+            return Ok(NULL);
+        }
+        definition
+    };
+    let span = p.current_span();
+    Ok(p.ast()
+        .builder(NodeKind::AssocDecl, span)
+        .add_child(inner)
+        .build())
 }
 
 fn try_modifier_def(p: &mut Parser, keyword: TokenKind, node_kind: NodeKind) -> ParseResult {
@@ -162,7 +257,7 @@ pub fn try_effect_def(p: &mut Parser) -> ParseResult {
 
     let params = try_multi_with_bracket(
         p,
-        &[Rule::comma("effect parameter", basic::try_parameter)],
+        &[Rule::comma("effect parameter", try_effect_parameter)],
         TokenKind::LParen,
         TokenKind::RParen,
     )?;
@@ -184,6 +279,45 @@ pub fn try_effect_def(p: &mut Parser) -> ParseResult {
         .add_multi_children(&params)
         .build();
     Ok(idx)
+}
+
+/// A catch binding is introduced by the runtime, never supplied by the caller.
+fn try_effect_parameter(p: &mut Parser) -> ParseResult {
+    let _g = p.enter();
+    if !p.eat_token(TokenKind::KwCatch) {
+        return basic::try_parameter(p);
+    }
+    let name = basic::try_id(p)?;
+    if name.is_null() {
+        return p
+            .err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected continuation identifier after `catch`",
+            )
+            .map(|()| NULL);
+    }
+    let ty = if p.eat_token(TokenKind::Colon) {
+        let ty = expr::try_expr_without_extended_call(p)?;
+        if ty.is_null() {
+            return p
+                .err(
+                    ParseErrorKind::InvalidSyntax,
+                    p.next_token_span(),
+                    "Expected continuation type after `:`",
+                )
+                .map(|()| NULL);
+        }
+        ty
+    } else {
+        NULL
+    };
+    let span = p.current_span();
+    Ok(p.ast()
+        .builder(NodeKind::ParamCatch, span)
+        .add_child(name)
+        .add_child(ty)
+        .build())
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +419,15 @@ pub fn try_struct_def(p: &mut Parser) -> ParseResult {
 fn try_struct_field(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
+    let modifier = if p.peek(&[TokenKind::KwPub, TokenKind::Id, TokenKind::Colon]) {
+        p.eat_token(TokenKind::KwPub);
+        Some(NodeKind::PubDef)
+    } else if p.peek(&[TokenKind::KwPrivate, TokenKind::Id, TokenKind::Colon]) {
+        p.eat_token(TokenKind::KwPrivate);
+        Some(NodeKind::PrivateDef)
+    } else {
+        None
+    };
     let name = basic::try_id(p)?;
     if name.is_null() {
         return Ok(NULL);
@@ -323,7 +466,11 @@ fn try_struct_field(p: &mut Parser) -> ParseResult {
         .add_child(ty)
         .add_child(default)
         .build();
-    Ok(idx)
+    Ok(if let Some(kind) = modifier {
+        p.ast().builder(kind, span).add_child(idx).build()
+    } else {
+        idx
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +518,17 @@ pub fn try_enum_def(p: &mut Parser) -> ParseResult {
 fn try_enum_variant(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
+    let visibility = if p.peek(&[TokenKind::KwPub, TokenKind::Id]) {
+        Some(NodeKind::PubDef)
+    } else if p.peek(&[TokenKind::KwPrivate, TokenKind::Id]) {
+        Some(NodeKind::PrivateDef)
+    } else {
+        None
+    };
+    if visibility.is_some() {
+        p.next_token();
+    }
+
     let name = basic::try_id(p)?;
     if name.is_null() {
         return Ok(NULL);
@@ -394,7 +552,11 @@ fn try_enum_variant(p: &mut Parser) -> ParseResult {
         .add_child(name)
         .add_multi_children(&params)
         .build();
-    Ok(idx)
+    if let Some(visibility) = visibility {
+        Ok(p.ast().builder(visibility, span).add_child(idx).build())
+    } else {
+        Ok(idx)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,7 +1034,7 @@ pub fn try_use_statement(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    let path = try_use_path(p)?;
+    let path = crate::use_path::try_use_path(p)?;
     if path.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -891,115 +1053,60 @@ pub fn try_use_statement(p: &mut Parser) -> ParseResult {
     Ok(idx)
 }
 
-/// Parse use path: `id(.id)*(.*|.{id, ...})?` or `super.path` or `package.path`
-fn try_use_path(p: &mut Parser) -> ParseResult {
-    let _g = p.enter();
+#[cfg(test)]
+mod global_tests {
+    use super::*;
 
-    // Handle super/package prefix
-    let mut path = if p.eat_token(TokenKind::KwSelfLower) {
-        // self prefix
-        let str_id = str_interner::intern("self");
-        let span = p.current_span();
-        p.ast()
-            .builder(NodeKind::Id, span)
-            .set_str_id(str_id)
-            .build()
-    } else {
-        let id = basic::try_id(p)?;
-        if id.is_null() {
-            return Ok(NULL);
-        }
-        id
-    };
+    use diagnostic::DiagnosticContext;
+    use rustc_span::{FileName, SourceMap, source_map::FilePathMapping};
 
-    // Parse .id chains and terminal .* or .{...}
-    while p.peek(&[TokenKind::Dot]) {
-        p.next_token(); // consume dot
-
-        let next = p.peek_token();
-        match next.kind {
-            TokenKind::Star => {
-                // .*
-                p.next_token();
-                let span = p.current_span();
-                path = p
-                    .ast()
-                    .builder(NodeKind::PathProjectionAll, span)
-                    .add_child(path)
-                    .add_multi_children(&[])
-                    .build();
-                break;
-            }
-            TokenKind::LBrace => {
-                // .{ id, id, ... }
-                let items = try_multi_with_bracket(
-                    p,
-                    &[Rule::comma("use item", try_use_item)],
-                    TokenKind::LBrace,
-                    TokenKind::RBrace,
-                )?;
-                let span = p.current_span();
-                path = p
-                    .ast()
-                    .builder(NodeKind::PathProjectionMulti, span)
-                    .add_child(path)
-                    .add_child(NULL)
-                    .add_multi_children(&items)
-                    .build();
-                break;
-            }
-            _ => {
-                // .id
-                let id = basic::try_id(p)?;
-                if id.is_null() {
-                    let _ = p.err(
-                        ParseErrorKind::InvalidSyntax,
-                        p.next_token_span(),
-                        "Expected identifier after `.` in use path",
-                    );
-                    break;
-                }
-                let span = p.current_span();
-                path = p
-                    .ast()
-                    .builder(NodeKind::PathProjection, span)
-                    .add_child(path)
-                    .add_child(id)
-                    .build();
-            }
-        }
+    fn parse(source: &str) -> (ast::Ast, Vec<String>) {
+        let map = SourceMap::new(FilePathMapping::empty());
+        let file = map.new_source_file(FileName::Custom("global-test.ns".into()), source.into());
+        let diagnostics = DiagnosticContext::new(&map);
+        let (tokens, errors) = lexer::tokenize(source);
+        assert!(errors.is_empty());
+        let ast = Parser::new(&tokens, source, &diagnostics, file.start_pos).parse();
+        (
+            ast,
+            diagnostics
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect(),
+        )
     }
 
-    Ok(path)
-}
-
-/// `id` or `id as alias`
-fn try_use_item(p: &mut Parser) -> ParseResult {
-    let _g = p.enter();
-
-    let id = basic::try_id(p)?;
-    if id.is_null() {
-        return Ok(NULL);
+    #[test]
+    fn global_variable_retains_modifier_and_complete_value_declaration() {
+        let (ast, errors) = parse("pub global counter: i64 = 42");
+        assert!(errors.is_empty(), "{errors:?}");
+        let public = ast.multi_children(ast.root)[0];
+        assert_eq!(ast.node(public).kind, NodeKind::PubDef);
+        let global = ast.fixed_children(public)[0];
+        assert_eq!(ast.node(global).kind, NodeKind::GlobalDecl);
+        let value = ast.fixed_children(global)[0];
+        assert_eq!(ast.node(value).kind, NodeKind::VarDecl);
+        let children = ast.fixed_children(value);
+        assert_eq!(children.len(), 3);
+        assert_eq!(str_interner::get(ast.node(children[0]).str_id), "counter");
+        assert_eq!(str_interner::get(ast.node(children[1]).str_id), "i64");
+        assert_eq!(ast.node(children[2]).kind, NodeKind::Int);
     }
 
-    if p.eat_token(TokenKind::KwAs) {
-        let alias = basic::try_id(p)?;
-        if alias.is_null() {
-            let _ = p.err(
-                ParseErrorKind::InvalidSyntax,
-                p.next_token_span(),
-                "Expected alias name after `as`",
-            );
+    #[test]
+    fn globals_require_a_name_type_and_initializer() {
+        for source in [
+            "global",
+            "global counter = 42",
+            "global counter: = 42",
+            "global counter: i64",
+            "global counter: i64 =",
+            "global fn counter() {}",
+            "global let counter = 42",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(!errors.is_empty(), "accepted {source}");
         }
-        let span = p.current_span();
-        let idx = p
-            .ast()
-            .builder(NodeKind::PathAsBind, span)
-            .add_child(id)
-            .add_child(alias)
-            .build();
-        return Ok(idx);
     }
-
-    Ok(id)
 }

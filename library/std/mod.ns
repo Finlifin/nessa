@@ -1,9 +1,10 @@
--- std — Nessa standard library package root (`mod.ns`).
---
--- Submodules are file-based (discovered beside this file):
---   builtin.ns   — builtin type aliases (`.Name'builtin`)
---   prelude.ns   — intended implicit imports
---   io.ns        — print / println / conversions
---   math.ns      — abs, sin, cos, …
---   string.ns    — str_len / str_concat
---   process.ns   — exit / panic
+-- std — public modules of the standard library package.
+pub mod builtin
+pub mod ordering
+pub mod traits
+pub mod io
+pub mod math
+pub mod string
+pub mod process
+pub mod collections
+pub mod prelude

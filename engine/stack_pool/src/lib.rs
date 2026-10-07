@@ -1,6 +1,7 @@
 //! Task Stack Pool — mmap'd segmented stack management.
 //!
-//! Each Nessa task gets an 8 MB virtual memory slot for its call stack.
+//! Each Nessa stack segment gets an 8 MB virtual memory slot. A task may own
+//! several segments, including detached continuation stacks.
 //! Physical pages are demand-paged by the OS; only the first 8 KB is
 //! pre-committed via `madvise(WILLNEED)`.
 //!
@@ -109,6 +110,12 @@ struct Segment {
     mmap_size: usize,
 }
 
+// SAFETY: Segment exclusively owns its mmap reservation, which has no thread
+// affinity. StackPool only accesses segment metadata while holding its mutex;
+// live StackHandles keep the owning pool alive through the runtime's OwnedStack.
+// Moving the metadata does not move the mapping or dereference stack contents.
+unsafe impl Send for Segment {}
+
 impl Segment {
     /// Create a new segment with `slot_count` slots.
     fn new(slot_count: usize) -> Self {
@@ -141,11 +148,7 @@ impl Segment {
 
         // Advise the OS that most of the region won't be touched soon.
         unsafe {
-            libc::madvise(
-                base as *mut libc::c_void,
-                mmap_size,
-                libc::MADV_DONTNEED,
-            );
+            libc::madvise(base as *mut libc::c_void, mmap_size, libc::MADV_DONTNEED);
         }
 
         Self {
@@ -236,7 +239,10 @@ impl StackPool {
             inner.grow();
         }
 
-        let slot_id = inner.free_list.pop().expect("free list should not be empty after grow");
+        let slot_id = inner
+            .free_list
+            .pop()
+            .expect("free list should not be empty after grow");
         inner.active_count += 1;
 
         let seg = &inner.segments[slot_id.segment as usize];
@@ -385,7 +391,10 @@ pub unsafe fn install_guard_page_handler(pool: &StackPool) {
                 0,
             )
         };
-        assert!(alt_stack_mem != libc::MAP_FAILED, "mmap for alt stack failed");
+        assert!(
+            alt_stack_mem != libc::MAP_FAILED,
+            "mmap for alt stack failed"
+        );
 
         let ss = libc::stack_t {
             ss_sp: alt_stack_mem,
@@ -398,7 +407,7 @@ pub unsafe fn install_guard_page_handler(pool: &StackPool) {
         // Install SIGSEGV handler.
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        sa.sa_sigaction = guard_page_sigsegv_handler as usize;
+        sa.sa_sigaction = guard_page_sigsegv_handler as *const () as usize;
         unsafe { libc::sigemptyset(&mut sa.sa_mask) };
 
         let rc = unsafe { libc::sigaction(libc::SIGSEGV, &sa, &raw mut PREV_SIGACTION) };
@@ -436,7 +445,7 @@ extern "C" fn guard_page_sigsegv_handler(
 
     // Not our guard page — chain to previous handler.
     unsafe {
-        let prev = &*(&raw const PREV_SIGACTION);
+        let prev = (&raw const PREV_SIGACTION).read();
         if prev.sa_flags & libc::SA_SIGINFO != 0 {
             let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
                 std::mem::transmute(prev.sa_sigaction);
@@ -469,6 +478,31 @@ fn page_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_pool_allocates_distinct_slots_across_threads() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let pool = Arc::new(StackPool::new());
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                std::thread::spawn(move || (0..8).map(|_| pool.alloc()).collect::<Vec<_>>())
+            })
+            .collect();
+        let handles: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        let ids: HashSet<_> = handles.iter().map(|handle| handle.id).collect();
+        assert_eq!(ids.len(), 32);
+        assert_eq!(pool.active_count(), 32);
+        for handle in handles {
+            pool.dealloc(&handle);
+        }
+        assert_eq!(pool.active_count(), 0);
+    }
 
     #[test]
     fn page_size_is_reasonable() {
@@ -521,7 +555,10 @@ mod tests {
         // One more should trigger growth.
         let extra = pool.alloc();
         assert_eq!(pool.segment_count(), 2);
-        assert_eq!(pool.total_slots(), INITIAL_SEGMENT_SLOTS + INITIAL_SEGMENT_SLOTS * 2);
+        assert_eq!(
+            pool.total_slots(),
+            INITIAL_SEGMENT_SLOTS + INITIAL_SEGMENT_SLOTS * 2
+        );
 
         pool.dealloc(&extra);
         for h in &handles {

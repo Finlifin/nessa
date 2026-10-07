@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+source_span = { path = "../source_span" }
 rustc_span = { workspace = true }
 str_interner = { path = "../str_interner" }

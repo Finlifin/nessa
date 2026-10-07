@@ -1,9 +1,9 @@
 use ast::{NodeIndex, NodeKind};
 use lexer::token::TokenKind;
 
-use crate::basic::{self, try_multi_with_bracket, Rule};
+use crate::basic::{self, Rule, try_multi_with_bracket};
 use crate::error::{ParseErrorKind, ParseResult};
-use crate::parser::{Parser, NULL};
+use crate::parser::{NULL, Parser};
 
 // ---------------------------------------------------------------------------
 // Pattern parsing options
@@ -47,23 +47,53 @@ pub struct PatternOpInfo {
 pub fn get_pattern_op_info(kind: TokenKind) -> PatternOpInfo {
     match kind {
         // Boolean guards
-        TokenKind::KwIf => PatternOpInfo { node_kind: NodeKind::PatternIfGuard, prec: 10 },
-        TokenKind::KwOr => PatternOpInfo { node_kind: NodeKind::PatternOr, prec: 20 },
-        TokenKind::KwAnd => PatternOpInfo { node_kind: NodeKind::PatternAndIs, prec: 30 },
+        TokenKind::KwIf => PatternOpInfo {
+            node_kind: NodeKind::PatternIfGuard,
+            prec: 10,
+        },
+        TokenKind::KwOr => PatternOpInfo {
+            node_kind: NodeKind::PatternOr,
+            prec: 20,
+        },
+        TokenKind::KwAnd => PatternOpInfo {
+            node_kind: NodeKind::PatternAndIs,
+            prec: 30,
+        },
 
         // Binding/alias
-        TokenKind::KwAs => PatternOpInfo { node_kind: NodeKind::PatternAsBind, prec: 90 },
+        TokenKind::KwAs => PatternOpInfo {
+            node_kind: NodeKind::PatternAsBind,
+            prec: 90,
+        },
 
         // Constructor / destruction
-        TokenKind::LParen => PatternOpInfo { node_kind: NodeKind::PatternCall, prec: 100 },
-        TokenKind::LBrace => PatternOpInfo { node_kind: NodeKind::PatternExtendedCall, prec: 100 },
-        TokenKind::Question => PatternOpInfo { node_kind: NodeKind::PatternOptionSome, prec: 100 },
-        TokenKind::Bang => PatternOpInfo { node_kind: NodeKind::PatternErrorOk, prec: 100 },
+        TokenKind::LParen => PatternOpInfo {
+            node_kind: NodeKind::PatternCall,
+            prec: 100,
+        },
+        TokenKind::LBrace => PatternOpInfo {
+            node_kind: NodeKind::PatternExtendedCall,
+            prec: 100,
+        },
+        TokenKind::Question => PatternOpInfo {
+            node_kind: NodeKind::PatternOptionSome,
+            prec: 100,
+        },
+        TokenKind::Bang => PatternOpInfo {
+            node_kind: NodeKind::PatternErrorOk,
+            prec: 100,
+        },
 
         // Projection
-        TokenKind::Dot => PatternOpInfo { node_kind: NodeKind::PropertyPattern, prec: 110 },
+        TokenKind::Dot => PatternOpInfo {
+            node_kind: NodeKind::PropertyPattern,
+            prec: 110,
+        },
 
-        _ => PatternOpInfo { node_kind: NodeKind::Invalid, prec: -1 },
+        _ => PatternOpInfo {
+            node_kind: NodeKind::Invalid,
+            prec: -1,
+        },
     }
 }
 
@@ -81,19 +111,14 @@ pub fn try_pattern_without_extended_call(p: &mut Parser) -> ParseResult {
 
 pub fn try_pattern_with_option(p: &mut Parser, option: PatternOption) -> ParseResult {
     let _g = p.enter();
-    let result = try_pattern_pratt(p, 0, option);
-    result
+    try_pattern_pratt(p, 0, option)
 }
 
 // ---------------------------------------------------------------------------
 // Pratt parser for patterns
 // ---------------------------------------------------------------------------
 
-fn try_pattern_pratt(
-    p: &mut Parser,
-    min_prec: i32,
-    option: PatternOption,
-) -> ParseResult {
+fn try_pattern_pratt(p: &mut Parser, min_prec: i32, option: PatternOption) -> ParseResult {
     let mut left = try_prefix_pattern(p, option)?;
     if left.is_null() {
         return Ok(NULL);
@@ -121,7 +146,15 @@ fn try_pattern_pratt(
 
         // Consume operator, parse right side (infix)
         p.next_token();
-        let right = try_pattern_pratt(p, op.prec + 1, option)?;
+        if op.node_kind == NodeKind::PatternAndIs {
+            left = parse_constraint(p, left, op.prec, option)?;
+            continue;
+        }
+        let right = if op.node_kind == NodeKind::PatternIfGuard {
+            crate::expr::try_expr(p)?
+        } else {
+            try_pattern_pratt(p, op.prec + 1, option)?
+        };
         if right.is_null() {
             let _ = p.err(
                 ParseErrorKind::InvalidSyntax,
@@ -140,6 +173,45 @@ fn try_pattern_pratt(
     }
 
     Ok(left)
+}
+
+/// The constrained expression has expression syntax, while `is` introduces a
+/// pattern. Keeping all three children explicit avoids Boolean `matches`
+/// expression scope rules hiding the successful right-hand bindings.
+fn parse_constraint(
+    p: &mut Parser,
+    left: NodeIndex,
+    precedence: i32,
+    option: PatternOption,
+) -> ParseResult {
+    let expression = if option.no_extended_call {
+        crate::expr::try_expr_without_extended_call(p)?
+    } else {
+        crate::expr::try_expr(p)?
+    };
+    if expression.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected expression after `and` in pattern constraint",
+        );
+    }
+    p.expect_token(TokenKind::KwIs)?;
+    let right = try_pattern_pratt(p, precedence + 1, option)?;
+    if right.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected pattern after `is` in pattern constraint",
+        );
+    }
+    let span = p.ast().node(left).span.to(p.current_span());
+    Ok(p.ast()
+        .builder(NodeKind::PatternAndIs, span)
+        .add_child(left)
+        .add_child(expression)
+        .add_child(right)
+        .build())
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +242,7 @@ fn try_prefix_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
         }
 
         TokenKind::Dot => {
-            // Check for `..` (rest pattern) vs `.id` (symbol)
+            // Rest bindings use the documented three-dot spelling.
             if p.peek(&[TokenKind::Dot, TokenKind::Dot]) {
                 try_rest_pattern(p, option)
             } else {
@@ -181,8 +253,9 @@ fn try_prefix_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
         TokenKind::LBracket => try_list_pattern(p, option),
         TokenKind::LBrace => try_object_pattern(p, option),
         TokenKind::Minus => try_negative_pattern(p),
+        TokenKind::KwNot => try_not_pattern(p, option),
         TokenKind::Hash => try_effect_pattern(p, option),
-        TokenKind::Bang => try_error_pattern(p, option),
+        TokenKind::Bang | TokenKind::KwError => try_error_pattern(p, option),
         TokenKind::KwAsync => try_async_pattern(p, option),
 
         _ => Ok(NULL),
@@ -240,16 +313,13 @@ fn try_paren_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
 
     if p.eat_token(TokenKind::Comma) {
         let mut elems = vec![first];
-        let rest = basic::try_multi(
-            p,
-            &[Rule::comma("tuple pattern element", try_pattern)],
-        )?;
+        let rest = basic::try_multi(p, &[Rule::comma("tuple pattern element", try_pattern)])?;
         elems.extend(rest);
         p.expect_token(TokenKind::RParen)?;
         let span = p.current_span();
         let idx = p
             .ast()
-        .builder(NodeKind::PatternTuple, span)
+            .builder(NodeKind::PatternTuple, span)
             .add_multi_children(&elems)
             .build();
         return Ok(idx);
@@ -293,7 +363,10 @@ fn try_object_pattern(p: &mut Parser, _option: PatternOption) -> ParseResult {
 
     let elems = try_multi_with_bracket(
         p,
-        &[Rule::comma("object pattern property", try_pattern_property_item)],
+        &[Rule::comma(
+            "object pattern property",
+            try_pattern_property_item,
+        )],
         TokenKind::LBrace,
         TokenKind::RBrace,
     )?;
@@ -340,30 +413,37 @@ fn try_pattern_property_item(p: &mut Parser) -> ParseResult {
     Ok(idx)
 }
 
-/// `..` or `..pat`
-fn try_rest_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
+/// `...id`
+fn try_rest_pattern(p: &mut Parser, _option: PatternOption) -> ParseResult {
     let _g = p.enter();
 
-    // Consume two dots
-    if !p.peek(&[TokenKind::Dot, TokenKind::Dot]) {
-        return Ok(NULL);
+    if !p.peek(&[TokenKind::Dot, TokenKind::Dot, TokenKind::Dot]) {
+        return p
+            .err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Rest binding requires `...` followed by an identifier",
+            )
+            .map(|()| NULL);
     }
-    p.next_token(); // first dot
-    p.next_token(); // second dot
-
-    let pat = try_pattern_with_option(p, option)?;
+    for _ in 0..3 {
+        p.next_token();
+    }
+    let pat = basic::try_id(p)?;
+    if pat.is_null() {
+        return p
+            .err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Rest binding requires an identifier after `...`",
+            )
+            .map(|()| NULL);
+    }
     let span = p.current_span();
-
-    let idx = if pat.is_null() {
-        p.ast().builder(NodeKind::PatternRestBind, span).build()
-    } else {
-        p.ast()
-            .builder(NodeKind::PatternRestBind, span)
-            .add_child(pat)
-            .build()
-    };
-
-    Ok(idx)
+    Ok(p.ast()
+        .builder(NodeKind::PatternRestBind, span)
+        .add_child(pat)
+        .build())
 }
 
 /// `-expr` (negative literal pattern)
@@ -412,17 +492,39 @@ fn try_effect_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
     let span = p.current_span();
     let idx = p
         .ast()
-        .builder(NodeKind::PatternError, span)
+        .builder(NodeKind::PatternEffect, span)
         .add_child(inner)
         .build();
     Ok(idx)
 }
 
-/// `!pat` - error pattern
+/// Negation binds above `as`, while constructor and projection suffixes stay
+/// inside the predicate. Parentheses allow negating a complete guarded pattern.
+fn try_not_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
+    let _g = p.enter();
+    if !p.eat_token(TokenKind::KwNot) {
+        return Ok(NULL);
+    }
+    let inner = try_pattern_pratt(p, 95, option)?;
+    if inner.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected pattern after `not`",
+        );
+    }
+    let span = p.current_span();
+    Ok(p.ast()
+        .builder(NodeKind::PatternNot, span)
+        .add_child(inner)
+        .build())
+}
+
+/// `!pat` - legacy error pattern, distinct from logical negation.
 fn try_error_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
     let _g = p.enter();
 
-    if !p.eat_token(TokenKind::Bang) {
+    if !(p.eat_token(TokenKind::Bang) || p.eat_token(TokenKind::KwError)) {
         return Ok(NULL);
     }
 
@@ -438,7 +540,7 @@ fn try_error_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
     let span = p.current_span();
     let idx = p
         .ast()
-        .builder(NodeKind::PatternNot, span)
+        .builder(NodeKind::PatternError, span)
         .add_child(inner)
         .build();
     Ok(idx)
@@ -471,11 +573,7 @@ fn try_async_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
 }
 
 /// Postfix: `name(pat, ...)` - destructuring call
-fn parse_des_call_paren(
-    p: &mut Parser,
-    left: NodeIndex,
-    _option: PatternOption,
-) -> ParseResult {
+fn parse_des_call_paren(p: &mut Parser, left: NodeIndex, _option: PatternOption) -> ParseResult {
     let _g = p.enter();
 
     let args = try_multi_with_bracket(
@@ -496,11 +594,7 @@ fn parse_des_call_paren(
 }
 
 /// Postfix: `name { prop: pat, ... }` - destructuring brace call
-fn parse_des_call_brace(
-    p: &mut Parser,
-    left: NodeIndex,
-    option: PatternOption,
-) -> ParseResult {
+fn parse_des_call_brace(p: &mut Parser, left: NodeIndex, option: PatternOption) -> ParseResult {
     if option.no_extended_call {
         return Err(ParseErrorKind::ControlMeetExtendedCall);
     }
@@ -508,7 +602,10 @@ fn parse_des_call_brace(
 
     let args = try_multi_with_bracket(
         p,
-        &[Rule::comma("destructor property", try_pattern_property_item)],
+        &[Rule::comma(
+            "destructor property",
+            try_pattern_property_item,
+        )],
         TokenKind::LBrace,
         TokenKind::RBrace,
     )?;
@@ -527,6 +624,15 @@ fn parse_des_call_brace(
 fn parse_pattern_property(p: &mut Parser, left: NodeIndex) -> ParseResult {
     let _g = p.enter();
     p.expect_token(TokenKind::Dot)?;
+
+    if p.eat_token(TokenKind::Star) {
+        let span = p.current_span();
+        return Ok(p
+            .ast()
+            .builder(NodeKind::PatternTypeFamily, span)
+            .add_child(left)
+            .build());
+    }
 
     let id = basic::try_id(p)?;
     if id.is_null() {

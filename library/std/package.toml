@@ -1,0 +1,6 @@
+[package]
+name = "std"
+domain = "org.nessa"
+version = "0.1.0"
+type = "lib"
+description = "Nessa standard library"

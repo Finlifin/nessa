@@ -16,18 +16,6 @@ let name: ?String = "alice"     -- 有值
 let missing: ?String = null     -- 无值
 ```
 
-## Optional 消除 (Elimination)
-
-通过 `?` 后缀加消除块来处理 null 情况：
-
-```nessa
-let a = map.get("key")? {
-    -- 当值为 null 时执行此块
-    return null
-}
--- 此处 a 的类型已经是非 optional 的
-```
-
 ## Optional 传播 (Propagation)
 
 使用 `?` 后缀运算符传播 null——如果值为 null，立即返回 null：

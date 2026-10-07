@@ -31,9 +31,7 @@ impl Reg {
     pub const RESERVED_SP: u8 = 31;
 
     /// Callee-saved registers r19..=r28 that the callee (VM) must preserve across calls.
-    pub const CALLEE_SAVED: &'static [u8] = &[
-        19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-    ];
+    pub const CALLEE_SAVED: &'static [u8] = &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
 }
 
 /// Identifies a function in the bytecode store.
@@ -91,100 +89,129 @@ impl AddrMode {
 #[repr(u8)]
 pub enum Opcode {
     // ── R-type (00): arithmetic & register ops ─────────────────
-    Add        = 0x00,
-    Sub        = 0x01,
-    Mul        = 0x02,
-    Div        = 0x03,
-    Mod        = 0x04,
-    Neg        = 0x05,
-    BitAnd     = 0x06,
-    BitOr      = 0x07,
-    BitXor     = 0x08,
-    BitNot     = 0x09,
-    Shl        = 0x0A,
-    Shr        = 0x0B,
-    UShr       = 0x0C,
+    Add = 0x00,
+    Sub = 0x01,
+    Mul = 0x02,
+    Div = 0x03,
+    Mod = 0x04,
+    Neg = 0x05,
+    BitAnd = 0x06,
+    BitOr = 0x07,
+    BitXor = 0x08,
+    BitNot = 0x09,
+    Shl = 0x0A,
+    Shr = 0x0B,
+    UShr = 0x0C,
 
     // ── R-type (00): comparison ────────────────────────────────
-    CmpEq      = 0x10,
-    CmpNe      = 0x11,
-    CmpLt      = 0x12,
-    CmpLe      = 0x13,
-    CmpGt      = 0x14,
-    CmpGe      = 0x15,
+    CmpEq = 0x10,
+    CmpNe = 0x11,
+    CmpLt = 0x12,
+    CmpLe = 0x13,
+    CmpGt = 0x14,
+    CmpGe = 0x15,
 
     // ── R-type (00): register manipulation ─────────────────────
-    Mov        = 0x18,
-    Swap       = 0x19,
+    Mov = 0x18,
+    Swap = 0x19,
 
     // ── A-type (01): loads with addressing mode ────────────────
     /// `r[dst] = operand(amode)` — Imm / Const / RegOff.
-    Load          = 0x40,
+    Load = 0x40,
     /// Wide constant-pool load: index in imm12|base<<12 (19-bit), amode ignored.
     LoadConstWide = 0x41,
-    LoadUnit      = 0x42,
-    LoadTrue      = 0x43,
-    LoadFalse     = 0x44,
-    LoadNull      = 0x45,
-    TypeCheck     = 0x48,
-    TypeCast      = 0x49,
-    TypeCastSafe  = 0x4A,
+    LoadUnit = 0x42,
+    LoadTrue = 0x43,
+    LoadFalse = 0x44,
+    LoadNull = 0x45,
+    TypeCheck = 0x48,
+    TypeCast = 0x49,
+    TypeCastSafe = 0x4A,
+    TypeAssert = 0x4B,
 
     // ── A-type (01): memory / index (independent of amode) ─────
-    LoadField     = 0x50,
-    StoreField    = 0x51,
-    LoadIndex     = 0x52,
-    StoreIndex    = 0x53,
-    LoadGlobal    = 0x54,
-    StoreGlobal   = 0x55,
-    LoadCapture   = 0x56,
+    LoadField = 0x50,
+    StoreField = 0x51,
+    LoadIndex = 0x52,
+    StoreIndex = 0x53,
+    LoadGlobal = 0x54,
+    StoreGlobal = 0x55,
+    LoadCapture = 0x56,
     LoadGlobalWide = 0x57,
     StoreGlobalWide = 0x58,
 
     // ── A-type (01): object creation ───────────────────────────
-    NewObject     = 0x60,
-    NewList       = 0x61,
-    NewMap        = 0x62,
-    NewClosure    = 0x63,
+    NewObject = 0x60,
+    NewList = 0x61,
+    NewMap = 0x62,
+    NewClosure = 0x63,
     NewClosureWide = 0x64,
+    LoadSlot = 0x65,
+    StoreSlot = 0x66,
+    NewEnum = 0x67,
+    EnumIs = 0x68,
+    EnumField = 0x69,
+    /// Obtain a caller-selected trait proof for raw receiver data.
+    TraitProof = 0x6A,
+    /// Check data in dst against the proof in base and the declared view.
+    TraitAssert = 0x6B,
+    /// Project a frozen proof to an ancestor trait view.
+    TraitProject = 0x6C,
+    ErrorOk = 0x6D,
+    ErrorErr = 0x6E,
+    ErrorIsOk = 0x6F,
+    ErrorPayload = 0x70,
 
     // ── J-type (10): control flow ──────────────────────────────
-    Jmp           = 0x80,
-    JmpIf         = 0x81,
-    JmpIfNot      = 0x82,
-    JmpIfNull     = 0x83,
-    JmpIfNotNull  = 0x84,
+    Jmp = 0x80,
+    JmpIf = 0x81,
+    JmpIfNot = 0x82,
+    JmpIfNull = 0x83,
+    JmpIfNotNull = 0x84,
     /// Far jump: 22-bit signed offset in payload (amode ignored).
-    JmpFar        = 0x85,
+    JmpFar = 0x85,
 
     // ── C-type (10): calls / returns ───────────────────────────
-    Call          = 0x88,
-    CallIndirect  = 0x89,
-    CallMethod    = 0x8A,
-    CallWasm      = 0x8B,
-    TailCall      = 0x8C,
+    Call = 0x88,
+    CallIndirect = 0x89,
+    CallMethod = 0x8A,
+    CallWasm = 0x8B,
+    TailCall = 0x8C,
     /// Call a registered builtin by [`runtime::BuiltinFnId`](id).
-    CallBuiltin   = 0x8D,
-    ReturnUnit    = 0x8E,
-    Return        = 0x8F,
+    CallBuiltin = 0x8D,
+    ReturnUnit = 0x8E,
+    Return = 0x8F,
     /// Far call: func_id from const pool index in imm12, arg_count in high bits.
-    CallFar       = 0x90,
+    CallFar = 0x90,
     CallMethodFar = 0x91,
+    /// Frozen proof in receiver field, interface slot in imm12.
+    TraitCall = 0x92,
+    /// Indirect call whose arguments already use the physical user layout.
+    CallIndirectProof = 0x93,
 
     // ── E-type (11): effects & continuations ───────────────────
-    EffectCall    = 0xC0,
+    EffectCall = 0xC0,
     EffectCallDyn = 0xC1,
-    PushHandler   = 0xC2,
-    PopHandler    = 0xC3,
-    Shift         = 0xC4,
-    Reset         = 0xC5,
-    Resume        = 0xC6,
+    PushHandler = 0xC2,
+    PopHandler = 0xC3,
+    Shift = 0xC4,
+    Reset = 0xC5,
+    Resume = 0xC6,
     PushHandlerWide = 0xC7,
+    CloneContinuation = 0xC8,
+    DropContinuation = 0xC9,
+    PushHandlerClosure = 0xCA,
+    PushCapturingHandler = 0xCB,
+    ResetClosure = 0xCC,
+    ResumeContinuation = 0xCD,
+    ResumeContinuationOnce = 0xCE,
 
     // ── E-type (11): system ────────────────────────────────────
-    Safepoint     = 0xD0,
-    DebugBreak    = 0xD1,
-    Nop           = 0xD2,
+    Safepoint = 0xD0,
+    DebugBreak = 0xD1,
+    Nop = 0xD2,
+    AllocateSlots = 0xD3,
+    MatchFail = 0xD4,
 }
 
 impl Opcode {
@@ -204,20 +231,16 @@ impl Opcode {
     }
 
     pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0x00..=0x0C => Some(unsafe { std::mem::transmute(v) }),
-            0x10..=0x15 => Some(unsafe { std::mem::transmute(v) }),
-            0x18..=0x19 => Some(unsafe { std::mem::transmute(v) }),
-            0x40..=0x45 => Some(unsafe { std::mem::transmute(v) }),
-            0x48..=0x4A => Some(unsafe { std::mem::transmute(v) }),
-            0x50..=0x58 => Some(unsafe { std::mem::transmute(v) }),
-            0x60..=0x64 => Some(unsafe { std::mem::transmute(v) }),
-            0x80..=0x85 => Some(unsafe { std::mem::transmute(v) }),
-            0x88..=0x91 => Some(unsafe { std::mem::transmute(v) }),
-            0xC0..=0xC7 => Some(unsafe { std::mem::transmute(v) }),
-            0xD0..=0xD2 => Some(unsafe { std::mem::transmute(v) }),
-            _ => None,
+        if !matches!(v,
+            0x00..=0x0C | 0x10..=0x15 | 0x18..=0x19 | 0x40..=0x45 |
+            0x48..=0x4B | 0x50..=0x58 | 0x60..=0x70 | 0x80..=0x85 |
+            0x88..=0x93 | 0xC0..=0xCE | 0xD0..=0xD4
+        ) {
+            return None;
         }
+        // SAFETY: Opcode is repr(u8), and every value in these checked ranges
+        // has an explicitly declared variant. Gaps are rejected above.
+        Some(unsafe { std::mem::transmute::<u8, Self>(v) })
     }
 }
 
@@ -313,8 +336,12 @@ impl Instruction {
                     | (imm12 as u32 & IMM12_MASK)
             }
             InstructionData::J { cond, offset } => {
-                let off_bits = (offset as u32) & OFFSET17_MASK;
-                ((cond.0 as u32 & 0x1F) << 17) | off_bits
+                if self.opcode == Opcode::JmpFar {
+                    (offset as u32) & PAYLOAD22_MASK
+                } else {
+                    let off_bits = (offset as u32) & OFFSET17_MASK;
+                    ((cond.0 as u32 & 0x1F) << 17) | off_bits
+                }
             }
             InstructionData::C { payload } | InstructionData::E { payload } => {
                 payload & PAYLOAD22_MASK
@@ -473,6 +500,35 @@ impl Instruction {
         Self::a_type(Opcode::LoadUnit, AddrMode::Imm, dst, Reg(0), 0)
     }
 
+    /// Allocate the current function's local value slots at entry.
+    pub fn allocate_slots(count: u32) -> Self {
+        assert!(count <= (1 << 17));
+        Self::e_type(Opcode::AllocateSlots, count)
+    }
+
+    /// Slots use a register field and a 17-bit unsigned slot index.
+    pub fn load_slot(dst: Reg, slot: u32) -> Self {
+        assert!(slot < (1 << 17));
+        Self::a_type(
+            Opcode::LoadSlot,
+            AddrMode::Imm,
+            dst,
+            Reg((slot >> 12) as u8),
+            (slot & 0xFFF) as u16,
+        )
+    }
+
+    pub fn store_slot(slot: u32, source: Reg) -> Self {
+        assert!(slot < (1 << 17));
+        Self::a_type(
+            Opcode::StoreSlot,
+            AddrMode::Imm,
+            source,
+            Reg((slot >> 12) as u8),
+            (slot & 0xFFF) as u16,
+        )
+    }
+
     pub fn load_true(dst: Reg) -> Self {
         Self::a_type(Opcode::LoadTrue, AddrMode::Imm, dst, Reg(0), 0)
     }
@@ -540,6 +596,51 @@ impl Instruction {
         Self::c_type(Opcode::CallIndirect, payload)
     }
 
+    pub fn call_indirect_proof(closure_reg: Reg, physical_arg_count: u8) -> Self {
+        let mut instruction = Self::call_indirect(closure_reg, physical_arg_count);
+        instruction.opcode = Opcode::CallIndirectProof;
+        instruction
+    }
+
+    pub fn trait_proof(dst: Reg, receiver: Reg, view: TypeIndex) -> Self {
+        debug_assert!(view.as_u32() < 1 << 12);
+        Self::a_type(
+            Opcode::TraitProof,
+            AddrMode::Imm,
+            dst,
+            receiver,
+            view.as_u32() as u16,
+        )
+    }
+
+    pub fn trait_assert(data: Reg, proof: Reg, view: TypeIndex) -> Self {
+        debug_assert!(view.as_u32() < 1 << 12);
+        Self::a_type(
+            Opcode::TraitAssert,
+            AddrMode::Imm,
+            data,
+            proof,
+            view.as_u32() as u16,
+        )
+    }
+
+    pub fn trait_project(dst: Reg, proof: Reg, view: TypeIndex) -> Self {
+        debug_assert!(view.as_u32() < 1 << 12);
+        Self::a_type(
+            Opcode::TraitProject,
+            AddrMode::Imm,
+            dst,
+            proof,
+            view.as_u32() as u16,
+        )
+    }
+
+    pub fn trait_call(proof: Reg, slot: u32, physical_arg_count: u8) -> Self {
+        let mut instruction = Self::call_method(proof, slot, physical_arg_count);
+        instruction.opcode = Opcode::TraitCall;
+        instruction
+    }
+
     /// CallMethod: arg_count[21:17], recv[16:12], method_id[11:0].
     pub fn call_method(receiver_reg: Reg, method_str_id: u32, arg_count: u8) -> Self {
         debug_assert!(method_str_id < (1 << 12));
@@ -570,15 +671,26 @@ impl Instruction {
         Self::a_type(Opcode::NewObject, AddrMode::Imm, dst, Reg(0), idx as u16)
     }
 
+    /// Allocate a payload variant from a checked tuple of field values.
+    pub fn new_enum(dst: Reg, tuple: Reg, descriptor: u16) -> Self {
+        Self::a_type(Opcode::NewEnum, AddrMode::Imm, dst, tuple, descriptor)
+    }
+
+    pub fn enum_is(dst: Reg, value: Reg, descriptor: u16) -> Self {
+        Self::a_type(Opcode::EnumIs, AddrMode::Imm, dst, value, descriptor)
+    }
+
+    pub fn enum_field(dst: Reg, value: Reg, field: u16) -> Self {
+        Self::a_type(Opcode::EnumField, AddrMode::Imm, dst, value, field)
+    }
+
+    pub fn match_fail() -> Self {
+        Self::e_type(Opcode::MatchFail, 0)
+    }
+
     pub fn load_field(dst: Reg, obj: Reg, field_idx: u32) -> Self {
         debug_assert!(field_idx < (1 << 12));
-        Self::a_type(
-            Opcode::LoadField,
-            AddrMode::Imm,
-            dst,
-            obj,
-            field_idx as u16,
-        )
+        Self::a_type(Opcode::LoadField, AddrMode::Imm, dst, obj, field_idx as u16)
     }
 
     pub fn store_field(obj: Reg, field_idx: u32, val: Reg) -> Self {
@@ -627,6 +739,106 @@ impl Instruction {
 
     pub fn safepoint() -> Self {
         Self::e_type(Opcode::Safepoint, 0)
+    }
+
+    /// Enter a delimiter. Prompt is read from a register, arguments from r0..rN.
+    /// Payload: prompt register (5), argument count (5), body FuncId (12).
+    pub fn reset(prompt: Reg, body: u16, arg_count: u8) -> Self {
+        assert!(prompt.0 < 32 && body < (1 << 12) && arg_count < 32);
+        Self::e_type(
+            Opcode::Reset,
+            ((prompt.0 as u32) << 17) | ((arg_count as u32) << 12) | body as u32,
+        )
+    }
+
+    /// Capture to a prompt; the resumed effect result is written to `destination`.
+    /// The capture returns its internal continuation handle in the parent's r0.
+    pub fn shift(prompt: Reg, destination: Reg) -> Self {
+        assert!(prompt.0 < 32 && destination.0 < 32);
+        Self::e_type(
+            Opcode::Shift,
+            ((prompt.0 as u32) << 17) | ((destination.0 as u32) << 12),
+        )
+    }
+
+    /// Consume a suspended stack handle and supply the effect result.
+    pub fn resume(continuation: Reg, value: Reg) -> Self {
+        assert!(continuation.0 < 32 && value.0 < 32);
+        Self::e_type(
+            Opcode::Resume,
+            ((continuation.0 as u32) << 17) | ((value.0 as u32) << 12),
+        )
+    }
+
+    pub fn e_control_regs(payload: u32) -> (Reg, Reg) {
+        (
+            Reg(((payload >> 17) & 0x1F) as u8),
+            Reg(((payload >> 12) & 0x1F) as u8),
+        )
+    }
+
+    /// Dynamic invocation: argument count (5), effect TypeIndex (17).
+    pub fn effect_call(effect: TypeIndex, arg_count: u8) -> Self {
+        assert!(effect.as_u32() < (1 << 17) && arg_count < 32);
+        Self::e_type(
+            Opcode::EffectCallDyn,
+            ((arg_count as u32) << 17) | effect.as_u32(),
+        )
+    }
+
+    /// Install a closure handler: closure register (5), effect TypeIndex (17).
+    pub fn push_handler_closure(effect: TypeIndex, closure: Reg) -> Self {
+        assert!(effect.as_u32() < (1 << 17) && closure.0 < 32);
+        Self::e_type(
+            Opcode::PushHandlerClosure,
+            ((closure.0 as u32) << 17) | effect.as_u32(),
+        )
+    }
+
+    pub fn push_capturing_handler(closure: Reg, metadata: u32) -> Self {
+        assert!(closure.0 < 32 && metadata < (1 << 17));
+        Self::e_type(
+            Opcode::PushCapturingHandler,
+            ((closure.0 as u32) << 17) | metadata,
+        )
+    }
+
+    pub fn reset_closure(body: Reg, handler_count: u8) -> Self {
+        assert!(body.0 < 32 && handler_count < 32);
+        Self::e_type(
+            Opcode::ResetClosure,
+            ((body.0 as u32) << 17) | ((handler_count as u32) << 12),
+        )
+    }
+
+    pub fn resume_continuation(continuation: Reg, value: Reg) -> Self {
+        assert!(continuation.0 < 32 && value.0 < 32);
+        Self::e_type(
+            Opcode::ResumeContinuation,
+            ((continuation.0 as u32) << 17) | ((value.0 as u32) << 12),
+        )
+    }
+
+    pub fn clone_continuation(destination: Reg, source: Reg) -> Self {
+        assert!(destination.0 < 32 && source.0 < 32);
+        Self::e_type(
+            Opcode::CloneContinuation,
+            ((destination.0 as u32) << 17) | ((source.0 as u32) << 12),
+        )
+    }
+
+    /// Consume a source continuation proven to have no other observable uses.
+    pub fn resume_continuation_once(continuation: Reg, value: Reg) -> Self {
+        assert!(continuation.0 < 32 && value.0 < 32);
+        Self::e_type(
+            Opcode::ResumeContinuationOnce,
+            ((continuation.0 as u32) << 17) | ((value.0 as u32) << 12),
+        )
+    }
+
+    pub fn drop_continuation(source: Reg) -> Self {
+        assert!(source.0 < 32);
+        Self::e_type(Opcode::DropContinuation, (source.0 as u32) << 17)
     }
 
     pub fn nop() -> Self {
@@ -692,8 +904,19 @@ pub struct FuncHeader {
 pub enum Constant {
     Int(i64),
     UInt(u64),
+    Int128(i128),
+    UInt128(u128),
+    /// A reference to an entry in the artifact's type pool, not a stable TypeId.
+    Type(TypeIndex),
+    /// Enum identity/tag descriptor; only nullary variants can be loaded directly.
+    Enum {
+        type_index: TypeIndex,
+        variant: u32,
+    },
     Float(f64),
     Str(String),
+    /// A Unicode scalar value, loaded as a character immediate.
+    Char(char),
     BigInt(Vec<u8>),
 }
 
@@ -703,6 +926,73 @@ pub enum Constant {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trait_operations_preserve_views_slots_and_physical_counts() {
+        let view = type_pool::TypeIndex::from_raw(4095);
+        for instruction in [
+            super::Instruction::trait_proof(super::Reg(31), super::Reg(30), view),
+            super::Instruction::trait_assert(super::Reg(1), super::Reg(2), view),
+            super::Instruction::trait_project(super::Reg(3), super::Reg(4), view),
+            super::Instruction::trait_call(super::Reg(31), 4095, 31),
+            super::Instruction::call_indirect_proof(super::Reg(31), 31),
+        ] {
+            let decoded = super::Instruction::decode(instruction.encode()).unwrap();
+            assert_eq!(decoded, instruction);
+        }
+        let call = super::Instruction::trait_call(super::Reg(31), 4095, 31);
+        let super::InstructionData::C { payload } = call.data else {
+            panic!("call encoding");
+        };
+        assert_eq!(
+            super::Instruction::c_call_method(payload),
+            (31, super::Reg(31), 4095)
+        );
+    }
+
+    #[test]
+    fn enum_and_match_failure_opcodes_preserve_their_operands() {
+        for instruction in [
+            super::Instruction::new_enum(super::Reg(31), super::Reg(30), 4095),
+            super::Instruction::enum_is(super::Reg(3), super::Reg(2), 123),
+            super::Instruction::enum_field(super::Reg(2), super::Reg(1), 4095),
+            super::Instruction::match_fail(),
+            super::Instruction::a_type(
+                super::Opcode::ErrorOk,
+                super::AddrMode::Imm,
+                super::Reg(31),
+                super::Reg(30),
+                4095,
+            ),
+            super::Instruction::a_type(
+                super::Opcode::ErrorErr,
+                super::AddrMode::Imm,
+                super::Reg(31),
+                super::Reg(30),
+                4095,
+            ),
+            super::Instruction::a_type(
+                super::Opcode::ErrorIsOk,
+                super::AddrMode::Imm,
+                super::Reg(31),
+                super::Reg(30),
+                0,
+            ),
+            super::Instruction::a_type(
+                super::Opcode::ErrorPayload,
+                super::AddrMode::Imm,
+                super::Reg(31),
+                super::Reg(30),
+                0,
+            ),
+        ] {
+            let decoded = super::Instruction::decode(instruction.encode()).unwrap();
+            assert_eq!(decoded.opcode, instruction.opcode);
+            assert_eq!(decoded.encode(), instruction.encode());
+        }
+        assert_eq!(super::Opcode::from_u8(0x71), None);
+        assert_eq!(super::Opcode::from_u8(0xd5), None);
+    }
+
     use super::*;
 
     #[test]
@@ -732,6 +1022,13 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_type_assert_preserves_boundary_operands() {
+        let instruction =
+            Instruction::a_type(Opcode::TypeAssert, AddrMode::Imm, Reg(31), Reg(30), 4095);
+        assert_eq!(Instruction::decode(instruction.encode()), Some(instruction));
+    }
+
+    #[test]
     fn encode_decode_load_reg_off() {
         let instr = Instruction::load_reg_off(Reg(2), Reg(5), -3);
         let word = instr.encode();
@@ -749,9 +1046,7 @@ mod tests {
 
     #[test]
     fn reserved_amode_rejected_for_load() {
-        let word = (Opcode::Load as u32) << 24
-            | (0b11u32 << 22)
-            | ((3u32) << 17);
+        let word = (Opcode::Load as u32) << 24 | (0b11u32 << 22) | ((3u32) << 17);
         assert!(Instruction::decode(word).is_none());
     }
 
@@ -795,12 +1090,72 @@ mod tests {
     }
 
     #[test]
+    fn source_effect_instructions_preserve_their_payload_fields() {
+        let effect = TypeIndex::from_raw(0x1FFFF);
+        let fixtures = [
+            (
+                Instruction::effect_call(effect, 31),
+                Opcode::EffectCallDyn,
+                (31 << 17) | 0x1FFFF,
+            ),
+            (
+                Instruction::push_handler_closure(effect, Reg(31)),
+                Opcode::PushHandlerClosure,
+                (31 << 17) | 0x1FFFF,
+            ),
+            (
+                Instruction::push_capturing_handler(Reg(30), 0x1FFFF),
+                Opcode::PushCapturingHandler,
+                (30 << 17) | 0x1FFFF,
+            ),
+            (
+                Instruction::reset_closure(Reg(29), 31),
+                Opcode::ResetClosure,
+                (29 << 17) | (31 << 12),
+            ),
+            (
+                Instruction::resume_continuation(Reg(28), Reg(27)),
+                Opcode::ResumeContinuation,
+                (28 << 17) | (27 << 12),
+            ),
+            (
+                Instruction::resume_continuation_once(Reg(26), Reg(25)),
+                Opcode::ResumeContinuationOnce,
+                (26 << 17) | (25 << 12),
+            ),
+        ];
+        for (instruction, opcode, payload) in fixtures {
+            assert_eq!(instruction.encode(), ((opcode as u32) << 24) | payload);
+            assert_eq!(Instruction::decode(instruction.encode()), Some(instruction));
+        }
+    }
+
+    #[test]
     fn opcode_format_families() {
         assert_eq!(Opcode::Add.format(), Format::R);
         assert_eq!(Opcode::Load.format(), Format::A);
         assert_eq!(Opcode::Jmp.format(), Format::J);
         assert_eq!(Opcode::Call.format(), Format::C);
         assert_eq!(Opcode::Safepoint.format(), Format::E);
+    }
+
+    #[test]
+    fn local_slot_instructions_preserve_wide_indices() {
+        for index in [0, 4095, 4096, 70000, (1 << 17) - 1] {
+            for instruction in [
+                Instruction::load_slot(Reg(17), index),
+                Instruction::store_slot(index, Reg(16)),
+            ] {
+                let decoded = Instruction::decode(instruction.encode()).unwrap();
+                assert_eq!(decoded, instruction);
+                let InstructionData::A { base, imm12, .. } = decoded.data else {
+                    panic!("expected slot instruction");
+                };
+                assert_eq!(((base.0 as u32) << 12) | imm12 as u32, index);
+            }
+        }
+        let allocation = Instruction::allocate_slots(1 << 17);
+        assert_eq!(Instruction::decode(allocation.encode()), Some(allocation));
     }
 
     #[test]
@@ -814,6 +1169,16 @@ mod tests {
             assert_eq!(src1.0, 10);
         } else {
             panic!("expected R-type");
+        }
+    }
+
+    #[test]
+    fn far_jumps_preserve_all_twenty_two_signed_offset_bits() {
+        for offset in [-(1 << 21), -70000, -1, 0, 70000, (1 << 21) - 1] {
+            let instruction = Instruction::jmp_far(offset);
+            let word = instruction.encode();
+            assert_eq!(word & PAYLOAD22_MASK, offset as u32 & PAYLOAD22_MASK);
+            assert_eq!(Instruction::decode(word), Some(instruction));
         }
     }
 

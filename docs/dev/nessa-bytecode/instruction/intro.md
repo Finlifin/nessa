@@ -62,6 +62,7 @@
 | 0x48 | TYPE_CHECK | r[d] = r[s] is TypeIndex(imm) | 类型检查，结果为 bool |
 | 0x49 | TYPE_CAST | r[d] = r[s] as TypeIndex(imm) | 类型转换（失败则 panic） |
 | 0x4A | TYPE_CAST_SAFE | r[d] = r[s] as? TypeIndex(imm) | 安全转换（失败返回 null） |
+| 0x4B | TYPE_ASSERT | r[d] = checked r[s] : TypeIndex(imm) | 隐式类型边界检查；允许数值拓宽，禁止显式转换才允许的窄化/截断 |
 
 ### 内存访问 (A-type: 01，独立索引，不走 amode)
 
@@ -86,6 +87,31 @@
 | 0x62 | NEW_MAP | r[d] = Map(capacity=imm) | 创建 Map |
 | 0x63 | NEW_CLOSURE | r[d] = Closure(func_id, captures) | 创建闭包（func_id:12） |
 | 0x64 | NEW_CLOSURE_WIDE | 同上，func_id 来自常量池 | 大 func_id |
+| 0x65 | LOAD_SLOT | r[d] = local_slots[index] | dst:5 \| slot:17 |
+| 0x66 | STORE_SLOT | local_slots[index] = r[s] | source:5 \| slot:17 |
+| 0x67 | NEW_ENUM | r[d] = enum(descriptor, r[s]) | dst:5 \| Tuple/Unit参数寄存器:5 \| descriptor常量:12 |
+| 0x68 | ENUM_IS | r[d] = enum_variant_is(r[s], descriptor) | dst:5 \| value:5 \| descriptor常量:12 |
+| 0x69 | ENUM_FIELD | r[d] = enum_payload(r[s], imm) | dst:5 \| value:5 \| field:12，不包含tag |
+| 0x6A | TRAIT_PROOF | r[d] = acquire(r[s], view) | dst:5 \| data:5 \| view:12，实际 caller scope |
+| 0x6B | TRAIT_ASSERT | r[d] = check(r[d], r[s], view) | data/dst:5 \| proof:5 \| view:12 |
+| 0x6C | TRAIT_PROJECT | r[d] = parent_view(r[s], view) | dst:5 \| proof:5 \| view:12，保留原 table 选择 |
+| 0x6D | ERROR_OK | r[d] = Ok(r[s], descriptor) | dst:5 \| value:5 \| Type常量索引:12 |
+| 0x6E | ERROR_ERR | r[d] = Err(r[s], descriptor) | dst:5 \| value:5 \| Type常量索引:12 |
+| 0x6F | ERROR_IS_OK | r[d] = is_ok(r[s]) | dst:5 \| value:5，imm12必须0 |
+| 0x70 | ERROR_PAYLOAD | r[d] = checked_payload(r[s]) | dst:5 \| value:5，imm12必须0 |
+
+Error四条指令要求amode为Imm（编码0）且寄存器有效。构造descriptor必须是
+受检的Error限定Type常量，索引至多4095，并参与归档常量重定位；不能把
+裸TypeIndex误当descriptor。ERROR_OK显式构造成功分支，ERROR_ERR取实际
+载荷的完整128位TypeId并检查目标错误集合。分支检查和提取核验对象角色、
+布局、标签及载荷；保留位非零、非法目标或未支持旧布局均报错。
+
+NewEnum的descriptor为Enum常量，不是TypeIndex；source为已求值并保存根的
+Tuple（无参数可用Unit），元素数须匹配variant，逐字段受检转换后初始化完整
+Enum对象。无载荷variant可直接加载Enum常量，不需要heap分配。
+EnumIs比较名义Enum身份和tag，对其它正常Enum或非Enum值返回false，损坏值
+报错。EnumField核对当前variant、payload/header和字段类型，仅提取载荷字段。
+三条A-type指令不解释amode，保留位必须0；descriptor参与归档常量索引搬迁。
 
 ### 控制流 (J-type: 10)
 
@@ -112,6 +138,13 @@
 | 0x8F | RETURN | return r[s] | 函数返回 |
 | 0x90 | CALL_FAR | call via const pool | 大 func_id |
 | 0x91 | CALL_METHOD_FAR | method via const pool | 大 method_id |
+| 0x92 | TRAIT_CALL | call frozen interface slot | physical_count:5 \| proof:5 \| slot:12，r0 为 receiver data |
+| 0x93 | CALL_INDIRECT_PROOF | call r[s](physical args...) | physical_count:5 \| callee:5 \| 0:12，不含 captures |
+
+TraitCall 的 proof 寄存器在参数区之后；receiver 的 proof 不重复加入参数区。
+TraitProof、TraitCall、CallIndirectProof 属于 Calls scope coverage；TraitAssert
+属于 CallsAndTypes；TraitProject 不查询词法 scope。旧 EffectCallDyn 没有该
+证明取得上下文契约，带裸 trait 输入明确拒绝，零输入 effect 捕获 proof 可执行。
 
 ### Effect 相关 (E-type: 11)
 
@@ -125,6 +158,18 @@
 | 0xC5 | RESET | establish reset prompt | 建立 reset 边界 |
 | 0xC6 | RESUME | resume continuation with value | 恢复 continuation |
 | 0xC7 | PUSH_HANDLER_WIDE | push via const pool | 宽 handler 元数据 |
+| 0xC8 | CLONE_CONTINUATION | branch suspended computation | 为多次恢复建立独立分支 |
+| 0xC9 | DROP_CONTINUATION | discard suspended computation | 归还捕获的整个栈段链 |
+| 0xCA | PUSH_HANDLER_CLOSURE | install in-place closure | closure 寄存器:5 \| effect:17 |
+| 0xCB | PUSH_CAPTURING_HANDLER | install capturing closure | closure 寄存器:5 \| metadata 常量:17 |
+| 0xCC | RESET_CLOSURE | enter closure on delimiter stack | body 寄存器:5 \| handler 数量:5 \| 0:12 |
+| 0xCD | RESUME_CONTINUATION | invoke multi-shot language value | continuation 寄存器:5 \| value 寄存器:5 \| 0:12 |
+| 0xCE | RESUME_CONTINUATION_ONCE | consume proven single use | 同上；直接转移原栈段链 |
+
+`RESET`、`SHIFT`、`RESUME` 与 continuation 生命周期指令的 v3 编码及执行协议见
+[continuation-stack-abi.md](../../continuation-stack-abi.md)。捕获和恢复均转移栈段链接，
+`CLONE_CONTINUATION` 与多次调用的语言指令建立独立分支时复制状态，
+`RESUME_CONTINUATION_ONCE` 经编译器证明单次使用后直接恢复原链。
 
 ### 系统指令 (E-type: 11)
 
@@ -133,6 +178,8 @@
 | 0xD0 | SAFEPOINT | GC/调度检查点 | 检查 gc_flag 和 preempt_flag |
 | 0xD1 | DEBUG_BREAK | 调试断点 | 仅 debug 模式有效 |
 | 0xD2 | NOP | 无操作 | 用于对齐或占位 |
+| 0xD3 | ALLOCATE_SLOTS | allocate function local value slots | count:22，当前最大 131072 |
+| 0xD4 | MATCH_FAIL | 返回NoMatchingCase错误 | payload必须0，无后继控制流 |
 
 ## 调用约定
 
@@ -140,7 +187,19 @@
 - 返回值放入 r0
 - 调用者保存 r0–r17 中仍需存活的值（caller-saved）
 - 被调用者入场时由 VM 保存/恢复 r19–r28（callee-saved）
-- Evidence 参数作为隐式额外参数附加在显式参数之后
+- trait 用户参数按 proof、data 展开；具体默认方法的 TraitSelf 同样展开
+- closure capture 按 data、proof 保存
+- effect handler chain 是独立机制，不是 trait 参数证明表
+
+当前解释器编译器采用保守的 frame slots 布局：每个 NIR local 对应一个
+TaggedValue 槽，计算临时值用 r16/r17，结果用 r8。函数进入时先把全部参数写入
+槽；普通调用移动槽的所有权到 CallFrame，返回时移回，避免局部值依赖参数
+寄存器或永久取模分配。当前 VM 的参数窗口可用 32 个寄存器，间接调用保留一个
+寄存器存 receiver，最多 31 个显式参数；这是解释器实现状态。以上设计的 8 个
+参数寄存器与其余参数的栈传递仍须统一，不能将当前窗口当作完成了原生 ABI。
+
+slot 索引在 A-type 的 base:5 与 imm12:12 中保存高/低位，不表示寻址寄存器。
+越界访问返回 VM 错误，GC 枚举当前函数以及所有保存 CallFrame 的槽。
 
 ## 整数溢出处理
 

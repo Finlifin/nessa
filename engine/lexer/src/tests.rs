@@ -2,6 +2,22 @@ use crate::error::LexErrorKind;
 use crate::lexer::Lexer;
 use crate::token::{TokenKind, lookup_keyword};
 
+#[test]
+fn nested_integer_projections_do_not_consume_a_decimal_literal() {
+    assert_eq!(texts("pair.0.1"), ["pair", ".", "0", ".", "1"],);
+    let projections = kinds_ok("pair.0.1");
+    assert_eq!(
+        projections
+            .iter()
+            .filter(|&&kind| kind == TokenKind::Integer)
+            .count(),
+        2
+    );
+    assert!(!projections.contains(&TokenKind::Real));
+    assert!(kinds_ok("0.1").contains(&TokenKind::Real));
+    assert!(kinds_ok("call(0.1)").contains(&TokenKind::Real));
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

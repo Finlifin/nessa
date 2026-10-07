@@ -192,6 +192,17 @@ k(())  -- 传入 Unit，因为 yield 的返回类型是 Unit
 - **跨 task 传递**可能导致未定义行为
 - **clone** 会复制整个计算上下文，内存开销可能很大
 
+### 栈段 ABI
+
+Continuation 的捕获与恢复采用 delimiter 边界栈切换：进入可捕获的 delimiter
+时建立独立栈段，捕获时分离栈段链，恢复时重新连接并切回原执行上下文。
+这两步不复制调用帧。一个 task 可以拥有多个活动或暂停的栈段。
+
+多次恢复的语言语义仍然保留，独立分支通过显式的内部克隆步骤建立；复制成本
+属于分支建立，不属于捕获或恢复。内部线性执行句柄不能直接替代语言层的
+多次调用接口。完整协议与当前实现范围见
+[continuation-stack-abi.md](../dev/continuation-stack-abi.md)。
+
 > **最佳实践**：仅在确实需要非线性控制流时使用 `catch k`。绝大多数场景下，默认的 in-place handler application 更加安全和高效。
 
 ## 与 In-Place Handler Application 的关系

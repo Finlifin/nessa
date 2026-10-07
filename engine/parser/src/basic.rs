@@ -17,6 +17,7 @@ pub struct Rule {
     pub name: &'static str,
     pub parser: ParserFn,
     pub separator: TokenKind,
+    pub additional_separator: Option<TokenKind>,
 }
 
 impl Rule {
@@ -26,6 +27,7 @@ impl Rule {
             name,
             parser,
             separator: TokenKind::Comma,
+            additional_separator: None,
         }
     }
 
@@ -35,6 +37,16 @@ impl Rule {
             name,
             parser,
             separator: TokenKind::Semi,
+            additional_separator: None,
+        }
+    }
+
+    pub fn comma_or_semicolon(name: &'static str, parser: ParserFn) -> Self {
+        Self {
+            name,
+            parser,
+            separator: TokenKind::Semi,
+            additional_separator: Some(TokenKind::Comma),
         }
     }
 }
@@ -59,7 +71,11 @@ pub fn try_multi(p: &mut Parser, rules: &[Rule]) -> Result<Vec<NodeIndex>, Parse
 
             nodes.push(node);
 
-            if !p.eat_token(rule.separator) {
+            if !p.eat_token(rule.separator)
+                && !rule
+                    .additional_separator
+                    .is_some_and(|separator| p.eat_token(separator))
+            {
                 break 'outer;
             }
             continue 'outer;
@@ -112,21 +128,16 @@ pub fn try_multi_in_block(
     let (open, close) = match p.peek_token().kind {
         TokenKind::LBrace => (TokenKind::LBrace, TokenKind::RBrace),
         TokenKind::Indent => (TokenKind::Indent, TokenKind::Outdent),
-        TokenKind::Colon => {
-            if p.peek(&[TokenKind::Colon, TokenKind::Indent]) {
-                p.next_token(); // consume colon
-                (TokenKind::Indent, TokenKind::Outdent)
-            } else {
-                return Err(ParseErrorKind::InvalidBlockPrefix);
-            }
+        TokenKind::Colon if p.peek(&[TokenKind::Colon, TokenKind::Indent]) => {
+            p.next_token(); // consume colon
+            (TokenKind::Indent, TokenKind::Outdent)
         }
         _ => {
             return Err(ParseErrorKind::InvalidBlockPrefix);
         }
     };
 
-    let result = try_multi_with_bracket(p, rules, open, close);
-    result
+    try_multi_with_bracket(p, rules, open, close)
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +189,11 @@ pub fn try_id(p: &mut Parser) -> ParseResult {
     let str_id = str_interner::intern(text);
     let span = p.next_token_span();
     p.next_token();
-    let idx = p.ast().builder(NodeKind::Id, span).set_str_id(str_id).build();
+    let idx = p
+        .ast()
+        .builder(NodeKind::Id, span)
+        .set_str_id(str_id)
+        .build();
     Ok(idx)
 }
 
@@ -257,6 +272,13 @@ pub fn try_named_arg(p: &mut Parser) -> ParseResult {
     let id = try_id(p)?;
     p.expect_token(TokenKind::Eq)?;
     let e = expr::try_expr(p)?;
+    if e.is_null() {
+        p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected a value for named argument",
+        )?;
+    }
 
     let span = p.current_span();
     let idx = p
@@ -336,8 +358,7 @@ pub fn try_block_or_statement(p: &mut Parser) -> ParseResult {
         Ok(_) => {}
     }
 
-    let result = statement::try_definition_or_statement(p);
-    result
+    statement::try_definition_or_statement(p)
 }
 
 /// Parse a pattern arm: `pattern => block_or_statement`
@@ -468,7 +489,14 @@ pub fn try_parameter(p: &mut Parser) -> ParseResult {
             ty = expr::try_expr_without_extended_call(p)?;
         }
         p.expect_token(TokenKind::Eq)?;
-        let init = expr::try_expr_without_extended_call(p)?;
+        let init = expr::try_expr(p)?;
+        if init.is_null() {
+            p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected a default value for optional parameter",
+            )?;
+        }
         let span = p.current_span();
         let idx = p
             .ast()

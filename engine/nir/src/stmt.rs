@@ -2,11 +2,11 @@
 //! within basic blocks.
 
 use ast::{Ast, NodeIndex, NodeKind};
-use resolution::{ResolvedAst, SymbolKind};
+use resolution::ResolvedAst;
 
-use crate::builder::FunctionBuilder;
+use crate::builder::{FunctionBuilder, LoopTargets};
 use crate::expr::lower_expr;
-use crate::{BinOp, BlockId, NirExpr, NirStmt, NirValue, Terminator};
+use crate::{BlockId, NirExpr, NirStmt, NirValue, Terminator};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -28,10 +28,19 @@ pub(crate) fn lower_body_into(
     let ast = &resolved.ast;
     let node = ast.node(node_idx);
     match node.kind {
+        NodeKind::ExprStatement | NodeKind::ReturnStatement | NodeKind::ResumeStatement => {
+            lower_stmt(resolved, node_idx, builder, block, true);
+        }
         NodeKind::Block => {
             let stmts = ast.multi_children(node_idx);
             let last_idx = stmts.len().saturating_sub(1);
             for (i, &stmt) in stmts.iter().enumerate() {
+                if !matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                ) {
+                    break;
+                }
                 lower_stmt(resolved, stmt, builder, block, i == last_idx);
             }
             // If block is still unterminated, add return unit.
@@ -67,15 +76,67 @@ pub(crate) fn lower_stmt(
     let ast = &resolved.ast;
     let node = ast.node(node_idx);
     match node.kind {
+        NodeKind::PubDef | NodeKind::PrivateDef => {
+            lower_stmt(
+                resolved,
+                ast.fixed_children(node_idx)[0],
+                builder,
+                block,
+                is_last,
+            );
+        }
         // ── Return ─────────────────────────────────────────────────
-        NodeKind::ReturnStatement => {
+        NodeKind::ReturnStatement | NodeKind::ResumeStatement => {
             let children = ast.fixed_children(node_idx);
+            if !children[1].is_null() {
+                // Evaluate the guard before the value: a false guard must not
+                // execute effects in the return/resume expression.
+                let condition = lower_expr(resolved, children[1], builder, block);
+                let return_block = builder.new_block();
+                let continue_block = builder.new_block();
+                builder.blocks[block.0 as usize].terminator =
+                    Terminator::Branch(condition, return_block, continue_block);
+                *block = return_block;
+                let value = if children[0].is_null() {
+                    NirValue::Unit
+                } else {
+                    lower_expr(resolved, children[0], builder, block)
+                };
+                builder.blocks[block.0 as usize].terminator = Terminator::Return(value);
+                *block = continue_block;
+                return;
+            }
             let val = if !children[0].is_null() {
                 lower_expr(resolved, children[0], builder, block)
             } else {
                 NirValue::Unit
             };
             builder.blocks[block.0 as usize].terminator = Terminator::Return(val);
+        }
+
+        NodeKind::BreakStatement | NodeKind::ContinueStatement => {
+            let children = ast.fixed_children(node_idx);
+            let label = (!children[0].is_null()).then(|| ast.node(children[0]).str_id);
+            let targets = builder
+                .loop_targets
+                .iter()
+                .rev()
+                .find(|target| label.is_none() || target.label == label)
+                .expect("resolution validates loop control targets");
+            let target = if node.kind == NodeKind::BreakStatement {
+                targets.break_to
+            } else {
+                targets.continue_to
+            };
+            if children[1].is_null() {
+                builder.blocks[block.0 as usize].terminator = Terminator::Goto(target);
+            } else {
+                let condition = lower_expr(resolved, children[1], builder, block);
+                let remainder = builder.new_block();
+                builder.blocks[block.0 as usize].terminator =
+                    Terminator::Branch(condition, target, remainder);
+                *block = remainder;
+            }
         }
 
         // ── Variable declarations ──────────────────────────────────
@@ -151,13 +212,38 @@ fn lower_var_decl(
     let children = ast.fixed_children(node_idx);
     // [0] pattern  [1] type  [2] value  [3] else
     let pattern_node = children[0];
+    if ast.node(pattern_node).kind == NodeKind::PatternTuple {
+        let value = lower_expr(resolved, children[2], builder, block);
+        crate::tuples::bind_pattern(resolved, pattern_node, value, builder, *block);
+        return;
+    }
+    if let Some(global) = resolved
+        .node_symbols
+        .get(&pattern_node)
+        .and_then(|symbol| builder.global_map.get(symbol))
+        .copied()
+    {
+        let value = lower_expr(resolved, children[2], builder, block);
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::StoreGlobal(global, value).in_source_scope(resolved, node_idx));
+        return;
+    }
     let local = if let Some(&sym_id) = resolved.node_symbols.get(&pattern_node) {
-        builder.local_for_symbol(sym_id)
+        let local = builder.local_for_symbol(sym_id);
+        crate::trait_parameters::bind_local_type(
+            resolved,
+            local,
+            builder.symbol_type(resolved, sym_id),
+            builder,
+        );
+        local
     } else {
         builder.alloc_local()
     };
     if children.len() > 2 && !children[2].is_null() {
         let val = lower_expr(resolved, children[2], builder, block);
+        crate::trait_parameters::copy_proof(local, val, builder, *block);
         builder.blocks[block.0 as usize]
             .stmts
             .push(NirStmt::Assign(local, NirExpr::Use(val)));
@@ -185,30 +271,60 @@ fn lower_if(
 
     builder.blocks[block.0 as usize].terminator = Terminator::Branch(cond, then_block, else_block);
 
-    lower_body_into(resolved, children[1], builder, &mut then_block);
-    // Patch then to jump to merge if not already terminated with Return.
-    if matches!(
-        builder.blocks[then_block.0 as usize].terminator,
-        Terminator::Return(NirValue::Unit)
-    ) && !is_last
-    {
-        builder.blocks[then_block.0 as usize].terminator = Terminator::Goto(merge_block);
+    if is_last {
+        lower_body_into(resolved, children[1], builder, &mut then_block);
+    } else {
+        lower_non_tail_body(resolved, children[1], builder, &mut then_block);
+        if matches!(
+            builder.blocks[then_block.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            builder.blocks[then_block.0 as usize].terminator = Terminator::Goto(merge_block);
+        }
     }
 
     if children.len() > 2 && !children[2].is_null() {
-        lower_body_into(resolved, children[2], builder, &mut else_block);
-        if matches!(
-            builder.blocks[else_block.0 as usize].terminator,
-            Terminator::Return(NirValue::Unit)
-        ) && !is_last
-        {
-            builder.blocks[else_block.0 as usize].terminator = Terminator::Goto(merge_block);
+        if is_last {
+            lower_body_into(resolved, children[2], builder, &mut else_block);
+        } else {
+            lower_non_tail_body(resolved, children[2], builder, &mut else_block);
+            if matches!(
+                builder.blocks[else_block.0 as usize].terminator,
+                Terminator::Unreachable
+            ) {
+                builder.blocks[else_block.0 as usize].terminator = Terminator::Goto(merge_block);
+            }
         }
     } else {
         builder.blocks[else_block.0 as usize].terminator = Terminator::Goto(merge_block);
     }
 
     *block = merge_block;
+}
+
+/// Discard ordinary expression values while preserving explicit control flow.
+fn lower_non_tail_body(
+    resolved: &ResolvedAst,
+    node: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    if node.is_null() {
+        return;
+    }
+    if resolved.ast.node(node).kind == NodeKind::Block {
+        for &statement in resolved.ast.multi_children(node) {
+            if !matches!(
+                builder.blocks[block.0 as usize].terminator,
+                Terminator::Unreachable
+            ) {
+                break;
+            }
+            lower_stmt(resolved, statement, builder, block, false);
+        }
+    } else {
+        lower_stmt(resolved, node, builder, block, false);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,79 +341,81 @@ fn lower_for_loop(
     let children = ast.fixed_children(node_idx);
     // ForLoop: [0] label  [1] pattern  [2] iterable  [3] body
 
-    // Evaluate the iterable in the current block.
+    let plan = builder
+        .for_loop(resolved, node_idx)
+        .expect("resolution froze the iterator protocol")
+        .clone();
     let iterable = lower_expr(resolved, children[2], builder, block);
-
-    // Desugar: let __iter = iterable.into_iter()
-    // Check if the iterable's type has IntoIterator impl.
-    let iterable_ti = resolved.node_types.get(&children[2]).copied();
-    let wk = &resolved.type_pool.well_known;
-    let has_into_iter = iterable_ti
-        .map(|ti| resolved.type_pool.has_trait_impl(ti, wk.into_iterator))
-        .unwrap_or(false);
-
     let iter_local = builder.alloc_local();
-    if has_into_iter {
-        // Call into_iter() on the iterable.
-        let into_iter_str = str_interner::intern("into_iter");
-        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
-            iter_local,
-            NirExpr::MethodCall(iterable, into_iter_str, vec![]),
-        ));
+    let iter_expression = if let Some(call) = plan.into_iter {
+        let function = builder.func_map[&call.function.expect("checked into_iter target")];
+        NirExpr::Call(function, vec![iterable])
     } else {
-        // Assume the iterable IS an iterator (or no trait dispatch available).
-        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
-            iter_local,
-            NirExpr::Use(iterable),
-        ));
-    }
+        NirExpr::Use(iterable)
+    };
+    builder.blocks[block.0 as usize]
+        .stmts
+        .push(NirStmt::Assign(iter_local, iter_expression));
     let iter_val = NirValue::Local(iter_local);
-
-    // Create basic blocks for the loop structure.
     let header_block = builder.new_block();
+    let payload_block = builder.new_block();
     let body_block = builder.new_block();
     let exit_block = builder.new_block();
-
-    // Jump from current block to header.
     builder.blocks[block.0 as usize].terminator = Terminator::Goto(header_block);
 
-    // Header: check iterator has_next().
-    let has_next_str = str_interner::intern("has_next");
-    let has_next_local = builder.alloc_local();
-    builder.blocks[header_block.0 as usize].stmts.push(NirStmt::Assign(
-        has_next_local,
-        NirExpr::MethodCall(iter_val.clone(), has_next_str, vec![]),
-    ));
+    // Each visit consumes exactly one next result. Only the explicit done tag
+    // terminates; yielded null/Unit is still an element.
+    let step_local = builder.alloc_local();
+    let function = builder.func_map[&plan.next.function.expect("checked next target")];
+    builder.blocks[header_block.0 as usize]
+        .stmts
+        .push(NirStmt::Assign(
+            step_local,
+            NirExpr::Call(function, vec![iter_val]),
+        ));
+    let done = builder.alloc_local();
+    builder.blocks[header_block.0 as usize]
+        .stmts
+        .push(NirStmt::Assign(
+            done,
+            NirExpr::EnumIs(
+                NirValue::Local(step_local),
+                plan.step_type,
+                type_pool::ITERATION_DONE_TAG,
+            ),
+        ));
     builder.blocks[header_block.0 as usize].terminator =
-        Terminator::Branch(NirValue::Local(has_next_local), body_block, exit_block);
-
-    // Body: call next() and bind the result to the loop variable.
-    let next_str = str_interner::intern("next");
-    let next_local = builder.alloc_local();
-    builder.blocks[body_block.0 as usize].stmts.push(NirStmt::Assign(
-        next_local,
-        NirExpr::MethodCall(iter_val, next_str, vec![]),
-    ));
-
-    // Bind the pattern variable to the next() result.
-    let pat = children[1];
-    if !pat.is_null() {
-        if let Some(&sym_id) = resolved.node_symbols.get(&pat) {
-            let pat_local = builder.local_for_symbol(sym_id);
-            builder.blocks[body_block.0 as usize].stmts.push(NirStmt::Assign(
-                pat_local,
-                NirExpr::Use(NirValue::Local(next_local)),
-            ));
-        }
-    }
+        Terminator::Branch(NirValue::Local(done), exit_block, payload_block);
+    let item = builder.alloc_local();
+    builder.blocks[payload_block.0 as usize]
+        .stmts
+        .push(NirStmt::Assign(
+            item,
+            NirExpr::EnumField(NirValue::Local(step_local), 0).in_source_scope(resolved, node_idx),
+        ));
+    crate::patterns::branch(
+        resolved,
+        children[1],
+        NirValue::Local(item),
+        builder,
+        payload_block,
+        body_block,
+        header_block,
+    );
 
     // Lower body into body block.
     let mut body_block_cur = body_block;
-    lower_body_into(resolved, children[3], builder, &mut body_block_cur);
+    builder.loop_targets.push(LoopTargets {
+        label: (!children[0].is_null()).then(|| ast.node(children[0]).str_id),
+        break_to: exit_block,
+        continue_to: header_block,
+    });
+    lower_non_tail_body(resolved, children[3], builder, &mut body_block_cur);
+    builder.loop_targets.pop();
     // After body, jump back to header (loop back edge).
     if matches!(
         builder.blocks[body_block_cur.0 as usize].terminator,
-        Terminator::Return(NirValue::Unit) | Terminator::Unreachable
+        Terminator::Unreachable
     ) {
         builder.blocks[body_block_cur.0 as usize].terminator = Terminator::Goto(header_block);
     }
@@ -334,11 +452,17 @@ fn lower_while_loop(
 
     // Body.
     let mut body_block_cur = body_block;
-    lower_body_into(resolved, children[2], builder, &mut body_block_cur);
+    builder.loop_targets.push(LoopTargets {
+        label: (!children[0].is_null()).then(|| ast.node(children[0]).str_id),
+        break_to: exit_block,
+        continue_to: header_block,
+    });
+    lower_non_tail_body(resolved, children[2], builder, &mut body_block_cur);
+    builder.loop_targets.pop();
     // After body, jump back to header.
     if matches!(
         builder.blocks[body_block_cur.0 as usize].terminator,
-        Terminator::Return(NirValue::Unit) | Terminator::Unreachable
+        Terminator::Unreachable
     ) {
         builder.blocks[body_block_cur.0 as usize].terminator = Terminator::Goto(header_block);
     }
@@ -352,110 +476,69 @@ fn lower_while_loop(
 
 fn lower_post_match_stmt(
     resolved: &ResolvedAst,
-    ast: &Ast,
+    _ast: &Ast,
     node_idx: NodeIndex,
     builder: &mut FunctionBuilder,
     block: &mut BlockId,
     is_last: bool,
 ) {
-    // Conservative fallback for non-tail match statements.
-    if !is_last {
-        let _ = lower_expr(resolved, node_idx, builder, block);
-        return;
+    let value = crate::patterns::lower_match(resolved, node_idx, builder, block);
+    if is_last
+        && matches!(
+            builder.blocks[block.0 as usize].terminator,
+            Terminator::Unreachable
+        )
+    {
+        builder.blocks[block.0 as usize].terminator = Terminator::Return(value);
     }
-
-    let children = ast.fixed_children(node_idx);
-    let scrutinee = lower_expr(resolved, children[0], builder, block);
-    let arms = ast.multi_children(node_idx);
-    if arms.is_empty() {
-        builder.blocks[block.0 as usize].terminator = Terminator::Return(NirValue::Unit);
-        return;
-    }
-
-    let mut current_check_block = *block;
-    for (i, &arm_node) in arms.iter().enumerate() {
-        let arm_children = ast.fixed_children(arm_node);
-        let pattern_node = arm_children[0];
-        let body_node = arm_children[1];
-
-        let is_last_arm = i == arms.len() - 1;
-        if is_wildcard_pattern(ast, pattern_node) || is_last_arm {
-            let body_val = lower_expr(resolved, body_node, builder, &mut current_check_block);
-            builder.blocks[current_check_block.0 as usize].terminator =
-                Terminator::Return(body_val);
-            return;
-        }
-
-        let pattern_val = lower_case_pattern_value(
-            resolved,
-            ast,
-            pattern_node,
-            builder,
-            &mut current_check_block,
-        );
-        let cmp_local = builder.alloc_local();
-        builder.blocks[current_check_block.0 as usize]
-            .stmts
-            .push(NirStmt::Assign(
-                cmp_local,
-                NirExpr::BinOp(BinOp::Eq, scrutinee, pattern_val),
-            ));
-
-        let mut then_block = builder.new_block();
-        let else_block = builder.new_block();
-        builder.blocks[current_check_block.0 as usize].terminator =
-            Terminator::Branch(NirValue::Local(cmp_local), then_block, else_block);
-
-        let body_val = lower_expr(resolved, body_node, builder, &mut then_block);
-        builder.blocks[then_block.0 as usize].terminator = Terminator::Return(body_val);
-
-        current_check_block = else_block;
-    }
-
-    // Should not happen when a last arm exists, but keep deterministic behavior.
-    builder.blocks[current_check_block.0 as usize].terminator = Terminator::Return(NirValue::Unit);
 }
 
-fn is_wildcard_pattern(ast: &Ast, node_idx: NodeIndex) -> bool {
-    if node_idx.is_null() {
-        return false;
-    }
-    matches!(ast.node(node_idx).kind, NodeKind::Underscore)
-}
-
+#[cfg(test)]
 fn lower_case_pattern_value(
     resolved: &ResolvedAst,
     ast: &Ast,
-    node_idx: NodeIndex,
-    _builder: &mut FunctionBuilder,
-    _block: &mut BlockId,
+    node: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
 ) -> NirValue {
-    if node_idx.is_null() {
-        return NirValue::Unit;
-    }
-    let node = ast.node(node_idx);
-    match node.kind {
-        NodeKind::PropertyPattern => {
-            let children = ast.fixed_children(node_idx);
-            let member_node = children[1];
-            if let Some(&sym_id) = resolved.node_symbols.get(&member_node) {
-                let sym = &resolved.symbols[sym_id.0 as usize];
-                if sym.kind == SymbolKind::EnumVariant {
-                    if let Some(&idx) = resolved.enum_variant_indices.get(&sym_id) {
-                        return NirValue::ConstInt(idx as i64);
-                    }
-                }
-            }
-            NirValue::Unit
+    crate::expr::lower_pattern_value(resolved, ast, node, builder, block)
+}
+
+#[cfg(test)]
+mod integer_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn statement_patterns_keep_radix_and_signed_minimum() {
+        for (text, negative, ty, expected) in [
+            ("0o52", false, "i64", NirValue::ConstInt(42)),
+            (
+                "170141183460469231731687303715884105728",
+                true,
+                "i128",
+                NirValue::ConstI128(i128::MIN),
+            ),
+            (
+                "0xffffffffffffffffffffffffffffffff",
+                false,
+                "u128",
+                NirValue::ConstU128(u128::MAX),
+            ),
+        ] {
+            let (resolved, pattern) = crate::literal::tests::resolved_integer(text, negative, ty);
+            let mut builder =
+                FunctionBuilder::new(nsbc::FuncId(0), str_interner::intern("pattern"));
+            let mut block = builder.new_block();
+            assert_eq!(
+                lower_case_pattern_value(
+                    &resolved,
+                    &resolved.ast,
+                    pattern,
+                    &mut builder,
+                    &mut block
+                ),
+                expected
+            );
         }
-        NodeKind::Int => {
-            let text = str_interner::get(node.str_id);
-            NirValue::ConstInt(text.parse().unwrap_or(0))
-        }
-        NodeKind::Bool => {
-            let text = str_interner::get(node.str_id);
-            NirValue::ConstBool(text == "true")
-        }
-        _ => NirValue::Unit,
     }
 }

@@ -1,6 +1,6 @@
 //! Nessa CLI — the command-line interface for the Nessa language.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::process;
 
 fn main() {
@@ -33,21 +33,20 @@ fn print_usage() {
         "Usage: nessa <command> [options]\n\
          \n\
          Commands:\n\
-         \x20 run <file.ns>      Compile and run a source file\n\
-         \x20 build <file.ns>    Compile to .nsbc archive\n\
-         \x20 check <file.ns>    Type-check without running\n\
+         \x20 run <file.ns|file.nsbc|directory>  Run source, package or archive\n\
+         \x20 build <file.ns|directory>  Compile to .nsbc archive\n\
+         \x20 check <file.ns|directory>  Type-check without running\n\
          \x20 version            Print version\n\
          \x20 help               Print this help\n\
          \n\
          Options:\n\
-         \x20 --emit-ast-dump    Write AST dump to ast.lisp"
+         \x20 --emit-ast-dump    Write a source AST dump beside the input"
     );
 }
 
-/// Extract the source file path and flags from command arguments.
+/// Extract the input file path and flags without assuming a text input.
 struct CmdArgs<'a> {
     file: &'a str,
-    source: String,
     emit_ast_dump: bool,
 }
 
@@ -67,32 +66,41 @@ fn parse_cmd_args(args: &[String]) -> CmdArgs<'_> {
     }
 
     let Some(file) = file else {
-        eprintln!("error: missing source file");
+        eprintln!("error: missing input file");
         process::exit(1);
-    };
-
-    let source = match std::fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read {file}: {e}");
-            process::exit(1);
-        }
     };
 
     CmdArgs {
         file,
-        source,
         emit_ast_dump,
     }
 }
 
-fn maybe_emit_ast_dump(cmd: &CmdArgs<'_>) {
+fn read_source(cmd: &CmdArgs<'_>) -> String {
+    match std::fs::read_to_string(cmd.file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", cmd.file);
+            process::exit(1);
+        }
+    }
+}
+
+fn maybe_emit_ast_dump(cmd: &CmdArgs<'_>, source: Option<&str>) {
     if !cmd.emit_ast_dump {
         return;
     }
-    let output_path = PathBuf::from(cmd.file).with_extension("lisp");
+    let input = Path::new(cmd.file);
+    let output_path = match source {
+        Some(_) => input.with_extension("lisp"),
+        None => input.join("package.lisp"),
+    };
     let driver = driver::Driver::new();
-    match driver.emit_ast_dump(&cmd.source, &output_path) {
+    let result = match source {
+        Some(source) => driver.emit_ast_dump(source, &output_path),
+        None => driver.emit_package_ast_dump(input, &output_path),
+    };
+    match result {
         Ok(()) => {
             eprintln!("wrote {}", output_path.display());
         }
@@ -105,10 +113,26 @@ fn maybe_emit_ast_dump(cmd: &CmdArgs<'_>) {
 
 fn cmd_run(args: &[String]) {
     let cmd = parse_cmd_args(args);
-    maybe_emit_ast_dump(&cmd);
-
     let driver = driver::Driver::new();
-    match driver.run(&cmd.source) {
+    let input = Path::new(cmd.file);
+    let result = if input.is_dir() {
+        maybe_emit_ast_dump(&cmd, None);
+        driver.run_package(input)
+    } else if input
+        .extension()
+        .is_some_and(|extension| extension == "nsbc")
+    {
+        if cmd.emit_ast_dump {
+            eprintln!("error: --emit-ast-dump requires source input");
+            process::exit(1);
+        }
+        driver.run_archive_file(Path::new(cmd.file))
+    } else {
+        let source = read_source(&cmd);
+        maybe_emit_ast_dump(&cmd, Some(&source));
+        driver.run(&source)
+    };
+    match result {
         driver::RunResult::Ok => {}
         driver::RunResult::CompileError(diagnostics) => {
             for diag in &diagnostics {
@@ -128,11 +152,21 @@ fn cmd_run(args: &[String]) {
 
 fn cmd_build(args: &[String]) {
     let cmd = parse_cmd_args(args);
-    maybe_emit_ast_dump(&cmd);
-
-    let output_path = PathBuf::from(cmd.file).with_extension("nsbc");
+    let input = Path::new(cmd.file);
     let driver = driver::Driver::new();
-    match driver.compile_to_archive(&cmd.source, &output_path) {
+    let (output_path, result) = if input.is_dir() {
+        maybe_emit_ast_dump(&cmd, None);
+        let output = input.join("package.nsbc");
+        let result = driver.compile_package_to_archive(input, &output);
+        (output, result)
+    } else {
+        let source = read_source(&cmd);
+        maybe_emit_ast_dump(&cmd, Some(&source));
+        let output = input.with_extension("nsbc");
+        let result = driver.compile_to_archive(&source, &output);
+        (output, result)
+    };
+    match result {
         Ok(()) => {
             println!("wrote {}", output_path.display());
         }
@@ -145,10 +179,16 @@ fn cmd_build(args: &[String]) {
 
 fn cmd_check(args: &[String]) {
     let cmd = parse_cmd_args(args);
-    maybe_emit_ast_dump(&cmd);
-
     let driver = driver::Driver::new();
-    let result = driver.compile(&cmd.source);
+    let input = Path::new(cmd.file);
+    let result = if input.is_dir() {
+        maybe_emit_ast_dump(&cmd, None);
+        driver.compile_package(input)
+    } else {
+        let source = read_source(&cmd);
+        maybe_emit_ast_dump(&cmd, Some(&source));
+        driver.compile(&source)
+    };
     if result.has_errors {
         eprintln!("check failed with errors");
         process::exit(1);

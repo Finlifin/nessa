@@ -29,7 +29,7 @@ definition_core ->
 ```ebnf
 -- 函数是没有async的
 function_def -> fn id ((param*)) (-> expr)? (handles expr)? ((= expr) | block)
-effect_def -> async? effect id (param*) (-> expr)?
+effect_def -> async? effect id (effect_param*) (-> expr)?
 ```
 
 ## 结构与枚举
@@ -105,10 +105,19 @@ param_typed -> pattern : expr
 param_self -> self
 param_varargs -> ...id (: expr)?
 param_lambda -> lambda pattern (: expr)?
+
+effect_param -> param | param_catch
+param_catch -> catch id (: expr)?
 ```
+
+`catch` 参数仅用于效应声明，同一效应最多有一个。它绑定运行时捕获的
+continuation，不是效应调用者传入的参数；其类型为 `Continuation`，省略类型
+注解时使用该类型，显式注解也必须指向该类型。
 
 ## 可见性与关联性关键字
 
 - `pub`、`private` 与 `assoc` 已在词法层作为保留关键字。
 - `assoc_decl -> assoc id : expr = expr`。
 - `assoc_decl` 仅允许出现在 `trait`、`impl`、`extend` 的语句体中。
+- 此语法构建独立关联绑定AST；Type关联声明支持具体trait实现绑定和签名替换，
+  关联常量及动态关联trait视图仍明确拒绝，不将其降为普通常量。

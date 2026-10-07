@@ -104,6 +104,11 @@ impl Interner {
         &self.strings[id.0 as usize]
     }
 
+    /// Look up a handle without panicking if it is outside this interner.
+    pub fn try_get(&self, id: StrId) -> Option<&str> {
+        self.strings.get(id.0 as usize).map(String::as_str)
+    }
+
     /// Total number of interned strings.
     pub fn len(&self) -> usize {
         self.strings.len()
@@ -352,6 +357,11 @@ pub fn get(id: StrId) -> String {
     with_global(|i| i.get(id).to_owned())
 }
 
+/// Retrieve a global string, returning `None` for an invalid handle.
+pub fn try_get(id: StrId) -> Option<String> {
+    with_global(|i| i.try_get(id).map(str::to_owned))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -375,6 +385,19 @@ mod tests {
         let mut interner = Interner::new();
         let id = interner.intern("foo");
         assert_eq!(interner.get(id), "foo");
+    }
+
+    #[test]
+    fn checked_lookup_rejects_invalid_handles() {
+        let mut interner = Interner::new();
+        let id = interner.intern("checked");
+        assert_eq!(interner.try_get(id), Some("checked"));
+        assert_eq!(interner.try_get(StrId::from_raw(u32::MAX)), None);
+        assert_eq!(
+            try_get(intern("checked_global")).as_deref(),
+            Some("checked_global")
+        );
+        assert_eq!(try_get(StrId::from_raw(u32::MAX)), None);
     }
 
     #[test]

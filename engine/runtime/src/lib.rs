@@ -1,13 +1,18 @@
-use nsbc::{FuncId, Reg};
-use stack_pool::StackHandle;
+use nsbc::{FuncId, GlobalInfo, Reg};
 use type_pool::TypeIndex;
 
+pub mod stacks;
+pub use stacks::{ContinuationId, PromptId, StackContext, StackError, TaskStacks};
+pub mod numeric;
+pub use numeric::{Number, NumericError};
+
 pub mod builtin;
-pub use builtin::{
-    catalog_lookup, catalog_register_intrinsic_types, catalog_register_type, lookup_builtin_fn_id,
-    lookup_builtin_fn_meta, BuiltinCatalog, BuiltinFnId, BuiltinFnMeta, BuiltinKind, BUILTIN_FN_META,
-};
 pub use builtin::ids;
+pub use builtin::{
+    BUILTIN_ABI_VERSION, BUILTIN_FN_META, BuiltinCatalog, BuiltinFnId, BuiltinFnMeta, BuiltinKind,
+    catalog_lookup, catalog_register_intrinsic_types, catalog_register_type, lookup_builtin_fn_id,
+    lookup_builtin_fn_meta,
+};
 
 // ---------------------------------------------------------------------------
 // TaggedValue — the universal 64-bit runtime value
@@ -23,6 +28,7 @@ pub use builtin::ids;
 ///   1xx  Reserved
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct TaggedValue(u64);
 
 // Tag constants
@@ -43,6 +49,9 @@ const IMM_SYMBOL: u64 = 0x4;
 const IMM_NULL: u64 = 0x5;
 const IMM_UNIT: u64 = 0x6;
 const IMM_CHAR: u64 = 0x7;
+const IMM_TYPE: u64 = 0x8;
+const IMM_ENUM: u64 = 0x9;
+const IMM_TRAIT_PROOF: u64 = 0xA;
 
 impl TaggedValue {
     pub const UNIT: Self = Self::make_imm(IMM_UNIT, 0);
@@ -56,31 +65,46 @@ impl TaggedValue {
 
     // -- Constructors --------------------------------------------------------
 
-    pub fn from_i64(v: i64) -> Self {
-        // Fits in 57 bits?
-        let max = (1i64 << 56) - 1;
-        let min = -(1i64 << 56);
-        if v >= min && v <= max {
-            Self::make_imm(IMM_I_SMALL, (v as u64) & ((1u64 << 57) - 1))
-        } else {
-            // TODO: promote to heap BigInt
-            Self::make_imm(IMM_I_SMALL, (v as u64) & ((1u64 << 57) - 1))
-        }
+    /// Encode an immediate integer, or return None when heap storage is needed.
+    pub fn try_from_i64(v: i64) -> Option<Self> {
+        (-(1_i64 << 56)..(1_i64 << 56))
+            .contains(&v)
+            .then(|| Self::make_imm(IMM_I_SMALL, (v as u64) & ((1_u64 << 57) - 1)))
     }
 
-    pub fn from_u64(v: u64) -> Self {
-        if v < (1u64 << 57) {
-            Self::make_imm(IMM_U_SMALL, v)
-        } else {
-            // TODO: promote to heap BigUint
-            Self::make_imm(IMM_U_SMALL, v & ((1u64 << 57) - 1))
-        }
+    /// Encode an immediate unsigned integer without truncation.
+    pub fn try_from_u64(v: u64) -> Option<Self> {
+        (v < (1_u64 << 57)).then(|| Self::make_imm(IMM_U_SMALL, v))
     }
 
-    pub fn from_f64(v: f64) -> Self {
-        // Store truncated mantissa; for full precision we'd box on heap.
+    /// Encode a float only when all bits survive immediate compression.
+    pub fn try_from_f64(v: f64) -> Option<Self> {
         let bits = v.to_bits();
-        Self::make_imm(IMM_F64, bits >> 7) // keep top 57 bits
+        (bits & 0x7f == 0).then(|| Self::make_imm(IMM_F64, bits >> 7))
+    }
+
+    /// Encode a known small integer. Use the VM numeric factory for arbitrary values.
+    ///
+    /// # Panics
+    /// Panics when `v` needs heap storage.
+    pub fn from_i64(v: i64) -> Self {
+        Self::try_from_i64(v).expect("integer needs heap storage")
+    }
+
+    /// Encode a known small unsigned integer.
+    ///
+    /// # Panics
+    /// Panics when `v` needs heap storage.
+    pub fn from_u64(v: u64) -> Self {
+        Self::try_from_u64(v).expect("unsigned integer needs heap storage")
+    }
+
+    /// Encode a float known to fit the compressed immediate representation exactly.
+    ///
+    /// # Panics
+    /// Panics when any float bits would be lost; use the VM numeric factory instead.
+    pub fn from_f64(v: f64) -> Self {
+        Self::try_from_f64(v).expect("float needs heap storage")
     }
 
     pub fn from_bool(v: bool) -> Self {
@@ -89,6 +113,45 @@ impl TaggedValue {
 
     pub fn from_char(ch: char) -> Self {
         Self::make_imm(IMM_CHAR, ch as u64)
+    }
+
+    /// Construct a type value holding a pool-local index, not a stable TypeId.
+    /// Pool membership is checked by the VM using its active type pool.
+    pub fn from_type(ty: TypeIndex) -> Option<Self> {
+        (ty != TypeIndex::INVALID).then(|| Self::make_imm(IMM_TYPE, u64::from(ty.as_u32())))
+    }
+
+    /// Encode a pool-local enum identity and a 25-bit variant tag. The VM
+    /// checks pool membership and whether this variant has an empty payload.
+    pub fn from_enum(ty: TypeIndex, variant: u32) -> Option<Self> {
+        (ty != TypeIndex::INVALID && variant < (1 << 25)).then(|| {
+            Self::make_imm(
+                IMM_ENUM,
+                (u64::from(ty.as_u32()) << 25) | u64::from(variant),
+            )
+        })
+    }
+
+    /// Decode enum representation only; legacy symbols are never enum values.
+    pub fn as_enum(self) -> Option<(TypeIndex, u32)> {
+        if !self.is_immediate() || self.imm_sub() != IMM_ENUM {
+            return None;
+        }
+        let data = self.imm_data();
+        let ty = TypeIndex::from_raw((data >> 25) as u32);
+        (ty != TypeIndex::INVALID).then_some((ty, (data & ((1 << 25) - 1)) as u32))
+    }
+
+    /// Encode an opaque VM proof handle. IDs are globally unique and registry
+    /// membership, view and implementor are checked before use.
+    pub fn from_trait_proof(id: u64) -> Option<Self> {
+        (id != 0 && id < (1 << 57)).then(|| Self::make_imm(IMM_TRAIT_PROOF, id))
+    }
+
+    pub fn as_trait_proof(self) -> Option<u64> {
+        (self.is_immediate() && self.imm_sub() == IMM_TRAIT_PROOF)
+            .then(|| self.imm_data())
+            .filter(|&id| id != 0)
     }
 
     pub fn from_symbol(sym: u64) -> Self {
@@ -184,6 +247,17 @@ impl TaggedValue {
         }
     }
 
+    /// Decode a type value, rejecting malformed raw payloads and INVALID.
+    /// This validates the representation; the VM validates pool membership.
+    pub fn as_type(self) -> Option<TypeIndex> {
+        if !self.is_immediate() || self.imm_sub() != IMM_TYPE {
+            return None;
+        }
+        let raw = u32::try_from(self.imm_data()).ok()?;
+        let ty = TypeIndex::from_raw(raw);
+        (ty != TypeIndex::INVALID).then_some(ty)
+    }
+
     /// Get the raw heap pointer (payload pointer, after ObjectHeader).
     pub fn as_heap_ptr(self) -> Option<*const u8> {
         if self.is_heap() {
@@ -217,6 +291,8 @@ impl std::fmt::Debug for TaggedValue {
             write!(f, "{v}")
         } else if let Some(v) = self.as_char() {
             write!(f, "'{v}'")
+        } else if let Some(ty) = self.as_type() {
+            write!(f, "Type({ty:?})")
         } else if self.is_heap() {
             write!(f, "HeapObj({:#x})", self.0 & !TAG_MASK)
         } else {
@@ -266,16 +342,29 @@ impl Default for RegisterFile {
 /// A frame on the call stack.
 #[derive(Clone)]
 pub struct CallFrame {
+    pub display_state: Option<DisplayState>,
     /// Return address (instruction index to return to).
     pub return_pc: u32,
     /// Function being executed.
     pub func_id: FuncId,
     /// Saved register values (spilled before call).
     pub saved_regs: Vec<(Reg, TaggedValue)>,
+    /// Caller-local values, moved into the frame while the callee executes.
+    pub local_slots: Vec<TaggedValue>,
     /// Evidence chain for effect handlers.
     pub evidence: Vec<HandlerRef>,
     /// Closure environment pointer (for LoadCapture), None if not a closure call.
     pub closure_env: Option<TaggedValue>,
+}
+
+/// Traversal state is owned by a frame/segment; cloning a continuation copies
+/// its path independently. Every retained receiver is an enumerated GC root.
+#[derive(Clone, Default)]
+pub struct DisplayState {
+    pub depth: usize,
+    pub ancestors: Vec<TaggedValue>,
+    pub current_target: bool,
+    pub inline_count: usize,
 }
 
 /// A reference to an installed effect handler.
@@ -309,20 +398,12 @@ pub struct TaskId(pub u64);
 pub struct TaskState {
     pub id: TaskId,
     pub status: TaskStatus,
-    pub registers: RegisterFile,
-    pub call_stack: Vec<CallFrame>,
-    /// Current program counter (instruction index within current function).
-    pub pc: u32,
-    /// Current function being executed.
-    pub current_func: FuncId,
+    /// Active, delimited and captured execution stacks owned by this task.
+    pub stacks: TaskStacks,
     /// Parent task (for structured concurrency / task tree).
     pub parent: Option<TaskId>,
     /// Child tasks spawned by this task.
     pub children: Vec<TaskId>,
-    /// Effect handler stack for this task.
-    pub handler_stack: Vec<EffectHandler>,
-    /// mmap'd stack slot from the stack pool (if allocated).
-    pub stack: Option<StackHandle>,
 }
 
 impl TaskState {
@@ -330,15 +411,25 @@ impl TaskState {
         Self {
             id,
             status: TaskStatus::Ready,
-            registers: RegisterFile::new(),
-            call_stack: Vec::new(),
-            pc: 0,
-            current_func: func_id,
+            stacks: TaskStacks::new(func_id),
             parent: None,
             children: Vec::new(),
-            handler_stack: Vec::new(),
-            stack: None,
         }
+    }
+}
+
+// Existing register and frame operations always address the active segment.
+impl std::ops::Deref for TaskState {
+    type Target = StackContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.stacks.active()
+    }
+}
+
+impl std::ops::DerefMut for TaskState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.stacks.active_mut()
     }
 }
 
@@ -354,6 +445,10 @@ pub struct EffectHandler {
     pub handler_func: FuncId,
     /// Whether this is an async handler (spawns child task).
     pub is_async: bool,
+    /// Closure and its captures, retained as a GC root while installed.
+    pub closure_env: Option<TaggedValue>,
+    /// Runtime-provided continuation argument position for capturing handlers.
+    pub continuation_param: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -367,11 +462,15 @@ pub struct BytecodeStore {
 }
 
 pub struct FunctionCode {
+    pub display_owner: Option<type_pool::TypeIndex>,
     pub func_id: FuncId,
     pub instructions: Vec<u32>, // encoded 32-bit instruction words
     pub register_count: u8,
     pub param_count: u8,
     pub is_closure: bool,
+    pub function_type: type_pool::TypeIndex,
+    /// Explicit entry layout; None retains legacy value-only interpretation.
+    pub abi: Option<nsbc::FunctionAbi>,
 }
 
 impl BytecodeStore {
@@ -392,6 +491,10 @@ impl BytecodeStore {
         &self.functions[id.0 as usize]
     }
 
+    pub fn try_get_function(&self, id: FuncId) -> Option<&FunctionCode> {
+        self.functions.get(id.0 as usize)
+    }
+
     pub fn function_count(&self) -> usize {
         self.functions.len()
     }
@@ -410,36 +513,181 @@ impl Default for BytecodeStore {
 /// Table of global variables.
 pub struct GlobalTable {
     values: Vec<TaggedValue>,
+    slots: Vec<GlobalSlot>,
+    schema_initialized: bool,
+}
+
+struct GlobalSlot {
+    info: GlobalInfo,
+    initialized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalError {
+    InvalidIndex(u32),
+    Uninitialized(u32),
+    Immutable(u32),
+    SchemaAlreadyInitialized,
+    OutOfMemory,
 }
 
 impl GlobalTable {
     pub fn new() -> Self {
-        Self { values: Vec::new() }
+        Self {
+            values: Vec::new(),
+            slots: Vec::new(),
+            schema_initialized: false,
+        }
+    }
+
+    /// Install a schema before publishing any globals. Values remain unreadable
+    /// until their first store, including const bindings.
+    pub fn initialize(&mut self, schema: &[GlobalInfo]) -> Result<(), GlobalError> {
+        if self.schema_initialized || !self.values.is_empty() {
+            return Err(GlobalError::SchemaAlreadyInitialized);
+        }
+        self.values
+            .try_reserve_exact(schema.len())
+            .map_err(|_| GlobalError::OutOfMemory)?;
+        self.slots
+            .try_reserve_exact(schema.len())
+            .map_err(|_| GlobalError::OutOfMemory)?;
+        self.values.resize(schema.len(), TaggedValue::UNIT);
+        self.slots.extend(schema.iter().map(|&info| GlobalSlot {
+            info,
+            initialized: false,
+        }));
+        self.schema_initialized = true;
+        Ok(())
     }
 
     pub fn alloc(&mut self, init: TaggedValue) -> u32 {
         let idx = self.values.len() as u32;
         self.values.push(init);
+        self.slots.push(GlobalSlot {
+            info: GlobalInfo {
+                type_index: type_pool::Intrinsic::Any.type_index(),
+                is_mutable: true,
+            },
+            initialized: true,
+        });
         idx
     }
 
-    pub fn get(&self, idx: u32) -> TaggedValue {
-        self.values[idx as usize]
+    pub fn get(&self, idx: u32) -> Result<TaggedValue, GlobalError> {
+        let slot = self
+            .slots
+            .get(idx as usize)
+            .ok_or(GlobalError::InvalidIndex(idx))?;
+        if !slot.initialized {
+            return Err(GlobalError::Uninitialized(idx));
+        }
+        Ok(self.values[idx as usize])
     }
 
-    pub fn set(&mut self, idx: u32, val: TaggedValue) {
+    pub fn set(&mut self, idx: u32, val: TaggedValue) -> Result<(), GlobalError> {
+        self.check_store(idx)?;
         self.values[idx as usize] = val;
+        self.slots[idx as usize].initialized = true;
+        Ok(())
+    }
+
+    /// Check write permission before any potentially allocating type coercion.
+    pub fn check_store(&self, idx: u32) -> Result<GlobalInfo, GlobalError> {
+        let slot = self
+            .slots
+            .get(idx as usize)
+            .ok_or(GlobalError::InvalidIndex(idx))?;
+        if slot.initialized && !slot.info.is_mutable {
+            return Err(GlobalError::Immutable(idx));
+        }
+        Ok(slot.info)
     }
 
     /// Iterate over all values (for GC root scanning).
     pub fn values(&self) -> &[TaggedValue] {
         &self.values
     }
+
+    /// Update registered value slots during exclusive stopped-world root tracing.
+    /// Forwarding preserves each slot's type and initialization state.
+    pub fn values_mut(&mut self) -> &mut [TaggedValue] {
+        &mut self.values
+    }
 }
 
 impl Default for GlobalTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod global_tests {
+    use super::*;
+
+    #[test]
+    fn globals_track_initialization_and_const_permissions_separately_from_values() {
+        let mut table = GlobalTable::new();
+        table
+            .initialize(&[
+                GlobalInfo {
+                    type_index: type_pool::Intrinsic::Unit.type_index(),
+                    is_mutable: false,
+                },
+                GlobalInfo {
+                    type_index: type_pool::Intrinsic::Any.type_index(),
+                    is_mutable: true,
+                },
+            ])
+            .unwrap();
+        assert_eq!(table.get(0), Err(GlobalError::Uninitialized(0)));
+        assert_eq!(
+            table.get(u32::MAX),
+            Err(GlobalError::InvalidIndex(u32::MAX))
+        );
+        assert_eq!(
+            table.set(2, TaggedValue::UNIT),
+            Err(GlobalError::InvalidIndex(2))
+        );
+        table.set(0, TaggedValue::UNIT).unwrap();
+        assert_eq!(table.get(0), Ok(TaggedValue::UNIT));
+        assert_eq!(
+            table.set(0, TaggedValue::TRUE),
+            Err(GlobalError::Immutable(0))
+        );
+        assert_eq!(table.get(0), Ok(TaggedValue::UNIT));
+        table.set(1, TaggedValue::FALSE).unwrap();
+        table.set(1, TaggedValue::TRUE).unwrap();
+        assert_eq!(table.get(1), Ok(TaggedValue::TRUE));
+        assert_eq!(table.values(), &[TaggedValue::UNIT, TaggedValue::TRUE]);
+        assert_eq!(
+            table.initialize(&[]),
+            Err(GlobalError::SchemaAlreadyInitialized)
+        );
+    }
+
+    #[test]
+    fn host_allocations_remain_initialized_mutable_globals() {
+        let mut table = GlobalTable::new();
+        let index = table.alloc(TaggedValue::NULL);
+        assert_eq!(table.get(index), Ok(TaggedValue::NULL));
+        table.set(index, TaggedValue::TRUE).unwrap();
+        assert_eq!(table.get(index), Ok(TaggedValue::TRUE));
+        assert_eq!(
+            table.initialize(&[]),
+            Err(GlobalError::SchemaAlreadyInitialized)
+        );
+    }
+
+    #[test]
+    fn an_empty_schema_is_still_installed_only_once() {
+        let mut table = GlobalTable::new();
+        table.initialize(&[]).unwrap();
+        assert_eq!(
+            table.initialize(&[]),
+            Err(GlobalError::SchemaAlreadyInitialized)
+        );
     }
 }
 
@@ -470,6 +718,12 @@ impl ConstantPool {
     /// Iterate over all values (for GC root scanning).
     pub fn values(&self) -> &[TaggedValue] {
         &self.values
+    }
+
+    /// Update registered value slots during exclusive stopped-world root tracing.
+    /// Forwarding preserves each slot's type and initialization state.
+    pub fn values_mut(&mut self) -> &mut [TaggedValue] {
+        &mut self.values
     }
 }
 
@@ -549,6 +803,68 @@ impl ClosureEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_values_keep_pool_local_indices_and_distinct_immediate_identity() {
+        for raw in [0, 42, u32::MAX - 1] {
+            let ty = TypeIndex::from_raw(raw);
+            let value = TaggedValue::from_type(ty).unwrap();
+            assert_eq!(value.as_type(), Some(ty));
+            assert!(value.is_immediate());
+            assert!(!value.is_heap());
+            assert!(!value.is_null());
+            assert!(!value.is_unit());
+            assert_eq!(value.as_i64(), None);
+            assert_eq!(value.as_u64(), None);
+            assert_eq!(value.as_f64(), None);
+            assert_eq!(value.as_bool(), None);
+            assert_eq!(value.as_char(), None);
+        }
+        assert_ne!(
+            TaggedValue::from_type(TypeIndex::from_raw(0)),
+            TaggedValue::from_type(TypeIndex::from_raw(1))
+        );
+        assert_eq!(TaggedValue::TRUE.as_type(), None);
+        assert_eq!(TaggedValue::from_i64(42).as_type(), None);
+    }
+
+    #[test]
+    fn enum_immediates_preserve_identity_and_reject_legacy_symbols() {
+        for ty in [0, 1, u32::MAX - 1] {
+            for variant in [0, (1 << 25) - 1] {
+                let ty = TypeIndex::from_raw(ty);
+                let value = TaggedValue::from_enum(ty, variant).unwrap();
+                assert_eq!(value.as_enum(), Some((ty, variant)));
+                assert_eq!(value.as_type(), None);
+                assert_eq!(TaggedValue::from_symbol(value.imm_data()).as_enum(), None);
+            }
+        }
+        assert_eq!(TaggedValue::from_enum(TypeIndex::INVALID, 0), None);
+        assert_eq!(
+            TaggedValue::from_enum(TypeIndex::from_raw(0), 1 << 25),
+            None
+        );
+        assert_eq!(
+            TaggedValue::from_raw(TaggedValue::make_imm(IMM_ENUM, u64::from(u32::MAX) << 25).raw())
+                .as_enum(),
+            None
+        );
+        assert_ne!(
+            TaggedValue::from_enum(TypeIndex::from_raw(1), 0),
+            TaggedValue::from_enum(TypeIndex::from_raw(2), 0)
+        );
+    }
+
+    #[test]
+    fn type_values_reject_invalid_indices_and_oversized_raw_payloads() {
+        assert_eq!(TaggedValue::from_type(TypeIndex::INVALID), None);
+        for raw in [u64::from(u32::MAX), 1_u64 << 32, (1_u64 << 57) - 1] {
+            let malformed = TaggedValue::from_raw(
+                TAG_IMM | (IMM_TYPE << IMM_SUB_SHIFT) | (raw << IMM_DATA_SHIFT),
+            );
+            assert_eq!(malformed.as_type(), None);
+        }
+    }
 
     #[test]
     fn tagged_value_i64() {

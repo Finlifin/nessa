@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::{Ast, NodeIndex, NodeType};
@@ -35,7 +36,7 @@ fn dump_node(ast: &Ast, index: NodeIndex, buf: &mut String) {
     match nt {
         NodeType::NoChild => {
             // Leaf node – print source text if available, otherwise just the kind.
-            let text = span_text(ast, node.span);
+            let text = leaf_text(ast, index);
             if let Some(t) = text {
                 let _ = write!(buf, "({kind_name} \"{t}\")");
             } else {
@@ -184,7 +185,7 @@ fn dump_node_pretty(ast: &Ast, index: NodeIndex, buf: &mut String, depth: usize)
 
     if children.is_empty() {
         // Leaf node.
-        let text = span_text(ast, node.span);
+        let text = leaf_text(ast, index);
         if let Some(t) = text {
             let _ = write!(buf, "({kind_name} \"{t}\")");
         } else {
@@ -206,11 +207,42 @@ fn dump_node_pretty(ast: &Ast, index: NodeIndex, buf: &mut String, depth: usize)
 }
 
 /// Try to extract the source text for a span from the AST's stored source.
-fn span_text(ast: &Ast, span: rustc_span::Span) -> Option<&str> {
-    if ast.source.is_empty() || span.is_dummy() {
-        return None;
+// Parsed token text remains authoritative. Generated module identifiers have
+// no lexical range and use their interned name in either dump format.
+fn leaf_text(ast: &Ast, index: NodeIndex) -> Option<Cow<'_, str>> {
+    if let Some(text) = ast.original_node_text(index) {
+        return Some(Cow::Borrowed(text));
     }
-    let lo = span.lo().0 as usize;
-    let hi = span.hi().0 as usize;
-    ast.source.get(lo..hi)
+    let node = ast.node(index);
+    (node.kind == crate::NodeKind::Id
+        && node.span.is_dummy()
+        && node.str_id != str_interner::StrId::from_raw(0))
+    .then(|| Cow::Owned(str_interner::get(node.str_id)))
+}
+
+#[cfg(test)]
+fn span_text(ast: &Ast, span: rustc_span::Span) -> Option<&str> {
+    ast.raw_span_text(span)
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_span::{BytePos, Span};
+
+    use super::*;
+
+    #[test]
+    fn source_span_dump_handles_absent_empty_out_of_bounds_and_unicode_source() {
+        let span = Span::new(BytePos(1), BytePos(3));
+        assert_eq!(span_text(&Ast::new(), span), None);
+        assert_eq!(
+            span_text(&Ast::new().with_source(String::new()), span),
+            None
+        );
+        let ast = Ast::new().with_source("hé".into());
+        assert_eq!(span_text(&ast, span), Some("é"));
+        assert_eq!(span_text(&ast, Span::new(BytePos(2), BytePos(3))), None);
+        assert_eq!(span_text(&ast, Span::new(BytePos(10), BytePos(12))), None);
+        assert_eq!(span_text(&ast, rustc_span::DUMMY_SP), None);
+    }
 }

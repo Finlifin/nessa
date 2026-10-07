@@ -1,4 +1,12 @@
 -- std.string — string builtins
 
+use .builtin.*
+
 pub const str_len: fn(String) -> i64 = .str_len'builtin
 pub const str_concat: fn(String, String) -> String = .str_concat'builtin
+
+impl String {
+    pub fn concat(self, other: String) -> String { str_concat(self, other) }
+    -- Length follows str_len and counts UTF-8 bytes.
+    pub fn len(self) -> i64 { str_len(self) }
+}

@@ -1,10 +1,13 @@
 pub mod emitter;
+pub use source_span::{
+    LocatedSourceSpan, RawByteRange, SourceMapping, SourceSpanError, SourceSpanMapper,
+};
 
 use ariadne::{Color, ColorGenerator, Label, Report, ReportKind, Source};
-use rustc_span::{FileNameDisplayPreference, SourceMap, Span};
+use rustc_span::{BytePos, FileNameDisplayPreference, SourceMap, Span};
 use std::{
-    cell::{Cell, RefCell},
-    fmt, mem,
+    cell::{Cell, Ref, RefCell},
+    fmt,
 };
 
 // 罢了, warning也用这个trait吧
@@ -46,6 +49,7 @@ impl Level {
 #[derive(Debug, Clone)]
 pub struct DiagnosticMessage {
     pub span: Span,
+    pub source_start: Option<BytePos>,
     pub message: String,
     pub level: Level,
 }
@@ -54,6 +58,7 @@ impl DiagnosticMessage {
     pub fn new(span: Span, message: String, level: Level) -> Self {
         Self {
             span,
+            source_start: None,
             message,
             level,
         }
@@ -67,6 +72,7 @@ pub struct Diagnostic {
     pub code: Option<u32>,
     pub message: String,
     pub primary_span: Option<Span>,
+    pub primary_source_start: Option<BytePos>,
     pub labels: Vec<DiagnosticMessage>,
     pub notes: Vec<String>,
     pub helps: Vec<String>,
@@ -79,6 +85,7 @@ impl Diagnostic {
             code: None,
             message,
             primary_span: None,
+            primary_source_start: None,
             labels: Vec::new(),
             notes: Vec::new(),
             helps: Vec::new(),
@@ -137,6 +144,21 @@ impl DiagnosticBuilder {
 
     pub fn with_primary_span(mut self, span: Span) -> Self {
         self.diagnostic.primary_span = Some(span);
+        self.diagnostic.primary_source_start = None;
+        self
+    }
+
+    /// Attach an authenticated owning file, including genuine zero-width spans.
+    pub fn with_primary_source_span(mut self, location: LocatedSourceSpan) -> Self {
+        self.diagnostic.primary_span = Some(location.span);
+        self.diagnostic.primary_source_start = location.file_start;
+        self
+    }
+
+    pub fn with_error_source_span(mut self, location: LocatedSourceSpan, message: String) -> Self {
+        let mut label = DiagnosticMessage::new(location.span, message, Level::Error);
+        label.source_start = location.file_start;
+        self.diagnostic.labels.push(label);
         self
     }
 
@@ -234,12 +256,12 @@ impl<'a> DiagnosticContext<'a> {
         self.warning_count.get() > 0
     }
 
-    pub unsafe fn diagnostics<'b>(&'b self) -> &'b [Diagnostic] {
-        unsafe {
-            mem::transmute::<&[Diagnostic], &'b [Diagnostic]>(
-                self.emitted_diagnostics.borrow().as_ref(),
-            )
-        }
+    /// Borrow stored diagnostics while retaining the RefCell's borrow guard.
+    /// Clone the slice before emitting more diagnostics into this context.
+    pub fn diagnostics(&self) -> Ref<'_, [Diagnostic]> {
+        Ref::map(self.emitted_diagnostics.borrow(), |diagnostics| {
+            diagnostics.as_slice()
+        })
     }
 
     /// Create a new diagnostic builder
@@ -259,18 +281,94 @@ impl<'a> DiagnosticContext<'a> {
         DiagnosticBuilder::help(message)
     }
 
-    /// Emit diagnostic using ariadne
-    fn emit_to_ariadne(&self, diagnostic: &Diagnostic) {
-        let primary_span = diagnostic.primary_span.unwrap_or_else(|| {
-            // Use the first label span if no primary span is provided
-            diagnostic
-                .labels
-                .first()
-                .map(|label| label.span)
-                .unwrap_or(rustc_span::DUMMY_SP)
-        });
+    /// Match raw bytes against the registered file, or retain legacy local coordinates.
+    pub fn source_span_mapper(
+        &self,
+        base: BytePos,
+        raw: &str,
+    ) -> Result<SourceSpanMapper, SourceSpanError> {
+        if let Some(file) = self
+            .source_map
+            .files()
+            .into_iter()
+            .find(|file| file.start_pos == base)
+        {
+            SourceSpanMapper::for_source(&file, raw)
+        } else {
+            SourceSpanMapper::raw_local(base, raw)
+        }
+    }
 
-        let source_file = self.source_map.lookup_source_file(primary_span.lo());
+    pub fn mapped_raw_span(
+        &self,
+        base: BytePos,
+        range: RawByteRange,
+    ) -> Result<LocatedSourceSpan, SourceSpanError> {
+        if let Some(file) = self
+            .source_map
+            .files()
+            .into_iter()
+            .find(|file| file.start_pos == base)
+        {
+            SourceSpanMapper::from_file(&file)?.map_range(range)
+        } else {
+            SourceMapping::raw_local(base, range.end as usize)?.map_range(range)
+        }
+    }
+
+    #[cfg(test)]
+    fn source_for_span(
+        &self,
+        span: Span,
+    ) -> Option<impl std::ops::Deref<Target = rustc_span::SourceFile> + AsRef<rustc_span::SourceFile>>
+    {
+        self.source_for_location(span, None)
+    }
+
+    pub(crate) fn source_for_location(
+        &self,
+        span: Span,
+        source_start: Option<BytePos>,
+    ) -> Option<impl std::ops::Deref<Target = rustc_span::SourceFile> + AsRef<rustc_span::SourceFile>>
+    {
+        if span.is_dummy() && source_start.is_none() {
+            return None;
+        }
+        let file = self
+            .source_map
+            .files()
+            .into_iter()
+            .filter(|file| {
+                source_start.map_or(file.start_pos <= span.lo(), |base| file.start_pos == base)
+            })
+            .max_by_key(|file| file.start_pos)?;
+        if span.lo() < file.start_pos || span.hi() < span.lo() || span.hi() > file.end_pos {
+            return None;
+        }
+        let start = span.lo().0.checked_sub(file.start_pos.0)? as usize;
+        let end = span.hi().0.checked_sub(file.start_pos.0)? as usize;
+        file.src.as_ref()?.get(start..end)?;
+        Some(file)
+    }
+
+    /// Emit diagnostic using ariadne, or plain text without a real source span.
+    fn emit_to_ariadne(&self, diagnostic: &Diagnostic) {
+        let span = diagnostic
+            .primary_span
+            .map(|span| (span, diagnostic.primary_source_start))
+            .or_else(|| {
+                diagnostic
+                    .labels
+                    .first()
+                    .map(|label| (label.span, label.source_start))
+            });
+        let Some((primary_span, source_file)) = span.and_then(|(span, anchor)| {
+            self.source_for_location(span, anchor)
+                .map(|file| (span, file))
+        }) else {
+            emit_plain_diagnostic(diagnostic);
+            return;
+        };
         let mut colors = ColorGenerator::new();
         let file_id_str = format!(
             "{}",
@@ -314,10 +412,13 @@ impl<'a> DiagnosticContext<'a> {
         report = report.with_message(&diagnostic.message);
 
         // Add labels - only from the same file for simplicity
+        let mut has_source_label = false;
         for label in &diagnostic.labels {
             // 检查 span 是否来自同一个文件
-            let label_file = self.source_map.lookup_source_file(label.span.lo());
-            if std::ptr::eq(label_file.as_ref(), source_file.as_ref()) {
+            if let Some(label_file) = self.source_for_location(label.span, label.source_start)
+                && std::ptr::eq(label_file.as_ref(), source_file.as_ref())
+            {
+                has_source_label = true;
                 let color = colors.next();
 
                 let label_byte_start = (label.span.lo().0 - source_file.start_pos.0) as usize;
@@ -341,6 +442,15 @@ impl<'a> DiagnosticContext<'a> {
             }
         }
 
+        // Ariadne only renders source locations with a label. Preserve the exact
+        // primary range when no valid same-file label provides that location.
+        if !has_source_label {
+            report = report.with_label(
+                Label::new((&file_id_str, char_start..char_end))
+                    .with_color(diagnostic.level.color()),
+            );
+        }
+
         // Add notes
         for note in &diagnostic.notes {
             report = report.with_note(note);
@@ -362,10 +472,27 @@ impl<'a> DiagnosticContext<'a> {
 
         if let Err(e) = report
             .finish()
-            .print((&file_id_str, Source::from(source_content)))
+            .eprint((&file_id_str, Source::from(source_content)))
         {
             eprintln!("Error printing diagnostic: {}", e);
         }
+    }
+}
+
+pub(crate) fn emit_plain_diagnostic(diagnostic: &Diagnostic) {
+    if let Some(code) = diagnostic.code {
+        eprintln!("[{code}] {:?}: {}", diagnostic.level, diagnostic.message);
+    } else {
+        eprintln!("{:?}: {}", diagnostic.level, diagnostic.message);
+    }
+    for label in &diagnostic.labels {
+        eprintln!("{:?}: {}", label.level, label.message);
+    }
+    for note in &diagnostic.notes {
+        eprintln!("Note: {note}");
+    }
+    for help in &diagnostic.helps {
+        eprintln!("Help: {help}");
     }
 }
 
@@ -421,4 +548,52 @@ macro_rules! diag_help {
     ($ctx:expr, $msg:expr, $($arg:tt)*) => {
         $ctx.help(format!($msg, $($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_span::{BytePos, FileName, source_map::FilePathMapping};
+
+    use super::*;
+
+    #[test]
+    fn unmapped_diagnostics_are_retained_and_both_emitters_do_not_panic() {
+        let map = SourceMap::new(FilePathMapping::empty());
+        let context = DiagnosticContext::new(&map);
+        let diagnostic = Diagnostic::error("source contents are unavailable".into());
+        context.emit(diagnostic.clone());
+        assert_eq!(context.error_count(), 1);
+        assert_eq!(context.diagnostics().len(), 1);
+        assert_eq!(context.diagnostics()[0].message, diagnostic.message);
+        emitter::AriadneEmitter::new_default().emit_diagnostic(&diagnostic, &context);
+        let invalid = Span::new(BytePos(5), BytePos(7));
+        context
+            .error("unmapped span".into())
+            .with_primary_span(invalid)
+            .emit(&context);
+        emitter::AriadneEmitter::new_default().emit_diagnostic(&context.diagnostics()[1], &context);
+        assert_eq!(context.error_count(), 2);
+        assert_eq!(context.diagnostics()[1].primary_span, Some(invalid));
+    }
+
+    #[test]
+    fn checked_diagnostic_source_requires_actual_source_boundaries() {
+        let map = SourceMap::new(FilePathMapping::empty());
+        let file = map.new_source_file(FileName::Custom("actual.ns".into()), "let value=42".into());
+        let context = DiagnosticContext::new(&map);
+        assert!(
+            context
+                .source_for_span(Span::new(file.start_pos, file.end_pos))
+                .is_some()
+        );
+        assert!(
+            context
+                .source_for_span(Span::new(file.end_pos, BytePos(file.end_pos.0 + 1)))
+                .is_none()
+        );
+        assert!(context.source_for_span(rustc_span::DUMMY_SP).is_none());
+        context.warning("no source location".into()).emit(&context);
+        assert_eq!(context.warning_count(), 1);
+        assert_eq!(context.diagnostics()[0].primary_span, None);
+    }
 }

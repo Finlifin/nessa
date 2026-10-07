@@ -1,0 +1,328 @@
+-- std.traits — explicit scalar trait implementations.
+-- Equality shares the VM comparison rules, including NaN != NaN for floats.
+use .builtin.*
+use .ordering.*
+
+const scalar_equal: fn(Any, Any) -> bool = .__scalar_eq'builtin
+const display_value: fn(Any) -> String = .to_string'builtin
+
+impl Eq for u8 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for u8 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for u8 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for u16 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for u16 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for u16 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for u32 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for u32 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for u32 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for u64 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for u64 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for u64 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for u128 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for u128 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for u128 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for usize {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for usize {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for usize {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for i8 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for i8 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for i8 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for i16 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for i16 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for i16 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for i32 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for i32 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for i32 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for i64 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for i64 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for i64 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for i128 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for i128 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for i128 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for isize {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for isize {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for isize {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for f32 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for f32 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for f32 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for f64 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for f64 {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for f64 {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for bool {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for bool {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for bool {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for char {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for char {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for char {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for String {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for String {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for String {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for Unit {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for Unit {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for Unit {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+impl Eq for Type {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl PartialEq for Type {
+    pub fn eq(self, other: Self) -> bool { scalar_equal(self, other) }
+}
+impl Display for Type {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+-- The native comparison keeps exact mixed numeric rules. Public methods return
+-- nominal values; no type-pool index is embedded in the native ABI.
+const scalar_compare: fn(Any, Any) -> ?i64 = .__scalar_cmp'builtin
+fn scalar_order(left: Any, right: Any) -> ?Ordering {
+    let result = scalar_compare(left, right)
+    if result == null { null }
+    else if result.as(i64) == -1 { Ordering.less }
+    else if result.as(i64) == 1 { Ordering.greater }
+    else { Ordering.equal }
+}
+
+impl Ord for u8 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for u8 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for u16 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for u16 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for u32 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for u32 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for u64 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for u64 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for u128 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for u128 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for usize {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for usize {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for i8 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for i8 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for i16 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for i16 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for i32 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for i32 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for i64 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for i64 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for i128 {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for i128 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for isize {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for isize {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for bool {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for bool {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for char {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for char {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for String {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for String {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl Ord for Unit {
+    pub fn cmp(self, other: Self) -> Ordering { scalar_order(self, other).as(Ordering) }
+}
+impl PartialOrd for Unit {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl PartialOrd for f32 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+impl PartialOrd for f64 {
+    pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}

@@ -10,6 +10,10 @@ use type_pool::TypeIndex;
 /// Stable identifier for a builtin function (encoded in `CallBuiltin`).
 pub type BuiltinFnId = u32;
 
+/// Version of the stable builtin IDs and calling semantics stored in artifacts.
+/// Increment when an ID changes meaning or compilation requires new native capabilities.
+pub const BUILTIN_ABI_VERSION: u32 = 8;
+
 /// What a `'builtin` view resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinKind {
@@ -58,6 +62,31 @@ pub mod ids {
 
     // ── List ───────────────────────────────────────────────────────
     pub const LIST_INIT: BuiltinFnId = 100;
+    pub const LIST_LEN: BuiltinFnId = 101;
+    pub const LIST_GET: BuiltinFnId = 102;
+    pub const LIST_SET: BuiltinFnId = 103;
+    pub const LIST_PUSH: BuiltinFnId = 104;
+    pub const LIST_POP: BuiltinFnId = 105;
+
+    // ── String-keyed Map ────────────────────────────────────────────
+    pub const MAP_INIT: BuiltinFnId = 110;
+    pub const MAP_LEN: BuiltinFnId = 111;
+    pub const MAP_GET: BuiltinFnId = 112;
+    pub const MAP_SET: BuiltinFnId = 113;
+    pub const MAP_REMOVE: BuiltinFnId = 114;
+    pub const MAP_CONTAINS: BuiltinFnId = 115;
+    /// Appended after ABI7 capabilities; earlier IDs retain their meanings.
+    pub const MAP_KEYS: BuiltinFnId = 126;
+
+    // Compiler-generated Display adapter; retains the legacy field formatter.
+    pub const DERIVED_DISPLAY: BuiltinFnId = 120;
+    /// Scalar equality used by the standard library trait implementations.
+    pub const SCALAR_EQ: BuiltinFnId = 121;
+    /// Partial scalar comparison; std maps its optional sign to Ordering.
+    pub const SCALAR_CMP: BuiltinFnId = 122;
+    pub const DISPLAY_QUOTE: BuiltinFnId = 123;
+    pub const DISPLAY_ENTER_TUPLE: BuiltinFnId = 124;
+    pub const DISPLAY_EXIT_TUPLE: BuiltinFnId = 125;
 }
 
 /// Static metadata for a builtin function (no function pointer).
@@ -69,6 +98,30 @@ pub struct BuiltinFnMeta {
 
 /// All builtin functions known to the compiler and runtime.
 pub const BUILTIN_FN_META: &[BuiltinFnMeta] = &[
+    BuiltinFnMeta {
+        id: ids::DISPLAY_QUOTE,
+        name: "__display_quote",
+    },
+    BuiltinFnMeta {
+        id: ids::DISPLAY_ENTER_TUPLE,
+        name: "__display_enter_tuple",
+    },
+    BuiltinFnMeta {
+        id: ids::DISPLAY_EXIT_TUPLE,
+        name: "__display_exit_tuple",
+    },
+    BuiltinFnMeta {
+        id: ids::SCALAR_CMP,
+        name: "__scalar_cmp",
+    },
+    BuiltinFnMeta {
+        id: ids::SCALAR_EQ,
+        name: "__scalar_eq",
+    },
+    BuiltinFnMeta {
+        id: ids::DERIVED_DISPLAY,
+        name: "__derived_display",
+    },
     BuiltinFnMeta {
         id: ids::PRINT,
         name: "print",
@@ -149,6 +202,54 @@ pub const BUILTIN_FN_META: &[BuiltinFnMeta] = &[
         id: ids::LIST_INIT,
         name: "__list_init",
     },
+    BuiltinFnMeta {
+        id: ids::LIST_LEN,
+        name: "__list_len",
+    },
+    BuiltinFnMeta {
+        id: ids::LIST_GET,
+        name: "__list_get",
+    },
+    BuiltinFnMeta {
+        id: ids::LIST_SET,
+        name: "__list_set",
+    },
+    BuiltinFnMeta {
+        id: ids::LIST_PUSH,
+        name: "__list_push",
+    },
+    BuiltinFnMeta {
+        id: ids::LIST_POP,
+        name: "__list_pop",
+    },
+    BuiltinFnMeta {
+        id: ids::MAP_INIT,
+        name: "__map_init",
+    },
+    BuiltinFnMeta {
+        id: ids::MAP_LEN,
+        name: "__map_len",
+    },
+    BuiltinFnMeta {
+        id: ids::MAP_GET,
+        name: "__map_get",
+    },
+    BuiltinFnMeta {
+        id: ids::MAP_SET,
+        name: "__map_set",
+    },
+    BuiltinFnMeta {
+        id: ids::MAP_REMOVE,
+        name: "__map_remove",
+    },
+    BuiltinFnMeta {
+        id: ids::MAP_CONTAINS,
+        name: "__map_contains",
+    },
+    BuiltinFnMeta {
+        id: ids::MAP_KEYS,
+        name: "__map_keys",
+    },
 ];
 
 /// Look up a builtin function id by its language-facing name.
@@ -189,8 +290,7 @@ impl BuiltinCatalog {
     }
 
     pub fn register_fn(&mut self, id: BuiltinFnId, name: &str) {
-        self.by_name
-            .insert(name.to_string(), BuiltinKind::Fn(id));
+        self.by_name.insert(name.to_string(), BuiltinKind::Fn(id));
     }
 
     pub fn register_type(&mut self, name: &str, type_index: TypeIndex) {
@@ -235,10 +335,7 @@ pub fn catalog_lookup(name: &str) -> Option<BuiltinKind> {
     if let Some(id) = lookup_builtin_fn_id(name) {
         return Some(BuiltinKind::Fn(id));
     }
-    global_catalog()
-        .read()
-        .ok()
-        .and_then(|g| g.lookup(name))
+    global_catalog().read().ok().and_then(|g| g.lookup(name))
 }
 
 /// Register a builtin type name into the global catalog (engine init).
@@ -257,6 +354,12 @@ pub fn catalog_register_intrinsic_types(type_pool: &type_pool::TypePool) {
         }
         let idx = type_pool.intrinsic(intr);
         catalog_register_type(intr.name(), idx);
+    }
+    if let Some(list) = type_pool.list_type() {
+        catalog_register_type("List", list);
+    }
+    if let Some(map) = type_pool.map_type() {
+        catalog_register_type("Map", map);
     }
 }
 

@@ -27,3 +27,19 @@ pub typealias Unit = .Unit'builtin
 pub typealias Any = .Any'builtin
 pub typealias NoReturn = .NoReturn'builtin
 pub typealias Type = .Type'builtin
+pub typealias IterationStep = .IterationStep'builtin
+
+-- Runtime continuation and language trait descriptors.
+pub typealias Continuation = .Continuation'builtin
+pub typealias Display = .Display'builtin
+pub typealias Hash = .Hash'builtin
+pub typealias Eq = .Eq'builtin
+pub typealias Ord = .Ord'builtin
+pub typealias PartialEq = .PartialEq'builtin
+pub typealias PartialOrd = .PartialOrd'builtin
+pub typealias Iterator = .Iterator'builtin
+pub typealias IntoIterator = .IntoIterator'builtin
+
+pub typealias List = .List'builtin
+
+pub typealias Map = .Map'builtin

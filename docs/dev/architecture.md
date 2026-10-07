@@ -306,6 +306,10 @@ TypeIndex → TypePool 查询获取完整的 128-bit TypeID 和类型元数据
 
 ### 5.3 Task Stack Manager
 
+一个 task 拥有多个独立的栈段：根计算使用根栈，支持 continuation 捕获的
+delimiter 在进入时建立新栈段。嵌套 delimiter 通过父链接连接；暂停的
+continuation 保留它自己的栈段链。栈池的 slot 分配单位是栈段，不再是 task。
+
 ```
 ┌─────────────────── Virtual Memory Space ──────────────────────────┐
 │                                                                    │
@@ -482,12 +486,17 @@ shift/reset 机制:
   // 结果: 10 + 20 = 30
 
 运行时实现:
-  - shift 捕获当前栈帧到 reset 点之间的所有帧
-  - 帧被复制到堆上形成 Continuation 对象
-  - resume(k, val) 恢复 continuation：
-    将保存的帧压回栈，设置返回值，跳转到捕获点
-  - one-shot continuation 可以 move 而非 copy（零开销），提供显示clone方法
+  - reset 进入时建立独立栈段，保存父计算的执行上下文
+  - shift 按最近匹配的 prompt 分离栈段链，父计算恢复执行
+  - continuation 持有被分离的栈段，不复制帧到另一处存储
+  - resume(k, val) 重接栈段链，写入效应结果并切换执行上下文
+  - delimiter 完成后切回 resume 调用者，返回结果并归还该栈段
+  - 多次调用通过独立分支执行；只有显式的分支克隆操作复制计算状态
 ```
+
+ABI 的字段、所有权、GC 要求和当前实现范围见
+[continuation-stack-abi.md](continuation-stack-abi.md)。语言层仍需保留多次恢复、
+延迟恢复和 `clone` 语义，内部的线性执行句柄不改变语言接口。
 
 ---
 
@@ -897,3 +906,45 @@ pub use .builtin.{
 }
 pub use .io.{print, println}
 ```
+
+
+### 当前标准库实现边界（2026-10-07）
+
+driver 已编译实际 `library/std` 的7个源码文件，以可信节点权限绑定 builtin，
+关闭用户根作用域中的引擎名称注入。实际模块、pub use 和隐式 prelude 提供类型
+与函数；native 函数值由源码签名生成 adapter closure，函数元数据用于反射和
+精确动态签名检查。入口取用户文件 main，不取模块或导入同名函数。
+
+源码编译路径已生成共享全局 schema 与显式启动入口。File/Module/Struct/Enum
+顶层值和语句按各作用域源码顺序执行，再调用无参数、返回 Unit 的 `__init__`；
+bootstrap 按已加载作用域的依赖初始化，最后调用用户 main 并保留结果。软导入
+环使用稳定顺序，实际值依赖环诊断；同作用域前向读取明确报未初始化。未引用
+作用域不执行 hook，初始化失败阻止 main。函数和 lambda 共用全局槽，只有局部
+变量进入捕获列表；VM 校验 schema、槽索引、初始化状态、写入类型和 const 限制，
+globals 参与真实 GC 根扫描。initializer 的分支、循环与 break/continue 已接通。
+
+这仍不是上文完整的 core/alloc/std 分层：Newtype/Impl/Extend 关联作用域初始化、
+通用包发现、完整数据类型/traits、泛型函数签名尚未完成。动态间接初始化依赖
+仍由受检读取兜底。完整 `CompiledArtifact` 已持久化 TypePool、函数签名、全局
+schema、入口、方法名称重定位及 builtin ABI/ID/名称清单；源码与归档共用 driver
+安装路径，CLI 可独立执行 `.nsbc`。编译后删除源码并扰动加载进程 interner 的
+跨进程回归已通过。`write_artifact` 支持 globals，低层 `write_archive` 缺少
+TypePool/entry，仍拒绝非空 globals。
+
+容器已计算并验证 SHA-256，完整加载检查 target、元数据/字节码引用及入口，
+拒绝不兼容 builtin manifest。STACK_MAPS 保存 safepoint PC，运行采用明确的
+tagged-root 扫描模式；精确 stackmap、DEBUG_INFO、文本字节码、跨包
+imports/exports 和稳定 TypeId 仍未完成。optional/default/variadic 的完整参数
+绑定 ABI 尚缺，未实现的缺参调用明确拒绝。多 worker/事件循环、完整启动关闭
+流程、原生 SP/FP continuation 栈切换和最后引用模板回收仍是设计目标。
+自包含归档可执行不等于上文整个引擎和包系统完成。
+
+
+结构体构造与关联命名空间实现补充（2026-10-07）：resolution 的 `structs` 生成
+字段绑定计划，`defaults` 统一参数和字段默认检查，`associated` 管理canonical
+类型的多个plain impl词法作用域。NIR `construction` 按源码顺序保存值，再按
+字段声明布局装载；`defaults` 提供实际选中默认表达式的初始化依赖。
+NIR同时返回源函数符号到FuncId映射，driver发布TypePool之前原子搬迁methods、
+trait impl和vtable。解释器的`fields`模块集中检查布局、边界及字段动态类型。
+元数据/归档布局保持原版本；源码private检查不等于归档数据的访问控制机制。
+集合布局及ABI兼容策略见 `collections-implementation-plan.md`，尚待真实实现。

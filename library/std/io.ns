@@ -1,9 +1,11 @@
 -- std.io — input / output and basic conversions
 
+use .builtin.*
+
 pub const print: fn(Any) -> Unit = .print'builtin
 pub const println: fn(Any) -> Unit = .println'builtin
 
-pub const type_of: fn(Any) -> String = .type_of'builtin
+pub const type_of: fn(Any) -> Type = .type_of'builtin
 pub const to_i64: fn(Any) -> i64 = .to_i64'builtin
 pub const to_f64: fn(Any) -> f64 = .to_f64'builtin
 pub const to_string: fn(Any) -> String = .to_string'builtin

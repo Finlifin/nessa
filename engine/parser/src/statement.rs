@@ -54,6 +54,7 @@ pub fn try_definition_or_statement(p: &mut Parser) -> ParseResult {
         TokenKind::KwMod => definition::try_mod_def(p),
         TokenKind::KwUse => definition::try_use_statement(p),
         TokenKind::KwPub => definition::try_pub_def(p),
+        TokenKind::KwPrivate => definition::try_private_def(p),
         TokenKind::KwGlobal => definition::try_global_def(p),
         TokenKind::KwAssoc => definition::try_assoc_def(p),
         // Statements

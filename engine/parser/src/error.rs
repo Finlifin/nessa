@@ -1,4 +1,4 @@
-use diagnostic::{DiagnosticContext, NessaError};
+use diagnostic::{DiagnosticContext, LocatedSourceSpan, NessaError};
 use rustc_span::{BytePos, Span};
 
 use ast::NodeIndex;
@@ -22,6 +22,7 @@ pub struct ParseError {
     pub message: String,
     pub span: Span,
     pub label: Option<ParseErrorLabel>,
+    pub source_start: Option<BytePos>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,7 @@ impl ParseError {
             message: message.into(),
             span,
             label: None,
+            source_start: None,
         }
     }
 
@@ -51,6 +53,7 @@ impl ParseError {
             kind,
             message: message.into(),
             span,
+            source_start: None,
             label: Some(ParseErrorLabel {
                 span: label_span,
                 message: label_message.into(),
@@ -85,10 +88,19 @@ impl NessaError for ParseError {
         let mut builder = diag_ctx
             .error(self.message.clone())
             .with_code(self.error_code())
-            .with_primary_span(self.span);
+            .with_primary_source_span(LocatedSourceSpan {
+                span: self.span,
+                file_start: self.source_start,
+            });
 
         if let Some(lbl) = &self.label {
-            builder = builder.with_error_label(lbl.span, lbl.message.clone());
+            builder = builder.with_error_source_span(
+                LocatedSourceSpan {
+                    span: lbl.span,
+                    file_start: self.source_start,
+                },
+                lbl.message.clone(),
+            );
         }
 
         builder.emit(diag_ctx);

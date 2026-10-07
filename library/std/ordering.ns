@@ -1,0 +1,19 @@
+-- std.ordering — ordinary nominal ordering values.
+use .builtin.*
+
+pub enum Ordering { pub less, pub equal, pub greater }
+derive Eq, PartialEq, Ord, PartialOrd for Ordering
+
+const display_value: fn(Any) -> String = .to_string'builtin
+impl Display for Ordering {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+
+-- These ordinary source functions provide the trusted default bodies. Concrete
+-- implementations may override them; adapters keep the caller's frozen proof.
+impl Ord {
+    pub fn lt(self, other: Self) -> bool { self.cmp(other) == Ordering.less }
+    pub fn gt(self, other: Self) -> bool { self.cmp(other) == Ordering.greater }
+    pub fn lte(self, other: Self) -> bool { not self.gt(other) }
+    pub fn gte(self, other: Self) -> bool { not self.lt(other) }
+}

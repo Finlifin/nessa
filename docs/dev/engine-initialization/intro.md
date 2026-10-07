@@ -159,3 +159,29 @@ Root task 完成后:
 --stack-size=<bytes>      每个 task 的栈大小 (默认: 8MB)
 --gc-strategy=<name>      GC 策略 (默认: lxr)
 ```
+
+## 当前实现边界（2026-10-07）
+
+driver 源码编译已解析并合并7个真实 std 源文件，通过可信节点权限暴露 builtin，
+以真实模块与 `use std.prelude.*` 提供用户 API。用户入口明确来自根文件 main。
+已生成 File/Module/Struct/Enum initializer、bootstrap 和全局类型/可变性 schema。
+VM 先安装 schema；各已加载作用域按源码顺序执行顶层值和语句，再调用无参数、
+返回 Unit 的 `__init__`，最后执行用户 main 并保留返回值。初始化错误阻止 main。
+未引用作用域的 hook 不运行；import/reference 决定加载集合，已知初始化值读取
+及 helper 调用决定硬依赖。软 import 环按稳定顺序执行，硬值依赖环诊断；同
+作用域前向读取报 UninitializedGlobal。动态依赖通过受检全局读取发现错误。
+
+共享槽拒绝非法类型/索引、错误类型写入与 const 二次写入；闭包不捕获全局旧值，
+globals 纳入 GC 根。分支、循环和带 guard/标签的 break/continue 初始化路径已
+覆盖。源码和归档现在共用 `driver::install_artifact`：验证类型池、字节码与
+builtin ABI/ID/名称之后，依次安装类型池、global schema、函数和常量，再执行
+保存的入口。CLI build 写完整 `CompiledArtifact`，run 的 `.nsbc` 输入按字节读取；
+加载不需要原源码，也不重新安排模块初始化。完整产物带 checksum、目标兼容
+检查和方法名称重定位；源文件删除及 interner 扰动的独立进程回归已通过。
+低层 `write_archive` 仍拒绝非空 globals，因为它没有类型池与 entry；完整
+`write_artifact` 已支持这些字段。
+
+Newtype/Impl/Extend 关联作用域、通用包发现、跨包链接和完整参数绑定 ABI 仍未
+完成；optional/default/variadic 缺省实参没有生成，缺参调用明确拒绝。上文多
+worker、事件循环、完整配置和关闭流程仍是设计目标。原生 SP/FP 切换、语言
+continuation 最后引用回收及精确 stackmap 也未因独立加载验证通过而完成。

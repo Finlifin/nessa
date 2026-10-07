@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod syntax {
     use ast::NodeKind;
     use ast::dump::dump_ast_to_string;
     use diagnostic::DiagnosticContext;
@@ -9,6 +9,23 @@ mod tests {
 
     use crate::parser::Parser;
 
+    #[test]
+    fn parse_and_finish_retain_original_source_bytes_without_source_map_entries() {
+        for source in ["", "let value=42\r\n", "let text=\"你好\"\r\n"] {
+            let (tokens, errors) = tokenize(source);
+            assert!(errors.is_empty(), "{errors:?}");
+            let map = SourceMap::new(FilePathMapping::empty());
+            let diagnostics = DiagnosticContext::new(&map);
+            let parsed = Parser::new(&tokens, source, &diagnostics, rustc_span::BytePos(0)).parse();
+            assert!(!diagnostics.has_errors(), "{:?}", diagnostics.diagnostics());
+            assert_eq!(parsed.source.as_deref(), Some(source));
+            let (partial, errors) =
+                Parser::new(&tokens, source, &diagnostics, rustc_span::BytePos(0)).finish();
+            assert!(errors.is_empty());
+            assert_eq!(partial.source.as_deref(), Some(source));
+        }
+    }
+
     /// Helper: parse source code and return the AST S-expression dump.
     fn parse_dump(src: &str) -> String {
         let (tokens, lex_errors) = tokenize(src);
@@ -17,9 +34,7 @@ mod tests {
         let sm = SourceMap::new(FilePathMapping::empty());
         let sf = sm.new_source_file(FileName::Custom("test".into()), src.to_string());
         let diag = DiagnosticContext::new(&sm);
-        let mut parser = Parser::new(&tokens, src, &diag, sf.start_pos);
-        parser.ast().source = src.to_string();
-        let ast = parser.parse();
+        let ast = Parser::new(&tokens, src, &diag, sf.start_pos).parse();
         dump_ast_to_string(&ast, ast.root)
     }
 
@@ -37,6 +52,34 @@ mod tests {
     // -----------------------------------------------------------------------
     // Basic expression tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn named_call_arguments_are_keys_with_values_not_assignments() {
+        for source in ["f(value = 42)", "f(.value = 42)"] {
+            let dump = parse_dump(source);
+            assert!(dump.contains("NamedArg"), "{dump}");
+            assert!(!dump.contains("Assign"), "{dump}");
+        }
+    }
+
+    #[test]
+    fn named_arguments_and_optional_parameters_require_values() {
+        for source in ["f(value = )", "fn f(.value: i64 = ) {}"] {
+            let (tokens, errors) = tokenize(source);
+            assert!(errors.is_empty());
+            let map = SourceMap::new(FilePathMapping::empty());
+            let file = map.new_source_file(FileName::Custom("arguments".into()), source.to_owned());
+            let diagnostics = DiagnosticContext::new(&map);
+            Parser::new(&tokens, source, &diagnostics, file.start_pos).parse();
+            assert!(
+                diagnostics
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.level == diagnostic::Level::Error),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn test_integer_literal() {
@@ -185,6 +228,60 @@ mod tests {
             dump.contains("Projection"),
             "Expected Projection, got: {dump}"
         );
+    }
+
+    #[test]
+    fn match_arms_accept_commas_semicolons_and_newlines_with_expression_guards() {
+        for separator in [",", ";", "\n"] {
+            let source =
+                format!("fn main() {{ 42 match {{ n if n > 40 => n{separator}_ => 0 }} }}");
+            let (tokens, errors) = tokenize(&source);
+            assert!(errors.is_empty());
+            let map = SourceMap::new(FilePathMapping::empty());
+            let file = map.new_source_file(FileName::Custom("match".into()), source.clone());
+            let diagnostics = DiagnosticContext::new(&map);
+            let ast = Parser::new(&tokens, &source, &diagnostics, file.start_pos).parse();
+            assert!(!diagnostics.has_errors(), "{:?}", diagnostics.diagnostics());
+            let matcher = ast
+                .nodes
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| {
+                    (node.kind == NodeKind::PostMatch).then_some(ast::NodeIndex(index as u32))
+                })
+                .unwrap();
+            assert_eq!(ast.multi_children(matcher).len(), 2);
+            let first = ast.multi_children(matcher)[0];
+            let guard = ast.fixed_children(first)[0];
+            assert_eq!(ast.node(guard).kind, NodeKind::PatternIfGuard);
+            assert_eq!(
+                ast.node(ast.fixed_children(guard)[1]).kind,
+                NodeKind::BoolGt
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_numeric_projection_preserves_the_index_node() {
+        let source = "pair.0";
+        let (tokens, errors) = tokenize(source);
+        assert!(errors.is_empty());
+        let map = SourceMap::new(FilePathMapping::empty());
+        let file = map.new_source_file(FileName::Custom("projection".into()), source.into());
+        let diagnostics = DiagnosticContext::new(&map);
+        let ast = Parser::new(&tokens, source, &diagnostics, file.start_pos).parse();
+        assert!(!diagnostics.has_errors());
+        let projection = ast
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| {
+                (node.kind == NodeKind::Projection).then_some(ast::NodeIndex(index as u32))
+            })
+            .unwrap();
+        let member = ast.fixed_children(projection)[1];
+        assert_eq!(ast.node(member).kind, NodeKind::Int);
+        assert_eq!(str_interner::get(ast.node(member).str_id), "0");
     }
 
     #[test]
@@ -512,6 +609,22 @@ mod tests {
         assert!(
             dump.contains("InfixFnCall"),
             "Expected InfixFnCall, got: {dump}"
+        );
+    }
+    #[test]
+    fn error_sets_nested_qualifiers_and_branch_patterns_have_distinct_ast() {
+        let dump = parse_dump(
+            "enum E{bad,};fn f(v:![E] ++ [E] ![] i64){v match{ok! =>ok,error E.* as e=>1,#e=>0}}",
+        );
+        assert_eq!(dump.matches("ErrorQualifiedType").count(), 2, "{dump}");
+        assert!(dump.contains("Concat"), "{dump}");
+        assert!(dump.contains("PatternErrorOk"), "{dump}");
+        assert!(dump.contains("PatternTypeFamily"), "{dump}");
+        assert!(dump.contains("PatternEffect"), "{dump}");
+        assert!(dump.contains("PatternError"), "{dump}");
+        assert!(
+            !dump.contains("ErrorPropagation"),
+            "nested qualifier consumed as propagation: {dump}"
         );
     }
 }

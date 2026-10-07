@@ -13,6 +13,8 @@
 | [normalied-intermediate-representation/](normalied-intermediate-representation/) | NIR 设计：脱糖、基本块、闭包转换 |
 | [static-and-dynamic-decision-procedures.md/](static-and-dynamic-decision-procedures.md/) | 名称解析、类型推断、Effect 静态/动态分派决策 |
 | [engine-initialization/](engine-initialization/) | 引擎启动流程、TypePool 预填充、GC/Scheduler 初始化 |
+| [continuation-stack-abi.md](continuation-stack-abi.md) | delimiter 栈切换、continuation 所有权与 NSBC v3 ABI |
+| [implementation-progress.md](implementation-progress.md) | 当前实现证据、完整目标与待完成工作 |
 
 ## 编译管线概览
 
@@ -28,6 +30,10 @@ Source (.ns)
 ```
 
 ## 各 Crate 实现状态
+
+以下历史表格尚未按当前代码重新审计，不能据此判断功能已完成或完全未实现。
+已有多项子系统实现和测试；当前证据及已确认缺口见
+[implementation-progress.md](implementation-progress.md)。
 
 | Crate | 状态 |
 |-------|------|

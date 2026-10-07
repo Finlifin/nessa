@@ -1,16 +1,8 @@
--- std.prelude — symbols intended for implicit import into every file.
---
--- When the module system auto-imports this file, it should re-export:
---
---   pub use .builtin.{
---       u8, u16, u32, u64, u128, usize,
---       i8, i16, i32, i64, i128, isize,
---       f32, f64, bool, char, String, Unit, Any, NoReturn,
---   }
---   pub use .io.{print, println, type_of, to_i64, to_f64, to_string}
---   pub use .math.{abs, sin, cos, sqrt, floor, ceil, round, pow, log}
---   pub use .string.{str_len, str_concat}
---   pub use .process.{exit, panic}
---
--- Until then, script mode exposes builtin function names in the root scope
--- (`ResolveOptions::expose_root_builtins`), and types remain root-registered.
+-- std.prelude — actual implicit imports for user source units.
+pub use .builtin.*
+pub use .ordering.*
+pub use .traits.*
+pub use .io.*
+pub use .math.*
+pub use .string.*
+pub use .process.*

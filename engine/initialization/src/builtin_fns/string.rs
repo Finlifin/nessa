@@ -1,37 +1,46 @@
 //! String builtins.
 
 use interpreter::{BuiltinCtx, VmError};
-use runtime::TaggedValue;
 
 pub fn str_len(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    let val = ctx.arg(0)?;
-    let ptr = val.as_heap_ptr().ok_or(VmError::TypeError)?;
-    let len = unsafe { *(ptr as *const u64) } as i64;
-    ctx.return_i64(len);
+    let len = ctx.arg_string(0)?.len() as i64;
+    ctx.return_i64(len)?;
     Ok(())
 }
 
 pub fn str_concat(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let a = ctx.arg(0)?;
-    let b = ctx.arg(1)?;
-    let mut bytes: Vec<u8> = Vec::new();
-    append_heap_string_bytes(a, &mut bytes)?;
-    append_heap_string_bytes(b, &mut bytes)?;
-    let s = String::from_utf8(bytes).map_err(|_| VmError::TypeError)?;
-    let result = ctx.alloc_string(&s);
-    ctx.set_return(result);
+    let mut s = ctx.arg_string(0)?;
+    let right = ctx.arg_string(1)?;
+    let bytes = s
+        .len()
+        .checked_add(right.len())
+        .ok_or(VmError::DisplaySizeExceeded)?;
+    ctx.check_display_size(bytes)?;
+    s.push_str(&right);
+    ctx.return_string(&s)
+}
+
+/// Preserve literal quoting for String-typed aggregate components.
+pub fn display_quote(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    let value = ctx.arg_string(0)?;
+    let quoted = format!("{value:?}");
+    ctx.return_string(&quoted)
+}
+
+pub fn display_enter_tuple(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    let value = ctx.arg(0)?;
+    let entered = ctx.display_tuple_enter(value)?;
+    ctx.return_bool(entered);
     Ok(())
 }
 
-fn append_heap_string_bytes(val: TaggedValue, out: &mut Vec<u8>) -> Result<(), VmError> {
-    let ptr = val.as_heap_ptr().ok_or(VmError::TypeError)?;
-    let len = unsafe { *(ptr as *const u64) } as usize;
-    if len > 64 * 1024 * 1024 {
-        return Err(VmError::TypeError);
-    }
-    let data = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(8), len) };
-    out.extend_from_slice(data);
-    Ok(())
+pub fn display_exit_tuple(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    let value = ctx.arg(0)?;
+    ctx.display_tuple_exit(value)?;
+    ctx.set_return(runtime::TaggedValue::UNIT)
 }

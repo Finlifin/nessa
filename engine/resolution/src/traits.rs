@@ -4,7 +4,7 @@
 //! trait symbols registered by Phase 3a.  Also records impl-trait
 //! relationships discovered from `ImplTraitDef` / `ExtendTraitDef` nodes.
 
-use ast::{Ast, NodeIndex, NodeKind};
+use ast::{Ast, NodeKind};
 use type_pool::{MethodSlot, TraitImplRecord, TypeKind, VTable};
 
 use crate::resolver::Resolver;
@@ -15,6 +15,34 @@ use crate::{SymbolKind, TraitInfo};
 // ---------------------------------------------------------------------------
 
 /// Collect [`TraitInfo`] entries and record impl-trait relationships.
+/// Parent identities are needed by body typing before implementations exist.
+pub(crate) fn prepare_trait_parents(r: &mut Resolver, ast: &Ast) {
+    for symbol in &r.symbols {
+        if symbol.kind != SymbolKind::Trait || symbol.def_node.is_null() {
+            continue;
+        }
+        let parent_node = ast.fixed_children(symbol.def_node)[1];
+        if parent_node.is_null() {
+            continue;
+        }
+        let parents = ast
+            .multi_children(parent_node)
+            .iter()
+            .filter_map(|node| {
+                let parent = r.symbols[r.node_symbols.get(node)?.0 as usize].type_index;
+                let parent = r.type_pool.canonical_type(parent)?;
+                matches!(r.type_pool.get(parent).kind, TypeKind::Trait { .. }).then_some(parent)
+            })
+            .collect();
+        if let TypeKind::Trait {
+            parents: target, ..
+        } = &mut r.type_pool.get_mut(symbol.type_index).kind
+        {
+            *target = parents;
+        }
+    }
+}
+
 pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
     // ── Collect trait method signatures ────────────────────────────
     let trait_defs: Vec<_> = r
@@ -38,30 +66,10 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         }
 
         // TraitDef: [0] name  [1] parents(ListOf/NULL)  multi: members
-        let children = ast.fixed_children(def_node);
-        let parents_node = children[1];
-
-        // Resolve parent traits.
-        let mut parent_indices = Vec::new();
-        if !parents_node.is_null() {
-            for &parent_expr in ast.multi_children(parents_node) {
-                if let Some(&sym_id) = r.node_symbols.get(&parent_expr) {
-                    let psym = &r.symbols[sym_id.0 as usize];
-                    if psym.kind == SymbolKind::Trait
-                        && psym.type_index != type_pool::TypeIndex::INVALID
-                    {
-                        parent_indices.push(psym.type_index);
-                    }
-                }
-            }
-        }
-
-        // Store parents in the TypeKind.
-        if !parent_indices.is_empty() {
-            if let TypeKind::Trait { parents, .. } = &mut r.type_pool.get_mut(type_index).kind {
-                *parents = parent_indices.clone();
-            }
-        }
+        let parent_indices = match &r.type_pool.get(type_index).kind {
+            TypeKind::Trait { parents, .. } => parents.clone(),
+            _ => Vec::new(),
+        };
 
         let mut required = Vec::new();
         let mut derived = Vec::new();
@@ -109,6 +117,8 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         .map(|scope| scope.node)
         .collect();
 
+    let mut parent_checks = Vec::new();
+    let mut implementations = std::collections::HashSet::new();
     for node_idx in impl_trait_nodes {
         // ImplTraitDef / ExtendTraitDef: [0] trait_expr  [1] type_expr  multi: members
         let children = ast.fixed_children(node_idx);
@@ -118,8 +128,10 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         // Look up the trait's type index via its resolved symbol.
         let trait_ti = r.node_symbols.get(&trait_node).and_then(|&sym_id| {
             let sym = &r.symbols[sym_id.0 as usize];
-            if sym.kind == SymbolKind::Trait && sym.type_index != type_pool::TypeIndex::INVALID {
-                Some(sym.type_index)
+            if let Some(ty) = r.type_pool.canonical_type(sym.type_index)
+                && matches!(r.type_pool.get(ty).kind, TypeKind::Trait { .. })
+            {
+                Some(ty)
             } else {
                 None
             }
@@ -128,52 +140,55 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         // Look up the target type's type index.
         let target_ti = r.node_symbols.get(&type_node).and_then(|&sym_id| {
             let sym = &r.symbols[sym_id.0 as usize];
-            if sym.type_index != type_pool::TypeIndex::INVALID {
-                Some(sym.type_index)
-            } else {
-                None
-            }
+            r.type_pool.canonical_type(sym.type_index)
         });
 
         let (Some(trait_type), Some(implementor)) = (trait_ti, target_ti) else {
             continue;
         };
-
-        // ── Orphan rule check (impl only, not extend) ─────────────
-        // `impl Trait for Type` requires the current package to own
-        // either `Trait` or `Type`.  `extend` bypasses this rule.
-        // TODO: enforce once package management is integrated with
-        //       resolution (currently single-file, no package ids).
-
-        // Determine scope restriction: extend trait impls are scope-local.
-        let is_extend = ast.node(node_idx).kind == NodeKind::ExtendTraitDef;
-        let visible_scope = if is_extend {
-            r.scopes
-                .iter()
-                .find(|s| s.node == node_idx)
-                .and_then(|s| s.parent)
-                .map(|sid| sid.0)
-        } else {
-            None
-        };
+        let visible_scope = r
+            .imports
+            .extension_scopes
+            .get(&r.imports.module_scopes[&node_idx])
+            .map(|scope| scope.0);
+        if !implementations.insert((implementor, trait_type, visible_scope)) {
+            r.diag_ctx
+                .error("duplicate trait implementation in the same scope".into())
+                .with_primary_span(ast.node(node_idx).span)
+                .emit(r.diag_ctx);
+            continue;
+        }
 
         // Collect method implementations from the impl block's members.
         let mut methods = Vec::new();
         let mut provided_names: Vec<str_interner::StrId> = Vec::new();
         for &member in ast.multi_children(node_idx) {
+            let member = if matches!(
+                ast.node(member).kind,
+                NodeKind::PubDef | NodeKind::PrivateDef
+            ) {
+                ast.fixed_children(member)[0]
+            } else {
+                member
+            };
             if ast.node(member).kind == NodeKind::FunctionDef {
                 let fn_children = ast.fixed_children(member);
                 let fn_name = ast.node(fn_children[0]).str_id;
 
-                let func_id = r
-                    .node_symbols
-                    .get(&fn_children[0])
-                    .map(|&sym_id| sym_id.0)
-                    .unwrap_or(0);
+                let Some(&method_symbol) = r.node_symbols.get(&fn_children[0]) else {
+                    r.diag_ctx
+                        .error("method declaration has no resolved function symbol".into())
+                        .with_primary_span(ast.node(member).span)
+                        .emit(r.diag_ctx);
+                    continue;
+                };
+                let func_id = method_symbol.0;
+                let access = crate::access::method_access(r, method_symbol);
 
                 methods.push(MethodSlot {
                     name: fn_name,
                     func_id,
+                    access,
                     trait_impl: Some(trait_type),
                     visible_scope,
                 });
@@ -183,6 +198,7 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
                     MethodSlot {
                         name: fn_name,
                         func_id,
+                        access,
                         trait_impl: Some(trait_type),
                         visible_scope,
                     },
@@ -193,7 +209,12 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         }
 
         // ── Validate required methods & inject defaults ───────────
-        if let Some(trait_info) = r.traits.iter().find(|ti| ti.type_index == trait_type) {
+        if let Some(trait_info) = r
+            .traits
+            .iter()
+            .find(|ti| ti.type_index == trait_type)
+            .cloned()
+        {
             let required = trait_info.required_methods.clone();
             let derived = trait_info.derived_methods.clone();
 
@@ -225,62 +246,95 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
                 .find(|s| s.kind == SymbolKind::Trait && s.type_index == trait_type)
                 .map(|s| s.def_node);
 
-            if let Some(trait_node) = trait_def_node {
-                if !trait_node.is_null() {
-                    // Find the scope for this trait definition.
-                    let trait_scope = r.scopes.iter().find(|s| s.node == trait_node);
+            if let Some(trait_node) = trait_def_node
+                && !trait_node.is_null()
+            {
+                // Find the scope for this trait definition.
+                let trait_scope = r.scopes.iter().find(|s| s.node == trait_node);
 
-                    if let Some(scope) = trait_scope {
-                        let bindings = scope.bindings.clone();
-                        for &derived_name in &derived {
-                            if !provided_names.contains(&derived_name) {
-                                // Use the trait's default function symbol.
-                                if let Some(&sym_id) = bindings.get(&derived_name) {
-                                    let default_func_id = sym_id.0;
-                                    let slot = MethodSlot {
-                                        name: derived_name,
-                                        func_id: default_func_id,
-                                        trait_impl: Some(trait_type),
-                                        visible_scope,
-                                    };
-                                    methods.push(slot.clone());
-                                    r.type_pool.add_method(implementor, slot);
-                                }
+                if let Some(scope) = trait_scope {
+                    let bindings = scope.bindings.clone();
+                    for &derived_name in &derived {
+                        if !provided_names.contains(&derived_name) {
+                            // Use the trait's default function symbol.
+                            if let Some(&sym_id) = bindings.get(&derived_name) {
+                                let provider_scope = r.node_scopes[&node_idx].0;
+                                let function = match crate::default_methods::register(
+                                    r,
+                                    ast,
+                                    sym_id,
+                                    implementor,
+                                    trait_type,
+                                    visible_scope,
+                                    provider_scope,
+                                ) {
+                                    Ok(function) => function,
+                                    Err(message) => {
+                                        r.diag_ctx
+                                            .error(message)
+                                            .with_primary_span(ast.node(node_idx).span)
+                                            .emit(r.diag_ctx);
+                                        continue;
+                                    }
+                                };
+                                let default_func_id = function.0;
+                                let slot = MethodSlot {
+                                    name: derived_name,
+                                    func_id: default_func_id,
+                                    access: crate::access::method_access(r, sym_id),
+                                    trait_impl: Some(trait_type),
+                                    visible_scope,
+                                };
+                                methods.push(slot.clone());
+                                r.type_pool.add_method(implementor, slot);
                             }
                         }
                     }
                 }
             }
 
-            // ── Validate parent trait impls ────────────────────────
-            let parent_traits = trait_info.parent_traits.clone();
-            for &parent_ti in &parent_traits {
-                if !r.type_pool.has_trait_impl(implementor, parent_ti) {
-                    let span = ast.node(node_idx).span;
-                    let parent_name = match &r.type_pool.get(parent_ti).kind {
-                        TypeKind::Trait { name, .. } => str_interner::get(*name),
-                        _ => "?".to_string(),
-                    };
-                    let trait_name = match &r.type_pool.get(trait_type).kind {
-                        TypeKind::Trait { name, .. } => str_interner::get(*name),
-                        _ => "?".to_string(),
-                    };
-                    let mut diag = diagnostic::Diagnostic::error(format!(
-                        "impl of trait `{trait_name}` requires parent trait `{parent_name}` to also be implemented",
-                    ));
-                    diag.primary_span = Some(span);
-                    r.diagnostics.push(diag);
-                }
+            // All declarations are collected before parent checks, so forward
+            // implementations obey the same rules as earlier declarations.
+            for &parent in &trait_info.parent_traits {
+                parent_checks.push((node_idx, implementor, trait_type, parent, visible_scope));
             }
         }
 
         // Record the trait implementation.
-        r.type_pool.add_trait_impl(TraitImplRecord {
+        let record = TraitImplRecord {
             trait_type,
             implementor,
             methods,
-        });
+            visible_scope,
+        };
+        if crate::associated_types::has_declarations(r, trait_type) {
+            if let Err(error) = r.type_pool.complete_trait_impl(record) {
+                r.diag_ctx
+                    .error(error.to_string())
+                    .with_primary_span(ast.node(node_idx).span)
+                    .emit(r.diag_ctx);
+            }
+        } else {
+            r.type_pool.add_trait_impl(record);
+        }
+
+        if crate::ordering::type_index(r).is_some()
+            && [
+                r.type_pool.well_known.ord,
+                r.type_pool.well_known.partial_ord,
+            ]
+            .contains(&trait_type)
+        {
+            let parent = if trait_type == r.type_pool.well_known.ord {
+                r.type_pool.well_known.eq
+            } else {
+                r.type_pool.well_known.partial_eq
+            };
+            parent_checks.push((node_idx, implementor, trait_type, parent, visible_scope));
+        }
     }
+
+    crate::associated_types::install_all(r, ast);
 
     // ── Register methods from plain impl blocks (no trait) ─────────
     let impl_nodes: Vec<_> = r
@@ -292,7 +346,10 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
                 return false;
             }
             let kind = ast.node(node).kind;
-            kind == NodeKind::ImplDef || kind == NodeKind::ExtendDef
+            matches!(
+                kind,
+                NodeKind::ImplDef | NodeKind::ExtendDef | NodeKind::StructDef | NodeKind::EnumDef
+            )
         })
         .map(|scope| scope.node)
         .collect();
@@ -315,11 +372,7 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
 
         let target_ti = r.node_symbols.get(&type_node).and_then(|&sym_id| {
             let sym = &r.symbols[sym_id.0 as usize];
-            if sym.type_index != type_pool::TypeIndex::INVALID {
-                Some(sym.type_index)
-            } else {
-                None
-            }
+            r.type_pool.canonical_type(sym.type_index)
         });
 
         let Some(implementor) = target_ti else {
@@ -327,21 +380,34 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         };
 
         for &member in ast.multi_children(node_idx) {
+            let member = if matches!(
+                ast.node(member).kind,
+                NodeKind::PubDef | NodeKind::PrivateDef
+            ) {
+                ast.fixed_children(member)[0]
+            } else {
+                member
+            };
             if ast.node(member).kind == NodeKind::FunctionDef {
                 let fn_children = ast.fixed_children(member);
                 let fn_name = ast.node(fn_children[0]).str_id;
 
-                let func_id = r
-                    .node_symbols
-                    .get(&fn_children[0])
-                    .map(|&sym_id| sym_id.0)
-                    .unwrap_or(0);
+                let Some(&method_symbol) = r.node_symbols.get(&fn_children[0]) else {
+                    r.diag_ctx
+                        .error("method declaration has no resolved function symbol".into())
+                        .with_primary_span(ast.node(member).span)
+                        .emit(r.diag_ctx);
+                    continue;
+                };
+                let func_id = method_symbol.0;
+                let access = crate::access::method_access(r, method_symbol);
 
                 r.type_pool.add_method(
                     implementor,
                     MethodSlot {
                         name: fn_name,
                         func_id,
+                        access,
                         trait_impl: None,
                         visible_scope,
                     },
@@ -350,65 +416,41 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         }
     }
 
-    // ── Process derive definitions ─────────────────────────────────
-    //
-    // `derive Eq, Show for Point` auto-registers trait impls.
-    // We collect DeriveDef nodes from the AST (they are NOT scope nodes).
-    let derive_nodes: Vec<_> = (1..ast.nodes.len())
-        .map(|i| NodeIndex(i as u32))
-        .filter(|&idx| ast.node(idx).kind == NodeKind::DeriveDef)
-        .collect();
+    crate::comparison_derivation::register(r, ast);
+    crate::ordering::complete_records(r, ast);
 
-    for node_idx in derive_nodes {
-        // DeriveDef: [0] type_expr  multi = trait_exprs
-        let children = ast.fixed_children(node_idx);
-        let type_node = children[0];
-
-        let target_ti = r.node_symbols.get(&type_node).and_then(|&sym_id| {
-            let sym = &r.symbols[sym_id.0 as usize];
-            if sym.type_index != type_pool::TypeIndex::INVALID {
-                Some(sym.type_index)
-            } else {
-                None
-            }
-        });
-
-        let Some(implementor) = target_ti else {
-            continue;
+    for (node, implementor, trait_type, parent, visible_scope) in parent_checks {
+        let available = match visible_scope {
+            Some(scope) => r
+                .type_pool
+                .find_trait_impl_scoped(implementor, parent, scope)
+                .map(|record| record.is_some()),
+            None => Ok(r.type_pool.has_trait_impl(implementor, parent)),
         };
-
-        for &trait_expr in ast.multi_children(node_idx) {
-            let trait_ti = r.node_symbols.get(&trait_expr).and_then(|&sym_id| {
-                let sym = &r.symbols[sym_id.0 as usize];
-                if sym.kind == SymbolKind::Trait && sym.type_index != type_pool::TypeIndex::INVALID
-                {
-                    Some(sym.type_index)
-                } else {
-                    None
-                }
-            });
-
-            let Some(trait_type) = trait_ti else {
-                continue;
-            };
-
-            // Generate synthetic method slots for well-known derivable traits.
-            let methods = generate_derive_methods(r, implementor, trait_type);
-
-            for slot in &methods {
-                r.type_pool.add_method(implementor, slot.clone());
+        match available {
+            Ok(true) => {}
+            result => {
+                let message = match result {
+                    Err(error) => format!("ambiguous parent trait implementation: {error}"),
+                    _ => format!(
+                        "impl of trait `{}` requires a visible parent trait `{}` implementation",
+                        r.type_pool.display_name(trait_type).unwrap_or_default(),
+                        r.type_pool.display_name(parent).unwrap_or_default()
+                    ),
+                };
+                r.diag_ctx
+                    .error(message)
+                    .with_primary_span(ast.node(node).span)
+                    .emit(r.diag_ctx);
             }
-
-            r.type_pool.add_trait_impl(TraitImplRecord {
-                trait_type,
-                implementor,
-                methods,
-            });
         }
     }
 
     // ── Build vtables for all recorded trait impls ─────────────────
+    crate::trait_schemas::register(r, ast);
     build_vtables(r);
+    crate::trait_signatures::validate(r, ast);
+    crate::display_derivation::validate(r, ast);
 }
 
 // ---------------------------------------------------------------------------
@@ -422,75 +464,64 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
 /// derived methods, in declaration order).  Parent trait methods are prepended
 /// so that a sub-trait vtable is a superset of its parent trait vtable(s).
 fn build_vtables(r: &mut Resolver) {
-    // Collect method order for each trait.
-    let trait_method_orders: Vec<(type_pool::TypeIndex, Vec<str_interner::StrId>)> = r
-        .traits
-        .iter()
-        .map(|ti| {
-            let mut order = Vec::new();
-            // Add parent trait methods first (recursively).
-            for &parent_ti in &ti.parent_traits {
-                if let Some(parent_info) = r.traits.iter().find(|t| t.type_index == parent_ti) {
-                    for m in &parent_info.required_methods {
-                        if !order.contains(m) {
-                            order.push(*m);
-                        }
-                    }
-                    for m in &parent_info.derived_methods {
-                        if !order.contains(m) {
-                            order.push(*m);
-                        }
-                    }
-                }
-            }
-            // Then this trait's own methods.
-            for m in &ti.required_methods {
-                if !order.contains(m) {
-                    order.push(*m);
-                }
-            }
-            for m in &ti.derived_methods {
-                if !order.contains(m) {
-                    order.push(*m);
-                }
-            }
-            (ti.type_index, order)
-        })
-        .collect();
-
-    // Build a vtable for every trait impl record.
-    let impl_records: Vec<_> = r
-        .type_pool
-        .trait_impls_snapshot()
-        .iter()
-        .map(|rec| (rec.trait_type, rec.implementor, rec.methods.clone()))
-        .collect();
-
-    for (trait_type, implementor, methods) in impl_records {
-        let method_order = trait_method_orders
-            .iter()
-            .find(|(ti, _)| *ti == trait_type)
-            .map(|(_, order)| order.as_slice());
-
-        let Some(order) = method_order else {
+    let records = r.type_pool.trait_impls_snapshot().to_vec();
+    for record in records {
+        let Some(schema) = r.type_pool.trait_schema(record.trait_type) else {
             continue;
         };
-
+        let order: Vec<_> = schema
+            .slots
+            .iter()
+            .map(|slot| (slot.trait_owner, slot.name))
+            .collect();
         let mut entries = Vec::with_capacity(order.len());
-        for &method_name in order {
-            let func_id = methods
-                .iter()
-                .find(|m| m.name == method_name)
-                .map(|m| m.func_id)
-                .unwrap_or(0); // 0 = unresolved placeholder
-            entries.push(func_id);
+        let mut complete = true;
+        for (owner, name) in order {
+            let own = record.methods.iter().find(|method| method.name == name);
+            let inherited = if own.is_none() {
+                match record.visible_scope {
+                    Some(scope) => match r.type_pool.find_trait_method_scoped(
+                        record.implementor,
+                        owner,
+                        name,
+                        scope,
+                    ) {
+                        Ok(method) => method,
+                        Err(error) => {
+                            complete = false;
+                            r.diag_ctx
+                                .error(format!("cannot resolve inherited trait method: {error}"))
+                                .emit(r.diag_ctx);
+                            continue;
+                        }
+                    },
+                    None => r
+                        .type_pool
+                        .find_trait_method(record.implementor, owner, name),
+                }
+            } else {
+                None
+            };
+            if let Some(method) = own.or(inherited) {
+                entries.push(method.func_id);
+            } else {
+                complete = false;
+                r.diag_ctx
+                    .error(format!(
+                        "trait vtable is missing checked method `{}`",
+                        str_interner::get(name)
+                    ))
+                    .emit(r.diag_ctx);
+            }
         }
-
-        r.type_pool.add_vtable(VTable {
-            trait_type,
-            implementor,
-            entries,
-        });
+        if complete {
+            r.type_pool.add_vtable(VTable {
+                trait_type: record.trait_type,
+                implementor: record.implementor,
+                entries,
+                visible_scope: record.visible_scope,
+            });
+        }
     }
 }
 
@@ -502,7 +533,7 @@ fn build_vtables(r: &mut Resolver) {
 /// Re-exported from type_pool for use by the interpreter.
 pub const DERIVE_FUNC_ID: u32 = type_pool::DERIVE_FUNC_ID;
 
-fn generate_derive_methods(
+pub(crate) fn generate_derive_methods(
     r: &Resolver,
     _implementor: type_pool::TypeIndex,
     trait_type: type_pool::TypeIndex,
@@ -514,6 +545,7 @@ fn generate_derive_methods(
         methods.push(MethodSlot {
             name: str_interner::intern("eq"),
             func_id: DERIVE_FUNC_ID,
+            access: type_pool::MethodAccess::Public,
             trait_impl: Some(trait_type),
             visible_scope: None,
         });
@@ -521,6 +553,7 @@ fn generate_derive_methods(
         methods.push(MethodSlot {
             name: str_interner::intern("cmp"),
             func_id: DERIVE_FUNC_ID,
+            access: type_pool::MethodAccess::Public,
             trait_impl: Some(trait_type),
             visible_scope: None,
         });
@@ -528,6 +561,7 @@ fn generate_derive_methods(
         methods.push(MethodSlot {
             name: str_interner::intern("hash"),
             func_id: DERIVE_FUNC_ID,
+            access: type_pool::MethodAccess::Public,
             trait_impl: Some(trait_type),
             visible_scope: None,
         });
@@ -535,6 +569,7 @@ fn generate_derive_methods(
         methods.push(MethodSlot {
             name: str_interner::intern("to_string"),
             func_id: DERIVE_FUNC_ID,
+            access: type_pool::MethodAccess::Public,
             trait_impl: Some(trait_type),
             visible_scope: None,
         });

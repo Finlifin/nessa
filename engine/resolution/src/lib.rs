@@ -9,11 +9,63 @@
 //! | 3c    | [`effect`] | Collect effect declarations                    |
 //! | 3d    | [`traits`] | Collect trait info, record impl relationships  |
 
+mod access;
+mod applications;
+mod arguments;
+mod associated;
+mod associated_types;
+mod collections;
+mod comparison_derivation;
+mod display_derivation;
+pub use display_derivation::{DerivedDisplayPlan, DisplayDerivationMode};
+mod default_body;
+mod default_methods;
+mod defaults;
+pub use default_methods::{DefaultBodyFacts, DefaultMethodPlan};
 mod effect;
+mod effect_contracts;
+mod enums;
+mod error_coverage;
+mod error_matrix;
+mod error_patterns;
+mod error_plans;
+mod errors;
+pub use comparison_derivation::DerivedComparisonPlan;
+pub use error_plans::{
+    ErrorConstructionPlan, ErrorConversionKind, ErrorConversionPlan, ErrorEliminationPlan,
+    ErrorPatternBranch, ErrorPatternPlan, ErrorPropagationPlan, ErrorTagSource,
+};
+mod identity;
+mod imports;
+mod inference;
+mod initialization;
+mod source_identity;
+pub use identity::SourcePackageIdentity;
+pub use source_identity::scratch_package_identity;
+mod list_patterns;
+mod lists;
+mod methods;
 mod name;
+mod optional;
+mod ordering;
+mod pattern_bindings;
+mod post_do;
 pub(crate) mod resolver;
+mod self_provenance;
+mod structs;
+mod trait_loops;
+pub use trait_loops::{ForLoopPlan, IteratorCall};
+mod trait_schemas;
+mod trait_signatures;
+mod trait_typing;
 mod traits;
+mod tuples;
+mod type_factories;
+pub use enums::{EnumConstructionPlan, EnumVariantRef};
+pub use type_factories::TypeFactory;
+mod extended;
 mod typing;
+mod variadics;
 
 use ast::{Ast, NodeIndex};
 use diagnostic::{Diagnostic, DiagnosticContext};
@@ -21,7 +73,13 @@ use runtime::BuiltinFnId;
 use str_interner::StrId;
 use type_pool::{TypeIndex, TypePool};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+pub use arguments::{
+    CallArgumentPlan, CallArgumentValue, CallParameterBinding, argument_value_node,
+};
+
+pub use structs::{StructConstructionPlan, StructFieldBinding, StructFieldValue};
 
 // ---------------------------------------------------------------------------
 // ResolveOptions
@@ -35,6 +93,22 @@ pub struct ResolveOptions {
     /// Expose builtin functions as root-scope symbols (script / test mode
     /// until prelude is fully wired).
     pub expose_root_builtins: bool,
+    /// Bootstrap names for standalone resolution; normal compilation imports std.
+    pub expose_root_types: bool,
+    /// Exact nodes loaded from trusted package sources; names do not grant privilege.
+    pub privileged_nodes: HashSet<NodeIndex>,
+    /// Explicit package-root module nodes in a combined AST.
+    pub package_roots: HashSet<NodeIndex>,
+    /// Synthetic weak prelude imports which local declarations may shadow.
+    pub implicit_imports: HashSet<NodeIndex>,
+    /// Real package contexts keyed by original package-root AST nodes.
+    pub package_identities: HashMap<NodeIndex, SourcePackageIdentity>,
+    /// Synthetic external source containers, absent from their parent's bindings.
+    /// Their children retain paths relative to the original source package.
+    pub detached_package_roots: HashSet<NodeIndex>,
+    /// Direct dependency candidates of each declaring package. Short-name
+    /// ambiguity is diagnosed on use; no transitive or global registry fallback.
+    pub package_dependencies: HashMap<NodeIndex, HashMap<StrId, Vec<NodeIndex>>>,
 }
 
 impl Default for ResolveOptions {
@@ -43,6 +117,13 @@ impl Default for ResolveOptions {
             builtin_access: false,
             // Transitional: keep `print(...)` working in single-file scripts.
             expose_root_builtins: true,
+            expose_root_types: true,
+            privileged_nodes: HashSet::new(),
+            package_roots: HashSet::new(),
+            implicit_imports: HashSet::new(),
+            package_identities: HashMap::new(),
+            detached_package_roots: HashSet::new(),
+            package_dependencies: HashMap::new(),
         }
     }
 }
@@ -53,6 +134,7 @@ impl ResolveOptions {
         Self {
             builtin_access: true,
             expose_root_builtins: false,
+            ..Self::default()
         }
     }
 }
@@ -88,6 +170,8 @@ pub enum SymbolKind {
     Function,
     /// A native builtin function (`CallBuiltin`), typically bound via `'builtin`.
     BuiltinFunction(BuiltinFnId),
+    /// A compile-time constructor; it has no runtime TypeIndex or callable ABI.
+    TypeFactory(TypeFactory),
     Type,
     Module,
     Effect,
@@ -160,6 +244,9 @@ pub struct EffectOperation {
     pub name: StrId,
     pub param_types: Vec<TypeIndex>,
     pub return_type: TypeIndex,
+    /// Handler parameter position reserved for the runtime-provided continuation.
+    /// It is excluded from `param_types`, which describe effect caller arguments.
+    pub continuation_param: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +273,21 @@ pub type NodeSymbolMap = HashMap<NodeIndex, SymbolId>;
 /// Mapping from AST node to resolved type.
 pub type NodeTypeMap = HashMap<NodeIndex, TypeIndex>;
 
+/// A checked boundary conversion attached to an expression's produced value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoercionKind {
+    /// Check gradual compatibility without permitting numeric narrowing.
+    Assert,
+    /// Perform a statically justified numeric widening or representation change.
+    Convert,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Coercion {
+    pub target: TypeIndex,
+    pub kind: CoercionKind,
+}
+
 /// The output of the resolution phase.
 pub struct ResolvedAst {
     /// The original AST (unchanged).
@@ -200,6 +302,32 @@ pub struct ResolvedAst {
     pub node_symbols: NodeSymbolMap,
     /// Mapping from expression AST nodes to their inferred type.
     pub node_types: NodeTypeMap,
+    pub node_coercions: HashMap<NodeIndex, Coercion>,
+    pub error_constructions: HashMap<NodeIndex, crate::ErrorConstructionPlan>,
+    pub error_conversions: HashMap<NodeIndex, Vec<crate::ErrorConversionPlan>>,
+    pub error_propagations: HashMap<NodeIndex, crate::ErrorPropagationPlan>,
+    pub error_eliminations: HashMap<NodeIndex, crate::ErrorEliminationPlan>,
+    pub error_patterns: HashMap<NodeIndex, crate::ErrorPatternPlan>,
+    /// Declaration-aware bindings in parameter order; explicit arguments keep
+    /// their original source indices for ordered evaluation by lowering.
+    pub call_arguments: HashMap<NodeIndex, CallArgumentPlan>,
+    /// Static constructor calls retain their type declaration for initialization dependencies.
+    pub constructor_types: HashMap<NodeIndex, SymbolId>,
+    pub struct_constructions: HashMap<NodeIndex, StructConstructionPlan>,
+    pub enum_constructions: HashMap<NodeIndex, EnumConstructionPlan>,
+    pub enum_variants: HashMap<NodeIndex, EnumVariantRef>,
+    pub for_loops: HashMap<NodeIndex, ForLoopPlan>,
+    pub derived_comparisons: Vec<DerivedComparisonPlan>,
+    pub display_derivations: Vec<DerivedDisplayPlan>,
+    pub default_methods: Vec<DefaultMethodPlan>,
+    /// Checked operator and instance method calls select a source function directly.
+    pub concat_calls: HashMap<NodeIndex, SymbolId>,
+    pub instance_methods: HashMap<NodeIndex, SymbolId>,
+    pub application_calls: HashMap<NodeIndex, SymbolId>,
+    pub update_calls: HashMap<NodeIndex, SymbolId>,
+    pub node_scopes: HashMap<NodeIndex, ScopeId>,
+    /// Types denoted by first-class type expressions (distinct from their value type Type).
+    pub node_type_values: HashMap<NodeIndex, TypeIndex>,
     /// Resolved effect declarations.
     pub effects: Vec<EffectInfo>,
     /// Resolved trait declarations.
@@ -246,10 +374,14 @@ mod tests {
     fn make_ast_with_let() -> Ast {
         // Build: let x = 42
         let mut ast = Ast::new();
-        let interner = &mut str_interner::Interner::new();
-        let x_str = interner.intern("x");
+        ast.source = Some("let x = 42".into());
+        let x_str = str_interner::intern("x");
 
-        let int_node = ast.builder(NodeKind::Int, rustc_span::DUMMY_SP).build();
+        let int_node = {
+            let mut b = ast.builder(NodeKind::Int, rustc_span::DUMMY_SP);
+            b.set_str_id(str_interner::intern("42"));
+            b.build()
+        };
         let id_node = {
             let mut b = ast.builder(NodeKind::Id, rustc_span::DUMMY_SP);
             b.set_str_id(x_str);
@@ -339,7 +471,7 @@ mod tests {
 
     #[test]
     fn builtin_view_resolves_with_access() {
-        let src = "const p = .print'builtin";
+        let src = "const p: fn(Any) -> Unit = .print'builtin";
         let (tokens, _) = lexer::tokenize(src);
         let sm = rustc_span::SourceMap::new(rustc_span::source_map::FilePathMapping::empty());
         let sf = sm.new_source_file(rustc_span::FileName::Custom("t".into()), src.to_string());
@@ -347,6 +479,7 @@ mod tests {
         let parser = parser::Parser::new(&tokens, src, &diag, sf.start_pos);
         let ast = parser.parse();
         let resolved = resolve_with_options(ast, &diag, ResolveOptions::for_builtin_package());
+        assert!(!diag.has_errors(), "{:?}", diag.diagnostics());
         assert!(
             resolved
                 .diagnostics

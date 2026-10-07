@@ -68,3 +68,27 @@ nessa 通过对 `package.toml` 的内容（不包括版本号字段）及其所�
 "com.example/baz" = "~1.2.0"     # 近似版本：>=1.2.0, <1.3.0
 "com.example/qux" = ">=1.0, <3.0" # 范围约束
 ```
+
+## 包身份协议与当前实现范围
+
+包身份采用版本1协议：域分离 SHA256 的前128位，输出32位小写十六进制。
+清单按 TOML 语义值编码，table键排序、array保持顺序，字符串/数字/日期等
+类型分别编码；包括描述性和未知字段。只排除 package.version，依赖约束
+另按规范化 ADT 编码；inline dependency table 的其它属性仍参与身份。
+递归选中子包的身份按限定包名排序参与 Merkle 节点，具体选中版本由 lock固定。
+
+版本约束匹配保留精确、caret、tilde、range的semver与预发布规则。没有任何
+预发布比较器的合取可规范化等价的省略零分量；若有显式预发布比较器，则
+保留分量精度，不将 `<3.0` 和 `<3.0.0` 等可能不同的边界混为同一身份。
+规范化不改变匹配规则，也不尝试将所有逻辑等价区间化为同一表达式。
+
+公开 API 由 ManifestDocument 保留完整清单，PackageManifest仍是既有五字段
+投影。PackageResolver对整个图共同求解，优先选择最高兼容版本，必要时回溯；
+缺依赖、冲突、循环和同名同版本内容冲突均明确报告。锁定图通过
+ResolvedPackageGraph.to_lock生成，resolve_document_locked只使用锁定的精确
+版本并复核约束、边、身份、root和所有可达项，拒绝未知格式/字段和多余/缺失项。
+
+lock schema1包括 schema_version、identity_schema、root表和packages数组；
+root含qualified_name/version/identity，package项另有dependencies限定名数组。
+这种包身份和lock API尚不等于源码包编译、包下载、跨包链接或源码TypeId赋值。
+确切字节编码、资源预算和验证结果见[实施记录](../dev/package-identity-audit.md)。

@@ -1,10 +1,11 @@
 //! Engine initialization — sets up the TypePool with intrinsic types,
 //! creates the VM, and prepares the runtime environment.
 
+use std::sync::Arc;
+
 use gc::GcConfig;
 use interpreter::Vm;
 use stack_pool::StackPool;
-use std::sync::Arc;
 use type_pool::TypePool;
 
 pub mod builtin_fns;
@@ -14,21 +15,12 @@ pub mod builtin_fns;
 // ---------------------------------------------------------------------------
 
 /// Configuration for initializing the Nessa engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EngineConfig {
     /// GC configuration.
     pub gc: GcConfig,
     /// Whether to enable debug instrumentation.
     pub debug: bool,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            gc: GcConfig::default(),
-            debug: false,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +70,7 @@ impl Engine {
 
     /// Get a reference to the type pool.
     pub fn type_pool(&self) -> &TypePool {
-        &self.vm.type_pool
+        self.vm.type_pool()
     }
 
     /// Get a mutable reference to the VM.

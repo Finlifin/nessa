@@ -10,7 +10,8 @@ use std::io::{self, Read, Write};
 // ---------------------------------------------------------------------------
 
 pub const MAGIC: &[u8; 4] = b"NSBC";
-pub const VERSION: u32 = 2;
+/// v4 adds authenticated Error envelopes; v3 continuation semantics remain unchanged.
+pub const VERSION: u32 = 4;
 
 /// Size of the file header in bytes.
 pub const FILE_HEADER_SIZE: usize = 60;
@@ -64,11 +65,11 @@ pub struct FileHeader {
     /// SHA-256 checksum of all data after the header (32 bytes).
     pub checksum: [u8; 32],
     /// Target architecture (0 = portable).
-    pub target_arch: u8,
+    pub target_arch: u16,
     /// Target OS (0 = portable).
-    pub target_os: u8,
+    pub target_os: u16,
     /// Flags (reserved).
-    pub flags: u16,
+    pub flags: u32,
     /// Number of sections.
     pub section_count: u32,
     /// Offset of the section table from start of file.
@@ -80,8 +81,8 @@ impl FileHeader {
         w.write_all(&self.magic)?;
         w.write_all(&self.version.to_le_bytes())?;
         w.write_all(&self.checksum)?;
-        w.write_all(&[self.target_arch])?;
-        w.write_all(&[self.target_os])?;
+        w.write_all(&self.target_arch.to_le_bytes())?;
+        w.write_all(&self.target_os.to_le_bytes())?;
         w.write_all(&self.flags.to_le_bytes())?;
         w.write_all(&self.section_count.to_le_bytes())?;
         w.write_all(&self.section_table_offset.to_le_bytes())?;
@@ -102,15 +103,14 @@ impl FileHeader {
         let mut checksum = [0u8; 32];
         r.read_exact(&mut checksum)?;
 
-        let mut buf1 = [0u8; 1];
-        r.read_exact(&mut buf1)?;
-        let target_arch = buf1[0];
-        r.read_exact(&mut buf1)?;
-        let target_os = buf1[0];
-
         let mut buf2 = [0u8; 2];
         r.read_exact(&mut buf2)?;
-        let flags = u16::from_le_bytes(buf2);
+        let target_arch = u16::from_le_bytes(buf2);
+        r.read_exact(&mut buf2)?;
+        let target_os = u16::from_le_bytes(buf2);
+
+        r.read_exact(&mut buf4)?;
+        let flags = u32::from_le_bytes(buf4);
 
         r.read_exact(&mut buf4)?;
         let section_count = u32::from_le_bytes(buf4);
@@ -174,8 +174,14 @@ impl SectionEntry {
         r.read_exact(&mut buf1)?;
         let kind = buf1[0];
 
-        let mut _pad = [0u8; 3];
-        r.read_exact(&mut _pad)?; // padding
+        let mut kind_high_bytes = [0u8; 3];
+        r.read_exact(&mut kind_high_bytes)?;
+        if kind_high_bytes != [0; 3] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid section kind",
+            ));
+        }
 
         let mut buf8 = [0u8; 8];
         r.read_exact(&mut buf8)?;
@@ -198,5 +204,38 @@ impl SectionEntry {
             alignment,
             flags,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_has_the_documented_field_widths_and_size() {
+        let header = FileHeader {
+            magic: *MAGIC,
+            version: VERSION,
+            checksum: [7; 32],
+            target_arch: 0x1234,
+            target_os: 0x5678,
+            flags: 0x90abcdef,
+            section_count: 3,
+            section_table_offset: 0x0102030405060708,
+        };
+        let mut bytes = Vec::new();
+        header.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), FILE_HEADER_SIZE);
+        assert_eq!(&bytes[40..44], &[0x34, 0x12, 0x78, 0x56]);
+        assert_eq!(&bytes[44..48], &0x90abcdefu32.to_le_bytes());
+        assert_eq!(&bytes[48..52], &3u32.to_le_bytes());
+        assert_eq!(&bytes[52..60], &header.section_table_offset.to_le_bytes());
+        let decoded = FileHeader::read_from(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.target_arch, header.target_arch);
+        assert_eq!(decoded.target_os, header.target_os);
+        assert_eq!(decoded.flags, header.flags);
+        assert_eq!(decoded.section_count, header.section_count);
+        assert_eq!(decoded.section_table_offset, header.section_table_offset);
+        assert_eq!(decoded.checksum, header.checksum);
     }
 }

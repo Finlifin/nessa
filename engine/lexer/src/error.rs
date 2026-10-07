@@ -1,6 +1,6 @@
 use std::fmt;
 
-use diagnostic::{DiagnosticContext, NessaError};
+use diagnostic::{DiagnosticContext, NessaError, RawByteRange};
 use rustc_span::{BytePos, Span};
 
 use crate::token::Index;
@@ -95,12 +95,21 @@ impl NessaError for LexError {
     }
 
     fn emit(&self, diag_ctx: &DiagnosticContext, base_pos: BytePos) {
-        let span = self.span(base_pos);
-        diag_ctx
+        let builder = diag_ctx
             .error(self.message.clone())
-            .with_code(self.error_code())
-            .with_primary_span(span)
-            .with_error_label(span, format!("{}", self.kind))
-            .emit(diag_ctx);
+            .with_code(self.error_code());
+        let builder = match diag_ctx.mapped_raw_span(
+            base_pos,
+            RawByteRange {
+                start: self.from,
+                end: self.to,
+            },
+        ) {
+            Ok(location) => builder
+                .with_primary_source_span(location)
+                .with_error_source_span(location, format!("{}", self.kind)),
+            Err(error) => builder.with_note(format!("Source location unavailable: {error}")),
+        };
+        builder.emit(diag_ctx);
     }
 }

@@ -1,4 +1,6 @@
 -- std.process — process control builtins
 
+use .builtin.*
+
 pub const exit: fn(i64) -> NoReturn = .exit'builtin
 pub const panic: fn(Any) -> NoReturn = .panic'builtin

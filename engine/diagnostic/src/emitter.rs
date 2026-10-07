@@ -40,15 +40,23 @@ impl AriadneEmitter {
 
     /// Emit a single diagnostic
     pub fn emit_diagnostic(&self, diagnostic: &Diagnostic, context: &DiagnosticContext) {
-        let primary_span = diagnostic.primary_span.unwrap_or_else(|| {
-            diagnostic
-                .labels
-                .first()
-                .map(|label| label.span)
-                .unwrap_or(rustc_span::DUMMY_SP)
-        });
-
-        let source_file = context.source_map().lookup_source_file(primary_span.lo());
+        let span = diagnostic
+            .primary_span
+            .map(|span| (span, diagnostic.primary_source_start))
+            .or_else(|| {
+                diagnostic
+                    .labels
+                    .first()
+                    .map(|label| (label.span, label.source_start))
+            });
+        let Some((primary_span, source_file)) = span.and_then(|(span, anchor)| {
+            context
+                .source_for_location(span, anchor)
+                .map(|file| (span, file))
+        }) else {
+            super::emit_plain_diagnostic(diagnostic);
+            return;
+        };
         let _colors = ColorGenerator::new();
         let file_name = format!("{:?}", source_file.name);
 
@@ -64,12 +72,6 @@ impl AriadneEmitter {
         let byte_start = (primary_span.lo().0 - source_file.start_pos.0) as usize;
         let byte_end = (primary_span.hi().0 - source_file.start_pos.0) as usize;
 
-        // Debug: 输出字节和字符位置信息
-        // eprintln!("Debug: byte_start={}, byte_end={}, file_start_pos={}",
-        //     byte_start, byte_end, source_file.start_pos.0);
-        // eprintln!("Debug: source content length: {} bytes, {} chars",
-        //     source_content.len(), source_content.chars().count());
-
         // Convert byte indices to character indices by counting UTF-8 chars
         let char_start = source_content
             .get(..byte_start.min(source_content.len()))
@@ -79,9 +81,6 @@ impl AriadneEmitter {
             .get(..byte_end.min(source_content.len()))
             .map(|s| s.chars().count())
             .unwrap_or(char_start);
-
-        // Debug: 输出转换后的字符位置
-        eprintln!("Debug: char_start={}, char_end={}", char_start, char_end);
 
         let mut report = Report::build(
             diagnostic.level.to_ariadne_kind(),
@@ -95,9 +94,12 @@ impl AriadneEmitter {
         report = report.with_message(&diagnostic.message);
 
         // Add labels with different colors
+        let mut has_source_label = false;
         for label in &diagnostic.labels {
-            let label_file = context.source_map().lookup_source_file(label.span.lo());
-            if std::ptr::eq(label_file.as_ref(), source_file.as_ref()) {
+            if let Some(label_file) = context.source_for_location(label.span, label.source_start)
+                && std::ptr::eq(label_file.as_ref(), source_file.as_ref())
+            {
+                has_source_label = true;
                 let color = match label.level {
                     Level::Error => Color::Red,
                     Level::Warning => Color::Yellow,
@@ -126,6 +128,14 @@ impl AriadneEmitter {
             }
         }
 
+        // Ariadne only renders source locations with a label. Preserve the exact
+        // primary range when no valid same-file label provides that location.
+        if !has_source_label {
+            report = report.with_label(
+                Label::new((&file_name, char_start..char_end)).with_color(diagnostic.level.color()),
+            );
+        }
+
         // Add notes
         for note in &diagnostic.notes {
             report = report.with_note(note);
@@ -147,7 +157,7 @@ impl AriadneEmitter {
 
         if let Err(e) = report
             .finish()
-            .print((&file_name, Source::from(source_content)))
+            .eprint((&file_name, Source::from(source_content)))
         {
             eprintln!("Error printing diagnostic: {}", e);
         }
@@ -155,10 +165,8 @@ impl AriadneEmitter {
 
     /// Emit all diagnostics from a context
     pub fn emit_all(&self, context: &DiagnosticContext) {
-        unsafe {
-            for diagnostic in context.diagnostics() {
-                self.emit_diagnostic(diagnostic, context);
-            }
+        for diagnostic in context.diagnostics().iter() {
+            self.emit_diagnostic(diagnostic, context);
         }
     }
 }

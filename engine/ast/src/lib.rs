@@ -1,4 +1,8 @@
+mod assembly;
+pub use assembly::{AstAssemblyError, AstStorageLimits};
 pub mod dump;
+pub mod literal;
+mod source;
 
 use rustc_span::Span;
 use str_interner::StrId;
@@ -311,9 +315,13 @@ pub enum NodeKind {
     /// children: multi = param_types
     FnType,
 
-    /// `effect_type -> async? effect (param_type*)`
+    /// `effect_type -> effect (param_type*)`
     /// children: multi = param_types
     EffectType,
+
+    /// `effect_type -> async effect (param_type*)`
+    /// children: multi = param_types
+    AsyncEffectType,
 
     // ── Statements ──────────────────────────────────────────────────
     /// Expression in statement position
@@ -336,9 +344,13 @@ pub enum NodeKind {
     /// children: [0] inner
     GlobalDecl,
 
-    /// `assoc_decl -> assoc id : expr (= expr)?`
-    /// children: [0] inner
+    /// `assoc_decl -> assoc id : expr = expr`, or `assoc <definition>`.
+    /// children: [0] inner; the named form contains an AssocBinding.
     AssocDecl,
+
+    /// Associated binding: `name: type = value` inside an AssocDecl.
+    /// children: [0] name  [1] type  [2] value
+    AssocBinding,
 
     /// `handles(expr) let id (: expr)? = expr`
     /// children: [0] effect  [1] name  [2] type  [3] value
@@ -437,6 +449,10 @@ pub enum NodeKind {
     /// `pattern_error -> error pattern`
     /// children: [0] inner
     PatternError,
+    /// Unsupported effect-pattern spelling; kept distinct from Error.
+    PatternEffect,
+    /// Entire concrete payload family, written `E.*`.
+    PatternTypeFamily,
 
     /// `pattern_call -> expr (pattern*)`
     /// children: [0] constructor  multi = args
@@ -455,7 +471,7 @@ pub enum NodeKind {
     PatternIfGuard,
 
     /// `pattern_and_is -> pattern and expr is pattern`
-    /// children: [0] lhs  [1] rhs
+    /// children: [0] lhs_pattern  [1] expression  [2] rhs_pattern
     PatternAndIs,
 
     /// `pattern_option_some -> pattern ?`
@@ -575,6 +591,10 @@ pub enum NodeKind {
     /// children: [0] inner
     PubDef,
 
+    /// Visibility modifier wrapper: `private definition`
+    /// children: [0] inner
+    PrivateDef,
+
     // ── Import / use ────────────────────────────────────────────────
     /// `use_statement -> pub? use path`
     /// children: [0] path
@@ -600,8 +620,8 @@ pub enum NodeKind {
     /// children: [0] path  multi = items
     PathProjectionMulti,
 
-    /// `path_as_bind -> id as id`
-    /// children: [0] id  [1] alias
+    /// `path_as_bind -> path as id`
+    /// children: [0] path  [1] alias
     PathAsBind,
 
     // ── Parameters ──────────────────────────────────────────────────
@@ -624,6 +644,10 @@ pub enum NodeKind {
     /// `param_typed -> pattern : expr`
     /// children: [0] pattern  [1] type
     ParamTyped,
+
+    /// Effect-only continuation binding: `catch id (: type)?`.
+    /// children: [0] id  [1] type
+    ParamCatch,
 
     // ── Structural ──────────────────────────────────────────────────
     /// `property -> id : expr`
@@ -685,27 +709,28 @@ impl NodeKind {
             // 1 child
             Negative | BoolNot | ErrorConstruction | OptionalType | RangeFrom | RangeTo
             | RangeToInclusive | EffectPropagation | ErrorPropagation | OptionPropagation
-            | ExprStatement | DeferStatement | PatternNot | PatternError | PatternAsync
-            | PatternOptionSome | PatternErrorOk | PatternRestBind | PatternFromExpr
-            | SuperPath | PackagePath | PathProjectionAll | ElseConditionArm | Symbol | PubDef
-            | GlobalDecl | AssocDecl => SingleChild,
+            | ExprStatement | DeferStatement | PatternNot | PatternError | PatternEffect
+            | PatternTypeFamily | PatternAsync | PatternOptionSome | PatternErrorOk
+            | PatternRestBind | PatternFromExpr | SuperPath | PackagePath | PathProjectionAll
+            | ElseConditionArm | Symbol | PubDef | PrivateDef | GlobalDecl | AssocDecl => {
+                SingleChild
+            }
 
             // 2 children
             Add | Sub | Mul | Div | Mod | Concat | BoolEq | BoolNotEq | BoolGt | BoolGtEq
             | BoolLt | BoolLtEq | BoolAnd | BoolOr | BoolMatches | Projection | View | Arrow
             | Pipeline | InfixFnCall | RangeFromTo | RangeFromToInclusive | HandlerApplication
             | TypeCast | PostDo | CaseMap | CaseAlternative | PatternAsBind | PatternIfGuard
-            | PatternAndIs | Assign | AddAssign | SubAssign | MulAssign | DivAssign | ModAssign
-            | Typealias | Newtype | PropertyPattern | PathProjection | PathAsBind
-            | ConditionArm | CaseArm | CatchArm | Property | PropertyAssignment | NamedArg
-            | EffectQualifiedType | ErrorQualifiedType | ParamVarargs | ParamLambda
-            | ParamTyped | PatternOr | ResetExpr | ReturnStatement | ResumeStatement
-            | BreakStatement | ContinueStatement => DoubleChildren,
+            | Assign | AddAssign | SubAssign | MulAssign | DivAssign | ModAssign | Typealias
+            | Newtype | PropertyPattern | PathProjection | PathAsBind | ConditionArm | CaseArm
+            | CatchArm | Property | PropertyAssignment | NamedArg | EffectQualifiedType
+            | ErrorQualifiedType | ParamVarargs | ParamLambda | ParamTyped | ParamCatch
+            | PatternOr | ResetExpr | ReturnStatement | ResumeStatement | BreakStatement
+            | ContinueStatement => DoubleChildren,
 
             // 3 children
-            VarDecl | IfStatement | ShiftExpr | StructField | ParamOptional | WhileLoop => {
-                TripleChildren
-            }
+            VarDecl | AssocBinding | IfStatement | ShiftExpr | StructField | ParamOptional
+            | WhileLoop | PatternAndIs => TripleChildren,
 
             // 3 + multi
             HandlesStatement | TraitDefFn => TripleWithMulti,
@@ -715,7 +740,8 @@ impl NodeKind {
 
             // Multi only
             ListOf | Tuple | Object | Block | FileScope | PatternList | PatternTuple
-            | PatternRecord | WhenStatement | FnType | EffectType | FStringConcat => MultiChildren,
+            | PatternRecord | WhenStatement | FnType | EffectType | AsyncEffectType
+            | FStringConcat => MultiChildren,
 
             // 1 + multi
             UseStatement | PathProjectionMulti | StructDef | EnumDef | ImplDef | DeriveDef
@@ -764,8 +790,11 @@ pub struct Ast {
     pub extra_children: Vec<NodeIndex>,
     /// Root node index (set after a successful parse).
     pub root: NodeIndex,
-    /// Source text for this AST (borrowed during dump).
-    pub source: String,
+    /// Original source bytes, if retained. Some("") is known empty input;
+    /// None means provenance was not supplied by this AST producer.
+    pub source: Option<String>,
+    source_records: Vec<source::SourceRecord>,
+    original_spans: Vec<Option<source::OriginalSpan>>,
 }
 
 impl Ast {
@@ -782,13 +811,63 @@ impl Ast {
             nodes: vec![null_node],
             extra_children: Vec::new(),
             root: NodeIndex::NULL,
-            source: String::new(),
+            source: None,
+            source_records: Vec::new(),
+            original_spans: vec![None],
         }
     }
 
     pub fn with_source(mut self, source: String) -> Self {
-        self.source = source;
+        self.replace_local_source(source);
         self
+    }
+
+    /// Append another AST arena and return its relocated root. Source spans
+    /// already refer to the shared source map and remain unchanged. This AST's
+    /// root and debug source text remain unchanged.
+    ///
+    /// Both arenas must contain valid internal node and child indices, as
+    /// produced by their builders. The merged arena must fit u32 indices.
+    ///
+    /// # Panics
+    /// Panics if the merged arena exceeds u32 storage indices. Invalid arenas
+    /// without their reserved null sentinel also violate this API's contract.
+    pub fn append_ast(&mut self, mut other: Ast) -> NodeIndex {
+        let node_offset = u32::try_from(self.nodes.len() - 1).expect("AST node indices fit u32");
+        let child_offset =
+            u32::try_from(self.extra_children.len()).expect("AST child indices fit u32");
+        let merged_nodes = self
+            .nodes
+            .len()
+            .checked_add(other.nodes.len() - 1)
+            .expect("AST arena size fits usize");
+        let merged_children = self
+            .extra_children
+            .len()
+            .checked_add(other.extra_children.len())
+            .expect("AST child storage size fits usize");
+        assert!(
+            merged_nodes <= u32::MAX as usize && merged_children <= u32::MAX as usize,
+            "merged AST storage fits u32 indices"
+        );
+        let relocate = |index: NodeIndex| {
+            if index.is_null() {
+                index
+            } else {
+                NodeIndex(index.0 + node_offset)
+            }
+        };
+        let root = relocate(other.root);
+        self.append_source_origins(&mut other);
+        self.extra_children
+            .extend(other.extra_children.into_iter().map(relocate));
+        self.nodes
+            .extend(other.nodes.into_iter().skip(1).map(|mut node| {
+                node.children = node.children.map(relocate);
+                node.multi_start += child_offset;
+                node
+            }));
+        root
     }
 
     /// Get a reference to the node at `index`.
@@ -838,6 +917,8 @@ impl Ast {
     /// Push a pre-built node directly and return its index.
     fn push_node(&mut self, node: Node) -> NodeIndex {
         let idx = self.nodes.len() as u32;
+        self.original_spans.resize(self.nodes.len(), None);
+        self.original_spans.push(self.origin_for_span(node.span));
         self.nodes.push(node);
         NodeIndex(idx)
     }
@@ -911,3 +992,125 @@ impl<'a> NodeBuilder<'a> {
 // Re-export dump functionality
 pub use dump::dump_ast;
 pub use dump::dump_ast_to_string;
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use rustc_span::BytePos;
+
+    #[test]
+    fn append_relocates_the_complete_arena_and_preserves_source_spans() {
+        let mut destination = Ast::new().with_source("destination".into());
+        let existing = destination
+            .builder(NodeKind::Int, rustc_span::DUMMY_SP)
+            .set_str_id(str_interner::intern("99"))
+            .build();
+        destination.root = destination
+            .builder(NodeKind::FileScope, rustc_span::DUMMY_SP)
+            .add_multi_children(&[existing])
+            .build();
+        let original_root = destination.root;
+        let node_offset = destination.nodes.len() - 1;
+        let child_offset = destination.extra_children.len();
+        let span = Span::new(BytePos(20), BytePos(23));
+        let mut source = Ast::new().with_source("source".into());
+        let name = source
+            .builder(NodeKind::Id, span)
+            .set_str_id(str_interner::intern("f"))
+            .build();
+        let value = source
+            .builder(NodeKind::Int, span)
+            .set_str_id(str_interner::intern("42"))
+            .build();
+        let tuple = source
+            .builder(NodeKind::Tuple, span)
+            .add_multi_children(&[value, NodeIndex::NULL, value])
+            .build();
+        let function = source
+            .builder(NodeKind::FunctionDef, span)
+            .add_child(name)
+            .add_child(NodeIndex::NULL)
+            .add_child(tuple)
+            .add_child(NodeIndex::NULL)
+            .add_multi_children(&[name, NodeIndex::NULL])
+            .build();
+        source.root = source
+            .builder(NodeKind::FileScope, span)
+            .add_multi_children(&[function])
+            .build();
+        let source_root = source.root;
+        let original_nodes = source.nodes.clone();
+        let original_children = source.extra_children.clone();
+        let appended_root = destination.append_ast(source);
+        assert_eq!(appended_root, NodeIndex(source_root.0 + node_offset as u32));
+        assert_eq!(destination.root, original_root);
+        assert_eq!(destination.source.as_deref(), Some("destination"));
+        assert_eq!(destination.multi_children(original_root), &[existing]);
+        let relocated = |index: NodeIndex| {
+            if index.is_null() {
+                index
+            } else {
+                NodeIndex(index.0 + node_offset as u32)
+            }
+        };
+        for (index, original) in original_nodes.iter().enumerate().skip(1) {
+            let actual = destination.node(NodeIndex((index + node_offset) as u32));
+            assert_eq!(actual.kind, original.kind);
+            assert_eq!(actual.span, original.span);
+            assert_eq!(actual.str_id, original.str_id);
+            assert_eq!(actual.children, original.children.map(relocated));
+            assert_eq!(
+                actual.multi_start as usize,
+                original.multi_start as usize + child_offset
+            );
+            assert_eq!(actual.multi_len, original.multi_len);
+        }
+        assert_eq!(
+            &destination.extra_children[child_offset..],
+            original_children
+                .into_iter()
+                .map(relocated)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn append_preserves_missing_known_empty_and_nonempty_destination_source() {
+        for destination_source in [None, Some(""), Some("destination")] {
+            for appended_source in [None, Some(""), Some("other")] {
+                let mut destination = Ast::new();
+                destination.source = destination_source.map(str::to_owned);
+                let mut other = Ast::new();
+                other.source = appended_source.map(str::to_owned);
+                destination.append_ast(other);
+                assert_eq!(destination.source.as_deref(), destination_source);
+            }
+        }
+        assert_eq!(
+            Ast::new().with_source(String::new()).source,
+            Some(String::new())
+        );
+        assert_eq!(Ast::new().source, None);
+    }
+
+    #[test]
+    fn appending_empty_and_successive_arenas_preserves_null_and_leaf_roots() {
+        let mut destination = Ast::new();
+        assert_eq!(destination.append_ast(Ast::new()), NodeIndex::NULL);
+        assert_eq!(destination.nodes.len(), 1);
+        for text in ["first", "second"] {
+            let mut other = Ast::new();
+            other.root = other
+                .builder(NodeKind::Id, rustc_span::DUMMY_SP)
+                .set_str_id(str_interner::intern(text))
+                .build();
+            let root = destination.append_ast(other);
+            assert_eq!(str_interner::get(destination.node(root).str_id), text);
+            assert!(destination.fixed_children(root).is_empty());
+            assert!(destination.multi_children(root).is_empty());
+            assert_eq!(destination.node(root).children, [NodeIndex::NULL; 4]);
+        }
+        assert_eq!(destination.nodes.len(), 3);
+        assert!(destination.root.is_null());
+    }
+}

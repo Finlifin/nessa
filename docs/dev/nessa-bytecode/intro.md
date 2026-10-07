@@ -7,7 +7,7 @@ Nessa Serialized ByteCode (NSBC) 是 Nessa 的编译产物格式，同时也是 
 - **指令宽度**: 固定 32 bits
 - **通用寄存器**: 32 个 (r0~r31)，每个 64-bit，存储 TaggedValue
 - **寻址模式**: 指令内 2-bit `amode`（立即 / 常量池 / 寄存器+有符号偏移 / 保留）
-- **Archive 版本**: 2（相对 v1 的 64-bit 指令不兼容）
+- **Archive 版本**: 3（沿用 v2 的 32-bit 指令，定义新的 continuation 栈切换 ABI；旧版本需重新编译）
 
 ## ABI（仿 ARM AAPCS）
 
@@ -80,6 +80,9 @@ Format 11: E-type (扩展)
 超出三种模式的操作数来源（字段索引、全局、捕获、宽 func_id 等）使用**独立 opcode**，不挤进 amode。
 
 ## 指令分类
+
+Continuation 指令与栈段所有权见
+[continuation-stack-abi.md](../continuation-stack-abi.md)。
 
 详见 [instruction/](instruction/) 目录。
 

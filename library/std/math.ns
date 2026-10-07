@@ -1,5 +1,7 @@
 -- std.math — mathematical builtins
 
+use .builtin.*
+
 pub const abs: fn(Any) -> Any = .abs'builtin
 pub const sin: fn(f64) -> f64 = .sin'builtin
 pub const cos: fn(f64) -> f64 = .cos'builtin
@@ -7,5 +9,6 @@ pub const sqrt: fn(f64) -> f64 = .sqrt'builtin
 pub const floor: fn(f64) -> f64 = .floor'builtin
 pub const ceil: fn(f64) -> f64 = .ceil'builtin
 pub const round: fn(f64) -> f64 = .round'builtin
-pub const pow: fn(f64, f64) -> f64 = .pow'builtin
+-- Numeric native dispatch preserves integral powers; generic numeric signatures are pending.
+pub const pow: fn(Any, Any) -> Any = .pow'builtin
 pub const log: fn(f64) -> f64 = .log'builtin

@@ -128,6 +128,15 @@ post_match -> expr match { case_arm* }
 post_do -> expr do (lambda | block)
 ```
 
+尾随 `do` 在名称解析前展开为普通调用。`f do lambda` 等价于 `f(lambda)`；
+`f(args) do lambda` 等价于 `f(args, lambda)`，尾随闭包按普通位置实参绑定。
+`f do { statements }` 等价于 `f(|| { statements })`，没有隐式参数；需要参数
+时使用显式 `|params|`。源码中的 callee、已有实参和闭包按该普通调用的顺序求值。
+闭包体在 callee 调用回调时执行，return/break/continue 使用闭包自身的控制边界。
+可选参数仍按名字供给，单 List 变参仍收集追加的位置实参。解析器的原始 AST
+保留 PostDo；编译后的 AST 与后续阶段使用普通 Call/Lambda。
+
+
 ## 消除表达式
 
 ```ebnf
@@ -167,3 +176,12 @@ effect_qualified_type -> #effect_set_expr type_expr
 error_qualified_type -> !error_set_expr type_expr
 optional_type -> ?type_expr
 ```
+## 拼接的当前编译路径
+
+`left ++ right` 调用左值类型的 `concat(self, other)` 实例方法。静态类型检查
+固定单操作数、可见性、参数及结果类型；结果不要求与左值同类型。先求值并保存
+left，再求值right。Any左值动态分派，非法方法或参数在运行时报错。
+
+String在std.string提供concat和len，len计UTF-8字节；`++`不自动把非字符串
+转成字符串。List在std.collections提供concat，创建新的容器，按顺序合并元素
+引用；输入容器保持不变，嵌套可变元素仍共享。Map没有定义隐含合并语义。

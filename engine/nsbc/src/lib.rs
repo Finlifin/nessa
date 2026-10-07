@@ -8,8 +8,16 @@
 //!
 //! Serialization and deserialization live in the companion `nsbc_io` crate.
 
-pub mod instruction;
 pub mod archive;
+mod display_metadata;
+mod function_abi;
+pub mod instruction;
+mod method_context;
+pub mod validation;
+
+pub use display_metadata::validate_display_owner;
+pub use function_abi::{CaptureAbi, FunctionAbi, ParameterAbi};
+pub use validation::{ArtifactError, builtin_references, uses_error_envelopes, validate_artifact};
 
 // Re-export instruction-level types at crate root for convenience.
 pub use crate::instruction::{
@@ -18,8 +26,7 @@ pub use crate::instruction::{
 
 // Re-export archive format types at crate root.
 pub use crate::archive::{
-    FileHeader, SectionEntry, SectionKind,
-    MAGIC, VERSION, FILE_HEADER_SIZE, SECTION_ENTRY_SIZE,
+    FILE_HEADER_SIZE, FileHeader, MAGIC, SECTION_ENTRY_SIZE, SectionEntry, SectionKind, VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -29,20 +36,118 @@ pub use crate::archive::{
 /// A compiled function ready for the bytecode store.
 #[derive(Debug)]
 pub struct CompiledFunction {
+    /// Authenticated compiler-generated Display traversal; legacy functions have None.
+    pub display_owner: Option<type_pool::TypeIndex>,
     pub func_id: FuncId,
     pub name: str_interner::StrId,
     pub instructions: Vec<u32>,
     pub register_count: u8,
     pub param_count: u8,
     pub is_closure: bool,
+    pub function_type: type_pool::TypeIndex,
+    /// None preserves the original entry interpretation of legacy bytecode.
+    pub abi: Option<FunctionAbi>,
     pub safepoint_pcs: Vec<u32>,
 }
 
 /// Output of compiling an entire module.
 #[derive(Debug)]
 pub struct CodegenOutput {
+    pub scope_coverage: ScopeCoverage,
     pub functions: Vec<CompiledFunction>,
     pub constants: Vec<Constant>,
+    pub globals: Vec<GlobalInfo>,
+    /// Complete lexical contexts for the instructions selected by scope_coverage.
+    /// None denotes legacy or host metadata.
+    pub method_call_scopes: Option<Vec<MethodCallScope>>,
+}
+
+/// Which instructions require lexical entries in the scope table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeCoverage {
+    Calls,
+    CallsAndTypes,
+}
+
+impl ScopeCoverage {
+    /// The opcode contract is shared by generation, loading and runtime installation.
+    pub fn covers(self, opcode: Opcode) -> bool {
+        matches!(
+            opcode,
+            Opcode::CallIndirect
+                | Opcode::CallMethod
+                | Opcode::CallMethodFar
+                | Opcode::CallIndirectProof
+                | Opcode::TraitProof
+                | Opcode::TraitCall
+        ) || (self == Self::CallsAndTypes
+            && matches!(
+                opcode,
+                Opcode::TypeCheck
+                    | Opcode::TypeCast
+                    | Opcode::TypeCastSafe
+                    | Opcode::TypeAssert
+                    | Opcode::TraitAssert
+                    | Opcode::StoreGlobal
+                    | Opcode::StoreGlobalWide
+                    | Opcode::LoadField
+                    | Opcode::StoreField
+                    | Opcode::NewEnum
+                    | Opcode::EnumField
+                    | Opcode::ErrorOk
+                    | Opcode::ErrorErr
+                    | Opcode::ErrorIsOk
+                    | Opcode::ErrorPayload
+            ))
+    }
+}
+
+/// Lexical context of an emitted instruction covered by ScopeCoverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodCallScope {
+    pub func_id: FuncId,
+    pub pc: u32,
+    pub scope: u32,
+}
+
+/// Index of a global binding shared by every function in an artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlobalId(pub u32);
+
+/// Runtime schema for a module binding; its first store initializes its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalInfo {
+    pub type_index: type_pool::TypeIndex,
+    pub is_mutable: bool,
+}
+
+/// A self-contained compilation unit with its exact-index runtime metadata.
+pub struct CompiledArtifact {
+    pub codegen_output: CodegenOutput,
+    pub type_pool: type_pool::TypePool,
+    /// Saved executable entry, which may be a generated module startup function.
+    pub entry: Option<FuncId>,
+    pub builtin_abi_version: u32,
+    pub builtins: Vec<BuiltinImport>,
+}
+
+impl std::fmt::Debug for CompiledArtifact {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledArtifact")
+            .field("codegen_output", &self.codegen_output)
+            .field("type_count", &self.type_pool.len())
+            .field("entry", &self.entry)
+            .field("builtin_abi_version", &self.builtin_abi_version)
+            .field("builtins", &self.builtins)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinImport {
+    pub id: u32,
+    pub name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +163,8 @@ pub struct BytecodeStore {
     code: Vec<Vec<u32>>,
     /// Global constant pool.
     constants: Vec<Constant>,
+    /// Schema retained with the artifact for its runtime global table.
+    globals: Vec<GlobalInfo>,
 }
 
 impl BytecodeStore {
@@ -66,6 +173,7 @@ impl BytecodeStore {
             headers: Vec::new(),
             code: Vec::new(),
             constants: Vec::new(),
+            globals: Vec::new(),
         }
     }
 
@@ -75,6 +183,7 @@ impl BytecodeStore {
             self.load_function(func);
         }
         self.constants.extend(output.constants);
+        self.globals.extend(output.globals);
     }
 
     /// Load a single compiled function.
@@ -123,6 +232,10 @@ impl BytecodeStore {
         self.headers.len()
     }
 
+    pub fn globals(&self) -> &[GlobalInfo] {
+        &self.globals
+    }
+
     /// Get a constant by index.
     pub fn constant(&self, idx: u32) -> Option<&Constant> {
         self.constants.get(idx as usize)
@@ -154,12 +267,15 @@ mod tests {
         let nop = Instruction::nop().encode();
         let ret = Instruction::return_unit().encode();
         store.load_function(CompiledFunction {
+            display_owner: None,
             func_id: FuncId(0),
             name: str_interner::StrId::from_raw(0),
             instructions: vec![nop, ret],
             register_count: 1,
             param_count: 0,
             is_closure: false,
+            function_type: type_pool::TypeIndex::INVALID,
+            abi: None,
             safepoint_pcs: vec![],
         });
 
@@ -177,14 +293,24 @@ mod tests {
     #[test]
     fn load_codegen_output_with_constants() {
         let mut store = BytecodeStore::new();
+        let global = GlobalInfo {
+            type_index: type_pool::Intrinsic::I64.type_index(),
+            is_mutable: false,
+        };
         store.load_codegen_output(CodegenOutput {
+            scope_coverage: crate::ScopeCoverage::Calls,
+            method_call_scopes: None,
+            globals: vec![global],
             functions: vec![CompiledFunction {
+                display_owner: None,
                 func_id: FuncId(0),
                 name: str_interner::StrId::from_raw(0),
                 instructions: vec![Instruction::nop().encode()],
                 register_count: 0,
                 param_count: 0,
                 is_closure: false,
+                function_type: type_pool::TypeIndex::INVALID,
+                abi: None,
                 safepoint_pcs: vec![],
             }],
             constants: vec![Constant::Int(42), Constant::Str("hello".into())],
@@ -192,6 +318,7 @@ mod tests {
 
         assert_eq!(store.function_count(), 1);
         assert_eq!(store.constant_count(), 2);
+        assert_eq!(store.globals(), &[global]);
         assert!(matches!(store.constant(0), Some(Constant::Int(42))));
     }
 
@@ -199,12 +326,15 @@ mod tests {
     fn sparse_func_ids() {
         let mut store = BytecodeStore::new();
         store.load_function(CompiledFunction {
+            display_owner: None,
             func_id: FuncId(5),
             name: str_interner::StrId::from_raw(0),
             instructions: vec![Instruction::nop().encode()],
             register_count: 2,
             param_count: 1,
             is_closure: false,
+            function_type: type_pool::TypeIndex::INVALID,
+            abi: None,
             safepoint_pcs: vec![],
         });
 

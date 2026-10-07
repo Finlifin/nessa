@@ -374,7 +374,7 @@ impl<'src> Lexer<'src> {
     // -- token recognition ------------------------------------------------
 
     fn recognize_token(&mut self, start: Index) -> Token {
-        let b = self.bytes[self.cursor as usize];
+        let b = self.bytes[self.cursor];
         match b {
             b'.' => {
                 self.cursor += 1;
@@ -667,10 +667,17 @@ impl<'src> Lexer<'src> {
             while i < self.bytes.len() {
                 match self.bytes[i] {
                     b'"' => break,
-                    b'\\' => { i += 2; }
-                    b'{' if self.bytes.get(i + 1) != Some(&b'{') => { found = true; break; }
+                    b'\\' => {
+                        i += 2;
+                    }
+                    b'{' if self.bytes.get(i + 1) != Some(&b'{') => {
+                        found = true;
+                        break;
+                    }
                     b'\n' => break,
-                    _ => { i += 1; }
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
             found
@@ -681,7 +688,12 @@ impl<'src> Lexer<'src> {
             loop {
                 match self.peek_byte() {
                     None => {
-                        self.push_error(LexErrorKind::InvalidStrLiteral, start, self.pos(), "unterminated string literal");
+                        self.push_error(
+                            LexErrorKind::InvalidStrLiteral,
+                            start,
+                            self.pos(),
+                            "unterminated string literal",
+                        );
                         return self.token(TokenKind::Invalid, start, self.pos());
                     }
                     Some(b'"') => {
@@ -691,22 +703,62 @@ impl<'src> Lexer<'src> {
                     Some(b'\\') => {
                         self.cursor += 1;
                         match self.peek_byte() {
-                            Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') => { self.cursor += 1; }
-                            Some(b'x') => { self.cursor += 1; if !self.expect_hex_digits(2, start) { return self.token(TokenKind::Invalid, start, self.pos()); } }
-                            Some(b'u') => { self.cursor += 1; if !self.expect_hex_digits(4, start) { return self.token(TokenKind::Invalid, start, self.pos()); } }
-                            Some(_) => { self.push_error(LexErrorKind::InvalidStrLiteral, start, self.pos(), "invalid escape sequence"); self.skip_to_string_end(); return self.token(TokenKind::Invalid, start, self.pos()); }
-                            None => { self.push_error(LexErrorKind::InvalidStrLiteral, start, self.pos(), "unterminated escape sequence"); return self.token(TokenKind::Invalid, start, self.pos()); }
+                            Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') => {
+                                self.cursor += 1;
+                            }
+                            Some(b'x') => {
+                                self.cursor += 1;
+                                if !self.expect_hex_digits(2, start) {
+                                    return self.token(TokenKind::Invalid, start, self.pos());
+                                }
+                            }
+                            Some(b'u') => {
+                                self.cursor += 1;
+                                if !self.expect_hex_digits(4, start) {
+                                    return self.token(TokenKind::Invalid, start, self.pos());
+                                }
+                            }
+                            Some(_) => {
+                                self.push_error(
+                                    LexErrorKind::InvalidStrLiteral,
+                                    start,
+                                    self.pos(),
+                                    "invalid escape sequence",
+                                );
+                                self.skip_to_string_end();
+                                return self.token(TokenKind::Invalid, start, self.pos());
+                            }
+                            None => {
+                                self.push_error(
+                                    LexErrorKind::InvalidStrLiteral,
+                                    start,
+                                    self.pos(),
+                                    "unterminated escape sequence",
+                                );
+                                return self.token(TokenKind::Invalid, start, self.pos());
+                            }
                         }
                     }
-                    Some(b'\n') => { self.push_error(LexErrorKind::InvalidStrLiteral, start, self.pos(), "unexpected newline in string literal"); return self.token(TokenKind::Invalid, start, self.pos()); }
-                    Some(_) => { self.advance_char(); }
+                    Some(b'\n') => {
+                        self.push_error(
+                            LexErrorKind::InvalidStrLiteral,
+                            start,
+                            self.pos(),
+                            "unexpected newline in string literal",
+                        );
+                        return self.token(TokenKind::Invalid, start, self.pos());
+                    }
+                    Some(_) => {
+                        self.advance_char();
+                    }
                 }
             }
         }
 
         // Interpolated string — emit FStringStart, then segments and expressions.
         // We eagerly push all tokens into `self.pending` and return the first.
-        self.pending.push_back(Token::new(TokenKind::FStringStart, start, start + 1));
+        self.pending
+            .push_back(Token::new(TokenKind::FStringStart, start, start + 1));
 
         loop {
             let seg_start = self.pos();
@@ -714,22 +766,40 @@ impl<'src> Lexer<'src> {
             loop {
                 match self.peek_byte() {
                     None | Some(b'\n') => {
-                        self.push_error(LexErrorKind::InvalidStrLiteral, start, self.pos(), "unterminated string literal");
+                        self.push_error(
+                            LexErrorKind::InvalidStrLiteral,
+                            start,
+                            self.pos(),
+                            "unterminated string literal",
+                        );
                         // Emit whatever we have and stop.
                         if self.pos() > seg_start {
-                            self.pending.push_back(Token::new(TokenKind::FStringLiteral, seg_start, self.pos()));
+                            self.pending.push_back(Token::new(
+                                TokenKind::FStringLiteral,
+                                seg_start,
+                                self.pos(),
+                            ));
                         }
-                        self.pending.push_back(Token::new(TokenKind::FStringEnd, self.pos(), self.pos()));
+                        self.pending.push_back(Token::new(
+                            TokenKind::FStringEnd,
+                            self.pos(),
+                            self.pos(),
+                        ));
                         return self.pending.pop_front().unwrap();
                     }
                     Some(b'"') => {
                         // End of string.
                         if self.pos() > seg_start {
-                            self.pending.push_back(Token::new(TokenKind::FStringLiteral, seg_start, self.pos()));
+                            self.pending.push_back(Token::new(
+                                TokenKind::FStringLiteral,
+                                seg_start,
+                                self.pos(),
+                            ));
                         }
                         self.cursor += 1;
                         let end = self.pos();
-                        self.pending.push_back(Token::new(TokenKind::FStringEnd, end - 1, end));
+                        self.pending
+                            .push_back(Token::new(TokenKind::FStringEnd, end - 1, end));
                         return self.pending.pop_front().unwrap();
                     }
                     Some(b'{') => {
@@ -740,34 +810,56 @@ impl<'src> Lexer<'src> {
                         }
                         // Start of interpolated expression.
                         if self.pos() > seg_start {
-                            self.pending.push_back(Token::new(TokenKind::FStringLiteral, seg_start, self.pos()));
+                            self.pending.push_back(Token::new(
+                                TokenKind::FStringLiteral,
+                                seg_start,
+                                self.pos(),
+                            ));
                         }
                         let brace_start = self.pos();
                         self.cursor += 1; // consume `{`
-                        self.pending.push_back(Token::new(TokenKind::FStringExprStart, brace_start, self.pos()));
+                        self.pending.push_back(Token::new(
+                            TokenKind::FStringExprStart,
+                            brace_start,
+                            self.pos(),
+                        ));
                         // Now lex expression tokens until matching `}`.
                         // We use a brace depth counter and call recognize_token repeatedly.
                         let mut depth: u32 = 1;
                         while depth > 0 && !self.at_end() {
                             self.skip_whitespace();
-                            if self.at_end() { break; }
+                            if self.at_end() {
+                                break;
+                            }
                             match self.peek_byte() {
                                 Some(b'{') => {
                                     let ts = self.pos();
                                     self.cursor += 1;
                                     depth += 1;
-                                    self.pending.push_back(Token::new(TokenKind::LBrace, ts, self.pos()));
+                                    self.pending.push_back(Token::new(
+                                        TokenKind::LBrace,
+                                        ts,
+                                        self.pos(),
+                                    ));
                                 }
                                 Some(b'}') => {
                                     depth -= 1;
                                     if depth == 0 {
                                         let ts = self.pos();
                                         self.cursor += 1;
-                                        self.pending.push_back(Token::new(TokenKind::FStringExprEnd, ts, self.pos()));
+                                        self.pending.push_back(Token::new(
+                                            TokenKind::FStringExprEnd,
+                                            ts,
+                                            self.pos(),
+                                        ));
                                     } else {
                                         let ts = self.pos();
                                         self.cursor += 1;
-                                        self.pending.push_back(Token::new(TokenKind::RBrace, ts, self.pos()));
+                                        self.pending.push_back(Token::new(
+                                            TokenKind::RBrace,
+                                            ts,
+                                            self.pos(),
+                                        ));
                                     }
                                 }
                                 Some(b'"') => {
@@ -778,7 +870,8 @@ impl<'src> Lexer<'src> {
                                     // or returns a single String token.
                                     if nested.kind == TokenKind::String
                                         || nested.kind == TokenKind::FStringStart
-                                        || nested.kind == TokenKind::Invalid {
+                                        || nested.kind == TokenKind::Invalid
+                                    {
                                         self.pending.push_back(nested);
                                     }
                                     // (if it was FStringStart the rest is already in pending)
@@ -796,13 +889,25 @@ impl<'src> Lexer<'src> {
                     Some(b'\\') => {
                         self.cursor += 1; // consume `\`
                         match self.peek_byte() {
-                            Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') => { self.cursor += 1; }
-                            Some(b'x') => { self.cursor += 1; self.expect_hex_digits(2, start); }
-                            Some(b'u') => { self.cursor += 1; self.expect_hex_digits(4, start); }
-                            _ => { self.cursor += 1; }
+                            Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') => {
+                                self.cursor += 1;
+                            }
+                            Some(b'x') => {
+                                self.cursor += 1;
+                                self.expect_hex_digits(2, start);
+                            }
+                            Some(b'u') => {
+                                self.cursor += 1;
+                                self.expect_hex_digits(4, start);
+                            }
+                            _ => {
+                                self.cursor += 1;
+                            }
                         }
                     }
-                    Some(_) => { self.advance_char(); }
+                    Some(_) => {
+                        self.advance_char();
+                    }
                 }
             }
         }
@@ -1050,13 +1155,14 @@ impl<'src> Lexer<'src> {
             self.cursor += 1;
         }
 
-        // Possible fractional part.
-        if self.peek_byte() == Some(b'.') {
-            if let Some(after_dot) = self.peek_byte_at(1) {
-                if after_dot.is_ascii_digit() {
-                    return self.lex_float_after_dot(start);
-                }
-            }
+        // A number after a projection dot is an integer member index. Keep
+        // subsequent dots separate so nested `value.0.1` is not a real literal.
+        if self.last_token_kind != Some(TokenKind::Dot)
+            && self.peek_byte() == Some(b'.')
+            && let Some(after_dot) = self.peek_byte_at(1)
+            && after_dot.is_ascii_digit()
+        {
+            return self.lex_float_after_dot(start);
         }
 
         self.token(TokenKind::Integer, start, self.pos())

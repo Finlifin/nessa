@@ -43,7 +43,7 @@ fn get_user(user_id: String) -> !ParseErr User {
     https.get(...)! {
         -- 消除块可以一次处理多个 error type
         -- 隐式的 ok 分支：将 parse 的可能 error 传播出去
-        ok! => response.parse(.json, User)!.as(User),
+        response! => response.parse(.json, User)!.as(User),
         HttpErr.Timeout(...) => ...,
         HttpErr.* as e => ...,
     }
@@ -53,6 +53,10 @@ fn get_user(user_id: String) -> !ParseErr User {
 ```
 
 函数返回值的 error type set 必须是内部传播出去的错误的父集，nessa 将自动生成类型转换。
+
+这里的父集是具体错误类型集合的包含关系。成员按别名规范化后的完整类型
+身份比较；数值类型的成功值转换不会改变错误标签。例如 `!i8 T` 的错误
+不能直接进入 `!i64 T`，但 `!E i8` 的成功载荷可以转换成 `!E i64`。
 
 ## Error 传播 (Propagation)
 
@@ -107,3 +111,48 @@ error_elimination -> expr ! { (catch_arm | case_arm)* }
 pattern_error_ok -> pattern !
 pattern_error -> error pattern
 ```
+
+## 消除分支的值与绑定
+
+未写成功分支时，消除块保留原成功值；未匹配的错误仍作为剩余Error限定值
+传递，只有显式后缀传播 `!` 才提前退出当前函数。不能仅因某个错误未匹配
+就在消除块中自动return。guard或可失败子模式不能证明该错误类型已完全消除。
+
+成功模式使用 `pattern!`：`value!`绑定成功载荷，`_!`忽略载荷，`ok!`中的ok
+也是普通绑定名，不是保留字或隐式通配符。这些规则已由用户明确选择。
+完整构造、传播、消除、模式与GC安全的128位标签表示已贯通并通过独立
+验收；具体布局与归档能力见开发文档，不能仅凭语法接受推断其他功能完成。
+
+
+## 动态载荷与错误集合
+
+`error value` 的 value 为 `Any` 时，标签取实际载荷具体类型的完整 TypeId，
+不能使用 Any 的 TypeId 代替。进入显式限定的错误集合时检查实际具体类型；
+不属于集合的值产生受检失败。这也适用于 `error e` 模式绑定后的重抛。
+普通未包装值进入 Error 限定类型时是成功分支，即使其具体类型也在错误
+集合中，仍不能凭载荷类型把它猜成错误分支。
+
+错误集合源码只接受可实例化的具体类型表达式；无上下文的动态错误在编译器
+内部保留开放错误集合，有限的类型分支不能证明消除了其中所有可能错误。
+开放集合的内部元数据表达见实施协议，不把它当作一个名为 Any 的具体错误。
+
+`catch e => body` 消除分支捕获任意错误的载荷，e 为普通 Any 绑定；这里不
+捕获 continuation，也不为 body 创建新的函数返回边界。`E.*` 选择一个
+具体枚举类型的所有分支，guard 或可失败子模式仍要求保留剩余错误。
+
+本节是完整 Error 实施采用并已验证的语义。
+
+## 普通 match 的穷尽性
+
+直接对 Error 限定值使用 `match` 时，分支必须覆盖所有可达的成功值和错误。
+成功类型为 NoReturn 时不需要成功分支；封闭错误集合中的每个类型必须被
+完整覆盖。开放错误集合需要无条件的 `error e`、`catch e` 或整体通配模式。
+仅匹配有限的具体错误类型不能穷尽开放集合，guard 也不能单独证明覆盖。
+整体通配模式绑定原限定值，`value!` 和 `error value` 才提取对应载荷。
+
+此规则适用于普通 `match`。Error 消除块 `value! { ... }` 仍按前述规则
+保留隐式成功值和未处理的剩余错误。
+
+错误集合允许可实例化的具体 Type 和 Continuation 类型，以及可作为载荷的
+具体限定类型别名。集合成员本身不会被展平；只有成功类型上连续的 Error
+限定会合并。Any、NoReturn、裸 trait、effect 和 module 不能作为显式集合成员。

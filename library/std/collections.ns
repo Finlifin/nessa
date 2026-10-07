@@ -1,0 +1,167 @@
+-- std.collections — checked List values and String-keyed Map values.
+use .builtin.*
+
+private const _init: fn() -> List = .__list_init'builtin
+private const _length: fn(List) -> i64 = .__list_len'builtin
+private const _get: fn(List, usize) -> Any = .__list_get'builtin
+private const _set: fn(List, usize, Any) -> Unit = .__list_set'builtin
+private const _push: fn(List, Any) -> Unit = .__list_push'builtin
+private const _pop: fn(List) -> Any = .__list_pop'builtin
+
+impl List {
+    pub fn new() -> List { _init() }
+    pub fn len(self) -> i64 { _length(self) }
+    pub fn get(self, index: usize) -> Any { _get(self, index) }
+    pub fn apply(self, index: usize) -> Any { _get(self, index) }
+    pub fn set(self, index: usize, value: Any) { _set(self, index, value) }
+    pub fn update(self, index: usize, value: Any) { _set(self, index, value) }
+    pub fn push(self, value: Any) { _push(self, value) }
+    -- Concatenation creates a new wrapper; element references stay shared.
+    pub fn concat(self, other: List) -> List {
+        let result = List()
+        var index: usize = 0
+        while index < self.len() {
+            result.push(self.get(index))
+            index = index + 1
+        }
+        index = 0
+        while index < other.len() {
+            result.push(other.get(index))
+            index = index + 1
+        }
+        result
+    }
+    -- Empty lists return null; pop clears the removed slot for GC.
+    pub fn pop(self) -> Any { _pop(self) }
+    -- A shallow snapshot freezes input slots; element objects remain shared.
+    -- The local cursor belongs to the call frame, including continuation forks.
+    pub fn map(self, callback: fn(Any) -> Any) -> List {
+        let result = List()
+        let values = self.concat(List())
+        var index: usize = 0
+        while index < values.len() {
+            result.push(callback(values.get(index)))
+            index = index + 1
+        }
+        result
+    }
+    pub fn filter(self, predicate: fn(Any) -> bool) -> List {
+        let result = List()
+        let values = self.concat(List())
+        var index: usize = 0
+        while index < values.len() {
+            let value = values.get(index)
+            if predicate(value) { result.push(value) }
+            index = index + 1
+        }
+        result
+    }
+    pub fn fold(self, initial: Any, callback: fn(Any, Any) -> Any) -> Any {
+        var result: Any = initial
+        let values = self.concat(List())
+        var index: usize = 0
+        while index < values.len() {
+            result = callback(result, values.get(index))
+            index = index + 1
+        }
+        result
+    }
+    pub fn each(self, callback: fn(Any) -> Unit) {
+        let values = self.concat(List())
+        var index: usize = 0
+        while index < values.len() {
+            callback(values.get(index))
+            index = index + 1
+        }
+    }
+    pub fn foreach(self, callback: fn(Any) -> Unit) { self.each(callback) }
+}
+
+
+private const _map_init: fn() -> Map = .__map_init'builtin
+private const _map_length: fn(Map) -> i64 = .__map_len'builtin
+private const _map_get: fn(Map, String) -> Any = .__map_get'builtin
+private const _map_set: fn(Map, String, Any) -> Unit = .__map_set'builtin
+private const _map_remove: fn(Map, String) -> Any = .__map_remove'builtin
+private const _map_contains: fn(Map, String) -> bool = .__map_contains'builtin
+private const _map_keys: fn(Map) -> List = .__map_keys'builtin
+
+impl Map {
+    pub fn new() -> Map { _map_init() }
+    pub fn len(self) -> i64 { _map_length(self) }
+    pub fn get(self, key: String) -> Any { _map_get(self, key) }
+    pub fn apply(self, key: String) -> Any { _map_get(self, key) }
+    pub fn set(self, key: String, value: Any) { _map_set(self, key, value) }
+    pub fn update(self, key: String, value: Any) { _map_set(self, key, value) }
+    -- Missing entries return null; contains distinguishes a stored null value.
+    pub fn remove(self, key: String) -> Any { _map_remove(self, key) }
+    pub fn contains(self, key: String) -> bool { _map_contains(self, key) }
+    -- Snapshot order is unspecified; no insertion-order promise is made.
+    pub fn keys(self) -> List { _map_keys(self) }
+    pub fn entries(self) -> List {
+        let result = List()
+        for key in self.keys() {
+            let name: String = key.as(String)
+            let entry: (String, Any) = (name, self.get(name))
+            result.push(entry)
+        }
+        result
+    }
+    pub fn values(self) -> List {
+        let result = List()
+        for key in self.keys() { result.push(self.get(key.as(String))) }
+        result
+    }
+}
+
+-- Each iterator owns a shallow element snapshot. Later source-list mutation
+-- does not alter this traversal; referenced element objects remain shared.
+pub struct ListIterator {
+    values: List,
+    index: usize
+}
+
+impl Iterator for ListIterator {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.index < self.values.len() {
+            let value = self.values.get(self.index)
+            self.index = self.index + 1
+            IterationStep(Any).yielded(value)
+        } else {
+            IterationStep(Any).done
+        }
+    }
+}
+
+impl IntoIterator for List {
+    assoc Iter: Type = ListIterator
+    pub fn into_iter(self) -> ListIterator {
+        ListIterator { values: self.concat(List()), index: 0 }
+    }
+}
+
+pub struct MapIterator {
+    entries: List,
+    index: usize
+}
+
+impl Iterator for MapIterator {
+    assoc Item: Type = (String, Any)
+    pub fn next(self) -> IterationStep((String, Any)) {
+        if self.index < self.entries.len() {
+            let entry: (String, Any) = self.entries.get(self.index).as((String, Any))
+            self.index = self.index + 1
+            IterationStep((String, Any)).yielded(entry)
+        } else {
+            IterationStep((String, Any)).done
+        }
+    }
+}
+
+impl IntoIterator for Map {
+    assoc Iter: Type = MapIterator
+    pub fn into_iter(self) -> MapIterator {
+        MapIterator { entries: self.entries(), index: 0 }
+    }
+}

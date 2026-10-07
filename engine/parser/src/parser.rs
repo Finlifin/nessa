@@ -1,5 +1,5 @@
 use ast::{Ast, NodeIndex};
-use diagnostic::{DiagnosticContext, NessaError};
+use diagnostic::{DiagnosticContext, NessaError, SourceSpanError, SourceSpanMapper};
 use lexer::token::{Token, TokenKind};
 use rustc_span::{BytePos, Span};
 
@@ -12,6 +12,7 @@ use crate::error::{ParseError, ParseErrorKind};
 pub struct Parser<'a> {
     tokens: &'a [Token],
     source: &'a str,
+    source_mapper: Result<SourceSpanMapper, SourceSpanError>,
     ast: Ast,
     diag_ctx: &'a DiagnosticContext<'a>,
 
@@ -21,6 +22,9 @@ pub struct Parser<'a> {
 
     /// Current cursor position in the token stream.
     cursor: usize,
+    /// A wildcard consumed as an import path terminator can end a statement;
+    /// the same token in an arithmetic expression cannot.
+    import_glob_end: Option<usize>,
 
     /// Stack of saved cursor positions (for span tracking per parse rule).
     cursor_stack: Vec<usize>,
@@ -39,10 +43,12 @@ impl<'a> Parser<'a> {
         Self {
             tokens,
             source,
+            source_mapper: diag_ctx.source_span_mapper(file_base_pos, source),
             ast: Ast::new(),
             diag_ctx,
             file_base_pos,
             cursor: 0,
+            import_glob_end: None,
             cursor_stack: vec![0],
             errors: Vec::new(),
         }
@@ -54,22 +60,46 @@ impl<'a> Parser<'a> {
     /// returning.  Callers that need to inspect errors programmatically should
     /// use [`finish`] instead.
     pub fn parse(mut self) -> Ast {
-        match crate::basic::try_file_scope(&mut self) {
-            Ok(root) => {
-                self.ast.root = root;
-            }
-            Err(_) => {}
+        if self.source_mapper.is_ok()
+            && let Ok(root) = crate::basic::try_file_scope(&mut self)
+        {
+            self.ast.root = root;
         }
-        if !self.errors.is_empty() {
-            for e in &self.errors {
-                e.emit(self.diag_ctx, self.file_base_pos);
-            }
+        let context = self.diag_ctx;
+        let base = self.file_base_pos;
+        let (ast, errors) = self.finish();
+        for error in errors {
+            error.emit(context, base);
         }
-        self.ast
+        ast
     }
 
-    /// Consume the parser and return the raw AST + errors.
-    pub fn finish(self) -> (Ast, Vec<ParseError>) {
+    /// Convert raw parser positions once while retaining original source bytes.
+    pub fn finish(mut self) -> (Ast, Vec<ParseError>) {
+        let mapped = (|| -> Result<(), SourceSpanError> {
+            let mapper = self.source_mapper.as_ref().map_err(|error| *error)?;
+            let mut errors = self.errors.clone();
+            for error in &mut errors {
+                let location = mapper.map_raw_absolute(error.span)?;
+                error.span = location.span;
+                error.source_start = location.file_start;
+                if let Some(label) = &mut error.label {
+                    label.span = mapper.map_raw_absolute(label.span)?.span;
+                }
+            }
+            self.ast.attach_source(self.source.to_owned(), mapper)?;
+            self.errors = errors;
+            Ok(())
+        })();
+        if let Err(error) = mapped {
+            self.ast.source = Some(self.source.to_owned());
+            self.ast.root = NodeIndex::NULL;
+            self.errors = vec![ParseError::new(
+                ParseErrorKind::InvalidSyntax,
+                rustc_span::DUMMY_SP,
+                format!("Invalid source coordinates: {error}"),
+            )];
+        }
         (self.ast, self.errors)
     }
 
@@ -101,6 +131,10 @@ impl<'a> Parser<'a> {
     }
 
     // -- Token access ---------------------------------------------------------
+
+    pub(crate) fn mark_import_glob_end(&mut self) {
+        self.import_glob_end = Some(self.cursor);
+    }
 
     /// Peek at the next meaningful token (skipping over non-semantic newlines),
     /// without consuming it.
@@ -192,7 +226,9 @@ impl<'a> Parser<'a> {
             if cursor > 0 && cursor < self.tokens.len() - 1 {
                 let prev = self.tokens[cursor - 1].kind;
                 let next = self.tokens[cursor + 1].kind;
-                if prev.can_end_statement() && next.can_start_statement() {
+                if (prev.can_end_statement() || self.import_glob_end == Some(cursor))
+                    && next.can_start_statement()
+                {
                     // Treat newline as semicolon
                     token.kind = TokenKind::Semi;
                     break;
@@ -236,7 +272,12 @@ impl<'a> Parser<'a> {
     /// Span of the next token (for error reporting), adjusted by file base pos.
     pub(crate) fn next_token_span(&self) -> Span {
         if self.cursor >= self.tokens.len() {
-            return rustc_span::DUMMY_SP;
+            return u32::try_from(self.source.len())
+                .ok()
+                .and_then(|length| self.file_base_pos.0.checked_add(length))
+                .map_or(rustc_span::DUMMY_SP, |end| {
+                    Span::new(BytePos(end), BytePos(end))
+                });
         }
         let token = self.next_token_inner(self.cursor).token;
         let lo = BytePos(self.file_base_pos.0 + token.from);

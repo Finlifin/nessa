@@ -1,10 +1,10 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use nsbc::FuncId;
 use runtime::{TaskId, TaskState, TaskStatus};
 use stack_pool::StackPool;
-
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // EventLoop — safe wrapper around libuv's uv_loop_t
@@ -21,7 +21,7 @@ pub enum RunMode {
 }
 
 impl RunMode {
-    fn to_uv(self) -> libuv_sys2::uv_run_mode {
+    fn into_uv(self) -> libuv_sys2::uv_run_mode {
         match self {
             RunMode::Default => libuv_sys2::uv_run_mode_UV_RUN_DEFAULT,
             RunMode::Once => libuv_sys2::uv_run_mode_UV_RUN_ONCE,
@@ -49,7 +49,7 @@ impl EventLoop {
 
     /// Run the event loop with the given mode. Returns the uv_run status.
     pub fn run(&mut self, mode: RunMode) -> i32 {
-        unsafe { libuv_sys2::uv_run(self.handle, mode.to_uv()) }
+        unsafe { libuv_sys2::uv_run(self.handle, mode.into_uv()) }
     }
 
     /// Check if the loop has active handles or requests.
@@ -70,6 +70,12 @@ impl EventLoop {
     /// Get the raw loop pointer (for registering handles).
     pub fn raw(&mut self) -> *mut libuv_sys2::uv_loop_t {
         self.handle
+    }
+}
+
+impl Default for EventLoop {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -154,13 +160,13 @@ impl Scheduler {
         let mut task = TaskState::new(id, func_id);
         task.parent = parent;
         task.status = TaskStatus::Ready;
-        task.stack = Some(self.stack_pool.alloc());
+        task.stacks = runtime::TaskStacks::with_pool(func_id, Arc::clone(&self.stack_pool));
 
         // Register as child of parent.
-        if let Some(pid) = parent {
-            if let Some(ptask) = self.find_task_mut(pid) {
-                ptask.children.push(id);
-            }
+        if let Some(pid) = parent
+            && let Some(ptask) = self.find_task_mut(pid)
+        {
+            ptask.children.push(id);
         }
 
         self.tasks.push(task);
@@ -171,10 +177,10 @@ impl Scheduler {
     /// Pick the next ready task to run.
     pub fn next_ready(&mut self) -> Option<TaskId> {
         while let Some(id) = self.ready_queue.pop_front() {
-            if let Some(task) = self.find_task(id) {
-                if task.status == TaskStatus::Ready {
-                    return Some(id);
-                }
+            if let Some(task) = self.find_task(id)
+                && task.status == TaskStatus::Ready
+            {
+                return Some(id);
             }
         }
         None
@@ -194,13 +200,23 @@ impl Scheduler {
         }
     }
 
+    /// Return a running task to the ready queue after cooperative yielding.
+    pub fn yield_task(&mut self, id: TaskId) {
+        if let Some(task) = self.find_task_mut(id)
+            && task.status == TaskStatus::Running
+        {
+            task.status = TaskStatus::Ready;
+            self.ready_queue.push_back(id);
+        }
+    }
+
     /// Resume a suspended/waiting task.
     pub fn resume(&mut self, id: TaskId) {
-        if let Some(task) = self.find_task_mut(id) {
-            if task.status == TaskStatus::Suspended || task.status == TaskStatus::Waiting {
-                task.status = TaskStatus::Ready;
-                self.ready_queue.push_back(id);
-            }
+        if let Some(task) = self.find_task_mut(id)
+            && (task.status == TaskStatus::Suspended || task.status == TaskStatus::Waiting)
+        {
+            task.status = TaskStatus::Ready;
+            self.ready_queue.push_back(id);
         }
     }
 
@@ -220,10 +236,7 @@ impl Scheduler {
 
         if let Some(task) = self.find_task_mut(id) {
             task.status = TaskStatus::Finished;
-            // Release the stack slot back to the pool.
-            if let Some(handle) = task.stack.take() {
-                self.stack_pool.dealloc(&handle);
-            }
+            task.stacks.finish();
         }
     }
 
@@ -239,9 +252,7 @@ impl Scheduler {
         }
         if let Some(task) = self.find_task_mut(id) {
             task.status = TaskStatus::Finished;
-            if let Some(handle) = task.stack.take() {
-                self.stack_pool.dealloc(&handle);
-            }
+            task.stacks.finish();
         }
     }
 
@@ -331,5 +342,49 @@ mod tests {
         sched.resume(t);
         assert_eq!(sched.get_task(t).unwrap().status, TaskStatus::Ready);
         assert!(sched.next_ready().is_some());
+    }
+
+    #[test]
+    fn yielding_requeues_running_tasks_once() {
+        let mut scheduler = Scheduler::new();
+        let task = scheduler.spawn(FuncId(0), None);
+        assert_eq!(scheduler.next_ready(), Some(task));
+        scheduler.set_running(task);
+        scheduler.yield_task(task);
+        scheduler.yield_task(task);
+        assert_eq!(scheduler.ready_count(), 1);
+        assert_eq!(scheduler.next_ready(), Some(task));
+        scheduler.set_running(task);
+        assert_eq!(
+            scheduler.get_task(task).unwrap().status,
+            TaskStatus::Running
+        );
+        scheduler.finish(task);
+        scheduler.yield_task(task);
+        assert_eq!(scheduler.next_ready(), None);
+    }
+
+    #[test]
+    fn cancel_releases_all_delimited_and_captured_child_stacks() {
+        let pool = Arc::new(StackPool::new());
+        let mut sched = Scheduler::with_stack_pool(Arc::clone(&pool));
+        let parent = sched.spawn(FuncId(0), None);
+        let child = sched.spawn(FuncId(1), Some(parent));
+        let task = sched.get_task_mut(child).unwrap();
+        task.stacks
+            .enter_delimiter(runtime::PromptId(1), FuncId(2), &[])
+            .unwrap();
+        task.stacks
+            .capture(runtime::PromptId(1), nsbc::Reg(0))
+            .unwrap();
+        task.stacks
+            .enter_delimiter(runtime::PromptId(2), FuncId(3), &[])
+            .unwrap();
+        assert_eq!(pool.active_count(), 4);
+        sched.cancel(parent);
+        assert_eq!(pool.active_count(), 0);
+        assert_eq!(sched.get_task(child).unwrap().status, TaskStatus::Finished);
+        sched.cancel(parent);
+        assert_eq!(pool.active_count(), 0);
     }
 }

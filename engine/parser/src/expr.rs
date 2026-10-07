@@ -205,8 +205,7 @@ pub fn try_expr_without_extended_call(p: &mut Parser) -> ParseResult {
 
 pub fn try_expr_with_option(p: &mut Parser, option: ExprOption) -> ParseResult {
     let _g = p.enter();
-    let result = try_expr_pratt(p, 0, option);
-    result
+    try_expr_pratt(p, 0, option)
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +339,7 @@ fn try_post_expr(
         TokenKind::Quote => parse_quote_expr(p, left),
         TokenKind::Hash => parse_effect_handling_expr(p, left),
         TokenKind::Bang => parse_error_handling_expr(p, left),
-        TokenKind::Question => parse_option_propagation_expr(p, left),
+        TokenKind::Question => parse_option_propagation_expr(p, left, option),
         TokenKind::KwMatch => parse_post_match_expr(p, left),
         TokenKind::KwMatches => parse_matches_expr(p, left, option),
         TokenKind::KwDo => parse_post_do_expr(p, left, option),
@@ -366,6 +365,11 @@ fn parse_call_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     )?;
     // Desugar tacit lambda placeholders (_0, _1, ...) in arguments.
     for arg in args.iter_mut() {
+        // Legacy `.name = value` call syntax has the same binding semantics as
+        // `name = value`; neither form is a lexical assignment expression.
+        if p.ast().node(*arg).kind == NodeKind::PropertyAssignment {
+            p.ast().nodes[arg.0 as usize].kind = NodeKind::NamedArg;
+        }
         *arg = maybe_wrap_tacit_lambda(p, *arg);
     }
     let span = p.current_span();
@@ -407,13 +411,12 @@ fn parse_dot_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     p.expect_token(TokenKind::Dot)?;
 
     let next = p.peek_token();
-    let result = match next.kind {
+    match next.kind {
         TokenKind::KwUse => parse_handler_apply_expr(p, left),
         TokenKind::KwAs => parse_type_cast_expr(p, left),
         TokenKind::Dot => parse_range_expr(p, left),
         _ => parse_projection_expr(p, left),
-    };
-    result
+    }
 }
 
 /// `expr ' id` — view, same shape as projection (`expr . id`).
@@ -447,7 +450,11 @@ fn parse_handler_apply_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
 }
 
 fn parse_projection_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
-    let id = basic::try_id(p)?;
+    let id = if p.peek(&[TokenKind::Integer]) {
+        basic::try_atomic(p)?
+    } else {
+        basic::try_id(p)?
+    };
     if id.is_null() {
         let _ = p.err_with_label(
             ParseErrorKind::InvalidSyntax,
@@ -608,9 +615,22 @@ fn parse_error_handling_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     Ok(idx)
 }
 
-fn parse_option_propagation_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
+fn parse_option_propagation_expr(
+    p: &mut Parser,
+    left: NodeIndex,
+    option: ExprOption,
+) -> ParseResult {
     let _g = p.enter();
     p.expect_token(TokenKind::Question)?;
+    // A control condition owns its following block; ordinary postfix Optional
+    // propagation has no null-handler block syntax.
+    if !option.no_extended_call && p.peek_token().kind == TokenKind::LBrace {
+        p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Optional null-handler blocks are not supported; use an explicit null check",
+        )?;
+    }
     let span = p.current_span();
     let idx = p
         .ast()
@@ -623,7 +643,7 @@ fn parse_option_propagation_expr(p: &mut Parser, left: NodeIndex) -> ParseResult
 fn parse_post_match_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     let _g = p.enter();
     p.expect_token(TokenKind::KwMatch)?;
-    let arms = try_multi_in_block(p, &[Rule::semicolon("match arm", try_pattern_arm)])?;
+    let arms = try_multi_in_block(p, &[Rule::comma_or_semicolon("match arm", try_pattern_arm)])?;
     let span = p.current_span();
     let idx = p
         .ast()
@@ -849,8 +869,7 @@ fn try_prefix_range_or_symbol(p: &mut Parser, option: ExprOption) -> ParseResult
     }
 
     // Otherwise try symbol: .id
-    let result = basic::try_symbol(p);
-    result
+    basic::try_symbol(p)
 }
 
 fn try_prefix_unary(p: &mut Parser, token_kind: TokenKind, node_kind: NodeKind) -> ParseResult {
@@ -916,7 +935,25 @@ fn try_error_qualified_type(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    let errs = try_expr_pratt(p, 90, ExprOption::new())?;
+    let mut errs = try_expr_pratt(p, 101, ExprOption::new())?;
+    while p.eat_token(TokenKind::PlusPlus) {
+        let right = try_expr_pratt(p, 101, ExprOption::new())?;
+        if right.is_null() {
+            p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected Error set after concat",
+            )?;
+            return Ok(NULL);
+        }
+        let span = p.current_span();
+        errs = p
+            .ast()
+            .builder(NodeKind::Concat, span)
+            .add_child(errs)
+            .add_child(right)
+            .build();
+    }
     if errs.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -978,7 +1015,7 @@ fn try_effect_type_expr(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
     // Allow optional `async` prefix
-    let _is_async = p.eat_token(TokenKind::KwAsync);
+    let is_async = p.eat_token(TokenKind::KwAsync);
 
     if !p.eat_token(TokenKind::KwEffect) {
         return Ok(NULL);
@@ -999,7 +1036,14 @@ fn try_effect_type_expr(p: &mut Parser) -> ParseResult {
     let span = p.current_span();
     let idx = p
         .ast()
-        .builder(NodeKind::EffectType, span)
+        .builder(
+            if is_async {
+                NodeKind::AsyncEffectType
+            } else {
+                NodeKind::EffectType
+            },
+            span,
+        )
         .add_multi_children(&params)
         .build();
     Ok(idx)
@@ -1316,7 +1360,11 @@ fn try_fstring(p: &mut Parser) -> ParseResult {
                 let raw = p.next_token_text().to_owned();
                 p.next_token(); // consume FStringLiteral
                 let str_id = str_interner::intern(&raw);
-                let seg = p.ast().builder(NodeKind::Str, seg_span).set_str_id(str_id).build();
+                let seg = p
+                    .ast()
+                    .builder(NodeKind::Str, seg_span)
+                    .set_str_id(str_id)
+                    .build();
                 parts.push(seg);
             }
             TokenKind::FStringExprStart => {
@@ -1328,12 +1376,20 @@ fn try_fstring(p: &mut Parser) -> ParseResult {
             }
             TokenKind::Eof => {
                 let span = p.next_token_span();
-                p.err(ParseErrorKind::UnexpectedToken, span, "unterminated f-string")?;
+                p.err(
+                    ParseErrorKind::UnexpectedToken,
+                    span,
+                    "unterminated f-string",
+                )?;
                 unreachable!()
             }
             _ => {
                 let span = p.next_token_span();
-                p.err(ParseErrorKind::UnexpectedToken, span, "unexpected token in f-string")?;
+                p.err(
+                    ParseErrorKind::UnexpectedToken,
+                    span,
+                    "unexpected token in f-string",
+                )?;
                 unreachable!()
             }
         }
@@ -1344,4 +1400,72 @@ fn try_fstring(p: &mut Parser) -> ParseResult {
         .builder(NodeKind::FStringConcat, span)
         .add_multi_children(&parts)
         .build())
+}
+
+#[cfg(test)]
+mod optional_tests {
+    use ast::{Ast, NodeKind};
+
+    fn parse(source: &str) -> (Ast, Vec<String>) {
+        let (tokens, errors) = lexer::tokenize(source);
+        assert!(errors.is_empty(), "{errors:?}");
+        let map = rustc_span::SourceMap::new(rustc_span::source_map::FilePathMapping::empty());
+        let file = map.new_source_file(
+            rustc_span::FileName::Custom("optional.ns".into()),
+            source.into(),
+        );
+        let diagnostics = diagnostic::DiagnosticContext::new(&map);
+        let ast = crate::Parser::new(&tokens, source, &diagnostics, file.start_pos).parse();
+        let errors = diagnostics
+            .diagnostics()
+            .iter()
+            .map(|error| error.message.clone())
+            .collect();
+        (ast, errors)
+    }
+
+    #[test]
+    fn optional_propagation_conditions_preserve_then_and_loop_blocks() {
+        for source in [
+            "if value? {42}else{0}",
+            "if (value?) {42}else{0}",
+            "while value? {break}",
+        ] {
+            let (ast, errors) = parse(source);
+            assert!(errors.is_empty(), "{source}: {errors:?}");
+            let statement = ast.multi_children(ast.root)[0];
+            let children = ast.fixed_children(statement);
+            let (condition, body) = if ast.node(statement).kind == NodeKind::WhileLoop {
+                (children[1], children[2])
+            } else {
+                (children[0], children[1])
+            };
+            assert_eq!(
+                ast.node(condition).kind,
+                NodeKind::OptionPropagation,
+                "{source}"
+            );
+            assert_eq!(ast.node(body).kind, NodeKind::Block, "{source}");
+        }
+        let (ast, errors) = parse("get()?.value");
+        assert!(errors.is_empty(), "{errors:?}");
+        let expression = ast.multi_children(ast.root)[0];
+        assert_eq!(ast.node(expression).kind, NodeKind::Projection);
+        assert_eq!(
+            ast.node(ast.fixed_children(expression)[0]).kind,
+            NodeKind::OptionPropagation
+        );
+    }
+
+    #[test]
+    fn optional_null_handler_blocks_have_an_explicit_rejection() {
+        for source in [
+            "value?{return null}",
+            "let result=value?{42}",
+            "if (value?{return false}) {42}else{0}",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(errors.iter().any(|error|error=="Optional null-handler blocks are not supported; use an explicit null check"), "{source}: {errors:?}");
+        }
+    }
 }

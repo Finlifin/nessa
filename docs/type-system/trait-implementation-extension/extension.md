@@ -66,3 +66,20 @@ mod b {
 extend_def -> extend expr { statement* }
 extend_trait_def -> extend expr for expr { statement* }
 ```
+
+## 当前实现与边界
+
+普通扩展与 trait 扩展的 `self/Self` 已绑定所属 canonical 类型，支持类型别名
+及导入目标。实例调用、apply/update/concat 沿用受检源函数绑定；具名和默认参数
+遵循普通参数规则。不同模块和局部块中的同名扩展独立可见，离开块后不能从
+其它调用点使用。可见且有访问权限的同名候选重叠时报歧义，不以登记顺序决胜。
+
+闭包保留声明处的方法可见性，逃出声明块后仍可执行其内部调用；把普通实例带
+出块并从外部调用扩展不会获得该权限。动态 Any 路径通过 NSAM3 词法上下文表与
+TPOL3 访问/作用域元数据执行相同筛选，效应暂停与恢复使用原调用点上下文。
+
+局部扩展成员已登记为普通函数；方法内部 lambda 可以捕获 self，但具名扩展
+方法捕获外层函数 local 尚无环境传递 ABI，当前明确诊断。同类型同 trait 的
+多个词法扩展已按声明作用域登记，类型注解、转换和比较只选择当前可见实现；
+同 scope 重复及可见重叠会明确诊断。完整 trait evidence/boxing ABI 和扩展自身
+const/global/hook 的完整初始化尚未落实。这些边界不代表完整扩展和 trait 设计已经完成。
