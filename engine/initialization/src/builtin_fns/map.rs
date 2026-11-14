@@ -54,3 +54,51 @@ pub fn map_keys(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     let map = ctx.arg(0)?;
     ctx.return_map_keys(map)
 }
+
+pub fn map_values(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    ctx.return_map_values(ctx.arg(0)?)
+}
+
+pub fn map_clear(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    ctx.map_clear(ctx.arg(0)?)?;
+    ctx.return_unit();
+    Ok(())
+}
+
+pub fn map_merge(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(2)?;
+    ctx.map_merge(ctx.arg(0)?, ctx.arg(1)?)?;
+    ctx.return_unit();
+    Ok(())
+}
+
+pub fn map_get_or_insert(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(3)?;
+    let value = ctx.map_get_or_insert(ctx.arg(0)?, ctx.arg(1)?, ctx.arg(2)?)?;
+    ctx.set_return(value)
+}
+
+pub fn map_insert_absent(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(3)?;
+    let inserted = ctx.map_insert_absent(ctx.arg(0)?, ctx.arg(1)?, ctx.arg(2)?)?;
+    ctx.return_bool(inserted);
+    Ok(())
+}
+
+pub fn map_entries(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    ctx.return_map_entries(ctx.arg(0)?)
+}
+
+pub fn map_is_empty(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    ctx.return_bool(ctx.map_len(ctx.arg(0)?)? == 0);
+    Ok(())
+}
+
+pub fn map_copy(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    ctx.map_copy(ctx.arg(0)?)
+}

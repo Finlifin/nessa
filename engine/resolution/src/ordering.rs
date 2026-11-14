@@ -5,29 +5,8 @@ use type_pool::{TypeIndex, TypeKind};
 use crate::{SymbolKind, resolver::Resolver};
 
 pub(crate) fn type_index(r: &Resolver<'_>) -> Option<TypeIndex> {
-    r.symbols.iter().find_map(|symbol| {
-        if symbol.kind != SymbolKind::Type
-            || str_interner::get(symbol.name) != "Ordering"
-            || !r.options.privileged_nodes.contains(&symbol.def_node)
-        {
-            return None;
-        }
-        let module = r.scopes.get(symbol.scope.0 as usize)?;
-        let declaration = r.symbols.iter().find(|candidate| {
-            candidate.kind == SymbolKind::Module
-                && candidate.def_node == module.node
-                && str_interner::get(candidate.name) == "ordering"
-        })?;
-        let package = r.scopes.get(declaration.scope.0 as usize)?;
-        let trusted_package = r.symbols.iter().any(|candidate| {
-            candidate.kind == SymbolKind::Module
-                && candidate.def_node == package.node
-                && str_interner::get(candidate.name) == "std"
-                && r.options.package_roots.contains(&candidate.def_node)
-        });
-        let ty = r.type_pool.canonical_type(symbol.type_index)?;
-        (trusted_package && matches!(r.type_pool.get(ty).kind, TypeKind::Enum { .. })).then_some(ty)
-    })
+    let (ty, _) = crate::trusted::std_type(r, "ordering", "Ordering")?;
+    matches!(r.type_pool.get(ty).kind, TypeKind::Enum { .. }).then_some(ty)
 }
 
 pub(crate) fn prepare(r: &mut Resolver<'_>) {

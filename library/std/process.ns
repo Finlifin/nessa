@@ -4,3 +4,13 @@ use .builtin.*
 
 pub const exit: fn(i64) -> NoReturn = .exit'builtin
 pub const panic: fn(Any) -> NoReturn = .panic'builtin
+
+-- The message is an optional named argument. It is formatted by `panic`.
+pub fn assert(condition: bool, .message: Any = "assertion failed") {
+    if not condition { panic(message) }
+}
+
+-- Compared with `==`, including lists, tuples and Any values.
+pub fn assert_eq(left: Any, right: Any, .message: Any = "values are not equal") {
+    if left != right { panic(message) }
+}

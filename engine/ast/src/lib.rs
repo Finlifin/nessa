@@ -466,6 +466,10 @@ pub enum NodeKind {
     /// children: [0] pattern  [1] id
     PatternAsBind,
 
+    /// `pattern_typed -> (id | _) : type`
+    /// children: [0] binder (`Id` or `Underscore`)  [1] type_expr
+    PatternTyped,
+
     /// `pattern_if_guard -> pattern if expr`
     /// children: [0] pattern  [1] guard_expr
     PatternIfGuard,
@@ -720,13 +724,13 @@ impl NodeKind {
             Add | Sub | Mul | Div | Mod | Concat | BoolEq | BoolNotEq | BoolGt | BoolGtEq
             | BoolLt | BoolLtEq | BoolAnd | BoolOr | BoolMatches | Projection | View | Arrow
             | Pipeline | InfixFnCall | RangeFromTo | RangeFromToInclusive | HandlerApplication
-            | TypeCast | PostDo | CaseMap | CaseAlternative | PatternAsBind | PatternIfGuard
-            | Assign | AddAssign | SubAssign | MulAssign | DivAssign | ModAssign | Typealias
-            | Newtype | PropertyPattern | PathProjection | PathAsBind | ConditionArm | CaseArm
-            | CatchArm | Property | PropertyAssignment | NamedArg | EffectQualifiedType
-            | ErrorQualifiedType | ParamVarargs | ParamLambda | ParamTyped | ParamCatch
-            | PatternOr | ResetExpr | ReturnStatement | ResumeStatement | BreakStatement
-            | ContinueStatement => DoubleChildren,
+            | TypeCast | PostDo | CaseMap | CaseAlternative | PatternAsBind | PatternTyped
+            | PatternIfGuard | Assign | AddAssign | SubAssign | MulAssign | DivAssign
+            | ModAssign | Typealias | Newtype | PropertyPattern | PathProjection | PathAsBind
+            | ConditionArm | CaseArm | CatchArm | Property | PropertyAssignment | NamedArg
+            | EffectQualifiedType | ErrorQualifiedType | ParamVarargs | ParamLambda
+            | ParamTyped | ParamCatch | PatternOr | ResetExpr | ReturnStatement
+            | ResumeStatement | BreakStatement | ContinueStatement => DoubleChildren,
 
             // 3 children
             VarDecl | AssocBinding | IfStatement | ShiftExpr | StructField | ParamOptional

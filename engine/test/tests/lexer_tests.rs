@@ -113,6 +113,7 @@ fn lex_string_literal() {
 fn lex_string_with_escape() {
     let kinds = token_kinds("\"line\\n\"");
     assert_eq!(kinds, vec![TokenKind::String]);
+    assert_eq!(token_kinds("\"a\\0b\""), vec![TokenKind::String]);
 }
 
 #[test]
@@ -517,4 +518,52 @@ fn lex_symbol_dot_prefix() {
 fn lex_multiple_ids_on_one_line() {
     let kinds = token_kinds("a b c");
     assert_eq!(kinds, vec![TokenKind::Id, TokenKind::Id, TokenKind::Id]);
+}
+
+// ===========================================================================
+// String interpolation
+// ===========================================================================
+
+#[test]
+fn interpolated_string_tokens_include_nested_strings() {
+    assert_eq!(
+        token_kinds(r#""a{f("}}")}b""#),
+        vec![
+            TokenKind::FStringStart,
+            TokenKind::FStringLiteral,
+            TokenKind::FStringExprStart,
+            TokenKind::Id,
+            TokenKind::LParen,
+            TokenKind::String,
+            TokenKind::RParen,
+            TokenKind::FStringExprEnd,
+            TokenKind::FStringLiteral,
+            TokenKind::FStringEnd,
+        ]
+    );
+}
+
+#[test]
+fn doubled_braces_do_not_start_an_interpolation() {
+    assert_eq!(token_kinds(r#""{{x}}""#), vec![TokenKind::String]);
+}
+
+#[test]
+fn malformed_interpolated_strings_are_rejected() {
+    for (source, message) in [
+        (r#""a}b""#, "must be written `}}`"),
+        (r#""{x} }""#, "must be written `}}`"),
+        (r#""{x}\q""#, "escape"),
+        (r#""{x}\uD800""#, "not a Unicode scalar value"),
+        ("\"{x\n\"", "unterminated string interpolation"),
+    ] {
+        let errors = lex_errors(source);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == LexErrorKind::InvalidStrLiteral
+                    && error.message.contains(message)),
+            "{source}: {errors:?}"
+        );
+    }
 }

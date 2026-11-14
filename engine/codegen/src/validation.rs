@@ -153,21 +153,8 @@ pub(crate) fn validate(module: &NirModule) -> Vec<EncodingError> {
                     }
                     invalid_local(*value, function.local_count)
                 }
-                NirStmt::Drop(local) => local.0 >= function.local_count,
                 NirStmt::PushHandler { closure, .. } => {
                     invalid_local(*closure, function.local_count)
-                }
-                NirStmt::EffectCall {
-                    evidence,
-                    result,
-                    args,
-                    ..
-                } => {
-                    evidence.0 >= function.local_count
-                        || result.0 >= function.local_count
-                        || args
-                            .iter()
-                            .any(|&value| invalid_local(value, function.local_count))
                 }
                 _ => false,
             };
@@ -224,7 +211,6 @@ pub(crate) fn validate(module: &NirModule) -> Vec<EncodingError> {
                     report("a closure currently supports at most 31 captures")
                 }
                 NirExpr::Call(_, args)
-                | NirExpr::CallWithProof(_, args)
                 | NirExpr::CallWithProof(_, args)
                 | NirExpr::CallBuiltin(_, args)
                     if args.len() > 32 =>

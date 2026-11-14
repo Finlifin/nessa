@@ -394,8 +394,9 @@ pub fn try_struct_def(p: &mut Parser) -> ParseResult {
         );
     }
 
-    let defs = try_multi_in_block(
+    let defs = basic::try_required_block(
         p,
+        "struct name",
         &[
             Rule::comma("struct field", try_struct_field),
             Rule::semicolon(
@@ -493,8 +494,9 @@ pub fn try_enum_def(p: &mut Parser) -> ParseResult {
         );
     }
 
-    let variants = try_multi_in_block(
+    let variants = basic::try_required_block(
         p,
+        "enum name",
         &[
             Rule::comma("enum variant", try_enum_variant),
             Rule::semicolon(
@@ -598,7 +600,11 @@ pub fn try_trait_def(p: &mut Parser) -> ParseResult {
         }
     };
 
-    let members = try_multi_in_block(p, &[Rule::semicolon("trait member", try_trait_member)])?;
+    let members = basic::try_required_block(
+        p,
+        "trait header",
+        &[Rule::semicolon("trait member", try_trait_member)],
+    )?;
 
     let span = p.current_span();
     let idx = p
@@ -756,8 +762,9 @@ pub fn try_impl_def(p: &mut Parser) -> ParseResult {
         (NodeKind::ImplDef, NULL, first_expr)
     };
 
-    let members = try_multi_in_block(
+    let members = basic::try_required_block(
         p,
+        "impl header",
         &[Rule::semicolon(
             "impl member",
             statement::try_definition_or_statement,
@@ -821,8 +828,9 @@ pub fn try_extend_def(p: &mut Parser) -> ParseResult {
         (NodeKind::ExtendDef, NULL, first_expr)
     };
 
-    let members = try_multi_in_block(
+    let members = basic::try_required_block(
         p,
+        "extend header",
         &[Rule::semicolon(
             "extend member",
             statement::try_definition_or_statement,

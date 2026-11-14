@@ -19,16 +19,9 @@ pub(crate) fn lower_construction(
     let plan = builder
         .struct_plan(resolved, node)
         .expect("resolved struct construction has a field binding plan");
-    let explicit: Vec<_> = resolved
-        .ast
-        .multi_children(node)
-        .iter()
-        .map(|&argument| {
-            let expression = if resolved.ast.node(argument).kind == NodeKind::Property {
-                resolved.ast.fixed_children(argument)[1]
-            } else {
-                argument
-            };
+    let explicit: Vec<_> = explicit_sources(resolved, node)
+        .into_iter()
+        .map(|expression| {
             let value = lower_expr(resolved, expression, builder, block);
             snapshot(value, builder, *block)
         })
@@ -50,4 +43,23 @@ pub(crate) fn lower_construction(
         NirExpr::NewObject(plan.type_index, fields),
     ));
     NirValue::Local(local)
+}
+
+/// Explicit field values in source order. Range operators carry their bounds
+/// as fixed operands; `Type { ... }` carries properties or shorthand names.
+fn explicit_sources(resolved: &ResolvedAst, node: NodeIndex) -> Vec<NodeIndex> {
+    let ast = &resolved.ast;
+    if ast.node(node).kind != NodeKind::ExtendedCall {
+        return ast.fixed_children(node).to_vec();
+    }
+    ast.multi_children(node)
+        .iter()
+        .map(|&argument| {
+            if ast.node(argument).kind == NodeKind::Property {
+                ast.fixed_children(argument)[1]
+            } else {
+                argument
+            }
+        })
+        .collect()
 }

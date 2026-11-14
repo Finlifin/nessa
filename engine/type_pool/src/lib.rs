@@ -13,7 +13,6 @@ mod identity_encoding;
 #[cfg(test)]
 mod identity_tests;
 mod iteration_step;
-mod native_derived;
 mod numeric;
 mod signatures;
 mod snapshot;
@@ -32,7 +31,6 @@ pub use identity::{
     TypeIdentityInput,
 };
 pub use iteration_step::{ITERATION_DONE_TAG, ITERATION_YIELDED_TAG};
-pub use native_derived::{NativeDerivedError, NativeDerivedMethod};
 pub use signatures::{
     TraitAssociatedPath, TraitMethodSignature, TraitParameterKind, TraitSignatureError,
     TraitTypeStep,
@@ -40,9 +38,10 @@ pub use signatures::{
 pub use snapshot::{SnapshotError, TypePoolSnapshot};
 pub use traits::TraitLookupError;
 
-/// Sentinel func_id indicating a compiler-derived (synthesized) method.
-/// Used by `derive Eq, Ord, ...` — the interpreter generates the
-/// implementation on the fly when it encounters this marker.
+/// Compile-time-only placeholder `func_id` written during `resolution` for
+/// compiler-derived (`derive`) methods before NIR lowering assigns `FuncId`s.
+/// Every occurrence must be replaced via [`TypePool::resolve_derived_methods`]
+/// before codegen, serialization, or execution.
 pub const DERIVE_FUNC_ID: u32 = 0xFFFF_FFFE;
 
 // ---------------------------------------------------------------------------
@@ -468,6 +467,9 @@ pub struct TypePool {
     identity_input: Option<TypeIdentityInput>,
     identity_dirty: std::sync::atomic::AtomicBool,
     identity_known: [TypeIndex; 8],
+    /// Types confirmed free of associated binders and templates. Appending
+    /// types cannot change a confirmed result; `get_mut` clears the cache.
+    concrete_types: std::sync::Mutex<Vec<bool>>,
 }
 
 impl TypePool {
@@ -490,6 +492,7 @@ impl TypePool {
             identity_input: None,
             identity_dirty: std::sync::atomic::AtomicBool::new(false),
             identity_known: [TypeIndex::INVALID; 8],
+            concrete_types: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -866,6 +869,10 @@ impl TypePool {
     /// Look up type info mutably by index.
     pub fn get_mut(&mut self, idx: TypeIndex) -> &mut TypeInfo {
         self.invalidate_type_identities();
+        self.concrete_types
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         &mut self.types[idx.as_u32() as usize]
     }
 

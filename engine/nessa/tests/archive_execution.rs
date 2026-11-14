@@ -227,10 +227,862 @@ fn map_snapshot_iteration_executes_without_source_and_rejects_older_native_capab
             .any(|import| import.id == 126 && import.name == "__map_keys")
     );
     let directory = TestDirectory::new();
-    for revision in 1..=7 {
+    for revision in 1..=8 {
         let mut bad = nsbc_io::read_artifact(&nsbc_io::write_artifact(&artifact).unwrap()).unwrap();
         bad.builtin_abi_version = revision;
         let path = directory.0.join(format!("old-map-keys-{revision}.nsbc"));
+        std::fs::write(&path, nsbc_io::write_artifact(&bad).unwrap()).unwrap();
+        let output = cli("run", &path);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("incompatible builtin ABI"));
+    }
+}
+
+#[test]
+fn split_once_executes_without_source() {
+    let source = r#"fn main(){let parts="héllo".split_once("é");println(parts match{pair?=>pair.0++"|"++pair.1,_=>"none"});println("abc".split_once("=")==null)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("split.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "h|llo\ntrue\n");
+}
+
+#[test]
+fn assertions_execute_without_source() {
+    let source = r#"fn main(){assert(true);assert_eq([1,2],[1,2],message="ok");println("passed")}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("assert.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "passed\n");
+}
+
+#[test]
+fn numeric_bounds_execute_without_source() {
+    let source = r#"fn main(){println(min(1,1.0));println(type_of(min(1.0,1))==f64);println(clamp(5,1,3));println(max(-2,4))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("bounds.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "1\ntrue\n3\n4\n");
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 161));
+}
+
+#[test]
+fn string_numeric_parse_executes_without_source() {
+    let source = r#"fn main(){println("0xff".parse_i64());println("-9223372036854775808".parse_i64());println("1.5e1".parse_f64());println("no".parse_i64()==null)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("parse.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "255\n-9223372036854775808\n15\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 163));
+}
+
+#[test]
+fn split_groups_execute_without_source() {
+    let source = r#"fn main(){println("a\nb".lines()==["a","b"]);println(("a=b=c".split_once("=") match {p?=>p.0=="a",_=>false}));println("héllo".find_char('l')==2);println([1,2,3].chunks(2)==[[1,2],[3]]);println([1,2].zip([3,4])(0)==(1,3));let m=Map();m.set("k",1);let n=m.copy();m.set("k",2);println(n.get("k")==1);println(Map().is_empty())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("split-group.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 572));
+}
+
+#[test]
+fn string_views_execute_without_source() {
+    let source = r#"fn main(){println("aé".bytes()==[97,195,169]);println("aé".char_indices()==[0,1]);println("aé".take(1)=="a");println("aé".first()=='a');let xs=[1];xs.append(xs);println(xs==[1,1]);println([].is_empty());println(["a","b"].join("-")=="a-b")}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("string-view.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 557));
+}
+
+#[test]
+fn float_bool_execute_without_source() {
+    let source = r#"fn main(){println(1.5.algebraic_add(2.5)==4.0);println(nan().nan_to(1.0)==1.0);println(0.0.is_zero());println(true.xor(false));println(false.then(3)==null)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("float-bool.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 542));
+}
+
+#[test]
+fn range_queries_execute_without_source() {
+    let source = r#"fn main(){println((0..5).len()==5);println((0..=4).contains(4));let xs=[1,2];xs.insert(1,9);println(xs==[1,9,2]);println(xs.take(2)==[1,9]);println(xs.first()==1)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("range-query.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 527));
+}
+
+#[test]
+fn list_copies_execute_without_source() {
+    let source = r#"fn main(){let xs=[1,2,3];println(xs.copy()==[1,2,3]);println(xs.reverse()==[3,2,1]);println(xs.concat([4])==[1,2,3,4]);xs.swap(0,2);println(xs==[3,2,1]);xs.clear();println(xs.len()==0 and "\u00E9".is_lowercase())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("copies.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 512));
+}
+
+#[test]
+fn map_edits_execute_without_source() {
+    let source = r#"fn main(){let m=Map();println(m.insert_absent("a",1));println(m.get_or_insert("a",2)==1);println(m.values().len()==1);println("af".is_ascii_hexdigit());println(1.0.classify()=="normal")}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("map-edits.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 497));
+}
+
+#[test]
+fn list_slices_execute_without_source() {
+    let source = r#"fn main(){let xs=[1,2,3,4];xs.resize(6,9);println(xs==[1,2,3,4,9,9]);println(xs.windows(2).len()==5);println(xs.chunks_exact(2).get(0)==[1,2]);println([1,2,3,4].rotate_left(1)==[2,3,4,1]);println([1,2,3].repeat(2)==[1,2,3,1,2,3])}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("slices.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 482));
+}
+
+#[test]
+fn exact_values_execute_without_source() {
+    let source = r#"fn main(){println(10.isqrt()==3);println((-8).wrapping_div_euclid(3)==-3);println((5).as(u64).checked_signed_diff((8).as(u64))==-3);println("foo:bar".trim_prefix("foo:")=="bar");println("bar:hello:foo".strip_circumfix("bar:",":foo") match { found? => found=="hello", _ => false })}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("exact.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 467));
+}
+
+#[test]
+fn bit_indexes_execute_without_source() {
+    let source = r#"fn main(){println((0b10100).highest_one()==4);println((-1).bit_width()==i64_bits());println("aaa".rfind_indices("aa")==[1]);println("\u00e9".byte_rfind_indices("")==[2,0]);println(char_min().to_code()==0)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("bits.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 452));
+}
+
+#[test]
+fn integer_bounds_execute_without_source() {
+    let source = r#"fn main(){println((1).as(u64).saturating_add_signed(-2)==0);println((1).unbounded_shl(64)==0);println((-1).unbounded_shr(64)==-1);println(i64_min()==(1).unbounded_shl(63));println('A'.eq_ignore_ascii_case('a'))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("bounds.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 437));
+}
+
+#[test]
+fn integer_text_executes_without_source() {
+    let source = r#"fn main(){println("255".parse_u64()==255);println(12.gcd(18)==6);println("A.B.".split_terminator(".")==["A","B"]);println("\u00e9\u00e9".byte_rfind("\u00e9")==2);println(char_max().to_code()==1114111)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("text.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 422));
+}
+
+#[test]
+fn floor_layout_executes_without_source() {
+    let source = r#"fn main(){println(8.div_floor(3)==2);println((1.0).is_sign_positive());println(f64_from_le_bytes((1.0).to_le_bytes())==1.0);println(f64_radix()==2);println("ab".split_at_checked(1) match { parts? => parts.len() == 2, _ => false })}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("floor.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 407));
+}
+
+#[test]
+fn rounding_executes_without_source() {
+    let source = r#"fn main(){println(8.div_ceil(3)==3);println(23.next_multiple_of(8)==24);println((1).to_le_bytes().get(0)==1);println(i64_from_le_bytes((1).to_le_bytes())==1);println((1.0).total_cmp(2.0)==-1)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("rounding.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 392));
+}
+
+#[test]
+fn radix_text_executes_without_source() {
+    let source = r#"fn main(){println((255).to_str_radix(16)=="ff");println(i64_from_str_radix("ff",16)==255);println(5.checked_add_unsigned((3).as(u64))==8);println("ab".split_at(1)==["a","b"]);println("\u00e9".char_at_byte(1)==null)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("radix.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 377));
+}
+
+#[test]
+fn saturating_division_executes_without_source() {
+    let source = r#"fn main(){println((-7).saturating_div(3)==-2);println((-7).saturating_div_euclid(3)==-3);println((1.9).trunc_i64()==1);println('7'.is_ascii_octdigit());println(frac_1_pi()*pi()==1.0);println(f64_max().is_finite())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("saturating.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 362));
+}
+
+#[test]
+fn strict_arithmetic_executes_without_source() {
+    let source = r#"fn main(){println(2.strict_add(3)==5);println((-7).strict_div(3)==-2);println(1.strict_shl(2)==4);println(2.strict_pow(3)==8);println(frac_pi_2()==pi()/2.0);println(log2_10()*log10_2()==1.0)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("strict.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 347));
+}
+
+#[test]
+fn constants_execute_without_source() {
+    let source = r#"fn main(){println("\u00e9".is_char_boundary(1)==false);println("\u00e9".floor_char_boundary(1)==0);println(tau()==pi()*2.0);println(infinity().is_infinite());println(nan().is_nan());println(epsilon()>0)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("constant.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 332));
+}
+
+#[test]
+fn encodings_execute_without_source() {
+    let source = r#"fn main(){println((-7).checked_div_euclid(3)==-3);println((-3).widening_mul(5)==-15);println((5).as(u64).next_power_of_two()==8);println(6.is_multiple_of(3));println(string_from_utf8([195,169])=="\u00e9");println(string_from_utf16_lossy([55296])=="\uFFFD")}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("encoding.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 317));
+}
+
+#[test]
+fn bitcasts_execute_without_source() {
+    let source = r#"fn main(){println((-7).wrapping_div(3)==-2);println((-9223372036854775808).checked_abs()==null);println(1000.checked_ilog(10)==3);println((2.0).powi(-1)==0.5);println('a'.encode_utf8()==[97]);println(char_from_code(0x1F600) match { value? => value.encode_utf16()==[55357, 56832], _ => false })}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("bitcast.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 302));
+}
+
+#[test]
+fn division_executes_without_source() {
+    let source = r#"fn main(){println((-7).div_euclid(3)==-3);println((-7).rem_euclid(3)==2);println(1.checked_shl(64)==null);println(2.wrapping_pow(3)==8);println((1.0).is_normal());println((0.0).asinh()==0)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("division.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 287));
+}
+
+#[test]
+fn overflow_executes_without_source() {
+    let source = r#"fn main(){println(9223372036854775807.wrapping_add(1)==-9223372036854775808);println(9223372036854775807.saturating_add(1)==9223372036854775807);println(9223372036854775807.checked_add(1)==null);println(8.checked_div(0)==null);println(char_from_digit(10, 16)=='a')}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("overflow.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 272));
+}
+
+#[test]
+fn angles_execute_without_source() {
+    let source = r#"fn main(){println((180.0).to_radians().to_degrees()==180);println((1.5).round_ties_even()==2);println('a'.to_digit(16));println(" Ab ".trim_ascii());println(1000.ilog10());println((-1).abs_diff(1))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("angles.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\n10\nAb\n3\n2\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 257));
+}
+
+#[test]
+fn escapes_execute_without_source() {
+    let source = r#"fn main(){println((-0.0).signum()==-1);println((-7.0).rem_euclid(3)==2);println('\n'.escape_debug());println('é'.utf8_len());println("a,b,c".split_inclusive(",").len());println("ab".find_all("").len())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("escape.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\n\\n\n2\n3\n3\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 242));
+}
+
+#[test]
+fn string_edits_execute_without_source() {
+    let source = r#"fn main(){println("aba".trim_matches("a"));println("a,b,c".rsplit(",").len());println("aaa".replacen("a","b",2));println('\n'.is_ascii_control());println('\u0080'.is_control());println('A'.is_ascii_uppercase())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("edits.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "b\n3\nbba\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 226));
+}
+
+#[test]
+fn integer_bits_execute_without_source() {
+    let source = r#"fn main(){println((0b1000).count_ones());println((1).as(i128).leading_zeros());println(8.is_power_of_two());println(8.ilog2());println(1.rotate_left(3));println(log2(-1).is_nan());println(true.to_i64())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("bits.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "1\n127\ntrue\n3\n8\ntrue\n1\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 212));
+}
+
+#[test]
+fn classify_and_case_executes_without_source() {
+    let source = r#"fn main(){println(is_nan(log2(-1)));println(is_infinite(log2(0)));println(is_sign_negative(-0.0));println(cbrt(-8)==-2);println("Abé".to_ascii_uppercase());println("  a  b ".split_whitespace().len());println('ß'.to_uppercase())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("classify.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "true\ntrue\ntrue\ntrue\nABé\n2\nSS\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 198));
+}
+
+#[test]
+fn float_and_search_batch_executes_without_source() {
+    let source = r#"fn main(){println("héllo".rfind("l"));println("aaa".count("a"));println("ab".is_ascii());println('é'.into_string());println(log2(8)==3);println(hypot(3,4)==5);println(trunc(-1.9)==-1)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("batch.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "3\n3\ntrue\né\ntrue\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 180));
+}
+
+#[test]
+fn rsplit_once_executes_without_source() {
+    let source = r#"fn show(s:String,sep:String)->String{s.rsplit_once(sep) match {parts?=>parts.0++"|"++parts.1,_=>"none"}};fn main(){println(show("a=b=c","="));println(show("héllo","l"));println(show("abc","="))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("rsplit.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "a=b|c\nhél|o\nnone\n"
+    );
+}
+
+#[test]
+fn unique_and_merge_execute_without_source() {
+    let source = r#"fn main(){let m=Map();m("a")=1;let n=Map();n("a")=2;n("b")=null;m.merge(n);println(m("a"));println(m.contains("b"));println([1,1.0,2,1].unique().len())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("merge.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "2\ntrue\n2\n");
+}
+
+#[test]
+fn list_groups_execute_without_source() {
+    let source = r#"fn main(){println([1,2,3,4,5].chunks(2).len());println([["a","b"],["c"]].flatten().join(","))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("group.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "3\na,b,c\n");
+}
+
+#[test]
+fn string_null_escape_executes_without_source() {
+    let source = r#"fn main(){println("a\0b".char_len());println("a\0b".char_at(1)=='\0')}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("nul.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "3\ntrue\n");
+}
+
+#[test]
+fn char_escapes_execute_without_source() {
+    let source =
+        r#"fn main(){println('\0'.to_code());println('\u00e9'=='é');println('\x41'=='A')}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("escape.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "0\ntrue\ntrue\n");
+}
+
+#[test]
+fn char_codes_execute_without_source() {
+    let source = r#"fn main(){println('é'.to_code());println(char_from_code(0x1F600)!=null);println(char_from_code(0xD800)==null)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("code.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "233\ntrue\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 168));
+}
+
+#[test]
+fn list_windows_execute_without_source() {
+    let source = r#"fn main(){let xs=["a","b","c"];println(xs.take(2).join(","));println(xs.drop(1).join(","));println(xs.zip(["x"]).len());println(xs.join(","))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("window.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "a,b\nb,c\n1\na,b,c\n"
+    );
+}
+
+#[test]
+fn string_pad_executes_without_source() {
+    let source = r#"fn main(){println("é".pad_start(3, "x"));println("ab".pad_end(5, "xy"));println("hi".pad_start(2, "z"))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("pad.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "xxé\nabxyx\nhi\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 166));
+}
+
+#[test]
+fn numeric_sign_executes_without_source() {
+    let source = r#"fn main(){println(sign(-1.5));println(sign(0));println(sign(-0.0));println(sign(sqrt(-1.0))==null)}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("sign.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "-1\n0\n0\ntrue\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 164));
+}
+
+#[test]
+fn string_search_executes_without_source() {
+    let source = r#"fn main(){println("héllo".rfind("l"));println("aaa".count("aa"));println("héllo".strip_prefix("hé"));println("héllo".strip_suffix("x"))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("search.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "3\n1\nllo\nnull\n"
+    );
+}
+
+#[test]
+fn append_and_map_clear_execute_without_source() {
+    let source = r#"fn main(){let xs=["a"];xs.append(["b"]);xs.append(xs);println(xs.join(","));let m=Map();m("a")=1;m.clear();println(m.is_empty())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("append.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "a,b,a,b\ntrue\n");
+}
+
+#[test]
+fn list_edits_execute_without_source() {
+    let source = r#"fn main(){let xs=["a","b","c"];xs.insert(1,"m");println(xs.remove(0));println(xs.join(","));xs.swap(0,1);println(xs.join(","));xs.clear();println(xs.len())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("edit.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "a\nm,b,c\nb,m,c\n0\n"
+    );
+}
+
+#[test]
+fn char_classes_execute_without_source() {
+    let source = r#"fn main(){println(' '.is_whitespace() and 'é'.is_lowercase() and not 'é'.is_ascii());println('b'.to_ascii_uppercase());println("\u3000".chars()(0).as(char).is_whitespace())}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("classes.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "true\nB\ntrue\n");
+}
+
+#[test]
+fn character_indexes_and_lines_execute_without_source() {
+    let source = r#"fn main(){let s="héllo";println(s.char_len());println(s.char_at(1));println(s.find("él"));println(s.slice(1,4));println("a\r\nb\n".lines().join("|"))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("chars.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "5\né\n1\néll\na|b\n"
+    );
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    assert!(artifact.builtins.iter().any(|import| import.id == 146));
+    let mut old = artifact;
+    old.builtin_abi_version = 8;
+    let path = directory.0.join("old.nsbc");
+    std::fs::write(&path, nsbc_io::write_artifact(&old).unwrap()).unwrap();
+    let output = cli("run", &path);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("incompatible builtin ABI"));
+}
+
+#[test]
+fn string_text_operations_execute_without_source_and_reject_older_native_capabilities() {
+    let source = r#"fn main(){let s="  Straße, Nessa  ".trim();println(s.to_upper());println(s.to_lower().replace("ss","s"));println(s.contains("Nessa") and s.starts_with("Str") and s.ends_with("sa") and not s.is_empty());println("ab".repeat(3) ++ "|" ++ "  x ".trim_start() ++ "|" ++ " y  ".trim_end());let parts=s.split(", ");println(parts);println(parts(1).as(String).chars());println("ab".repeat(-1))}"#;
+    let directory = TestDirectory::new();
+    let path = directory.0.join("program.ns");
+    std::fs::write(&path, source).unwrap();
+    assert_success(&cli("build", &path));
+    let archive = path.with_extension("nsbc");
+    std::fs::remove_file(&path).unwrap();
+    let output = cli("run", &archive);
+    // The trailing negative repeat is a runtime error after the earlier output.
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "STRASSE, NESSA\nstraße, nesa\ntrue\nababab|x | y\n[\"Straße\", \"Nessa\"]\n[N, e, s, s, a]\n"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("repeat count must not be negative"));
+
+    let artifact = nsbc_io::read_artifact(&std::fs::read(&archive).unwrap()).unwrap();
+    for (id, name) in [(130, "str_trim"), (137, "str_split"), (138, "str_chars")] {
+        assert!(
+            artifact
+                .builtins
+                .iter()
+                .any(|import| import.id == id && import.name == name),
+            "{name}"
+        );
+    }
+    for revision in 1..=8 {
+        let mut bad = nsbc_io::read_artifact(&nsbc_io::write_artifact(&artifact).unwrap()).unwrap();
+        bad.builtin_abi_version = revision;
+        let path = directory.0.join(format!("old-string-{revision}.nsbc"));
         std::fs::write(&path, nsbc_io::write_artifact(&bad).unwrap()).unwrap();
         let output = cli("run", &path);
         assert!(!output.status.success());
@@ -987,36 +1839,25 @@ fn archive_executes_escaping_closure_with_explicit_function_abi() {
     let archive_path = path.with_extension("nsbc");
     std::fs::remove_file(path).unwrap();
     let artifact = nsbc_io::read_artifact(&std::fs::read(&archive_path).unwrap()).unwrap();
-    assert!(
-        artifact
-            .codegen_output
-            .functions
-            .iter()
-            .all(|function| function.abi.is_some())
-    );
+    assert!(!artifact.codegen_output.functions.is_empty());
     let entry = artifact
         .codegen_output
         .functions
         .iter()
         .find(|function| Some(function.func_id) == artifact.entry)
         .unwrap();
-    let entry_abi = entry.abi.as_ref().unwrap();
+    let entry_abi = &entry.abi;
     assert!(entry_abi.captures.is_empty());
     assert!(entry_abi.parameters.is_empty());
     let captured: Vec<_> = artifact
         .codegen_output
         .functions
         .iter()
-        .filter(|function| {
-            function
-                .abi
-                .as_ref()
-                .is_some_and(|abi| !abi.captures.is_empty())
-        })
+        .filter(|function| !function.abi.captures.is_empty())
         .collect();
     assert_eq!(captured.len(), 1);
     assert!(captured[0].is_closure);
-    let closure_abi = captured[0].abi.as_ref().unwrap();
+    let closure_abi = &captured[0].abi;
     assert_eq!(closure_abi.captures.len(), 1);
     assert!(closure_abi.parameters.is_empty());
     let output = cli("run", &archive_path);
@@ -1251,15 +2092,28 @@ fn archive_executes_generated_display_and_comparison_methods_through_trait_proof
 #[test]
 fn generated_display_archive_rejects_missing_and_incompatible_native_imports() {
     let compiled = driver::Driver::new().compile(
-        "struct Value{number:i64}\nderive Display for Value\nfn display(x:Display)->String{x.to_string()}\nfn main(){println(display(Value{number:42}))}",
+        "struct Value{text:String,number:i64}\nderive Display for Value\nfn display(x:Display)->String{x.to_string()}\nfn main(){println(display(Value{text:\"你好\",number:42}))}",
     );
     assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
     let artifact = compiled.into_artifact().unwrap();
+    assert!(
+        !artifact
+            .builtins
+            .iter()
+            .any(|import| import.id == 120 || import.name == "__derived_display")
+    );
+    assert!(
+        artifact
+            .codegen_output
+            .functions
+            .iter()
+            .any(|function| function.display_owner.is_some())
+    );
     let native = artifact
         .builtins
         .iter()
-        .find(|import| import.name == "__derived_display")
-        .expect("generated Display must declare its new native capability")
+        .find(|import| import.name == "__display_quote")
+        .expect("compositional struct Display must declare __display_quote")
         .clone();
     let bytes = nsbc_io::write_artifact(&artifact).unwrap();
     let mut missing = nsbc_io::read_artifact(&bytes).unwrap();
@@ -1459,7 +2313,7 @@ fn archive_preserves_inferred_and_named_default_method_self_specialization() {
         assert_eq!(function.function_type, original.function_type);
         assert_eq!(function.abi, original.abi);
         assert_eq!(
-            function.abi.as_ref().unwrap().physical_parameter_count(),
+            function.abi.physical_parameter_count(),
             function.param_count as usize
         );
     }
@@ -1486,8 +2340,9 @@ fn default_self_callback_rejects_explicit_trait_values_with_wrong_concrete_type(
     assert!(String::from_utf8_lossy(&archive_run.stderr).contains("TypeError"));
 }
 
-fn legacy_archive_fixture(
+fn finalized_archive_fixture(
     mut pool: type_pool::TypePool,
+    declarations: Vec<(type_pool::TypeIndex, &'static str)>,
     instructions: Vec<nsbc::Instruction>,
     constants: Vec<nsbc::Constant>,
     builtins: Vec<nsbc::BuiltinImport>,
@@ -1497,14 +2352,40 @@ fn legacy_archive_fixture(
         params: vec![],
         ret: type_pool::Intrinsic::Unit.type_index(),
     });
+    if pool.identity_input().is_none() {
+        let packages = if declarations.is_empty() {
+            vec![]
+        } else {
+            vec![type_pool::PackageTypeContext {
+                identity_schema: 1,
+                identity: [0x51; 16],
+                qualified_name: "example.org/archive-fixture".into(),
+                version: "1.0.0".into(),
+            }]
+        };
+        let declarations = declarations
+            .into_iter()
+            .map(|(type_index, name)| type_pool::NominalTypeProvenance {
+                type_index,
+                package: 0,
+                path: vec![type_pool::IdentityPathSegment::Named(name.into())],
+                last_stable_version: "1.0.0".into(),
+            })
+            .collect();
+        pool.finalize_type_identities(type_pool::TypeIdentityInput {
+            schema: 1,
+            packages,
+            declarations,
+        })
+        .unwrap();
+    }
     nsbc::CompiledArtifact {
         codegen_output: nsbc::CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: nsbc::ScopeCoverage::Calls,
+            method_call_scopes: vec![],
             functions: vec![nsbc::CompiledFunction {
                 display_owner: None,
                 func_id: nsbc::FuncId(0),
-                name: str_interner::intern("legacy_entry"),
+                name: str_interner::intern("fixture_entry"),
                 instructions: instructions
                     .into_iter()
                     .map(nsbc::Instruction::encode)
@@ -1513,7 +2394,7 @@ fn legacy_archive_fixture(
                 param_count: 0,
                 is_closure: false,
                 function_type,
-                abi: None,
+                abi: nsbc::FunctionAbi::default(),
                 safepoint_pcs: vec![],
             }],
             constants,
@@ -1527,14 +2408,14 @@ fn legacy_archive_fixture(
 }
 
 #[test]
-fn legacy_integer_ordering_archive_keeps_its_original_protocol() {
-    use nsbc::{Instruction, Opcode, Reg};
+fn unresolved_derive_func_id_in_method_or_vtable_is_rejected_by_archive_writer() {
+    use nsbc::Instruction;
     use type_pool::{Intrinsic, TypeId, TypeInfo, TypeKind, TypePool};
 
     let mut pool = TypePool::with_intrinsics();
     let owner = pool.register(TypeInfo {
         kind: TypeKind::Struct {
-            name: str_interner::intern("LegacyOrdered"),
+            name: str_interner::intern("UnresolvedDerived"),
             fields: vec![type_pool::FieldInfo {
                 name: str_interner::intern("number"),
                 ty: Intrinsic::I64.type_index(),
@@ -1542,12 +2423,12 @@ fn legacy_integer_ordering_archive_keeps_its_original_protocol() {
                 has_default: false,
             }],
         },
-        type_id: TypeId(905, 1),
+        type_id: TypeId::ZERO,
         size: 8,
         align: 8,
     });
-    let view = pool.well_known.ord;
-    let name = str_interner::intern("cmp");
+    let view = pool.well_known.display;
+    let name = str_interner::intern("to_string");
     let method = type_pool::MethodSlot {
         name,
         func_id: type_pool::DERIVE_FUNC_ID,
@@ -1568,62 +2449,26 @@ fn legacy_integer_ordering_archive_keeps_its_original_protocol() {
         implementor: owner,
         entries: vec![type_pool::DERIVE_FUNC_ID],
     });
-    let artifact = legacy_archive_fixture(
+    let artifact = finalized_archive_fixture(
         pool,
-        vec![
-            Instruction::new_object(Reg(2), owner),
-            Instruction::load_const(Reg(0), 0),
-            Instruction::store_field(Reg(2), 0, Reg(0)),
-            Instruction::new_object(Reg(3), owner),
-            Instruction::load_const(Reg(0), 1),
-            Instruction::store_field(Reg(3), 0, Reg(0)),
-            Instruction::mov(Reg(0), Reg(3)),
-            Instruction::call_method(Reg(2), name.as_u32(), 1),
-            Instruction::mov(Reg(4), Reg(0)),
-            Instruction::call_builtin(1, 1),
-            Instruction::load_imm(Reg(1), 0),
-            Instruction::r_type(Opcode::CmpGt, Reg(0), Reg(4), Reg(1)),
-            Instruction::call_builtin(1, 1),
-            Instruction::return_unit(),
-        ],
-        vec![
-            nsbc::Constant::Int(i64::MAX),
-            nsbc::Constant::Int(i64::MAX / 2),
-        ],
-        vec![nsbc::BuiltinImport {
-            id: 1,
-            name: "println".into(),
-        }],
-        1,
+        vec![(owner, "UnresolvedDerived")],
+        vec![Instruction::return_unit()],
+        vec![],
+        vec![],
+        9,
     );
-    let bytes = nsbc_io::write_artifact(&artifact).unwrap();
-    let restored = nsbc_io::read_artifact(&bytes).unwrap();
-    assert!(restored.type_pool.trait_schema(view).is_none());
-    let TypeKind::Trait { parents, .. } = &restored.type_pool.get(view).kind else {
-        panic!("Ord must remain a trait")
-    };
-    assert!(parents.is_empty());
-    assert!(restored.type_pool.snapshot().types.iter().all(|info| {
-        !matches!(&info.kind, TypeKind::Enum{name,..} if str_interner::get(*name)=="Ordering")
-    }));
-    assert_eq!(
-        restored.type_pool.find_method(owner, name).unwrap().func_id,
-        type_pool::DERIVE_FUNC_ID
+    assert!(
+        nsbc_io::write_artifact(&artifact).is_err(),
+        "DERIVE_FUNC_ID sentinel must never serialize into executable .nsbc archives"
     );
-    assert!(restored.codegen_output.functions[0].abi.is_none());
-    let directory = TestDirectory::new();
-    let path = directory.0.join("legacy-cmp.nsbc");
-    std::fs::write(&path, bytes).unwrap();
-    let output = cli("run", &path);
-    assert_success(&output);
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "1\ntrue\n");
 }
 
 #[test]
-fn legacy_scalar_equality_abi_five_remains_executable() {
+fn stale_scalar_equality_abi_and_removed_derived_display_import_are_rejected() {
     use nsbc::{Instruction, Reg};
-    let artifact = legacy_archive_fixture(
+    let stale_abi = finalized_archive_fixture(
         type_pool::TypePool::with_intrinsics(),
+        vec![],
         vec![
             Instruction::load_imm(Reg(0), 42),
             Instruction::load_imm(Reg(1), 42),
@@ -1644,12 +2489,37 @@ fn legacy_scalar_equality_abi_five_remains_executable() {
         ],
         5,
     );
+    let removed_display = finalized_archive_fixture(
+        type_pool::TypePool::with_intrinsics(),
+        vec![],
+        vec![
+            Instruction::load_imm(Reg(0), 42),
+            Instruction::call_builtin(120, 1),
+            Instruction::call_builtin(1, 1),
+            Instruction::return_unit(),
+        ],
+        vec![],
+        vec![
+            nsbc::BuiltinImport {
+                id: 120,
+                name: "__derived_display".into(),
+            },
+            nsbc::BuiltinImport {
+                id: 1,
+                name: "println".into(),
+            },
+        ],
+        9,
+    );
     let directory = TestDirectory::new();
-    let path = directory.0.join("legacy-scalar-eq.nsbc");
-    std::fs::write(&path, nsbc_io::write_artifact(&artifact).unwrap()).unwrap();
-    let output = cli("run", &path);
-    assert_success(&output);
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "true\n");
+    for (idx, bad) in [stale_abi, removed_display].into_iter().enumerate() {
+        let path = directory.0.join(format!("rejected-{idx}.nsbc"));
+        std::fs::write(&path, nsbc_io::write_artifact(&bad).unwrap()).unwrap();
+        let output = cli("run", &path);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("incompatible builtin ABI"));
+    }
 }
 
 #[test]
@@ -1734,8 +2604,9 @@ fn ordering_trait_archive_rejects_mixed_concrete_receiver_proofs() {
 #[test]
 fn scalar_ordering_archive_rejects_stale_abi_and_untrusted_native_manifest() {
     use nsbc::{Instruction, Reg};
-    let artifact = legacy_archive_fixture(
+    let artifact = finalized_archive_fixture(
         type_pool::TypePool::with_intrinsics(),
+        vec![],
         vec![
             Instruction::load_imm(Reg(0), 42),
             Instruction::load_imm(Reg(1), 41),
@@ -1754,7 +2625,7 @@ fn scalar_ordering_archive_rejects_stale_abi_and_untrusted_native_manifest() {
                 name: "println".into(),
             },
         ],
-        6,
+        9,
     );
     let bytes = nsbc_io::write_artifact(&artifact).unwrap();
     let mut missing = nsbc_io::read_artifact(&bytes).unwrap();
@@ -1774,7 +2645,7 @@ fn scalar_ordering_archive_rejects_stale_abi_and_untrusted_native_manifest() {
                 .unwrap()
                 .name = "forged_scalar_cmp".into();
         } else {
-            bad.builtin_abi_version = 5;
+            bad.builtin_abi_version = 8;
         }
         let directory = TestDirectory::new();
         let path = directory.0.join("bad-scalar-cmp.nsbc");
@@ -1889,7 +2760,7 @@ fn ordering_archive_preserves_parent_slots_result_identity_and_function_abi() {
             assert_eq!(function.function_type, original.function_type);
             assert_eq!(function.abi, original.abi);
             assert_eq!(
-                function.abi.as_ref().unwrap().physical_parameter_count(),
+                function.abi.physical_parameter_count(),
                 function.param_count as usize
             );
             if !optional {
@@ -1920,7 +2791,7 @@ fn ordering_archive_preserves_parent_slots_result_identity_and_function_abi() {
                     };
                     if str_interner::get(*name) == "P" {
                         assert_eq!(
-                            function.abi.as_ref().unwrap().parameters,
+                            function.abi.parameters,
                             [
                                 nsbc::ParameterAbi::TraitSelf { view },
                                 nsbc::ParameterAbi::TraitSelf { view }
@@ -2358,36 +3229,46 @@ fn unsupported_derived_display_fields_do_not_produce_archives() {
 }
 
 #[test]
-fn archive_keeps_legacy_struct_display_for_any_list_and_user_display_fields() {
+fn archive_uses_compositional_struct_display_and_rejects_non_display_struct_fields() {
+    for invalid in [
+        "struct Raw{value:Any}\nderive Display for Raw\nfn main(){}",
+        "struct Bag{items:List}\nderive Display for Bag\nfn main(){}",
+    ] {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("invalid-struct-display.ns");
+        std::fs::write(&path, invalid).unwrap();
+        let output = cli("build", &path);
+        assert!(!output.status.success(), "{invalid}");
+        assert!(!path.with_extension("nsbc").exists());
+    }
+
     let source = r#"
         global calls:i64=0;
         struct Item{};
         impl Display for Item{pub fn to_string(self)->String{calls+=1;"changed"}};
-        struct Raw{value:Any};derive Display for Raw;
-        struct Bag{items:List,item:Item};derive Display for Bag;
+        struct Bag{item:Item,text:String};derive Display for Bag;
         fn show(x:Display)->String{x.to_string()};
         fn main(){
-            println(show(Raw{value:42}));
-            let ignored=show(Bag{items:[40,2],item:Item{}});
-            if calls==0 {println(42)} else {println(0)}
+            println(show(Bag{item:Item{},text:"hi"}));
+            if calls==1 {println(42)} else {println(0)}
         }
         "#;
-    roundtrip(source, "Raw { value: 42 }\n42\n");
+    roundtrip(source, "Bag { item: changed, text: \"hi\" }\n42\n");
     let compiled = driver::Driver::new().compile(source);
     assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
     let artifact = compiled.into_artifact().unwrap();
     assert!(
-        artifact
+        !artifact
             .builtins
             .iter()
-            .any(|import| import.id == 120 && import.name == "__derived_display")
+            .any(|import| import.id == 120 || import.name == "__derived_display")
     );
     assert!(
         artifact
             .codegen_output
             .functions
             .iter()
-            .all(|function| function.display_owner.is_none())
+            .any(|function| function.display_owner.is_some())
     );
     let loaded = nsbc_io::read_artifact(&nsbc_io::write_artifact(&artifact).unwrap()).unwrap();
     assert!(
@@ -2395,7 +3276,7 @@ fn archive_keeps_legacy_struct_display_for_any_list_and_user_display_fields() {
             .codegen_output
             .functions
             .iter()
-            .all(|function| function.display_owner.is_none())
+            .any(|function| function.display_owner.is_some())
     );
 }
 
@@ -2405,7 +3286,7 @@ fn generated_enum_and_tuple_display_archives_require_exact_quote_native_capabili
     let compiled = driver::Driver::new().compile(source);
     assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
     let artifact = compiled.into_artifact().unwrap();
-    assert_eq!(artifact.builtin_abi_version, 8);
+    assert_eq!(artifact.builtin_abi_version, 9);
     assert!(
         artifact
             .builtins
@@ -2447,111 +3328,6 @@ fn generated_enum_and_tuple_display_archives_require_exact_quote_native_capabili
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains("incompatible builtin ABI"));
     }
-    // Build the legacy capability set directly; today's bundled std also
-    // contains new Map helpers even when the user program does not call them.
-    use nsbc::{Instruction as I, Reg};
-    use type_pool::{FieldInfo, Intrinsic, TypeId, TypeInfo, TypeKind};
-    let mut pool = type_pool::TypePool::with_intrinsics();
-    let view = pool.well_known.display;
-    let declaration = pool.intern_structural(TypeKind::Function {
-        params: vec![view],
-        ret: Intrinsic::Str.type_index(),
-    });
-    let name = str_interner::intern("to_string");
-    pool.register_trait_schema(type_pool::TraitDispatchSchema {
-        trait_type: view,
-        slots: vec![type_pool::TraitMethodKey {
-            trait_owner: view,
-            name,
-            signature: Some(type_pool::TraitMethodSignature {
-                declaration,
-                self_paths: vec![vec![type_pool::TraitTypeStep::Parameter(0)]],
-                associated_paths: vec![],
-                parameter_kinds: vec![type_pool::TraitParameterKind::Receiver],
-            }),
-        }],
-    })
-    .unwrap();
-    let raw = pool.register(TypeInfo {
-        kind: TypeKind::Struct {
-            name: str_interner::intern("Raw"),
-            fields: vec![FieldInfo {
-                name: str_interner::intern("value"),
-                ty: Intrinsic::Any.type_index(),
-                has_default: false,
-                offset: 0,
-            }],
-        },
-        type_id: TypeId(943, 1),
-        size: 8,
-        align: 8,
-    });
-    let method = type_pool::MethodSlot {
-        name,
-        func_id: 1,
-        trait_impl: Some(view),
-        visible_scope: None,
-        access: type_pool::MethodAccess::Public,
-    };
-    pool.add_method(raw, method.clone());
-    pool.add_trait_impl(type_pool::TraitImplRecord {
-        implementor: raw,
-        trait_type: view,
-        visible_scope: None,
-        methods: vec![method],
-    });
-    pool.add_vtable(type_pool::VTable {
-        implementor: raw,
-        trait_type: view,
-        visible_scope: None,
-        entries: vec![1],
-    });
-    let mut wrapper = legacy_iterator_function(
-        &mut pool,
-        1,
-        "legacy_struct_display",
-        vec![raw],
-        Intrinsic::Str.type_index(),
-        vec![I::call_builtin(120, 1), I::ret(Reg(0))],
-    );
-    wrapper.abi = Some(nsbc::FunctionAbi {
-        captures: vec![],
-        parameters: vec![nsbc::ParameterAbi::Value],
-    });
-    let mut old = legacy_archive_fixture(
-        pool,
-        vec![
-            I::new_object(Reg(0), raw),
-            I::load_imm(Reg(1), 42),
-            I::store_field(Reg(0), 0, Reg(1)),
-            I::call(1, 1),
-            I::call_builtin(1, 1),
-            I::return_unit(),
-        ],
-        vec![],
-        vec![
-            nsbc::BuiltinImport {
-                id: 120,
-                name: "__derived_display".into(),
-            },
-            nsbc::BuiltinImport {
-                id: 1,
-                name: "println".into(),
-            },
-        ],
-        6,
-    );
-    old.codegen_output.functions.push(wrapper);
-    assert!(old.builtins.iter().all(|import| import.id < 123));
-    let directory = TestDirectory::new();
-    let path = directory.0.join("legacy-display.nsbc");
-    std::fs::write(&path, nsbc_io::write_artifact(&old).unwrap()).unwrap();
-    let output = cli("run", &path);
-    assert_success(&output);
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "Raw { value: 42 }\n"
-    );
 }
 
 #[test]
@@ -2630,8 +3406,6 @@ fn derived_display_archives_check_actual_user_field_method_returns() {
     artifact
         .codegen_output
         .method_call_scopes
-        .as_mut()
-        .unwrap()
         .retain(|context| context.func_id.0 != target);
     let directory = TestDirectory::new();
     let path = directory.0.join("bad-return.nsbc");
@@ -2924,7 +3698,7 @@ fn archive_specializes_associated_default_bodies_without_changing_explicit_any()
                 .iter()
                 .find(|function| function.func_id.0 == slot.func_id)
                 .unwrap();
-            let abi = function.abi.as_ref().unwrap();
+            let abi = &function.abi;
             assert!(
                 matches!(abi.parameters[0],nsbc::ParameterAbi::TraitSelf{view} if view==implementation.trait_type)
             );
@@ -3028,7 +3802,7 @@ fn archive_keeps_associated_default_bodies_bound_to_their_scoped_implementation(
         returns.insert(ret.as_u32());
         assert_eq!(function.param_count, 2);
         assert_eq!(
-            function.abi.as_ref().unwrap().parameters,
+            function.abi.parameters,
             vec![nsbc::ParameterAbi::TraitSelf {
                 view: implementation.trait_type
             }]
@@ -3145,190 +3919,42 @@ fn archive_orders_global_initialization_through_associated_default_body_dispatch
     );
 }
 
-fn legacy_iterator_function(
-    pool: &mut type_pool::TypePool,
-    id: u32,
-    name: &str,
-    params: Vec<type_pool::TypeIndex>,
-    ret: type_pool::TypeIndex,
-    code: Vec<nsbc::Instruction>,
-) -> nsbc::CompiledFunction {
-    use nsbc::{CompiledFunction, FuncId, Instruction as I};
-    use type_pool::TypeKind;
-    let signature = pool.intern_structural(TypeKind::Function { params, ret });
-    CompiledFunction {
-        display_owner: None,
-        func_id: FuncId(id),
-        name: str_interner::intern(name),
-        instructions: code.into_iter().map(I::encode).collect(),
-        register_count: 20,
-        param_count: if id == 0 { 0 } else { 1 },
-        is_closure: false,
-        function_type: signature,
-        abi: None,
-        safepoint_pcs: vec![],
-    }
-}
 #[test]
-fn legacy_iterator_archive_keeps_two_call_protocol() {
-    use nsbc::{CodegenOutput, CompiledArtifact, FuncId, Instruction as I, Opcode, Reg};
-    use type_pool::{
-        Intrinsic, MethodAccess, MethodSlot, TraitDispatchSchema, TraitImplRecord, TraitMethodKey,
-        TypeId, TypeInfo, TypeKind, TypePool, VTable,
-    };
-    let mut pool = TypePool::with_intrinsics();
-    let view = pool.well_known.iterator;
-    let owner = pool.register(TypeInfo {
-        kind: TypeKind::Struct {
-            name: str_interner::intern("LegacyIterator"),
-            fields: vec![type_pool::FieldInfo {
-                name: str_interner::intern("state"),
-                ty: Intrinsic::I64.type_index(),
-                offset: 0,
-                has_default: false,
-            }],
-        },
-        type_id: TypeId::ZERO,
-        size: 8,
-        align: 8,
-    });
-    let has_next = str_interner::intern("has_next");
-    let next = str_interner::intern("next");
-    pool.register_trait_schema(TraitDispatchSchema {
-        trait_type: view,
-        slots: vec![
-            TraitMethodKey {
-                trait_owner: view,
-                name: has_next,
-                signature: None,
-            },
-            TraitMethodKey {
-                trait_owner: view,
-                name: next,
-                signature: None,
-            },
-        ],
-    })
-    .unwrap();
-    let methods = vec![(has_next, 1), (next, 2)]
-        .into_iter()
-        .map(|(name, func_id)| MethodSlot {
-            name,
-            func_id,
-            access: MethodAccess::Public,
-            trait_impl: Some(view),
-            visible_scope: None,
-        })
-        .collect::<Vec<_>>();
-    for slot in &methods {
-        pool.add_method(owner, slot.clone());
-    }
-    pool.add_trait_impl(TraitImplRecord {
-        trait_type: view,
-        implementor: owner,
-        visible_scope: None,
-        methods,
-    });
-    pool.add_vtable(VTable {
-        trait_type: view,
-        implementor: owner,
-        visible_scope: None,
-        entries: vec![1, 2],
-    });
-    let functions = vec![
-        legacy_iterator_function(
-            &mut pool,
-            0,
-            "legacy_entry",
-            vec![],
-            Intrinsic::Unit.type_index(),
-            vec![
-                I::new_object(Reg(19), owner),
-                I::load_imm(Reg(0), 0),
-                I::store_field(Reg(19), 0, Reg(0)),
-                I::call_method(Reg(19), has_next.as_u32(), 0),
-                I::jmp_if_not(Reg(0), 4),
-                I::call_method(Reg(19), next.as_u32(), 0),
-                I::call_builtin(1, 1),
-                I::jmp(-4),
-                I::return_unit(),
-            ],
-        ),
-        legacy_iterator_function(
-            &mut pool,
-            1,
-            "legacy_has_next",
-            vec![owner],
-            Intrinsic::Bool.type_index(),
-            vec![
-                I::load_field(Reg(1), Reg(0), 0),
-                I::load_imm(Reg(2), 0),
-                I::r_type(Opcode::CmpEq, Reg(0), Reg(1), Reg(2)),
-                I::ret(Reg(0)),
-            ],
-        ),
-        legacy_iterator_function(
-            &mut pool,
-            2,
-            "legacy_next",
-            vec![owner],
-            Intrinsic::I64.type_index(),
-            vec![
-                I::load_imm(Reg(1), 1),
-                I::store_field(Reg(0), 0, Reg(1)),
-                I::load_imm(Reg(0), 42),
-                I::ret(Reg(0)),
-            ],
-        ),
-    ];
-    let artifact = CompiledArtifact {
-        codegen_output: CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: nsbc::ScopeCoverage::Calls,
-            functions,
-            constants: vec![],
-            globals: vec![],
-        },
-        type_pool: pool,
-        entry: Some(FuncId(0)),
-        builtin_abi_version: 1,
-        builtins: vec![nsbc::BuiltinImport {
-            id: 1,
-            name: "println".into(),
-        }],
-    };
+fn non_current_nsam_revisions_are_rejected() {
+    use nsbc::SectionKind;
+    use nsbc_io::{Archive, ArchiveWriter};
+
+    let compiled = driver::Driver::new().compile("fn main(){println(42)}");
+    assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
+    let artifact = compiled.into_artifact().unwrap();
     let bytes = nsbc_io::write_artifact(&artifact).unwrap();
-    let restored = nsbc_io::read_artifact(&bytes).unwrap();
-    for view in [
-        restored.type_pool.well_known.iterator,
-        restored.type_pool.well_known.into_iterator,
-    ] {
-        let TypeKind::Trait { assoc_types, .. } = &restored.type_pool.get(view).kind else {
-            panic!()
-        };
-        assert!(assoc_types.is_empty());
-    }
-    assert!(
-        restored
-            .type_pool
-            .trait_schema(view)
-            .unwrap()
-            .slots
-            .iter()
-            .all(|key| key.signature.is_none())
-    );
-    assert!(restored.type_pool.associated_bindings_snapshot().is_empty());
-    assert_eq!(nsbc_io::write_artifact(&restored).unwrap(), bytes);
     let directory = TestDirectory::new();
-    let path = directory.0.join("legacy-iterator.nsbc");
-    std::fs::write(&path, bytes).unwrap();
-    let output = cli("run", &path);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    for revision in 1u32..=5 {
+        let mut archive = Archive::read_from(&mut &bytes[..]).unwrap();
+        let metadata = &mut archive
+            .sections
+            .iter_mut()
+            .find(|(entry, _)| entry.kind == SectionKind::Metadata as u8)
+            .unwrap()
+            .1;
+        assert_eq!(&metadata[..4], b"NSAM");
+        metadata[4..8].copy_from_slice(&revision.to_le_bytes());
+        let mut writer = ArchiveWriter::new();
+        for (entry, body) in archive.sections {
+            writer.add_raw_section(SectionKind::from_u8(entry.kind).unwrap(), body);
+        }
+        let mut damaged = Vec::new();
+        writer.write_to(&mut damaged).unwrap();
+        assert!(
+            nsbc_io::read_artifact(&damaged).is_err(),
+            "accepted non-current NSAM revision {revision}"
+        );
+        let path = directory.0.join(format!("nsam-{revision}.nsbc"));
+        std::fs::write(&path, &damaged).unwrap();
+        let output = cli("run", &path);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
 }
 
 #[test]

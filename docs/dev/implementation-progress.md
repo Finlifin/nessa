@@ -1858,3 +1858,598 @@ CLI 操作通过，第二轮 11/11 适用标准通过，C4 不适用，C1/C2/C7/
 回归及嵌套导入加载根初始化对照，专项 13/13。全仓质量和新上下文验收仍在
 进行，以实际工件为准。依赖获取、目录 CLI 的依赖来源和外部归档链接尚未
 完成，完整项目目标保持进行。详见[跨包源码编译记录](cross-package-compiler-audit.md)。
+
+### String 基础文本操作与 builtin ABI9
+
+std.string 新增 String 方法：is_empty（纯源码）、contains、starts_with、ends_with、
+trim/trim_start/trim_end、to_upper/to_lower、repeat、replace、split、chars。后12项
+经私有 typed 常量绑定新 native ID127–138，builtin ABI 升为9；旧ABI8只接受
+ID<127，split/chars 导入要求 List/Buffer 角色。trim 使用 Unicode White_Space，
+大小写为完整 Unicode 映射。split 返回新 String 的新 List，chars 返回 char List；
+native 构造在分配后从根重新读取 List。负 repeat 次数与空 split 分隔符报
+新增的 `VmError::InvalidArgument`；repeat/replace 先以受检算术计算结果大小，
+超过 String 对象上限报 ObjectTooLarge，不在主机端先构造巨大字符串。
+
+源码4组（值、Unicode、边界、错误与静态拒绝）、独立8 MiB 堆的真实 GC 回归
+（split 分配期间发生收集，30000个元素内容完整）、driver ABI/角色1组和删除源码
+后的 CLI 归档1组通过。全 workspace 1857通过、0失败、1项已有忽略；fmt、
+all-targets check、严格 Clippy 与 diff 检查通过。日志
+`/tmp/nessa-string-workspace-final.log`。按 Unicode 标量索引的查找和切片见下文；
+本阶段未经独立验收。
+
+### for 循环、range 与复合赋值修复
+
+- 解析：`..`/`..=` 优先级低于所有二元运算符，`-n..n` 解析为 `(-n)..n`；一元负号
+  只绑定紧随的操作数（`-a + b` 为 `(-a) + b`）；`for i in 3.. {` 不再把循环体当作
+  range 终点；`a..=` 缺少终点报诊断。
+- std.range：`a..b`、`a..=b`、`a..`、`..b`、`..=b`、`..` 构造 std 结构体（i64 端点），
+  可重复迭代、可作一等值；`..b`、`..=b`、`..` 不可迭代，静态拒绝。`a..` 到达
+  i64::MAX 后报 NumericOverflow，`a..=i64::MAX` 不溢出。
+- for 输入：无静态类型的输入报诊断；`Any` 输入在运行时先选 IntoIterator，否则
+  Iterator，都不满足时报 TypeError；元素绑定为 Any，done 判断经 builtin 139。
+  Any 元素上的元组模式仍要求静态已知的元组输入。
+- 复合赋值：支持变量、全局、字段、嵌套字段与 List/Map 索引；接收者与索引只求值
+  一次。`Any` 字段赋值不再被静默丢弃，改为静态拒绝；其它调用目标的复合赋值显式拒绝。
+- 结构体字段类型无效时构造不再 panic。
+- 执行性能：同类型内建标量（数值、bool、char、String、Unit）的比较直接使用与 std
+  Eq/Ord 实现相同的原生内核，不再经 `cmp` 调用链（用户代码不能为内建类型提供
+  impl，作用域内 impl 仍走 trait 分派）；解释器只在当前函数变化时重新校验函数
+  ABI，作用域表只对 ScopeCoverage 覆盖的 opcode 查询；TypePool 缓存已确认不含
+  关联类型的结果（`get_mut` 清空，追加类型不影响已确认结果）。debug 构建下
+  16000 次 `while` 循环由约 2.0s 降至约 0.15s，range for 循环由约 3.3s 降至约 0.5s。
+  List 迭代每个元素仍有多次 std 方法调用，开销主要是未优化构建的通用成本。
+
+验证：range、动态迭代、复合赋值、标量比较的源码与归档往返测试，range/动态迭代的
+8 MiB 堆 GC 回归，driver ABI9 导入阈值与 interpreter done 判断单元测试；全 workspace
+测试、fmt、all-targets check、严格 Clippy 通过，`git diff --check` 仅报用户已有的
+`tests/hello.ns` 末尾空行。未经独立验收。仍缺：`not` 的优先级待定；用户类型
+apply/update 与 Any 接收者索引的复合赋值显式拒绝。（此前记录的“f-string 作为调用
+实参无法解析”是误判：Nessa 没有 `f` 前缀，普通字符串 `"{x}"` 即为插值。）
+
+### 字符串插值
+
+- 词法：所有字符串字面量支持 `{expr}` 插值；`{{`/`}}` 表示字面花括号，单独的
+  `}` 报错；插值内可嵌套任意字符串（此前嵌套字符串会破坏外层词法状态）；插值
+  文本片段与普通字符串一样解码转义，非法转义与 `\u` 代理码点报错（此前在插值
+  字符串中被静默接受或丢弃）；插值在换行或文件结束前未闭合时报错。
+- 语法：`{}` 缺少表达式时报诊断（此前在 NIR 降级时 panic）。
+- 类型：插值值的静态类型必须实现 `Display`，否则编译期报错；Any 值在运行时
+  建立 Display 证明，缺少时为 TypeError（此前未实现 Display 的值在运行时报
+  MethodNotFound）。降级经静态/派生 trait 分派或 TraitProof + TraitCall 调用
+  `Display.to_string`，String 部分直接拼接。
+
+验证：词法 token 序列与拒绝案例、插值的 Display 文本、转义/花括号/嵌套解码、
+静态拒绝（Tuple、List、Map、Range、无 Display 的结构体、null）、Any 的运行时
+成功与 TypeError、空插值与单独 `}` 的诊断。已知不足：`"{"` 这类未闭合插值会把
+后续 `"` 当作嵌套字符串起点，诊断落在单独 `}` 规则上而非“未终止插值”。
+
+### 类型测试模式与 Display 输出
+
+- 语法：`match`、`matches`、`case` 与 `for` 的模式（含其中嵌套的 Tuple、List、
+  构造参数）支持 `name: Type` 与 `_: Type`；类型按函数箭头优先级解析，停在
+  `or`、`and`、`as`、guard 与 `=>` 之前。声明、参数和 lambda 参数中的 `:` 仍是
+  类型标注。
+- 语义：仅接受静态类型为 Any 或 trait 的输入（其它输入静态报错）；运行时经
+  TypeCheck 在模式作用域内检查，成功后按 `.as(Type)` 转换绑定（trait 目标建立
+  证明，可调用 trait 方法）；`or` 两侧仍要求同名同类型。`.as` 与类型模式共用
+  NIR 转换逻辑，模式中的转换显式携带作用域。
+- `std.io.print`/`println` 改为源码函数：值在 `std.io` 作用域内有 Display 实现时
+  输出 `to_string` 结果，否则沿用原生输出；仍可作为一等函数值使用。
+
+验证：解析结构（与 `or`/guard/函数类型的优先级，声明中不启用）、按运行时类型
+选择分支、guard/`as`/`or`/`matches`/`for` 过滤、嵌套 List/枚举载荷/Tuple、
+trait 输入向具体类型测试、作用域内 trait 实现的可见性、静态输入与非法类型的
+拒绝；CLI 源码与删源归档运行断言 Display 与原生输出。已知不足：在 `std.io`
+不可见的作用域内 `extend Display` 不影响 `println`（仍为原生输出）；记录模式
+`{ a: x }` 的属性值暂不启用类型测试。
+
+### 条件中的模式 guard
+
+`if`/`while` 条件里的 `matches` 与 `for` 模式中的 guard 不再把后面的循环体或分支
+块当作花括号调用参数：guard 表达式沿用所在模式的“禁止花括号调用”上下文（与
+`and … is` 一致），因此 `if v matches x if x > 2 { … }` 可正常解析；`match` 分支中的
+guard 仍可使用花括号构造。验证：if/while/for 中的 guard 与类型模式 guard、match
+guard 中的结构体构造。
+
+### 列表、元组与 Any 的相等比较
+
+- `List` 在 std 中实现 `PartialEq`，逐元素比较，因此 `[[1], [2]] == [[1], [2]]`、
+  `[1] == [1.0]` 成立。
+- 元组 `==`/`!=` 逐元素比较。resolution 静态检查元数与每对元素类型，不匹配时报
+  “cannot be compared: arity or element types differ”。
+- 任一侧为 `Any` 的比较按运行时值进行。resolution 把 Any 与元组的比较记录到
+  `equality_calls`，NIR 调用可信的 `std.collections.dynamic_equal`：
+  - 它借助 builtin 140–142 处理原生值、元组和运行时类型不同的值；
+  - 返回 `null` 表示两侧运行时类型相同，此时由比较处生成的代码在本地作用域内检查
+    `Eq`，其次 `PartialEq`，因此模块内的局部实现生效；
+  - 两者都没有时，运行时证明失败，报 `TypeError`。
+- 列表或元组内部的元素比较发生在 std 中，只能看到 std 作用域可见的实现。包顶层
+  实现全局可见，不受影响；模块内的局部实现不参与元素比较，与 println 的 Display
+  缺口相同。
+- 新增 `List` 方法：`is_empty`、`contains`、`index_of`（返回 `?i64`）、`reverse`、
+  `enumerate`（`(i64, Any)` 列表）、`any`、`all`。
+- 已知缺口：resolution 对 `==` 没有一般的静态检查。没有 `Eq` 的结构体、
+  `1 == "a"` 和函数值的比较都能通过编译，错误推迟到运行时。这是既有缺口，
+  本轮只覆盖元组形状。
+
+### Map 相等与 List 端点、拼接
+
+沿用列表的结构相等：`Map` 在 std 中实现 `PartialEq`，两侧键集合相同且对应值
+`==` 时相等，插入顺序不影响结果；嵌套 Map 与 `Any` 中的 Map 同样适用。值没有
+可见相等实现时仍是运行时 `TypeError`。`Map.is_empty` 判断长度为 0。
+
+`List.first`/`last` 返回首尾元素，空列表返回 `null`（与 `pop` 一样，无法区分
+存入的 `null`）。`List.join` 用 `++` 拼接 String 元素，空列表得到空字符串；
+元素不是 String 时报 `TypeError`。
+
+### 按字符索引的字符串操作
+
+`len` 继续表示 UTF-8 字节数。新增方法使用与 `chars` 相同的 Unicode 标量索引，
+builtin ID 143–146 追加在 ABI9：
+
+- `char_len` 返回标量个数。`"héllo".len()` 为 6，`char_len` 为 5。
+- `char_at` 返回 `?char`。负索引和越界返回 `null`。
+- `find` 返回第一次出现的标量索引，空模式返回 0，找不到返回 `null`。
+- `slice(start, end)` 取半开区间。负索引、`end < start` 或越过 `char_len` 报
+  `InvalidArgument("string slice is out of range")`。
+- `lines` 按 `\n`、`\r\n` 和 `\r` 分行并去掉行尾。末尾的换行不额外产生空行；
+  空字符串没有行；仅一个换行得到一行空字符串。
+- `split_once` 在第一次匹配处分成 `?(String, String)`，分隔符不包含在结果里。
+  找不到时为 `null`。空分隔符沿用 `split` 的 `InvalidArgument`。索引单位与
+  `find`/`slice` 相同，因此 `"héllo".split_once("é")` 得到 `("h", "llo")`。
+  `rsplit_once` 用最后一次匹配，规则相同，因此 `"a=b=c".rsplit_once("=")` 得到
+  `("a=b", "c")`。它不新增 builtin。
+
+### 字符分类
+
+`char` 新增方法，builtin ID 147–158 追加在 ABI9：
+
+- `is_whitespace` 使用 Unicode White_Space，与 `trim` 去掉的集合相同。
+  `' '`、`'\n'`、`'\t'` 和 U+3000 为真，零宽空格 U+200B 为假。
+- `is_alphabetic`、`is_numeric`、`is_alphanumeric`、`is_uppercase`、`is_lowercase`
+  使用对应的 Unicode 类别。`½` 是数字，`中` 是字母。
+- `is_ascii`、`is_ascii_digit`、`is_ascii_alphabetic`、`is_ascii_hexdigit` 只覆盖
+  ASCII。`to_ascii_uppercase` 和 `to_ascii_lowercase` 只改 ASCII 字母，其它字符
+  原样返回。
+- `' '` 和 `'\t'` 现在是字符字面量。此前 `'` 后面的空格会被当成独立引号，空格字符
+  无法书写。`' {` 宏形式不变。
+
+### List 原地修改
+
+`insert(index, value)`、`remove(index)`、`swap(left, right)` 和 `clear` 修改原列表，
+别名看到同一次修改。`insert` 在 `index == len` 时追加，更大的索引与 `remove`、
+`swap` 的越界一样报 `InvalidIndex`。负索引不能作为 `usize` 参数。`remove` 把后面的
+元素前移，并用 `pop` 清掉腾出的槽，避免已删除元素留在缓冲区里被 GC 保留。
+`append(other)` 把另一个列表的元素追加到自身。追加前先做快照，因此 `xs.append(xs)`
+会终止，并且之后修改来源列表不会改变已经追加的元素。方法名不用 `extend`，因为
+`extend` 是关键字。`Map.clear` 按 `keys` 的快照删除全部条目，包括值为 `null` 的条目。
+
+### 数值 min、max、clamp
+
+`std.math` 新增 `min`、`max` 和 `clamp`，builtin ID 159–161 追加在 ABI9。参数必须
+是数值，其它类型报 `TypeError`。比较使用精确数值内核，整数和浮点数混合时不先
+四舍五入。结果保留被选中的那个操作数的数值种类：相等或无法比较（NaN）时保留左侧，
+因此 `min(1, 1.0)` 是 i64，`min(1.0, 1)` 是 f64。`clamp` 的边界是闭区间；下界大于
+上界时报 `InvalidArgument`。
+
+### 字符码点
+
+`char.to_code` 返回 Unicode 标量值，类型是 `i64`，包括 U+0000。`char_from_code`
+接受 `0..=0x10FFFF` 中除代理项（`0xD800..=0xDFFF`）以外的码点，返回 `?char`。
+负数、代理项和大于 U+10FFFF 的值返回 `null`。两者是 ABI9 的 builtin 167–168。
+字符字面量现在接受 `\0`、`\xHH` 和四位 `\uXXXX`。`\uD800` 这类代理项在词法阶段
+报错。花括号形式 `\u{...}` 仍然不是转义，和字符串一致。字符串字面量同样接受
+`\0`，`"a\0b"` 的中间标量是 U+0000。
+
+### 分行、一次切分与列表分组
+
+ABI9 追加 558–572，共 15 个 builtin：
+
+- `lines` 在 `\n`、`\r\n` 和 `\r` 处分行，丢掉行尾，末尾换行不产生空行。
+- `split_once` / `rsplit_once` 返回 `?(String, String)`。空分隔符与 `split` 相同报错。`strip_prefix` / `strip_suffix` 在没有对应词缀时返回 null。
+- `find_char` / `rfind_char` / `count_char` 按 Unicode 标量计。
+- `Map.entries` 与 `keys` 同序。`is_empty` 和 `copy` 走 native。`copy` 是浅拷贝。
+- `chunks` 保留最后一组短块。`enumerate`、`flatten`、`zip` 分配新列表。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 字符串视图、字符重复与列表拼接
+
+ABI9 追加 543–557，共 15 个 builtin：
+
+- `bytes` 是 UTF-8 字节的 i64 列表，与 `encode_utf8` 相同。`char_indices` 是每个 Unicode 标量的字节偏移。
+- `take` / `drop` 按标量计数，超出长度时截断。`first` / `last` 在空串上返回 null。`is_empty` 看字节是否为空。
+- `starts_with_char`、`ends_with_char`、`contains_char`、`replace_char` 以单个 `char` 为模式。`char.repeat` 重复该标量。
+- `List.append` 复制快照后追加，自追加会终止。`join` 要求元素都是 String。`is_empty` 走 native。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 浮点代数运算、本机字节与布尔方法
+
+ABI9 追加 528–542，共 15 个 builtin：
+
+- `to_ne_bytes` 和 `from_ne_bytes` 使用主机字节序。长度不是 8 或字节不在 0..=255 时报错，与现有的 be/le 路径相同。
+- `algebraic_add`、`algebraic_sub`、`algebraic_mul`、`algebraic_div` 和 `algebraic_rem` 在有限操作数上与 `+ - * / %` 得到同一结果。
+- `nan_to` 把 NaN 换成替换值，无穷保持原样。`abs_diff` 是绝对值差。`is_zero` 对正零和负零都为真。
+- 布尔方法是 `negate`、`bitand`、`bitor`、`xor`（`not`/`and`/`or` 是关键字）。两侧都会求值。`then` 在真时返回第二个参数，假时返回 null。`copysign` 现在也是 f64 方法。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 列表编辑与区间查询
+
+ABI9 追加 513–527，共 15 个 builtin：
+
+- `insert` 在 `index` 处插入。`index == len` 时追加，更大的下标是 `InvalidIndex`。`remove` 把后续元素前移，并清掉腾出的槽。
+- `take` 和 `drop` 复制前缀或后缀。超过长度时复制剩余全部。`first` 和 `last` 在空列表上返回 null。
+- `Range.len` 是 `end - start`，空区间是 0。闭区间跨度放不进 i64 时报 `NumericOverflow`。`contains` 和 `is_empty` 按各自开闭边界计算。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### Unicode 全串判断与列表复制
+
+ABI9 追加 498–512，共 15 个 builtin：
+
+- `is_numeric`、`is_alphabetic`、`is_alphanumeric`、`is_lowercase`、`is_uppercase`、`is_whitespace` 和 `is_control` 在每个 Unicode 标量都属于该类时为真。空字符串为真。
+- `is_ascii_graphic`、`is_ascii_punctuation` 和 `is_ascii_control` 对字节使用同样的规则。空字符串为真。
+- `copy`、`reverse` 和 `concat` 返回新列表，不修改源列表，元素对象仍然共享。
+- `swap` 就地交换两个下标。相同下标不变。越过长度是 `InvalidIndex`。`clear` 就地清空。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 映射编辑、浮点分类与 ASCII 全串判断
+
+ABI9 追加 483–497，共 15 个 builtin：
+
+- `values` 与 `keys` 使用同一顺序，存入的 `null` 也会出现。`clear` 清掉每个键和值的引用。`merge` 覆盖已有键，包括存入的 `null`。把映射合并进自身会保留原条目。
+- `get_or_insert` 在键已存在时返回存储值，包括存入的 `null`；否则插入并返回新值。`insert_absent` 只在键不存在时插入，并返回是否新增。存入的 `null` 算已存在。
+- `golden_ratio` 是黄金比例 φ，`euler_gamma` 是欧拉-马歇罗尼常数。`classify` 返回 `nan`、`infinite`、`zero`、`subnormal` 或 `normal`。正零和负零都是 `zero`。
+- 字符串的 `is_ascii_digit`、`is_ascii_alphabetic`、`is_ascii_alphanumeric`、`is_ascii_lowercase`、`is_ascii_uppercase`、`is_ascii_whitespace` 和 `is_ascii_hexdigit` 在每个字节都属于该类时为真。空字符串为真。出现非 ASCII 字节则为假。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 列表窗口与原地编辑
+
+ABI9 追加 468–482，共 15 个 builtin：
+
+- `windows` 返回长度为 `size` 的重叠浅拷贝。`size` 大于长度时得到空列表。`size` 为 0 报 `InvalidArgument("window size must not be zero")`。
+- `chunks_exact` 只保留完整分组。`rchunks` 从末尾分组，并保留较短的第一组。`rchunks_exact` 丢掉这段较短前缀。分组大小为 0 报 `InvalidArgument("chunk size must not be zero")`。
+- `chunks_remainder` 是精确分组丢掉的尾部，`rchunks_remainder` 是丢掉的前缀。
+- `split_at` 在 `0..=len` 处切成两个新列表。越过长度是 `InvalidIndex`。原列表不变。
+- `rotate_left` 和 `rotate_right` 返回新列表。距离超过长度报 `InvalidArgument("rotate distance is out of range")`。距离等于长度时顺序不变。
+- `repeat` 重复整份列表。负数报 `InvalidArgument("repeat count must not be negative")`。结果超过列表容量是 `ObjectTooLarge`。
+- `truncate` 就地缩短，更长的长度不改变列表。`fill` 把每个槽写成同一个值。`swap_remove` 把下标与最后一个元素交换后返回被移除的值。`split_off` 保留前缀并返回尾部。`resize` 缩短时同 `truncate`，变长时新槽共享填充值。
+- 这些拷贝与源列表共享元素对象。`windows`、`chunks_exact`、`rchunks`、`rchunks_exact`、`split_at`、`rotate_left`、`rotate_right` 和 `repeat` 不修改原列表。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 精确运算与词缀
+
+ABI9 追加 453–467，共 15 个 builtin：
+
+- `isqrt` 是向下取整的非负平方根。负数报 `InvalidArgument("square root of a negative value")`。`checked_isqrt` 返回 null。
+- `strict_abs` 只用于有符号数。有符号最小值是 `NumericOverflow`。
+- `wrapping_div_euclid` 向负无穷取整。除数为 0 报 `InvalidArgument("divisor must not be zero")`。有符号最小值除以 -1 回绕成最小值，`wrapping_rem_euclid` 在这种情况下是 0。
+- `checked_signed_diff` 把两个同宽度无符号数的差写成有符号宽度，放不下返回 null。
+- `checked_div_exact` 对除数为 0、溢出或有余数返回 null。`strict_div_exact` 把余数报成 `InvalidArgument("division is not exact")`。
+- 精确移位必须可以还原。距离达到或超过位宽时，checked 返回 null，strict 是 `NumericOverflow`。丢失比特时，checked 返回 null，strict 报 `InvalidArgument("shift is not exact")`。
+- `trim_prefix` 和 `trim_suffix` 去掉一次词缀，否则返回原字符串。`strip_circumfix` 同时去掉前后词缀。重叠或缺少词缀返回 null。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 位索引与匹配下标
+
+ABI9 追加 438–452，共 15 个 builtin：
+
+- `highest_one` 和 `lowest_one` 返回置位比特的下标。零是 null。`isolate_highest_one` 和 `isolate_lowest_one` 只保留那一位，零仍然是零。
+- `bit_width` 统计二进制补码表示所用的位数。负数使用完整宽度，零的宽度是 0。`i64_bits` 是 64，`i128_bits` 和 `u128_bits` 是 128，`isize_bits` 和 `usize_bits` 是 64。
+- `char_min` 是 U+0000。
+- `find_indices` 列出不重叠匹配的标量下标。空模式列出每个标量边界。`rfind_indices` 从末尾列出同样的匹配，重叠模式的起点可以不同。`byte_find_indices` 和 `byte_rfind_indices` 使用字节下标。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 有符号调整、无界移位与整数边界
+
+ABI9 追加 423–437，共 15 个 builtin：
+
+- `saturating_add_signed`、`wrapping_add_signed` 和 `strict_add_signed` 把同宽度的有符号数加到无符号接收者上。饱和停在 0 和无符号最大值。回绕保留低位。严格溢出是 `NumericOverflow`。对应的 `sub` 使用同样的规则。
+- `unbounded_shl` 和 `unbounded_shr` 不把位移距离按位宽取模。距离达到或超过位宽时结果是 0，但负数右移得到 -1。负距离报 `InvalidArgument("shift distance must not be negative")`。
+- `i64_min`、`i64_max`、`u64_max`、`i128_min`、`i128_max` 和 `u128_max` 是整数边界。`isize_min`、`isize_max` 和 `usize_max` 复用 64 位边界。
+- `eq_ignore_ascii_case` 只忽略 ASCII 字母的大小写。非 ASCII 字母仍然区分。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 更宽的整数解析、公约数与字节查找
+
+ABI9 追加 408–422，共 15 个 builtin：
+
+- `parse_u64`、`parse_i128` 和 `parse_u128` 沿用 `parse_i64` 的整段规则：可选符号，以及十进制、`0b`、`0o`、`0x`。格式不对返回 null。无符号解析遇到前导 `-` 返回 null。放不下是 `NumericOverflow`。`parse_isize` 复用 `parse_i64`，`parse_usize` 复用 `parse_u64`。
+- `f64_min_10_exp` 是 -307，`f64_max_10_exp` 是 308。
+- `split_terminator` 在文本以分隔符结尾时丢掉最后的空段。空分隔符报 `InvalidArgument("split separator must not be empty")`。`rsplit_terminator` 从末尾给出同样的片段。
+- `gcd` 和 `lcm` 返回同宽度的无符号结果。`gcd(0, 0)` 是 0，任一参数为 0 时 `lcm` 是 0。`lcm` 溢出是 `NumericOverflow`，`checked_lcm` 返回 null。
+- `byte_find` 和 `byte_rfind` 返回字节下标。空模式从 0 开始，`byte_rfind` 的空模式返回 `len`。找不到返回 null。空模式的 `byte_count` 是 `len + 1`。
+- `char_replacement` 是 U+FFFD，`char_max` 是 U+10FFFF。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 向下取整与 f64 布局
+
+ABI9 追加 393–407，共 15 个 builtin：
+
+- `div_floor` 向负无穷取整。除数为 0 报 `InvalidArgument("divisor must not be zero")`。溢出，包括有符号最小值除以 -1，是 `NumericOverflow`。`checked_div_floor` 对这两种情况返回 null。
+- `is_sign_positive` 读取符号位。`+0.0` 为正，`-0.0` 为负。`f64_to_be_bytes` 和 `f64_to_le_bytes` 返回 8 个原始字节。`f64_from_be_bytes` 和 `f64_from_le_bytes` 要求正好 8 个字节。长度不对报 `InvalidArgument("float byte length does not match")`。超出 0..=255 报 `InvalidArgument("float byte is out of range")`。
+- `f64_radix` 是 2，`f64_mantissa_digits` 是 53，`f64_digits` 是 15。`f64_min_exp` 是 -1021，`f64_max_exp` 是 1024。
+- `byte_at` 读取 `0..len` 里的字节。越界报 `InvalidArgument("string index is out of range")`。`get` 对反转、越界或不在字符边界上的半开字节区间返回 null。`split_at_checked` 对越界或落在字符中间的下标返回 null，否则返回两个字符串。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 向上取整、倍数与端序字节
+
+ABI9 追加 378–392，共 15 个 builtin：
+
+- `div_ceil` 向正无穷取整。除数为 0 报 `InvalidArgument("divisor must not be zero")`。溢出，包括有符号最小值除以 -1，是 `NumericOverflow`。`checked_div_ceil` 对这两种情况返回 null。
+- `next_multiple_of` 顺着因子的符号找倍数。正因子取不小于接收者的最小倍数，负因子取不大于接收者的最大倍数。因子为 -1 时返回接收者。因子为 0 报 `InvalidArgument("multiple must not be zero")`。溢出是 `NumericOverflow`。`checked_next_multiple_of` 对零因子和溢出返回 null。
+- `to_be_bytes` 和 `to_le_bytes` 返回原始字节。`from_*_bytes` 要求 64 位结果正好 8 个字节，128 位结果正好 16 个字节。长度不对报 `InvalidArgument("integer byte length does not match")`。超出 0..=255 报 `InvalidArgument("integer byte is out of range")`。
+- `total_cmp` 返回 -1、0 或 1。`-0.0` 小于 `0.0`，正 NaN 大于无穷大。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 有符号与无符号混算、进制文本
+
+ABI9 追加 363–377，共 15 个 builtin：
+
+- `checked_add_unsigned` 和 `checked_sub_unsigned` 的接收者是有符号整数，参数是同宽度无符号整数。溢出返回 null。饱和形式停在有符号边界，回绕形式保留低位。`strict_add_unsigned` 和 `strict_sub_unsigned` 的溢出是 `NumericOverflow`。参数带符号或宽度不同是 `TypeError`。
+- `int_to_str_radix` 使用小写字母。两个方向的进制超出 2..=36 都报 `InvalidArgument("digit radix must be from 2 to 36")`。`i64_from_str_radix`、`u64_from_str_radix`、`i128_from_str_radix` 和 `u128_from_str_radix` 对空串、空白、错误符号和溢出返回 null。`isize` 和 `usize` 复用 64 位解析。
+- `char_at_byte` 的字节下标不是字符边界，或正好等于 `len` 时返回 null。`split_at` 要求边界，返回两个字符串。落在字符中间报 `InvalidArgument("string index is not a character boundary")`。小于 0 或超过 `len` 报 `InvalidArgument("string index is out of range")`。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 饱和除法与浮点截断
+
+ABI9 追加 348–362，共 15 个 builtin：
+
+- `saturating_div` 向零取整。`saturating_div_euclid` 向负无穷取整。除数为 0 报 `InvalidArgument("divisor must not be zero")`。有符号最小值除以 -1 停在有符号最大值。
+- `trunc_i64`、`trunc_u64`、`trunc_i128` 和 `trunc_u128` 向零截断。非有限值，或结果放不进目标整数时返回 null。`(-1, 0)` 里的负数截成 0。
+- `is_ascii_octdigit` 只对 ASCII `'0'` 到 `'7'` 为真。
+- `frac_1_pi() * pi()` 是 1，`frac_2_pi() * pi()` 是 2，`frac_pi_8() * 8.0` 是 `pi()`。`f64_min` 和 `f64_max` 是有限 `f64` 的两端。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 严格整数运算与更多 f64 常量
+
+ABI9 追加 333–347，共 15 个 builtin：
+
+- `strict_add`、`strict_sub`、`strict_mul`、`strict_neg` 和 `strict_pow` 在放得下时返回原宽度的结果。溢出是 `NumericOverflow`，不回绕，也不返回 null。
+- `strict_div` 和 `strict_rem` 向零取整。除数为 0 报 `InvalidArgument("divisor must not be zero")`。有符号最小值除以 -1 是 `NumericOverflow`。
+- `strict_shl` 和 `strict_shr` 拒绝负数距离。距离达到或超过位宽是 `NumericOverflow`。
+- `min_positive` 是最小的正正规 `f64`。`frac_pi_2` 和 `frac_pi_4` 分别等于 `pi / 2` 和 `pi / 4`。`frac_1_sqrt_2` 是 `1 / sqrt(2)`。`log2_10() * log10_2()` 正好是 1。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 字符边界与 f64 常量
+
+ABI9 追加 318–332，共 15 个 builtin：
+
+- `is_char_boundary`、`floor_char_boundary` 和 `ceil_char_boundary` 使用字节下标，范围是 `0..=len`。负数或超过 `len` 报 `InvalidArgument("string index is out of range")`。`len` 本身是边界。`floor` 取不大于下标的最大标量边界，`ceil` 取不小于下标的最小标量边界。
+- `pi`、`euler`、`tau`、`ln_2`、`ln_10`、`log2_e`、`log10_e` 和 `sqrt_2` 是精确的 IEEE-754 常量。`tau` 等于 `2 * pi`。自然常数叫 `euler`，避免占掉错误绑定常用的名字 `e`。`infinity`、`neg_infinity`、`nan` 和 `epsilon` 是对应的 `f64` 值。`nan` 不等于它自己。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 全积、二次幂与 UTF 转换
+
+ABI9 追加 303–317，共 15 个 builtin：
+
+- `checked_div_euclid` 和 `checked_rem_euclid` 在除数为 0，或有符号最小值除以 -1 时返回 null。
+- `widening_mul` 给出两个 64 位整数的完整乘积，有符号是 `i128`，无符号是 `u128`。128 位输入是 `TypeError`。
+- `next_power_of_two` 只接受无符号整数。0 变成 1。结果放不下是 `NumericOverflow`，`checked_next_power_of_two` 则返回 null。
+- `checked_add_signed` 和 `checked_sub_signed` 把同宽度的有符号数加到或减自无符号数，溢出返回 null。
+- `is_multiple_of` 在除数为 0 时是 false，包括 `0.is_multiple_of(0)`。有符号最小值是 -1 的倍数。
+- `log_base` 是任意底的 IEEE 对数。`encode_utf8` 和 `encode_utf16` 把整个字符串编成 `i64` 列表。`string_from_utf8` 和 `string_from_utf16` 对无效序列返回 null。字节超出 0 到 255，或码元超出 0 到 65535，是 `InvalidArgument`。lossy 版本把无效序列换成 U+FFFD。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 回绕除法、位型重解释与字符编码
+
+ABI9 追加 288–302，共 15 个 builtin：
+
+- `wrapping_div` 和 `wrapping_rem` 向零取整。除数为 0 报 `InvalidArgument("divisor must not be zero")`。有符号最小值除以 -1 回绕成它自己，余数是 0。
+- `saturating_abs` 把有符号最小值变成最大值。`checked_abs` 对它返回 null。`wrapping_abs` 保持原值。三者都只接受有符号整数。`signum` 返回 -1、0 或 1。
+- `checked_ilog` 对零和负数返回 null。底数小于 2 报 `InvalidArgument("logarithm base must be at least 2")`。
+- `cast_unsigned` 和 `cast_signed` 只改变符号，位型不变。`to_bits` 把 `f64` 的 IEEE-754 位型交给 `u64`。`from_bits` 只接受无符号 64 位整数。`powi` 的指数必须放进 `i32`，否则是 `NumericOverflow`。`is_subnormal` 对零是 false。
+- `encode_utf8` 和 `encode_utf16` 返回 `i64` 列表，分别是字节和 UTF-16 码元。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 整数除法、移位与双曲反函数
+
+ABI9 追加 273–287，共 15 个 builtin：
+
+- `div_euclid` 和 `rem_euclid` 向负无穷取整，结果保持输入宽度。除数为 0 报 `InvalidArgument("divisor must not be zero")`。有符号最小值对 -1 做除法或求余是 `NumericOverflow`。
+- `unsigned_abs` 只接受有符号整数，返回同宽度的无符号绝对值，因此 `i64` 最小值放得下。`midpoint` 向负无穷取整。
+- 负的移位距离是 `InvalidArgument("shift distance must not be negative")`。`checked_shl` 和 `checked_shr` 在距离不小于宽度时返回 null。回绕移位把距离对宽度取模。
+- 负指数是 `InvalidArgument("exponent must not be negative")`。`checked_pow` 溢出返回 null。`wrapping_pow` 和 `saturating_pow` 给出同宽度的结果。
+- `asinh`、`acosh`、`atanh` 返回 IEEE 结果，定义域外是 NaN。`is_normal` 对零、无穷、NaN 和次正规数是 false。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 整数溢出与数字字符
+
+ABI9 追加 258–272，共 15 个 builtin：
+
+- `wrapping_add`、`wrapping_sub`、`wrapping_mul`、`wrapping_neg` 保留同宽度的低位。`i64` 最大值加 1 变成最小值。
+- `saturating_*` 停在该宽度的最小或最大可表示值。无符号的 `saturating_neg` 只有 0 保持 0，其余变成 0。
+- `checked_*` 溢出时返回 null。`checked_div` 和 `checked_rem` 在除数为 0 时也返回 null，包括 `i64` 最小值除以 -1。标准库方法要求另一个操作数和接收者同类型，宽度不同在编译期被拒绝。builtin 收到不同宽度时返回 `TypeError`。
+- `char_from_digit` 把 0 到 `radix - 1` 的数字变成字符，进制必须在 2 到 36。超出进制的数字返回 null。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 角度、ASCII 空白与整数对数
+
+ABI9 追加 243–257，共 15 个 builtin：
+
+- `to_radians`、`to_degrees` 使用和 Rust 相同的换算。`next_up`、`next_down` 走到相邻的可表示值。`midpoint` 取两个有限数的中点。`round_ties_even` 把一半舍入到偶数。
+- `char.is_digit` 和 `to_digit` 的进制必须在 2 到 36。超出范围报 `InvalidArgument("digit radix must be from 2 to 36")`。不是数字时 `to_digit` 返回 null。
+- `split_ascii_whitespace`、`trim_ascii`、`trim_ascii_start`、`trim_ascii_end` 只认 ASCII 空白，不间断空格会留下来。`eq_ignore_ascii_case` 只折叠 ASCII 字母。
+- `ilog10` 对零和负数返回 null，和 `ilog2` 一样。`abs_diff` 返回输入宽度的无符号结果：64 位是 `u64`，128 位是 `u128`。宽度不同是 `TypeError`。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 浮点余数、编码长度与转义
+
+ABI9 追加 228–242，共 15 个 builtin：
+
+- `signum` 返回 `1.0` 或 `-1.0`，负零是 `-1.0`，NaN 仍是 NaN。它和 `sign` 不同：`sign` 把负零当成 0，NaN 返回 null。
+- `recip(0)` 是无穷，不报运行时错误。`mul_add(a, b, c)` 是一次舍入的 `a * b + c`。`div_euclid` 向负无穷取整，`rem_euclid` 对有限数给出非负余数。
+- `char.utf8_len` 是 1 到 4，`utf16_len` 是 1 或 2。
+- `escape_debug`、`escape_unicode`、`escape_default` 同时给 `char` 和 `String`。规则与 Rust 同名方法一致。
+- `split_inclusive` 把分隔符留在每一段末尾，最后一段如果没有分隔符就原样保留。空分隔符与 `split` 同一错误。
+- `find_all` 列出不重叠匹配。空模式在每个标量边界匹配一次，所以个数是 `char_len + 1`。方法不叫 `matches`，因为那是关键字。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 字符分类与有限次字符串编辑
+
+ABI9 追加 213–227，共 15 个 builtin：
+
+- `char` 补上 ASCII 的 control、graphic、punctuation、whitespace、alphanumeric、uppercase、lowercase，以及 Unicode Control 类别的 `is_control`。U+0080 是 control，但不是 ASCII control。
+- `trim_start_matches`、`trim_end_matches`、`trim_matches` 反复去掉同一个字符串模式。空模式返回原字符串，不会空转。
+- `replacen` 只替换前 `count` 个不重叠匹配。次数为负时报错，零返回原字符串。
+- `splitn` 从左边最多切出 `count` 段，剩余内容留在最后一段。`rsplit` 从右边切，片段按从末尾到开头排列。`rsplitn` 是从右边的有限次切分。次数为负时报错，零返回空列表。空分隔符与 `split` 同一错误。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 整数位运算与标量方法
+
+ABI9 追加 201–212，共 12 个 builtin，作为 `i64`、`u64`、`i128`、`u128`、`isize`、`usize` 的方法：
+
+- `count_ones`、`count_zeros`、`leading_zeros`、`trailing_zeros`、`leading_ones`、`trailing_ones` 按运行时宽度计数。前四种 64 位类型是 64 位，`i128` 和 `u128` 是 128 位。零的前导零和末尾零等于整个宽度。
+- `reverse_bits`、`swap_bytes`、`rotate_left`、`rotate_right` 保持原来的数值种类。旋转距离为负时报 `InvalidArgument("rotate distance must not be negative")`。距离达到宽度后取模。
+- `is_power_of_two` 只对恰好一个比特为 1 的正数为真。`ilog2` 对零和负数返回 null。
+- 更窄的整数没有这些方法。它们的运行时载荷是 64 位标量，按 64 位计数会对不上类型宽度。
+- 有符号整数另有 `is_zero`、`is_negative`、`is_positive`；无符号整数有 `is_zero`。这几项是源码方法。
+- `f64` 增加 `is_nan`、`is_infinite`、`is_finite`、`is_sign_negative`、`abs`、`sign`、`floor`、`ceil`、`round`、`trunc`、`fract`、`sqrt` 方法。方法体调用同名自由函数会解析到方法自己，因此这些方法改走不重名的内部绑定。
+- `bool.to_i64` 把 `true` 变成 1、`false` 变成 0。
+
+旧 ABI8 归档不能导入 201–212。
+
+### 浮点分类、双曲函数与大小写
+
+ABI9 追加 185–200，共 16 个 builtin：
+
+- `is_nan`、`is_infinite`、`is_finite` 判断 IEEE 分类。`is_sign_negative` 读取符号位，负零和带负号的 NaN 为真；`sign` 仍把负零当成 0。
+- `sinh`、`cosh`、`tanh`、`cbrt`、`exp2`、`expm1`、`log1p` 接受 `f64`，返回 IEEE 结果。定义域错误和溢出是 NaN 或无穷。`cbrt` 接受负数。`log1p(-1)` 是负无穷。
+- `String.to_ascii_uppercase` / `to_ascii_lowercase` 只改 ASCII 字母，`é` 保持不变，字节长度不变。
+- `String.split_whitespace` 按 Unicode White_Space 切分，和 `trim` 同一字符集，不产生空段。空串和纯空白返回空列表。
+- `char.to_uppercase` / `to_lowercase` 做完整 Unicode 映射，结果是 String，因为一个字符可能变成多个标量。`'ß'` 大写是 `"SS"`。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 一批字符串与浮点 builtin
+
+ABI9 追加 169–184，共 16 个 builtin：
+
+- `str_rfind`、`str_count` 接过原来的源码循环。空模式的 `rfind` 仍是 `char_len`，
+  `count` 仍是 `char_len + 1`，计数仍不重叠。
+- `String.is_ascii` 判断每个字节是否都在 U+0000–U+007F，嵌入的 NUL 也算 ASCII。
+- `char.into_string` 把一个字符编码成单标量字符串。名字不用 `to_string`，以免和
+  Display 方法冲突。
+- `exp`、`log2`、`log10`、`trunc`、`fract`、`tan`、`asin`、`acos`、`atan`、
+  `copysign`、`atan2(y, x)`、`hypot` 接受 `f64`，返回 IEEE 结果。定义域错误和
+  溢出是 NaN 或无穷，不报运行时错误。`copysign` 复制符号位，包括负零。
+
+旧 ABI8 归档不能导入这些 ID。
+
+### 列表去重与 Map 合并
+
+`List.unique` 保留每组相等值的第一个，比较规则与 `contains` 相同，因此 `1` 和
+`1.0` 算同一个值。结果是新列表。元素没有可见的相等实现时报 `TypeError`。
+`Map.merge(other)` 按 `keys` 的快照写入，已有的键被覆盖，存入的 `null` 也会复制。
+合并自身会结束，不会丢掉原有条目。这两项不新增 builtin。
+
+### 列表分组与摊平
+
+`List.chunks(size)` 按元素个数分组，生成新的子列表，最后一组可以更短。`size` 为 0 时 `panic("chunk size must not be zero")`。`size` 是 `usize`，
+负值在编译期被拒绝。`List.flatten` 只展开一层嵌套列表；元素不是 `List` 时报
+`TypeError`。两者都不修改原列表，也不新增 builtin。
+
+### 列表截取与配对
+
+`List.take(count)` 把前 `count` 个元素复制到新列表，`count` 大于长度时复制全部。
+`List.drop(count)` 跳过前 `count` 个后复制其余元素，`count` 不小于长度时得到空列表。
+两者都不修改原列表。`count` 是 `usize`，负值在编译期被拒绝。`List.zip(other)`
+取两侧较短的长度，每个元素是 `(Any, Any)`。这三项是 `std.collections` 源码，不新增
+builtin。
+
+### 字符串填充
+
+`String.pad_start` 和 `String.pad_end` 追加为 ABI9 的 builtin 165–166。`width`
+按 Unicode 标量计数。字符串已经不短于 `width` 时原样返回，不截断。填充串循环使用，
+并切到刚好补满。负宽度报 `InvalidArgument("pad width must not be negative")`。
+只有确实需要填充时，空填充串才报 `InvalidArgument("pad fill must not be empty")`。
+结果大小在分配前检查，超过字符串上限报 `ObjectTooLarge`。
+
+### 数值符号
+
+`std.math.sign` 追加为 ABI9 的 builtin 164。参数必须是数值，其它类型报
+`TypeError`。结果按精确数值序与零比较，得到 `-1`、`0` 或 `1`，整数和浮点数混合
+时不先四舍五入。`NaN` 无法比较，返回 `null`。负零与零相等，符号是 `0`。
+
+### 字符串解析数值
+
+`String.parse_i64` 和 `String.parse_f64` 追加为 ABI9 的 builtin 162–163。整段
+字符串必须是一个数，前后空白不跳过，格式不符返回 `null`。`parse_i64` 接受可选
+正负号，以及十进制或 `0b`/`0o`/`0x`（前缀大小写不限）。`parse_f64` 接受可选正负号、
+十进制、小数点两侧都有数字的小数，以及指数；单独的点、`inf` 和 `NaN` 都是 `null`。
+格式正确但超出 `i64`，或浮点结果不是有限值时，报 `NumericOverflow`。
+
+`rfind` 返回最后一次出现的标量索引，空模式匹配在 `char_len`，找不到返回 `null`。
+`count` 统计不重叠的匹配次数；空模式匹配在字符之间，结果是 `char_len + 1`。
+`strip_prefix` 和 `strip_suffix` 在匹配时去掉前缀或后缀，空前缀、空后缀返回原字符串，
+不匹配返回 `null`。这四项是 `std.string` 源码，不新增 builtin。
+
+### 断言
+
+`std.process.assert(condition, .message = "assertion failed")` 在条件为假时调用
+`panic`。`assert_eq(left, right, .message = "values are not equal")` 用 `==` 比较，
+因此列表、元组和 `Any` 沿用已有的相等规则。消息是可选命名参数，不能按位置传入；
+显式消息在调用前求值，断言成功时也会求值。把 `assert` 存成函数值后，默认参数不会
+保留，调用必须带上消息。这是既有的函数值限制，不是断言特有的行为。
+
+### 缺少块的定义不再静默丢弃整个文件
+
+`struct P x`、`enum E x`、`trait T x`，以及缺块的 `impl`/`extend`/`match`/`when`，
+原先由 `try_multi_in_block` 返回未记录诊断的错误，`Parser::parse` 又忽略了该错误。
+结果整个文件被当作空程序，`check` 通过，`run` 无输出且退出码为 0。
+
+现在这些结构报告 “Expected `{` or an indented block after …”。根解析失败而没有
+记录诊断时，也会补报 “Unexpected token”，失败的解析不会再被当作空文件。
+
+## 旧代码清理与引擎 ABI 统一基线（2026-11-12）
+
+以上章节保留各阶段按时间顺序演进的记录；其中关于旧版归档兼容（`Container v3`、零校验和、
+`TPOL 1..=10`、`NSAM 1..=5`、`Builtin ABI 1..=8`）、低层 `write_archive`、原生结构体
+`__derived_display`（ID 120）以及早期低层控制流操作码的描述，均以本节统一后的当前基线为准：
+
+- **归档与元数据单一基线**：移除 `nsbc_io::write_archive`、`add_code_section`、`add_stack_maps_section`
+  与 `validate_legacy_code`；容器层仅接受 `VERSION = 4` 且非零且校验通过的 SHA-256；类型池仅读写
+  已 finalize 的 `TPOL` `revision = 11`（移除 `MethodAccess::LegacyUnknown`，拒绝未降级的
+  `DERIVE_FUNC_ID` 与 `Constant::BigInt` tag 5）；产物元数据仅读写 `NSAM` `revision = 6`
+  （`CompiledFunction.abi: FunctionAbi` 与 `CodegenOutput.method_call_scopes` 均为必需字段，
+  移除 `ScopeCoverage`，统一由 `nsbc::instruction_requires_scope` 约束词法作用域覆盖）；
+  运行时安装要求精确匹配 `runtime::BUILTIN_ABI_VERSION = 9`，并校验全部 `List`/`Map` 相关
+  内建函数的集合角色布局。
+- **结构体 `@derive(Display)` 组合式降级统一**：移除 `DisplayDerivationMode::LegacyStruct`、
+  内建 ID `120 (__derived_display)`、`type_pool::native_derived`、`nir::native_derivation`、
+  `interpreter::derived` 及 `BuiltinCtx::return_derived_display`；结构体与枚举、元组的
+  `@derive(Display)` 统一降级为带受检 `display_owner` 元数据的普通 NIR 函数，逐字段静态解析并调用
+  `Display.to_string`（无全局 `Display` 实现的字段如 `Any`/`List`/`Map` 在编译期明确拒绝）。
+- **指令集与运行时执行 ABI 收敛**：安全 `const fn Opcode::from_u8` 替代 `transmute`；移除未接线或已废弃的
+  `AddrMode::RegOff`、`LoadCapture`、`CallWasm`、`TailCall`、`EffectCall`、`PushHandler`、
+  `PushHandlerWide`、`Reset`、`Shift`、`Resume`、`CloneContinuation`、`DropContinuation`
+  以及 NIR 中的死节点 `NirStmt::{Drop, EffectCall}`；将 `0xD1` 从空操作 `DebugBreak` 替换为显式报错的
+  `Opcode::Unreachable`；统一 `StoreGlobal` 与 `StoreGlobalWide` 的源值寄存器到 `dst`（`base = Reg(0)`）；
+  移除 `CallFrame::{evidence, closure_env}`、`StackContext::entry_closure_env`、`HandlerRef` 与
+  `GLOBAL_CATALOG`，闭包捕获统一通过 `FunctionAbi` 入口前缀传递，栈段槽位根扫描统一收敛到
+  `StackContext::visit_slots_mut`；`stack_pool` 护卫页表改为无锁原子槽并在 `Segment::drop` 自动注销；
+  `pkg_manager` 移除旧字符串报错的 `PackageResolver::{register, resolve}` 与 `ResolvedPackages`；
+  CLI `nessa check` 补齐诊断输出。
+

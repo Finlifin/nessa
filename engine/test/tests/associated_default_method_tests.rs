@@ -69,7 +69,7 @@ fn item_equal_to_self_is_a_value_parameter_and_declared_self_retains_evidence() 
             .iter()
             .find(|function| function.func_id.0 == method.func_id)
             .unwrap();
-        assert_eq!(function.abi.as_ref().unwrap().parameters, expected);
+        assert_eq!(function.abi.parameters, expected);
     }
     assert_eq!(common::run_value(source).unwrap(), 42);
 }
@@ -100,17 +100,17 @@ fn nested_source_self_parameters_keep_their_own_frozen_proof_and_item_parameters
             .functions
             .iter()
             .any(|function| function.is_closure
-                && function.abi.as_ref().is_some_and(|abi| abi.parameters
-                    == [nsbc::ParameterAbi::TraitSelf { view }]
-                    && abi
-                        .captures
-                        .contains(&nsbc::CaptureAbi::TraitProof { view })))
+                && function.abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }]
+                && function
+                    .abi
+                    .captures
+                    .contains(&nsbc::CaptureAbi::TraitProof { view }))
     );
     let p=type_pool::TypeIndex::from_raw(compiled.type_pool.snapshot().types.iter().position(|info|
         matches!(&info.kind,type_pool::TypeKind::Struct{name,..} if str_interner::get(*name)=="P")).unwrap() as u32);
     assert!(compiled.codegen_output.functions.iter().any(|function|function.is_closure &&
         matches!(&compiled.type_pool.get(function.function_type).kind,type_pool::TypeKind::Function{params,ret} if params==&[p] && *ret==p)
-        && function.abi.as_ref().is_some_and(|abi|abi.parameters==[nsbc::ParameterAbi::Value])));
+        && function.abi.parameters == [nsbc::ParameterAbi::Value]));
     assert_eq!(common::run_value(source).unwrap(), 42);
     let named = "struct P{x:i64};trait Source{assoc Item:Type=Self;fn next(self)->Item;derive fn named(self)->fn(Self)->Item{fn inner(other:Self)->Item{other.next()};inner}};mod a{extend Source for P{pub fn next(self)->P{P{x:40}}};pub fn callback()->fn(P)->P{P{x:0}.named()}};mod b{extend Source for P{pub fn next(self)->P{P{x:2}}};pub fn answer()->i64{let f=a.callback();f(P{x:0}).x+40}};fn main(){b.answer()}";
     assert_eq!(common::run_value(named).unwrap(), 42);
@@ -118,10 +118,7 @@ fn nested_source_self_parameters_keep_their_own_frozen_proof_and_item_parameters
     assert!(!named.has_errors, "{:?}", named.diagnostics);
     assert!(named.codegen_output.functions.iter().any(|function| {
         str_interner::get(function.name) == "inner"
-            && function
-                .abi
-                .as_ref()
-                .is_some_and(|abi| abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }])
+            && function.abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }]
     }));
     let contextual = source.replace("|other:Self|", "|other|");
     assert_eq!(common::run_value(&contextual).unwrap(), 42);
@@ -129,10 +126,7 @@ fn nested_source_self_parameters_keep_their_own_frozen_proof_and_item_parameters
     assert!(!contextual.has_errors, "{:?}", contextual.diagnostics);
     assert!(contextual.codegen_output.functions.iter().any(|function| {
         function.is_closure
-            && function
-                .abi
-                .as_ref()
-                .is_some_and(|abi| abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }])
+            && function.abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }]
     }));
 }
 

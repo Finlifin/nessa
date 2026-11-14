@@ -163,6 +163,18 @@ impl Vm {
             .is_some_and(|actual| actual.ty == expected.ty && actual.variant == variant))
     }
 
+    /// Test the tag of any concrete `IterationStep(T)`, whatever its item type.
+    /// Nominal enums, templates and non-enum values are type errors.
+    pub(super) fn iteration_step_done(&self, value: TaggedValue) -> Result<bool, VmError> {
+        let layout = self.enum_layout(value)?.ok_or(VmError::TypeError)?;
+        self.state
+            .type_pool
+            .checked_iteration_step_item(layout.ty)
+            .map_err(|_| VmError::TypeError)?
+            .ok_or(VmError::TypeError)?;
+        Ok(layout.variant == type_pool::ITERATION_DONE_TAG)
+    }
+
     pub(super) fn enum_field(
         &mut self,
         value: TaggedValue,
@@ -300,6 +312,27 @@ mod tests {
         let value = vm.new_enum(descriptor, valid).unwrap();
         assert_eq!(vm.enum_field(value, 0).unwrap().as_i64(), Some(42));
         assert_eq!(vm.reflected_type(value).unwrap(), typed);
+        // The dynamic done test accepts every concrete item type.
+        assert!(!vm.iteration_step_done(value).unwrap());
+        assert!(!vm.iteration_step_done(yielded).unwrap());
+        assert!(vm.iteration_step_done(done).unwrap());
+        let typed_done = vm
+            .enum_constant(typed, type_pool::ITERATION_DONE_TAG)
+            .unwrap();
+        assert!(vm.iteration_step_done(typed_done).unwrap());
+    }
+
+    #[test]
+    fn dynamic_iteration_done_test_rejects_values_that_are_not_steps() {
+        let mut vm = make_vm();
+        let nominal = enum_type(&mut vm, 1);
+        let lookalike = vm.enum_constant(nominal, 0).unwrap();
+        for value in [lookalike, TaggedValue::from_i64(0), TaggedValue::NULL] {
+            assert!(matches!(
+                vm.iteration_step_done(value),
+                Err(VmError::TypeError)
+            ));
+        }
     }
 
     #[test]
@@ -369,7 +402,7 @@ mod tests {
                 .unwrap();
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(0),
                 func_id: FuncId(0),
                 instructions: vec![
                     Instruction::load_const(Reg(0), descriptor as u16).encode(),
@@ -430,7 +463,7 @@ mod tests {
             .unwrap();
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: nsbc::FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: vec![],
             register_count: 32,
@@ -530,7 +563,7 @@ mod tests {
             );
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(0),
                 func_id: FuncId(0),
                 instructions: [
                     Instruction::call_method(Reg(20), method.as_u32(), 0),
@@ -546,7 +579,7 @@ mod tests {
             });
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(1),
                 func_id: FuncId(1),
                 instructions: [
                     Instruction::a_type(

@@ -32,7 +32,7 @@ pub(crate) fn unwrap_member(ast: &Ast, mut node: NodeIndex) -> NodeIndex {
     node
 }
 
-fn fields(ast: &Ast, declaration: NodeIndex) -> Vec<NodeIndex> {
+pub(crate) fn fields(ast: &Ast, declaration: NodeIndex) -> Vec<NodeIndex> {
     ast.multi_children(declaration)
         .iter()
         .map(|&node| unwrap_member(ast, node))
@@ -234,8 +234,14 @@ pub(crate) fn resolve_construction(
         match member {
             Ok(symbol) => {
                 let expected = r.symbols[symbol.0 as usize].type_index;
-                crate::typing::resolve_types_expected(r, ast, value, Some(expected));
-                crate::typing::check_expected_type(r, ast, value, expected, "struct field");
+                if expected == TypeIndex::INVALID {
+                    // `prepare_fields` already reported the invalid field type.
+                    crate::typing::resolve_types(r, ast, value);
+                    valid = false;
+                } else {
+                    crate::typing::resolve_types_expected(r, ast, value, Some(expected));
+                    crate::typing::check_expected_type(r, ast, value, expected, "struct field");
+                }
             }
             Err(error) => {
                 report(r, ast, arg, error);
@@ -310,10 +316,32 @@ mod tests {
     }
 
     #[test]
-    fn source_struct_layout_and_native_display_plans_use_tagged_value_slots() {
-        let (resolved, errors) =
-            resolve("struct P{small:i8,text:String};typealias Alias=P;derive Display for Alias");
+    fn source_struct_layout_and_display_plans_use_tagged_value_slots() {
+        let (resolved, errors) = resolve(
+            "struct Raw{small:i8,text:String};struct Leaf{};impl Display for Leaf{pub fn to_string(self)->String{\"leaf\"}};struct P{first:Leaf,second:?Leaf};typealias Alias=P;derive Display for Alias",
+        );
         assert!(errors.is_empty(), "{errors:?}");
+        let raw_sym = resolved
+            .symbols
+            .iter()
+            .find(|sym| str_interner::get(sym.name) == "Raw")
+            .unwrap();
+        let raw_info = resolved.type_pool.get(raw_sym.type_index);
+        assert_eq!(raw_info.size, 16);
+        assert_eq!(raw_info.align, 8);
+        let TypeKind::Struct {
+            fields: raw_fields, ..
+        } = &raw_info.kind
+        else {
+            panic!("raw struct");
+        };
+        assert_eq!(
+            raw_fields
+                .iter()
+                .map(|field| field.offset)
+                .collect::<Vec<_>>(),
+            [0, 8]
+        );
         assert_eq!(resolved.display_derivations.len(), 1);
         let plan = &resolved.display_derivations[0];
         let info = resolved.type_pool.get(plan.implementor);
@@ -333,10 +361,8 @@ mod tests {
         assert_eq!(params, &[plan.implementor]);
         assert_eq!(*ret, type_pool::Intrinsic::Str.type_index());
         let schema = resolved.type_pool.trait_schema(plan.trait_type).unwrap();
-        resolved
-            .type_pool
-            .check_native_derived_method(&schema.slots[0], plan.implementor)
-            .unwrap();
+        assert_eq!(schema.slots.len(), 1);
+        assert_eq!(schema.slots[0].name, plan.method_name);
     }
 
     #[test]

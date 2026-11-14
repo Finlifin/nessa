@@ -38,11 +38,7 @@ impl Vm {
         let TypeKind::Function { params, .. } = &self.state.type_pool.get(ty).kind else {
             return Err(VmError::InvalidType(ty));
         };
-        let matching_parameters = match &function.abi {
-            Some(abi) => params.len() == abi.logical_parameter_count(),
-            None => params.len() + captures == function.param_count as usize,
-        };
-        if !matching_parameters {
+        if params.len() != function.abi.logical_parameter_count() {
             return Err(VmError::TypeError);
         }
         Ok(Some(ty))
@@ -75,7 +71,7 @@ impl Vm {
     }
 
     /// Only called with rooted VM values inside the execution operation.
-    fn value_type(&self, value: TaggedValue) -> Result<Option<TypeIndex>, VmError> {
+    pub(super) fn value_type(&self, value: TaggedValue) -> Result<Option<TypeIndex>, VmError> {
         self.value_type_depth(value, 0)
     }
 
@@ -520,7 +516,7 @@ mod tests {
         });
         vm.add_function(runtime::FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: nsbc::FunctionAbi::value_only(1),
             func_id: nsbc::FuncId(0),
             instructions: vec![],
             register_count: 32,

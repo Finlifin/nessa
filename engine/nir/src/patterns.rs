@@ -235,6 +235,32 @@ pub(crate) fn branch_payload(
             crate::tuples::bind_pattern(resolved, children[1], value, builder, binding);
             builder.blocks[binding.0 as usize].terminator = Terminator::Goto(success);
         }
+        NodeKind::PatternTyped => {
+            let children = ast.fixed_children(pattern);
+            let target = builder
+                .node_type(resolved, children[1])
+                .expect("checked typed pattern");
+            let binding = builder.new_block();
+            test(
+                builder,
+                block,
+                NirExpr::TypeCheck(value, target).in_source_scope(resolved, pattern),
+                binding,
+                failure,
+            );
+            if ast.node(children[0]).kind == NodeKind::Id {
+                let converted =
+                    crate::expr::lower_cast(resolved, pattern, value, target, builder, binding);
+                crate::tuples::bind_pattern(
+                    resolved,
+                    children[0],
+                    NirValue::Local(converted),
+                    builder,
+                    binding,
+                );
+            }
+            builder.blocks[binding.0 as usize].terminator = Terminator::Goto(success);
+        }
         NodeKind::PatternIfGuard => {
             let children = ast.fixed_children(pattern);
             let mut guard = builder.new_block();

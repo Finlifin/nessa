@@ -101,7 +101,6 @@ impl Fixture {
         context.local_slots.clear();
         context.call_stack.clear();
         context.handler_stack.clear();
-        context.entry_closure_env = None;
         context.display_state = None;
         self.vm.roots.temporary_values.borrow_mut().clear();
         assert!(self.vm.roots.constants.values().is_empty());
@@ -256,10 +255,13 @@ fn managed_capture_is_reclaimed_only_after_all_ordinary_register_and_frame_roots
         func_id: FuncId(0),
         saved_regs: vec![(Reg(9), owner)],
         local_slots: vec![owner],
-        evidence: vec![],
-        closure_env: Some(owner),
     });
-    context.entry_closure_env = Some(owner);
+    context.handler_stack.push(runtime::EffectHandler {
+        effect_type: type_pool::Intrinsic::Any.type_index(),
+        handler_func: FuncId(0),
+        closure_env: owner,
+        continuation_param: None,
+    });
     context.registers.regs.fill(TaggedValue::UNIT);
     fixture.collect();
     fixture.assert_counts(1, 2);

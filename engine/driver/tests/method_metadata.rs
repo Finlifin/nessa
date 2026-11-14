@@ -76,7 +76,10 @@ fn compiler_and_archive_preserve_method_access_and_scope_identity() {
             .methods
             .iter()
             .flatten()
-            .all(|method| method.access != MethodAccess::LegacyUnknown)
+            .all(|method| matches!(
+                method.access,
+                MethodAccess::Public | MethodAccess::Package(_) | MethodAccess::Private(_)
+            ))
     );
 
     let saved = nsbc_io::write_artifact(&artifact).unwrap();

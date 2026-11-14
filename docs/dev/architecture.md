@@ -925,18 +925,16 @@ globals 参与真实 GC 根扫描。initializer 的分支、循环与 break/cont
 
 这仍不是上文完整的 core/alloc/std 分层：Newtype/Impl/Extend 关联作用域初始化、
 通用包发现、完整数据类型/traits、泛型函数签名尚未完成。动态间接初始化依赖
-仍由受检读取兜底。完整 `CompiledArtifact` 已持久化 TypePool、函数签名、全局
-schema、入口、方法名称重定位及 builtin ABI/ID/名称清单；源码与归档共用 driver
-安装路径，CLI 可独立执行 `.nsbc`。编译后删除源码并扰动加载进程 interner 的
-跨进程回归已通过。`write_artifact` 支持 globals，低层 `write_archive` 缺少
-TypePool/entry，仍拒绝非空 globals。
+仍由受检读取兜底。完整 `CompiledArtifact` 持久化已 finalize 的 `TypePool`（`TPOL 11` 稳定
+`TypeId`）、必需的 `FunctionAbi` 与词法作用域表（`NSAM 6`）、全局 schema、入口、方法名称重定位
+及 `BUILTIN_ABI_VERSION = 9` 清单；源码与归档共用 driver 安装路径，CLI 可独立执行 `.nsbc`。
+旧低层 `write_archive` 与历史过渡版本兼容分支已移除。
 
-容器已计算并验证 SHA-256，完整加载检查 target、元数据/字节码引用及入口，
+容器强制生成并验证非零 SHA-256（`Container v4`），完整加载检查 target、元数据/字节码引用及入口，
 拒绝不兼容 builtin manifest。STACK_MAPS 保存 safepoint PC，运行采用明确的
-tagged-root 扫描模式；精确 stackmap、DEBUG_INFO、文本字节码、跨包
-imports/exports 和稳定 TypeId 仍未完成。optional/default/variadic 的完整参数
-绑定 ABI 尚缺，未实现的缺参调用明确拒绝。多 worker/事件循环、完整启动关闭
-流程、原生 SP/FP continuation 栈切换和最后引用模板回收仍是设计目标。
+tagged-root 扫描模式；精确 stackmap、DEBUG_INFO、文本字节码及跨包
+imports/exports 链接仍未完成。多 worker/事件循环、完整启动关闭
+流程与原生 SP/FP continuation 栈切换仍是设计目标。
 自包含归档可执行不等于上文整个引擎和包系统完成。
 
 

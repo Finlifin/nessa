@@ -643,14 +643,12 @@ fn deep_dags_are_checked_in_a_child_process_instead_of_aborting_the_suite() {
 }
 
 #[test]
-fn legacy_manifest_version_and_resolver_apis_remain_usable() {
-    let leaf = PackageManifest {
-        name: "leaf".into(),
-        domain: "example.org".into(),
-        version: Version::new(1, 0, 0),
-        package_type: PackageType::Lib,
-        dependencies: vec![],
-    };
+fn manifest_version_helpers_and_document_resolver_apis_work_together() {
+    let leaf = document(&package("leaf", "1.0.0", "", ""));
+    let root_doc = ManifestDocument::parse(
+        "[package]\nname=\"root\"\ndomain=\"example.org\"\nversion=\"1.0.0\"\ntype=\"exe\"\n[dependencies]\n\"example.org/leaf\"=\"^1.0.0\"\n",
+    )
+    .unwrap();
     let root = PackageManifest {
         name: "root".into(),
         domain: "example.org".into(),
@@ -663,11 +661,11 @@ fn legacy_manifest_version_and_resolver_apis_remain_usable() {
         }],
     };
     let mut resolver = PackageResolver::new();
-    resolver.register(leaf);
-    let graph = resolver.resolve(&root).unwrap();
-    assert_eq!(graph.packages.len(), 2);
-    assert_eq!(graph.packages[0].qualified_name(), "example.org/leaf");
-    assert_eq!(graph.packages[1].qualified_name(), "example.org/root");
+    resolver.register_document(leaf).unwrap();
+    let graph = resolver.resolve_document(&root_doc).unwrap();
+    assert_eq!(graph.packages().len(), 2);
+    assert_eq!(graph.packages()[0].qualified_name(), "example.org/leaf");
+    assert_eq!(graph.packages()[1].qualified_name(), "example.org/root");
     assert_eq!(root.entry_file(), "src/main.ns");
     let mut temporary = root.clone();
     temporary.package_type = PackageType::Tmp;

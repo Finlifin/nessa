@@ -18,7 +18,7 @@ fn concatenating_valid_strings_beyond_the_object_limit_is_a_runtime_error() {
         .unwrap();
     engine.vm_mut().add_function(FunctionCode {
         display_owner: None,
-        abi: None,
+        abi: nsbc::FunctionAbi::value_only(0),
         func_id: FuncId(0),
         instructions: [
             Instruction::load_const(Reg(0), constant as u16),

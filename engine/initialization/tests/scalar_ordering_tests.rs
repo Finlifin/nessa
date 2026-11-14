@@ -24,7 +24,7 @@ fn scalar_ordering_native_rejects_invalid_arity_and_operand_categories() {
         let mut engine = Engine::with_defaults();
         engine.vm_mut().add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: nsbc::FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: instructions.into_iter().map(Instruction::encode).collect(),
             register_count: 32,

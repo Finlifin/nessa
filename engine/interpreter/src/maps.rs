@@ -276,7 +276,7 @@ impl Vm {
         Ok(self.map_layout(map)?.length)
     }
 
-    pub(super) fn map_keys(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
+    fn map_column(&mut self, map: TaggedValue, field: usize) -> Result<TaggedValue, VmError> {
         let root = self.roots.temporary_values.borrow().len();
         self.with_temporary_roots(&[map], |vm| {
             // Validate all buckets and the occupied count before allocation.
@@ -285,22 +285,140 @@ impl Vm {
             for &bucket in &buckets {
                 string_key(layout.slot(bucket, 2))?;
             }
-            let keys = vm.new_list(buckets.len())?;
-            vm.with_temporary_roots(&[keys], |vm| {
+            let column = vm.new_list(buckets.len())?;
+            vm.with_temporary_roots(&[column], |vm| {
                 // Reacquire the layout after allocating the List. No managed
-                // allocation or callback occurs while copying the live keys.
+                // allocation or callback occurs while copying the live slots.
                 let map = vm.roots.temporary_values.borrow()[root];
                 let layout = vm.map_layout(map)?;
                 for (index, bucket) in buckets.into_iter().enumerate() {
                     vm.list_set(
-                        keys,
+                        column,
                         TaggedValue::from_u64(index as u64),
-                        layout.slot(bucket, 2),
+                        layout.slot(bucket, field),
                     )?;
                 }
-                Ok(keys)
+                Ok(column)
             })
         })
+    }
+
+    pub(super) fn map_keys(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
+        self.map_column(map, 2)
+    }
+
+    pub(super) fn map_values(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
+        self.map_column(map, 3)
+    }
+
+    pub(super) fn map_entries(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[map], |vm| {
+            let layout = vm.map_layout(map)?;
+            let buckets = layout.occupied_buckets()?;
+            for &bucket in &buckets {
+                string_key(layout.slot(bucket, 2))?;
+            }
+            let column = vm.new_list(buckets.len())?;
+            vm.with_temporary_roots(&[column], |vm| {
+                let str_ty = type_pool::Intrinsic::Str.type_index();
+                let any_ty = type_pool::Intrinsic::Any.type_index();
+                for (index, bucket) in buckets.into_iter().enumerate() {
+                    let map = vm.roots.temporary_values.borrow()[root];
+                    let layout = vm.map_layout(map)?;
+                    let key = layout.slot(bucket, 2);
+                    let value = layout.slot(bucket, 3);
+                    let pair = vm.alloc_tuple(&[str_ty, any_ty], &[key, value])?;
+                    let column = vm.roots.temporary_values.borrow()[root + 1];
+                    vm.list_set(column, TaggedValue::from_u64(index as u64), pair)?;
+                }
+                Ok(vm.roots.temporary_values.borrow()[root + 1])
+            })
+        })
+    }
+
+    pub(super) fn map_copy(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
+        let dest = self.new_map(0)?;
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[map, dest], |vm| {
+            let map = vm.roots.temporary_values.borrow()[root];
+            let dest = vm.roots.temporary_values.borrow()[root + 1];
+            vm.map_merge(dest, map)?;
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn map_clear(&mut self, map: TaggedValue) -> Result<(), VmError> {
+        let layout = self.map_layout(map)?;
+        if layout.capacity == 0 {
+            return Ok(());
+        }
+        let _ = layout.occupied_buckets()?;
+        // SAFETY: every bucket was checked above. Empty slots drop key and value
+        // edges so a cleared entry can be collected. No allocation follows.
+        unsafe {
+            for bucket in 0..layout.capacity {
+                let slot = layout.buffer.add(bucket * 4);
+                slot.write(TaggedValue::from_u64(EMPTY).raw());
+                slot.add(1).write(TaggedValue::from_u64(0).raw());
+                slot.add(2).write(TaggedValue::UNIT.raw());
+                slot.add(3).write(TaggedValue::UNIT.raw());
+            }
+            layout.wrapper.write(TaggedValue::from_u64(0).raw());
+        }
+        Ok(())
+    }
+
+    pub(super) fn map_merge(
+        &mut self,
+        map: TaggedValue,
+        other: TaggedValue,
+    ) -> Result<(), VmError> {
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[map, other], |vm| {
+            let other = vm.roots.temporary_values.borrow()[root + 1];
+            let layout = vm.map_layout(other)?;
+            let buckets = layout.occupied_buckets()?;
+            let entries: Vec<(TaggedValue, TaggedValue)> = buckets
+                .into_iter()
+                .map(|bucket| (layout.slot(bucket, 2), layout.slot(bucket, 3)))
+                .collect();
+            for &(key, value) in &entries {
+                vm.roots.temporary_values.borrow_mut().push(key);
+                vm.roots.temporary_values.borrow_mut().push(value);
+            }
+            for (key, value) in entries {
+                let map = vm.roots.temporary_values.borrow()[root];
+                vm.map_set(map, key, value)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn map_get_or_insert(
+        &mut self,
+        map: TaggedValue,
+        key: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        if self.map_contains(map, key)? {
+            return self.map_get(map, key);
+        }
+        self.map_set(map, key, value)?;
+        Ok(value)
+    }
+
+    pub(super) fn map_insert_absent(
+        &mut self,
+        map: TaggedValue,
+        key: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<bool, VmError> {
+        if self.map_contains(map, key)? {
+            return Ok(false);
+        }
+        self.map_set(map, key, value)?;
+        Ok(true)
     }
 
     pub(super) fn map_get(
@@ -646,7 +764,7 @@ mod tests {
         vm.push_constant(&Constant::Str("key".into())).unwrap();
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: nsbc::FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: [
                 Instruction::a_type(Opcode::NewMap, AddrMode::Imm, Reg(10), Reg(0), 3),

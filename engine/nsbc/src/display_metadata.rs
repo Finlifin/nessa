@@ -4,13 +4,13 @@ use type_pool::{Intrinsic, TypeIndex, TypeKind, TypePool};
 
 use crate::{FuncId, FunctionAbi, ParameterAbi};
 
-/// Validate an opted-in traversal without changing legacy functions' interpretation.
+/// Validate an opted-in compiler-generated Display traversal function.
 pub fn validate_display_owner(
     pool: &TypePool,
     id: FuncId,
     owner: TypeIndex,
     signature: TypeIndex,
-    abi: Option<&FunctionAbi>,
+    abi: &FunctionAbi,
     param_count: u8,
     is_closure: bool,
 ) -> Result<(), &'static str> {
@@ -41,9 +41,6 @@ pub fn validate_display_owner(
                 .all(|variant| variant.fields.len() < u16::MAX as usize) => {}
         _ => return Err("generated Display owner is not a supported aggregate"),
     }
-    let Some(abi) = abi else {
-        return Err("generated Display requires explicit ABI");
-    };
     if is_closure
         || param_count != 1
         || !abi.captures.is_empty()

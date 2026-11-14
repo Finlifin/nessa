@@ -399,6 +399,7 @@ pub(crate) fn pattern(
             crate::error_patterns::family_pattern(r, ast, node, expected)
         }
         NodeKind::PatternOptionSome => crate::optional::pattern(r, ast, node, expected),
+        NodeKind::PatternTyped => crate::type_patterns::resolve(r, ast, node, expected),
         NodeKind::PatternList => crate::list_patterns::resolve(r, ast, node, expected),
         NodeKind::PatternRestBind => report(
             r,

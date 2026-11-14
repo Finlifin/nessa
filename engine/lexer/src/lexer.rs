@@ -657,269 +657,263 @@ impl<'src> Lexer<'src> {
     // -- literal lexers ---------------------------------------------------
 
     fn lex_string(&mut self, start: Index) -> Token {
+        self.queue_string(start);
+        self.pending
+            .pop_front()
+            .expect("string lexing queues at least one token")
+    }
+
+    /// Queue the tokens of the string literal opening at `start`: one String or
+    /// Invalid token, or an interpolation sequence. Literal text may contain
+    /// braces only as `{{` and `}}`; a single `{` opens an interpolation.
+    fn queue_string(&mut self, start: Index) {
         self.cursor += 1; // consume opening '"'
+        if self.has_interpolation() {
+            self.queue_interpolated_string(start);
+        } else {
+            let token = self.lex_plain_string(start);
+            self.pending.push_back(token);
+        }
+    }
 
-        // Peek ahead to decide: does this string contain any `{expr}` interpolation?
-        // We do a quick scan to detect `{` that is not `{{`.
-        let has_interpolation = {
-            let mut i = self.cursor;
-            let mut found = false;
-            while i < self.bytes.len() {
-                match self.bytes[i] {
-                    b'"' => break,
-                    b'\\' => {
-                        i += 2;
-                    }
-                    b'{' if self.bytes.get(i + 1) != Some(&b'{') => {
-                        found = true;
-                        break;
-                    }
-                    b'\n' => break,
-                    _ => {
-                        i += 1;
-                    }
-                }
-            }
-            found
-        };
-
-        if !has_interpolation {
-            // Plain string — scan to closing `"` and return a single String token.
-            loop {
-                match self.peek_byte() {
-                    None => {
-                        self.push_error(
-                            LexErrorKind::InvalidStrLiteral,
-                            start,
-                            self.pos(),
-                            "unterminated string literal",
-                        );
-                        return self.token(TokenKind::Invalid, start, self.pos());
-                    }
-                    Some(b'"') => {
-                        self.cursor += 1;
-                        return self.token(TokenKind::String, start, self.pos());
-                    }
-                    Some(b'\\') => {
-                        self.cursor += 1;
-                        match self.peek_byte() {
-                            Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') => {
-                                self.cursor += 1;
-                            }
-                            Some(b'x') => {
-                                self.cursor += 1;
-                                if !self.expect_hex_digits(2, start) {
-                                    return self.token(TokenKind::Invalid, start, self.pos());
-                                }
-                            }
-                            Some(b'u') => {
-                                self.cursor += 1;
-                                if !self.expect_hex_digits(4, start) {
-                                    return self.token(TokenKind::Invalid, start, self.pos());
-                                }
-                            }
-                            Some(_) => {
-                                self.push_error(
-                                    LexErrorKind::InvalidStrLiteral,
-                                    start,
-                                    self.pos(),
-                                    "invalid escape sequence",
-                                );
-                                self.skip_to_string_end();
-                                return self.token(TokenKind::Invalid, start, self.pos());
-                            }
-                            None => {
-                                self.push_error(
-                                    LexErrorKind::InvalidStrLiteral,
-                                    start,
-                                    self.pos(),
-                                    "unterminated escape sequence",
-                                );
-                                return self.token(TokenKind::Invalid, start, self.pos());
-                            }
-                        }
-                    }
-                    Some(b'\n') => {
-                        self.push_error(
-                            LexErrorKind::InvalidStrLiteral,
-                            start,
-                            self.pos(),
-                            "unexpected newline in string literal",
-                        );
-                        return self.token(TokenKind::Invalid, start, self.pos());
-                    }
-                    Some(_) => {
-                        self.advance_char();
-                    }
-                }
+    fn has_interpolation(&self) -> bool {
+        let mut i = self.cursor;
+        while let Some(&byte) = self.bytes.get(i) {
+            match byte {
+                b'"' | b'\n' => return false,
+                b'\\' => i += 2,
+                b'{' if self.bytes.get(i + 1) == Some(&b'{') => i += 2,
+                b'{' => return true,
+                _ => i += 1,
             }
         }
+        false
+    }
 
-        // Interpolated string — emit FStringStart, then segments and expressions.
-        // We eagerly push all tokens into `self.pending` and return the first.
-        self.pending
-            .push_back(Token::new(TokenKind::FStringStart, start, start + 1));
-
+    fn lex_plain_string(&mut self, start: Index) -> Token {
         loop {
-            let seg_start = self.pos();
-            // Collect a literal segment up to `{`, `}`, or end of string.
-            loop {
-                match self.peek_byte() {
-                    None | Some(b'\n') => {
-                        self.push_error(
-                            LexErrorKind::InvalidStrLiteral,
-                            start,
-                            self.pos(),
-                            "unterminated string literal",
-                        );
-                        // Emit whatever we have and stop.
-                        if self.pos() > seg_start {
-                            self.pending.push_back(Token::new(
-                                TokenKind::FStringLiteral,
-                                seg_start,
-                                self.pos(),
-                            ));
-                        }
-                        self.pending.push_back(Token::new(
-                            TokenKind::FStringEnd,
-                            self.pos(),
-                            self.pos(),
-                        ));
-                        return self.pending.pop_front().unwrap();
+            match self.peek_byte() {
+                None => {
+                    self.push_error(
+                        LexErrorKind::InvalidStrLiteral,
+                        start,
+                        self.pos(),
+                        "unterminated string literal",
+                    );
+                    return self.token(TokenKind::Invalid, start, self.pos());
+                }
+                Some(b'"') => {
+                    self.cursor += 1;
+                    return self.token(TokenKind::String, start, self.pos());
+                }
+                Some(b'\n') => {
+                    self.push_error(
+                        LexErrorKind::InvalidStrLiteral,
+                        start,
+                        self.pos(),
+                        "unexpected newline in string literal",
+                    );
+                    return self.token(TokenKind::Invalid, start, self.pos());
+                }
+                // has_interpolation admits only doubled opening braces here.
+                Some(b'{') => self.cursor += 2,
+                Some(b'}') | Some(b'\\') => {
+                    if !self.lex_literal_escape(start) {
+                        self.skip_to_string_end();
+                        return self.token(TokenKind::Invalid, start, self.pos());
                     }
-                    Some(b'"') => {
-                        // End of string.
-                        if self.pos() > seg_start {
-                            self.pending.push_back(Token::new(
-                                TokenKind::FStringLiteral,
-                                seg_start,
-                                self.pos(),
-                            ));
-                        }
-                        self.cursor += 1;
-                        let end = self.pos();
-                        self.pending
-                            .push_back(Token::new(TokenKind::FStringEnd, end - 1, end));
-                        return self.pending.pop_front().unwrap();
-                    }
-                    Some(b'{') => {
-                        // `{{` → literal `{`
-                        if self.bytes.get(self.cursor + 1) == Some(&b'{') {
-                            self.cursor += 2;
-                            continue;
-                        }
-                        // Start of interpolated expression.
-                        if self.pos() > seg_start {
-                            self.pending.push_back(Token::new(
-                                TokenKind::FStringLiteral,
-                                seg_start,
-                                self.pos(),
-                            ));
-                        }
-                        let brace_start = self.pos();
-                        self.cursor += 1; // consume `{`
-                        self.pending.push_back(Token::new(
-                            TokenKind::FStringExprStart,
-                            brace_start,
-                            self.pos(),
-                        ));
-                        // Now lex expression tokens until matching `}`.
-                        // We use a brace depth counter and call recognize_token repeatedly.
-                        let mut depth: u32 = 1;
-                        while depth > 0 && !self.at_end() {
-                            self.skip_whitespace();
-                            if self.at_end() {
-                                break;
-                            }
-                            match self.peek_byte() {
-                                Some(b'{') => {
-                                    let ts = self.pos();
-                                    self.cursor += 1;
-                                    depth += 1;
-                                    self.pending.push_back(Token::new(
-                                        TokenKind::LBrace,
-                                        ts,
-                                        self.pos(),
-                                    ));
-                                }
-                                Some(b'}') => {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        let ts = self.pos();
-                                        self.cursor += 1;
-                                        self.pending.push_back(Token::new(
-                                            TokenKind::FStringExprEnd,
-                                            ts,
-                                            self.pos(),
-                                        ));
-                                    } else {
-                                        let ts = self.pos();
-                                        self.cursor += 1;
-                                        self.pending.push_back(Token::new(
-                                            TokenKind::RBrace,
-                                            ts,
-                                            self.pos(),
-                                        ));
-                                    }
-                                }
-                                Some(b'"') => {
-                                    // Nested string inside interpolation — lex it.
-                                    let ns = self.pos();
-                                    let nested = self.lex_string(ns);
-                                    // nested already pushed its tokens to pending if interpolated,
-                                    // or returns a single String token.
-                                    if nested.kind == TokenKind::String
-                                        || nested.kind == TokenKind::FStringStart
-                                        || nested.kind == TokenKind::Invalid
-                                    {
-                                        self.pending.push_back(nested);
-                                    }
-                                    // (if it was FStringStart the rest is already in pending)
-                                }
-                                _ => {
-                                    let ts = self.pos();
-                                    let tok = self.recognize_token(ts);
-                                    self.pending.push_back(tok);
-                                }
-                            }
-                        }
-                        // After closing `}` we continue scanning the string body.
-                        break; // break inner literal-scan loop, restart outer loop
-                    }
-                    Some(b'\\') => {
-                        self.cursor += 1; // consume `\`
-                        match self.peek_byte() {
-                            Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') => {
-                                self.cursor += 1;
-                            }
-                            Some(b'x') => {
-                                self.cursor += 1;
-                                self.expect_hex_digits(2, start);
-                            }
-                            Some(b'u') => {
-                                self.cursor += 1;
-                                self.expect_hex_digits(4, start);
-                            }
-                            _ => {
-                                self.cursor += 1;
-                            }
-                        }
-                    }
-                    Some(_) => {
-                        self.advance_char();
-                    }
+                }
+                Some(_) => {
+                    self.advance_char();
                 }
             }
         }
     }
 
-    /// Expect exactly `n` hex digits at the current position.  Returns
-    /// `false` and emits an error on failure.
-    fn expect_hex_digits(&mut self, n: usize, lit_start: Index) -> bool {
+    /// Consume `\`-escapes and `}}` in literal string text. On an invalid
+    /// sequence, record an error and return false with the cursor after it.
+    fn lex_literal_escape(&mut self, start: Index) -> bool {
+        if self.peek_byte() == Some(b'}') {
+            self.cursor += 1;
+            if self.peek_byte() == Some(b'}') {
+                self.cursor += 1;
+                return true;
+            }
+            self.push_error(
+                LexErrorKind::InvalidStrLiteral,
+                start,
+                self.pos(),
+                "a literal `}` in a string must be written `}}`",
+            );
+            return false;
+        }
+        self.cursor += 1; // consume `\`
+        match self.peek_byte() {
+            Some(b'n' | b't' | b'r' | b'0' | b'\\' | b'"' | b'\'') => {
+                self.cursor += 1;
+                true
+            }
+            Some(b'x') => {
+                self.cursor += 1;
+                self.expect_hex_digits(2, start).is_some()
+            }
+            Some(b'u') => {
+                self.cursor += 1;
+                let Some(value) = self.expect_hex_digits(4, start) else {
+                    return false;
+                };
+                if char::from_u32(value).is_none() {
+                    self.push_error(
+                        LexErrorKind::InvalidStrLiteral,
+                        start,
+                        self.pos(),
+                        "unicode escape is not a Unicode scalar value",
+                    );
+                    return false;
+                }
+                true
+            }
+            Some(_) => {
+                self.push_error(
+                    LexErrorKind::InvalidStrLiteral,
+                    start,
+                    self.pos(),
+                    "invalid escape sequence",
+                );
+                false
+            }
+            None => {
+                self.push_error(
+                    LexErrorKind::InvalidStrLiteral,
+                    start,
+                    self.pos(),
+                    "unterminated escape sequence",
+                );
+                false
+            }
+        }
+    }
+
+    fn queue_interpolated_string(&mut self, start: Index) {
+        self.pending
+            .push_back(Token::new(TokenKind::FStringStart, start, start + 1));
+        let mut segment_start = self.pos();
+        loop {
+            match self.peek_byte() {
+                None | Some(b'\n') => {
+                    self.push_error(
+                        LexErrorKind::InvalidStrLiteral,
+                        start,
+                        self.pos(),
+                        "unterminated string literal",
+                    );
+                    self.queue_segment(segment_start);
+                    self.pending.push_back(Token::new(
+                        TokenKind::FStringEnd,
+                        self.pos(),
+                        self.pos(),
+                    ));
+                    return;
+                }
+                Some(b'"') => {
+                    self.queue_segment(segment_start);
+                    self.cursor += 1;
+                    let end = self.pos();
+                    self.pending
+                        .push_back(Token::new(TokenKind::FStringEnd, end - 1, end));
+                    return;
+                }
+                Some(b'{') if self.bytes.get(self.cursor + 1) == Some(&b'{') => {
+                    self.cursor += 2;
+                }
+                Some(b'{') => {
+                    self.queue_segment(segment_start);
+                    self.queue_interpolation(start);
+                    segment_start = self.pos();
+                }
+                Some(b'}') | Some(b'\\') => {
+                    // The error is recorded; keep scanning so the string
+                    // boundary and later interpolations stay aligned.
+                    let _ = self.lex_literal_escape(start);
+                }
+                Some(_) => {
+                    self.advance_char();
+                }
+            }
+        }
+    }
+
+    fn queue_segment(&mut self, segment_start: Index) {
+        if self.pos() > segment_start {
+            self.pending.push_back(Token::new(
+                TokenKind::FStringLiteral,
+                segment_start,
+                self.pos(),
+            ));
+        }
+    }
+
+    /// Queue `{ expr }` tokens; nested braces and strings are part of `expr`.
+    fn queue_interpolation(&mut self, string_start: Index) {
+        let brace_start = self.pos();
+        self.cursor += 1; // consume `{`
+        self.pending.push_back(Token::new(
+            TokenKind::FStringExprStart,
+            brace_start,
+            self.pos(),
+        ));
+        let mut depth: u32 = 1;
+        loop {
+            self.skip_whitespace();
+            let token_start = self.pos();
+            match self.peek_byte() {
+                None | Some(b'\n') => {
+                    self.push_error(
+                        LexErrorKind::InvalidStrLiteral,
+                        string_start,
+                        self.pos(),
+                        "unterminated string interpolation; write `{{` for a literal `{`",
+                    );
+                    return;
+                }
+                Some(b'{') => {
+                    self.cursor += 1;
+                    depth += 1;
+                    self.pending
+                        .push_back(Token::new(TokenKind::LBrace, token_start, self.pos()));
+                }
+                Some(b'}') => {
+                    self.cursor += 1;
+                    depth -= 1;
+                    let kind = if depth == 0 {
+                        TokenKind::FStringExprEnd
+                    } else {
+                        TokenKind::RBrace
+                    };
+                    self.pending
+                        .push_back(Token::new(kind, token_start, self.pos()));
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                Some(b'"') => self.queue_string(token_start),
+                Some(_) => {
+                    let token = self.recognize_token(token_start);
+                    self.pending.push_back(token);
+                }
+            }
+        }
+    }
+
+    /// Expect exactly `n` hex digits at the current position and return their
+    /// value. Records an error and returns None on failure.
+    fn expect_hex_digits(&mut self, n: usize, lit_start: Index) -> Option<u32> {
+        let mut value = 0;
         for _ in 0..n {
             match self.peek_byte() {
                 Some(b) if b.is_ascii_hexdigit() => {
                     self.cursor += 1;
+                    value = value * 16 + (b as char).to_digit(16).unwrap_or_default();
                 }
                 _ => {
                     self.push_error(
@@ -928,12 +922,11 @@ impl<'src> Lexer<'src> {
                         self.pos(),
                         "invalid or incomplete hex/unicode escape sequence",
                     );
-                    self.skip_to_string_end();
-                    return false;
+                    return None;
                 }
             }
         }
-        true
+        Some(value)
     }
 
     /// After a string-literal error, skip forward to the closing `"` (or
@@ -970,7 +963,11 @@ impl<'src> Lexer<'src> {
 
         match self.peek_byte() {
             Some(b' ' | b'\t') => {
-                // Skip whitespace, then check for macro `'{`.
+                // `' '` and `'\t'` are character literals. Other whitespace still
+                // introduces a quote token or the `'{` macro form.
+                if self.looks_like_char_literal() {
+                    return self.lex_char_after_quote(start);
+                }
                 while matches!(self.peek_byte(), Some(b' ' | b'\t')) {
                     self.cursor += 1;
                 }
@@ -1007,7 +1004,7 @@ impl<'src> Lexer<'src> {
                 return true; // incomplete escape → char error path
             }
             let b = rest.as_bytes()[0];
-            if matches!(b, b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') {
+            if matches!(b, b'n' | b't' | b'r' | b'\\' | b'"' | b'\'' | b'0') {
                 return true; // complete or missing closer — char path handles both
             }
             if b == b'x' || b == b'u' {
@@ -1026,14 +1023,72 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// After a bad numeric escape, consume through the closing quote on this line.
+    fn finish_bad_char(&mut self, start: Index) -> Token {
+        while let Some(byte) = self.peek_byte() {
+            if byte == b'\'' || byte == b'\n' {
+                break;
+            }
+            self.cursor += 1;
+        }
+        if self.peek_byte() == Some(b'\'') {
+            self.cursor += 1;
+        }
+        self.token(TokenKind::Invalid, start, self.pos())
+    }
+
+    /// Read `digits` ASCII hex digits. A short or non-hex sequence is a character error.
+    fn take_char_hex(&mut self, start: Index, digits: usize) -> Option<u32> {
+        let mut value = 0;
+        for _ in 0..digits {
+            match self.peek_byte() {
+                Some(byte) if byte.is_ascii_hexdigit() => {
+                    self.cursor += 1;
+                    value = value * 16 + (byte as char).to_digit(16).unwrap_or_default();
+                }
+                _ => {
+                    self.push_error(
+                        LexErrorKind::InvalidCharLiteral,
+                        start,
+                        self.pos(),
+                        "invalid or incomplete hex/unicode escape sequence",
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(value)
+    }
+
     /// Starting right after the opening `'`, scan a character literal.
     fn lex_char_after_quote(&mut self, start: Index) -> Token {
         match self.peek_byte() {
             Some(b'\\') => {
                 self.cursor += 1;
                 match self.peek_byte() {
-                    Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'') => {
+                    Some(b'n' | b't' | b'r' | b'\\' | b'"' | b'\'' | b'0') => {
                         self.cursor += 1;
+                    }
+                    Some(b'x') => {
+                        self.cursor += 1;
+                        if self.take_char_hex(start, 2).is_none() {
+                            return self.finish_bad_char(start);
+                        }
+                    }
+                    Some(b'u') => {
+                        self.cursor += 1;
+                        let Some(value) = self.take_char_hex(start, 4) else {
+                            return self.finish_bad_char(start);
+                        };
+                        if char::from_u32(value).is_none() {
+                            self.push_error(
+                                LexErrorKind::InvalidCharLiteral,
+                                start,
+                                self.pos(),
+                                "unicode escape is not a Unicode scalar value",
+                            );
+                            return self.finish_bad_char(start);
+                        }
                     }
                     Some(_) => {
                         self.push_error(

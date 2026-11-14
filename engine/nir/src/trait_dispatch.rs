@@ -23,6 +23,16 @@ pub(crate) fn implements(
         .expect("resolution checked lexical trait evidence")
 }
 
+/// Dispatch slot of a method declared by a bootstrap trait.
+pub(crate) fn schema_slot(resolved: &ResolvedAst, view: TypeIndex, name: &str) -> u32 {
+    let name = str_interner::intern(name);
+    resolved
+        .type_pool
+        .trait_schema(view)
+        .and_then(|schema| schema.slots.iter().position(|key| key.name == name))
+        .expect("bootstrap traits declare their protocol methods") as u32
+}
+
 pub(crate) struct TraitMethodTarget<'a> {
     pub owner: TypeIndex,
     pub view: TypeIndex,

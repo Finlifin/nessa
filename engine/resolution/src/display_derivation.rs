@@ -1,4 +1,4 @@
-//! Compiler plans for legacy and compositional Display implementations.
+//! Compiler plans for compositional Display implementations.
 
 use std::collections::HashSet;
 
@@ -7,15 +7,8 @@ use type_pool::{Intrinsic, TypeIndex, TypeKind};
 
 use crate::resolver::Resolver;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisplayDerivationMode {
-    LegacyStruct,
-    FieldCalls,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedDisplayPlan {
-    pub mode: DisplayDerivationMode,
     pub node: NodeIndex,
     pub implementor: TypeIndex,
     pub trait_type: TypeIndex,
@@ -29,11 +22,6 @@ pub(crate) fn register_display(r: &mut Resolver<'_>, node: NodeIndex, implemento
         ret: Intrinsic::Str.type_index(),
     });
     r.display_derivations.push(DerivedDisplayPlan {
-        mode: if matches!(r.type_pool.get(implementor).kind, TypeKind::Struct { .. }) {
-            DisplayDerivationMode::LegacyStruct
-        } else {
-            DisplayDerivationMode::FieldCalls
-        },
         node,
         implementor,
         trait_type: r.type_pool.well_known.display,
@@ -141,9 +129,6 @@ fn displayable(r: &Resolver<'_>, ty: TypeIndex, seen: &mut HashSet<TypeIndex>, s
 
 pub(crate) fn validate(r: &Resolver<'_>, ast: &Ast) {
     for plan in &r.display_derivations {
-        if plan.mode == DisplayDerivationMode::LegacyStruct {
-            continue;
-        }
         let Some(scope) = r.node_scopes.get(&plan.node).map(|scope| scope.0) else {
             r.diag_ctx
                 .error("Display derivation is missing its lexical scope".into())
@@ -166,7 +151,6 @@ pub(crate) fn validate(r: &Resolver<'_>, ast: &Ast) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use diagnostic::DiagnosticContext;
     use rustc_span::{FileName, SourceMap, source_map::FilePathMapping};
 
@@ -187,13 +171,19 @@ mod tests {
     }
 
     #[test]
-    fn source_structs_keep_legacy_formatting_without_new_field_obligations() {
-        let (resolved, errors) = resolve("struct Legacy { value:Any }; derive Display for Legacy");
+    fn struct_display_plans_check_every_field_component() {
+        let (resolved, errors) = resolve(
+            "struct Leaf {}; impl Display for Leaf { pub fn to_string(self) -> String { \"leaf\" } }; struct Good { item: Leaf, maybe: ?Leaf }; derive Display for Good",
+        );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(resolved.display_derivations.len(), 1);
-        assert_eq!(
-            resolved.display_derivations[0].mode,
-            DisplayDerivationMode::LegacyStruct
+
+        let (_, errors) = resolve("struct Bad { value: Any }; derive Display for Bad");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("checked global Display implementation")),
+            "{errors:?}"
         );
     }
 
@@ -204,12 +194,6 @@ mod tests {
         );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(resolved.display_derivations.len(), 2);
-        assert!(
-            resolved
-                .display_derivations
-                .iter()
-                .all(|plan| plan.mode == DisplayDerivationMode::FieldCalls)
-        );
         for source in [
             "enum Bad { value(x:Any) }; derive Display for Bad",
             "typealias Bad=(Any,); derive Display for Bad",

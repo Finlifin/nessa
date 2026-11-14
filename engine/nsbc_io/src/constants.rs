@@ -9,8 +9,8 @@ use type_pool::TypeIndex;
 pub(super) fn decode(data: &[u8]) -> io::Result<Vec<Constant>> {
     let mut reader = ConstantReader { remaining: data };
     let count = u32::from_le_bytes(reader.fixed()?) as usize;
-    // Even an empty string or BigInt needs one tag and a four-byte length.
-    // Check the count before reserving memory from untrusted archive input.
+    // Even an empty string, type, or character constant needs one tag and four
+    // payload bytes. Check the count before reserving memory from untrusted input.
     if count > reader.remaining.len() / 5 {
         return Err(invalid("constant count exceeds CONSTANTS section data"));
     }
@@ -30,7 +30,6 @@ pub(super) fn decode(data: &[u8]) -> io::Result<Vec<Constant>> {
                     .map_err(|_| invalid("invalid UTF-8 in string constant"))?;
                 Constant::Str(value.to_owned())
             }
-            4 => Constant::BigInt(reader.variable()?.to_vec()),
             5 => Constant::Int128(i128::from_le_bytes(reader.fixed()?)),
             6 => Constant::UInt128(u128::from_le_bytes(reader.fixed()?)),
             7 => {
@@ -116,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn character_constants_reject_invalid_scalars_and_truncation() {
+    fn character_constants_and_retired_or_unknown_tags_are_rejected() {
         for scalar in [0xd800_u32, 0xdfff, 0x110000, u32::MAX] {
             let mut bytes = vec![1, 0, 0, 0, 9];
             bytes.extend_from_slice(&scalar.to_le_bytes());
@@ -128,8 +127,19 @@ mod tests {
             bytes.resize(5 + length, 0);
             assert!(decode(&bytes).is_err());
         }
-        let error = decode(&[1, 0, 0, 0, 10, 0, 0, 0, 0]).unwrap_err();
-        assert!(error.to_string().contains("unknown constant tag"));
+        for bad in [
+            &[1, 0, 0, 0, 4, 0, 0, 0, 0][..],
+            &[1, 0, 0, 0, 4, 1, 0, 0, 0, 99][..],
+            &[1, 0, 0, 0, 10, 0, 0, 0, 0][..],
+            &[1, 0, 0, 0, 255, 0, 0, 0, 0][..],
+        ] {
+            let error = decode(bad).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains("unknown constant tag"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

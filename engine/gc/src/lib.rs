@@ -97,18 +97,6 @@ impl ObjectHeader {
         Self::SIZE + self.payload_words() * 8
     }
 
-    pub fn is_pinned(&self) -> bool {
-        self.gc_meta & (1 << 31) != 0
-    }
-
-    pub fn set_pinned(&mut self, pinned: bool) {
-        if pinned {
-            self.gc_meta |= 1 << 31;
-        } else {
-            self.gc_meta &= !(1 << 31);
-        }
-    }
-
     /// # Safety
     /// `payload_ptr` must point to a valid payload from `Heap::alloc_object`.
     pub unsafe fn from_payload_ptr(payload_ptr: *const u8) -> &'static ObjectHeader {
@@ -946,30 +934,19 @@ mod tests {
         let hdr = ObjectHeader::new(TypeIndex::from_raw(42), 3);
         assert_eq!(hdr.payload_words(), 3);
         assert_eq!(hdr.object_size(), 16 + 24);
-        assert!(!hdr.is_pinned());
-    }
-
-    #[test]
-    fn object_header_pinned() {
-        let mut hdr = ObjectHeader::new(TypeIndex::from_raw(1), 0);
-        assert!(!hdr.is_pinned());
-        hdr.set_pinned(true);
-        assert!(hdr.is_pinned());
-        assert_eq!(hdr.payload_words(), 0);
     }
 
     #[test]
     fn payload_size_survives_gc_metadata_changes_at_large_object_boundaries() {
         for words in [8191, 8192, u16::MAX] {
             let mut header = ObjectHeader::new(Intrinsic::Str.type_index(), words);
-            header.set_pinned(true);
-            header.gc_meta |= 0b111; // forwarding and reserved mark bits
+            header.gc_meta |= (1 << 31) | 0b111; // upper bit + forwarding/reserved mark bits
             assert_eq!(header.payload_words(), words as usize);
             assert_eq!(
                 header.object_size(),
                 ObjectHeader::SIZE + words as usize * 8
             );
-            header.set_pinned(false);
+            header.gc_meta &= !(1 << 31);
             assert_eq!(header.payload_words(), words as usize);
         }
     }
@@ -1041,10 +1018,8 @@ mod tests {
         let mut header = ObjectHeader::new(TypeIndex::from_raw(1000), 3);
         header.gc_meta |= (PayloadRole::ErrorEnvelope as u32) << 19;
         header.gc_meta |= 7;
-        header.set_pinned(true);
         assert_eq!(header.payload_role(), Some(PayloadRole::ErrorEnvelope));
         assert_eq!(header.payload_words(), 3);
-        header.set_pinned(false);
         let fixture = Fixture {
             header,
             payload: [0x1000, 0x2000, 0x3000],

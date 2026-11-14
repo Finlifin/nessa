@@ -418,15 +418,27 @@ fn effect_dispatch_derives_resume_input_from_declared_effect_metadata() {
     });
     vm.add_function(FunctionCode {
         display_owner: None,
-        abi: None,
+        abi: nsbc::FunctionAbi::closure_values(0, 1),
         func_id: FuncId(0),
         instructions: vec![],
         register_count: 32,
         param_count: 1,
-        is_closure: false,
+        is_closure: true,
         function_type: TypeIndex::INVALID,
     });
     let task = task(&mut vm);
+    // SAFETY: TestVm holds an operation; initialize and publish the two-word
+    // closure metadata before any subsequent allocation or collection.
+    let handler_ptr = unsafe {
+        vm.state
+            .heap
+            .alloc_object(Intrinsic::Closure.type_index(), 2)
+    }
+    .unwrap();
+    let handler_closure = unsafe {
+        runtime::ClosureEnv::write(handler_ptr.as_ptr(), FuncId(0), &[]);
+        TaggedValue::from_heap_ptr(handler_ptr.as_ptr())
+    };
     vm.roots
         .scheduler
         .get_task_mut(task)
@@ -435,8 +447,7 @@ fn effect_dispatch_derives_resume_input_from_declared_effect_metadata() {
         .push(EffectHandler {
             effect_type: effect,
             handler_func: FuncId(0),
-            is_async: false,
-            closure_env: None,
+            closure_env: handler_closure,
             continuation_param: Some(0),
         });
     vm.roots

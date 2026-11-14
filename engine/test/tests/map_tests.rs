@@ -62,7 +62,7 @@ fn invalid_keys_arity_and_storage_access_are_compile_errors() {
         ("Map{}", "collection storage"),
         ("let m:Map={}", "anonymous Object"),
         ("let f=Map().get;f(\"key\")", "bound Map method values"),
-        ("let m=Map();m(\"key\")+=1", "compound assignment target"),
+        ("let m=Map();m(42)+=1", "Map index must have type String"),
     ] {
         let source = format!("fn main(){{{tail}}}");
         let result = driver::Driver::new().compile(&source);
@@ -90,6 +90,14 @@ fn gradual_keys_are_checked_at_runtime() {
         let error = common::run_value(source).expect_err("non-String dynamic key must fail");
         assert!(error.contains("TypeError"), "{source}: {error}");
     }
+}
+
+#[test]
+fn clear_removes_every_entry_including_stored_null() {
+    executes_42(&[
+        "fn main(){let m=Map();m(\"a\")=1;m(\"b\")=null;let alias=m;m.clear();if alias.len()==0 and m.is_empty() and not alias.contains(\"b\") and alias.get(\"a\")==null {42}else{0}}",
+        "fn main(){let m=Map();m.clear();if m.len()==0 {42}else{0}}",
+    ]);
 }
 
 #[test]

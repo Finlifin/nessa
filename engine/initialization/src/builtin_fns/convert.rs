@@ -30,13 +30,6 @@ pub fn to_string(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.return_string(&s)
 }
 
-/// Internal entry point used by compiler-generated Display wrappers.
-pub fn derived_display(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
-    ctx.require_arity(1)?;
-    let receiver = ctx.arg(0)?;
-    ctx.return_derived_display(receiver)
-}
-
 /// Primitive equality used by explicitly typed standard-library trait bodies.
 pub fn scalar_eq(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
@@ -45,6 +38,50 @@ pub fn scalar_eq(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     let equal = ctx.scalar_equal(left, right)?;
     ctx.return_bool(equal);
     Ok(())
+}
+
+/// Internal done test for `for` loops over dynamically typed iterables.
+pub fn iteration_step_done(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    let step = ctx.arg(0)?;
+    let done = ctx.iteration_step_done(step)?;
+    ctx.return_bool(done);
+    Ok(())
+}
+
+/// Internal native step of the standard library's Any equality.
+pub fn native_equal(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(2)?;
+    let left = ctx.arg(0)?;
+    let right = ctx.arg(1)?;
+    match ctx.native_equal(left, right)? {
+        Some(equal) => ctx.return_bool(equal),
+        None => ctx.return_null(),
+    }
+    Ok(())
+}
+
+pub fn tuple_len(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(1)?;
+    let value = ctx.arg(0)?;
+    match ctx.tuple_length(value)? {
+        Some(length) => {
+            let length = i64::try_from(length).map_err(|_| VmError::NumericOverflow)?;
+            ctx.return_i64(length)
+        }
+        None => {
+            ctx.return_null();
+            Ok(())
+        }
+    }
+}
+
+pub fn tuple_get(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(2)?;
+    let tuple = ctx.arg(0)?;
+    let index = ctx.arg_i64(1)?;
+    let element = ctx.tuple_element(tuple, index)?;
+    ctx.set_return(element)
 }
 
 /// Internal partial ordering result consumed by the standard-library Ordering adapter.

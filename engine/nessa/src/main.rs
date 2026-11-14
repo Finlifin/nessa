@@ -190,7 +190,12 @@ fn cmd_check(args: &[String]) {
         driver.compile(&source)
     };
     if result.has_errors {
-        eprintln!("check failed with errors");
+        for diag in &result.diagnostics {
+            eprintln!("error: {}", diag.message);
+        }
+        if result.diagnostics.is_empty() {
+            eprintln!("check failed with errors");
+        }
         process::exit(1);
     } else {
         println!("ok");

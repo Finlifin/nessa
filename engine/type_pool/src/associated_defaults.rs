@@ -277,7 +277,23 @@ impl TypePool {
     /// a Self-only template with no AssociatedType leaf. Such types are never
     /// executable layouts, signatures, or Type values before specialization.
     pub fn contains_associated_type(&self, ty: TypeIndex) -> bool {
-        contains_symbolic(&self.types, ty)
+        let index = ty.as_u32() as usize;
+        let mut concrete = self
+            .concrete_types
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if concrete.get(index).copied().unwrap_or(false) {
+            return false;
+        }
+        // A symbolic result may depend on an index registered later.
+        let symbolic = contains_symbolic(&self.types, ty);
+        if !symbolic {
+            if concrete.len() <= index {
+                concrete.resize(index + 1, false);
+            }
+            concrete[index] = true;
+        }
+        symbolic
     }
     pub fn associated_defaults_snapshot(&self) -> &[AssociatedTypeDefault] {
         &self.associated_defaults
@@ -726,6 +742,34 @@ mod tests {
             assoc_types.push((name, marker));
         }
         (owner, names)
+    }
+    #[test]
+    fn cached_concrete_results_follow_mutation_and_later_registration() {
+        let mut pool = TypePool::with_intrinsics();
+        let (_, names) = trait_with_bindings(&mut pool, &["Item"]);
+        let marker = TypeIndex(pool.len() as u32 - 1);
+        let holder = pool.intern_structural(TypeKind::Optional {
+            inner: Intrinsic::I64.type_index(),
+        });
+        assert!(!pool.contains_associated_type(holder));
+        assert!(!pool.contains_associated_type(holder));
+        pool.get_mut(holder).kind = TypeKind::Optional { inner: marker };
+        assert!(pool.contains_associated_type(holder));
+        assert!(
+            matches!(pool.get(marker).kind, TypeKind::AssociatedType { name, .. } if name == names[0])
+        );
+
+        let future = TypeIndex(pool.len() as u32 + 1);
+        let pending = pool.intern_structural(TypeKind::Optional { inner: future });
+        assert!(pool.contains_associated_type(pending));
+        assert_eq!(pool.len() as u32, future.0);
+        pool.register(TypeInfo {
+            kind: TypeKind::Tuple { elements: vec![] },
+            type_id: TypeId::ZERO,
+            size: 0,
+            align: 0,
+        });
+        assert!(!pool.contains_associated_type(pending));
     }
     #[test]
     fn required_declarations_need_explicit_bindings_and_cannot_be_nested() {

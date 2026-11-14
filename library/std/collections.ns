@@ -7,6 +7,41 @@ private const _get: fn(List, usize) -> Any = .__list_get'builtin
 private const _set: fn(List, usize, Any) -> Unit = .__list_set'builtin
 private const _push: fn(List, Any) -> Unit = .__list_push'builtin
 private const _pop: fn(List) -> Any = .__list_pop'builtin
+private const _copy: fn(List) -> List = .list_copy'builtin
+private const _reverse: fn(List) -> List = .list_reverse'builtin
+private const _concat: fn(List, List) -> List = .list_concat'builtin
+private const _swap: fn(List, usize, usize) -> Unit = .list_swap'builtin
+private const _clear: fn(List) -> Unit = .list_clear'builtin
+private const _insert: fn(List, usize, Any) -> Unit = .list_insert'builtin
+private const _remove: fn(List, usize) -> Any = .list_remove'builtin
+private const _take: fn(List, usize) -> List = .list_take'builtin
+private const _drop: fn(List, usize) -> List = .list_drop'builtin
+private const _first: fn(List) -> Any = .list_first'builtin
+private const _last: fn(List) -> Any = .list_last'builtin
+private const _append: fn(List, List) -> Unit = .list_append'builtin
+private const _join: fn(List, String) -> String = .list_join'builtin
+private const _list_is_empty: fn(List) -> bool = .list_is_empty'builtin
+private const _chunks: fn(List, usize) -> List = .list_chunks'builtin
+private const _enumerate: fn(List) -> List = .list_enumerate'builtin
+private fn _enumerate_entry() -> (i64, Any) { (0, null) }
+private const _flatten: fn(List) -> List = .list_flatten'builtin
+private const _zip: fn(List, List) -> List = .list_zip'builtin
+private const _windows: fn(List, usize) -> List = .list_windows'builtin
+private const _chunks_exact: fn(List, usize) -> List = .list_chunks_exact'builtin
+private const _rchunks: fn(List, usize) -> List = .list_rchunks'builtin
+private const _rchunks_exact: fn(List, usize) -> List = .list_rchunks_exact'builtin
+private const _chunks_remainder: fn(List, usize) -> List = .list_chunks_remainder'builtin
+private const _rchunks_remainder: fn(List, usize) -> List = .list_rchunks_remainder'builtin
+private const _split_at: fn(List, usize) -> List = .list_split_at'builtin
+private const _rotate_left: fn(List, usize) -> List = .list_rotate_left'builtin
+private const _rotate_right: fn(List, usize) -> List = .list_rotate_right'builtin
+private const _repeat: fn(List, i64) -> List = .list_repeat'builtin
+private const _truncate: fn(List, usize) -> Unit = .list_truncate'builtin
+private const _fill: fn(List, Any) -> Unit = .list_fill'builtin
+private const _swap_remove: fn(List, usize) -> Any = .list_swap_remove'builtin
+private const _split_off: fn(List, usize) -> List = .list_split_off'builtin
+private const _resize: fn(List, usize, Any) -> Unit = .list_resize'builtin
+private const _panic: fn(Any) -> NoReturn = .panic'builtin
 
 impl List {
     pub fn new() -> List { _init() }
@@ -17,20 +52,10 @@ impl List {
     pub fn update(self, index: usize, value: Any) { _set(self, index, value) }
     pub fn push(self, value: Any) { _push(self, value) }
     -- Concatenation creates a new wrapper; element references stay shared.
-    pub fn concat(self, other: List) -> List {
-        let result = List()
-        var index: usize = 0
-        while index < self.len() {
-            result.push(self.get(index))
-            index = index + 1
-        }
-        index = 0
-        while index < other.len() {
-            result.push(other.get(index))
-            index = index + 1
-        }
-        result
-    }
+    -- A new list. Element objects stay shared with both sources.
+    pub fn concat(self, other: List) -> List { _concat(self, other) }
+    -- A shallow copy. Later edits to either list do not change the other.
+    pub fn copy(self) -> List { _copy(self) }
     -- Empty lists return null; pop clears the removed slot for GC.
     pub fn pop(self) -> Any { _pop(self) }
     -- A shallow snapshot freezes input slots; element objects remain shared.
@@ -75,8 +100,164 @@ impl List {
         }
     }
     pub fn foreach(self, callback: fn(Any) -> Unit) { self.each(callback) }
+    pub fn is_empty(self) -> bool { _list_is_empty(self) }
+    -- Element tests use the same equality as `==` on Any values.
+    pub fn contains(self, value: Any) -> bool {
+        self.index_of(value) match {
+            _? => true,
+            _ => false,
+        }
+    }
+    pub fn index_of(self, value: Any) -> ?i64 {
+        var index: usize = 0
+        while index < self.len() {
+            if self.get(index) == value { return index.as(i64) }
+            index = index + 1
+        }
+        null
+    }
+    -- Keeps the first value of each equal group. Comparison is the same `==`
+    -- used by `contains`. The result is a new list.
+    pub fn unique(self) -> List {
+        let result = List()
+        var index: usize = 0
+        while index < self.len() {
+            let value = self.get(index)
+            if result.contains(value) {
+                index = index + 1
+            } else {
+                result.push(value)
+                index = index + 1
+            }
+        }
+        result
+    }
+    -- A new list in reverse order. The source stays unchanged.
+    pub fn reverse(self) -> List { _reverse(self) }
+    -- Pairs each element with its zero-based position as `(i64, Any)`.
+    pub fn enumerate(self) -> List { _enumerate(self) }
+    pub fn any(self, predicate: fn(Any) -> bool) -> bool {
+        let values = self.concat(List())
+        var index: usize = 0
+        while index < values.len() {
+            if predicate(values.get(index)) { return true }
+            index = index + 1
+        }
+        false
+    }
+    pub fn all(self, predicate: fn(Any) -> bool) -> bool {
+        let values = self.concat(List())
+        var index: usize = 0
+        while index < values.len() {
+            if not predicate(values.get(index)) { return false }
+            index = index + 1
+        }
+        true
+    }
+    -- Empty lists return null. A stored null element is indistinguishable.
+    -- Empty lists return null, same as a stored null.
+    pub fn first(self) -> Any { _first(self) }
+    pub fn last(self) -> Any { _last(self) }
+    -- `index == len` appends. A larger index is `InvalidIndex`, like `get`.
+    pub fn insert(self, index: usize, value: Any) { _insert(self, index, value) }
+    -- Shifts later elements down. The removed slot is cleared for GC.
+    pub fn remove(self, index: usize) -> Any { _remove(self, index) }
+    -- The same index is a no-op. An index past the end is `InvalidIndex`.
+    pub fn swap(self, left: usize, right: usize) { _swap(self, left, right) }
+    pub fn clear(self) { _clear(self) }
+    -- Copies the first `count` elements into a new list. A larger count copies
+    -- the whole list. A negative count is rejected because `count` is `usize`.
+    pub fn take(self, count: usize) -> List { _take(self, count) }
+    -- Copies the elements after the first `count` into a new list. A count past
+    -- the end returns an empty list.
+    pub fn drop(self, count: usize) -> List { _drop(self, count) }
+    -- Groups elements into new lists of `size`, with a shorter final group.
+    -- A size of zero panics. A negative size is rejected because `size` is `usize`.
+    pub fn chunks(self, size: usize) -> List { _chunks(self, size) }
+    -- Overlapping groups of `size`. A larger size yields an empty list. A size
+    -- of zero is an error. Copies are shallow, and the source stays unchanged.
+    pub fn windows(self, size: usize) -> List { _windows(self, size) }
+    -- Full groups only. The short tail is `chunks_remainder`.
+    pub fn chunks_exact(self, size: usize) -> List { _chunks_exact(self, size) }
+    -- Groups from the end. The first group is the tail, and a short group is kept.
+    pub fn rchunks(self, size: usize) -> List { _rchunks(self, size) }
+    -- Full groups from the end. The short prefix is `rchunks_remainder`.
+    pub fn rchunks_exact(self, size: usize) -> List { _rchunks_exact(self, size) }
+    pub fn chunks_remainder(self, size: usize) -> List { _chunks_remainder(self, size) }
+    pub fn rchunks_remainder(self, size: usize) -> List { _rchunks_remainder(self, size) }
+    -- Two new lists, split at an index in `0..=len`. The source stays unchanged.
+    pub fn split_at(self, index: usize) -> List { _split_at(self, index) }
+    -- A new list. `distance` must be at most the length; the length itself is a no-op.
+    pub fn rotate_left(self, distance: usize) -> List { _rotate_left(self, distance) }
+    pub fn rotate_right(self, distance: usize) -> List { _rotate_right(self, distance) }
+    -- A new list. A negative count is an error, and zero yields an empty list.
+    pub fn repeat(self, count: i64) -> List { _repeat(self, count) }
+    -- Shortens in place. A length past the end leaves the list unchanged.
+    pub fn truncate(self, len: usize) { _truncate(self, len) }
+    -- Every slot shares `value`.
+    pub fn fill(self, value: Any) { _fill(self, value) }
+    -- Removes `index` by swapping it with the last element, then returns it.
+    pub fn swap_remove(self, index: usize) -> Any { _swap_remove(self, index) }
+    -- Keeps `0..index` and returns `index..len` as a new list.
+    pub fn split_off(self, index: usize) -> List { _split_off(self, index) }
+    -- Shrinks like `truncate`, or grows by sharing `value` in each new slot.
+    pub fn resize(self, len: usize, value: Any) { _resize(self, len, value) }
+    -- Copies one level of nested lists into a new list. An element that is not
+    -- a List is a runtime type error.
+    pub fn flatten(self) -> List { _flatten(self) }
+    -- Pairs elements until the shorter list ends. Each element is an `(Any, Any)`.
+    pub fn zip(self, other: List) -> List { _zip(self, other) }
+    -- Appends a snapshot of `other`. Appending a list to itself terminates.
+    -- Named `append` because `extend` is a keyword.
+    pub fn append(self, other: List) { _append(self, other) }
+    -- Elements must be String values. An empty list returns an empty string.
+    pub fn join(self, separator: String) -> String { _join(self, separator) }
 }
 
+-- Lists are equal when they have the same length and pairwise equal elements.
+impl PartialEq for List {
+    pub fn eq(self, other: Self) -> bool {
+        if self.len() != other.len() { return false }
+        var index: usize = 0
+        while index < self.len() {
+            if self.get(index) != other.get(index) { return false }
+            index = index + 1
+        }
+        true
+    }
+}
+
+private const _native_equal: fn(Any, Any) -> ?bool = .__native_equal'builtin
+private const _tuple_len: fn(Any) -> ?i64 = .__tuple_len'builtin
+private const _tuple_get: fn(Any, i64) -> Any = .__tuple_get'builtin
+private const _runtime_type: fn(Any) -> Type = .type_of'builtin
+
+-- `==` on operands typed Any or tuple calls this function. Native kernels
+-- decide scalars and payload-free enums; tuples compare element-wise; values
+-- of different runtime types are unequal. `null` means both share a runtime
+-- type, so the Eq or PartialEq implementation visible at the comparison site
+-- decides. It must not use `==` on two Any values at the top level.
+fn dynamic_equal(left: Any, right: Any) -> ?bool {
+    _native_equal(left, right) match {
+        decided? => decided,
+        _ => _tuple_len(left) match {
+            length? => _tuple_len(right) match {
+                other? => length == other and tuple_elements_equal(left, right, length),
+                _ => false,
+            },
+            _ => if _runtime_type(left) == _runtime_type(right) { null } else { false },
+        },
+    }
+}
+
+fn tuple_elements_equal(left: Any, right: Any, length: i64) -> bool {
+    var index = 0
+    while index < length {
+        if _tuple_get(left, index) != _tuple_get(right, index) { return false }
+        index = index + 1
+    }
+    true
+}
 
 private const _map_init: fn() -> Map = .__map_init'builtin
 private const _map_length: fn(Map) -> i64 = .__map_len'builtin
@@ -85,6 +266,14 @@ private const _map_set: fn(Map, String, Any) -> Unit = .__map_set'builtin
 private const _map_remove: fn(Map, String) -> Any = .__map_remove'builtin
 private const _map_contains: fn(Map, String) -> bool = .__map_contains'builtin
 private const _map_keys: fn(Map) -> List = .__map_keys'builtin
+private const _map_values: fn(Map) -> List = .map_values'builtin
+private const _map_clear: fn(Map) -> Unit = .map_clear'builtin
+private const _map_merge: fn(Map, Map) -> Unit = .map_merge'builtin
+private const _map_get_or_insert: fn(Map, String, Any) -> Any = .map_get_or_insert'builtin
+private const _map_insert_absent: fn(Map, String, Any) -> bool = .map_insert_absent'builtin
+private const _map_entries: fn(Map) -> List = .map_entries'builtin
+private const _map_is_empty: fn(Map) -> bool = .map_is_empty'builtin
+private const _map_copy: fn(Map) -> Map = .map_copy'builtin
 
 impl Map {
     pub fn new() -> Map { _map_init() }
@@ -98,19 +287,35 @@ impl Map {
     pub fn contains(self, key: String) -> bool { _map_contains(self, key) }
     -- Snapshot order is unspecified; no insertion-order promise is made.
     pub fn keys(self) -> List { _map_keys(self) }
-    pub fn entries(self) -> List {
-        let result = List()
+    pub fn entries(self) -> List { _map_entries(self) }
+    -- Same order as `keys`. A stored null is included.
+    pub fn values(self) -> List { _map_values(self) }
+    pub fn is_empty(self) -> bool { _map_is_empty(self) }
+    -- A shallow copy. Later edits to either map do not change the other.
+    pub fn copy(self) -> Map { _map_copy(self) }
+    -- Drops every key and value edge. A later insert can reuse the map.
+    pub fn clear(self) { _map_clear(self) }
+    -- Copies entries from `other`. Keys already present are overwritten, including
+    -- a stored null. Merging a map into itself keeps the existing entries.
+    pub fn merge(self, other: Map) { _map_merge(self, other) }
+    -- Returns the stored value when the key is present, including a stored null.
+    -- Otherwise inserts `value` and returns it.
+    pub fn get_or_insert(self, key: String, value: Any) -> Any { _map_get_or_insert(self, key, value) }
+    -- Inserts only when the key is absent. A stored null counts as present.
+    pub fn insert_absent(self, key: String, value: Any) -> bool { _map_insert_absent(self, key, value) }
+}
+
+-- Maps are equal when they hold the same keys with pairwise equal values.
+-- Key order is irrelevant. Value comparison uses `==`, including nested maps.
+impl PartialEq for Map {
+    pub fn eq(self, other: Self) -> bool {
+        if self.len() != other.len() { return false }
         for key in self.keys() {
             let name: String = key.as(String)
-            let entry: (String, Any) = (name, self.get(name))
-            result.push(entry)
+            if not other.contains(name) { return false }
+            if self.get(name) != other.get(name) { return false }
         }
-        result
-    }
-    pub fn values(self) -> List {
-        let result = List()
-        for key in self.keys() { result.push(self.get(key.as(String))) }
-        result
+        true
     }
 }
 

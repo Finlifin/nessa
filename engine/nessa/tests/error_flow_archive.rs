@@ -388,9 +388,9 @@ fn nsbc3_cannot_smuggle_error_success_lifts_conversions_or_typed_function_capabi
 }
 
 #[test]
-fn genuine_unfinalized_nsbc3_preserves_legacy_error_metadata_but_never_reinterprets_payloads() {
+fn unfinalized_error_metadata_non_v4_containers_and_zero_checksums_reject() {
     use nsbc::{
-        BuiltinImport, CodegenOutput, CompiledArtifact, CompiledFunction, FuncId, ScopeCoverage,
+        BuiltinImport, CodegenOutput, CompiledArtifact, CompiledFunction, FuncId, FunctionAbi,
     };
     let mut pool = TypePool::with_intrinsics();
     let error = pool.register(TypeInfo {
@@ -416,10 +416,9 @@ fn genuine_unfinalized_nsbc3_preserves_legacy_error_metadata_but_never_reinterpr
         params: vec![],
         ret: Intrinsic::Unit.type_index(),
     });
-    let artifact = CompiledArtifact {
+    let unfinalized = CompiledArtifact {
         codegen_output: CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: ScopeCoverage::Calls,
+            method_call_scopes: vec![],
             functions: vec![CompiledFunction {
                 display_owner: None,
                 func_id: FuncId(0),
@@ -433,7 +432,7 @@ fn genuine_unfinalized_nsbc3_preserves_legacy_error_metadata_but_never_reinterpr
                 param_count: 0,
                 is_closure: false,
                 function_type: signature,
-                abi: None,
+                abi: FunctionAbi::default(),
                 safepoint_pcs: vec![],
             }],
             constants: vec![Constant::Type(legacy)],
@@ -441,33 +440,22 @@ fn genuine_unfinalized_nsbc3_preserves_legacy_error_metadata_but_never_reinterpr
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 1,
+        builtin_abi_version: 9,
         builtins: vec![BuiltinImport {
             id: 1,
             name: "println".into(),
         }],
     };
-    let mut bytes = nsbc_io::write_artifact(&artifact).unwrap();
-    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
-    let restored = nsbc_io::read_artifact(&bytes).unwrap();
-    assert!(restored.type_pool.identity_input().is_none());
-    assert_eq!(restored.type_pool.get(legacy).size, 0);
-    assert_eq!(restored.type_pool.get(error).type_id, TypeId(1234, 5678));
-    let d = Directory::new();
-    let p = d.0.join("legacy.nsbc");
-    std::fs::write(&p, &bytes).unwrap();
-    let run = cli("run", &p);
-    success(&run);
-    assert_eq!(run.stdout, b"42\n");
-    // Old descriptor reflection is metadata, not permission to instantiate a carrier.
-    let mut invalid = nsbc_io::read_artifact(&bytes).unwrap();
-    invalid.codegen_output.functions[0]
-        .instructions
-        .insert(0, Instruction::new_object(Reg(1), legacy).encode());
-    assert!(nsbc_io::write_artifact(&invalid).is_err());
-    for version in [1u32, 2, 5, u32::MAX] {
+    assert!(nsbc_io::write_artifact(&unfinalized).is_err());
+
+    let valid = compiled("enum E{bad};fn main(){let value:!E i64=42;println(value!{E.* =>0})}");
+    let bytes = nsbc_io::write_artifact(&valid).unwrap();
+    for version in [0u32, 1, 2, 3, 5, u32::MAX] {
         let mut bad = bytes.clone();
         bad[4..8].copy_from_slice(&version.to_le_bytes());
         rejects_before_entry(&bad);
     }
+    let mut zero_checksum = bytes;
+    zero_checksum[32..64].fill(0);
+    rejects_before_entry(&zero_checksum);
 }

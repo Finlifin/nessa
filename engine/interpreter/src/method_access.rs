@@ -33,13 +33,25 @@ impl Vm {
                 .instructions
                 .get(context.pc as usize)
                 .and_then(|&word| Instruction::decode(word))
-                .filter(|instruction| nsbc::ScopeCoverage::CallsAndTypes.covers(instruction.opcode))
+                .filter(|instruction| nsbc::instruction_requires_scope(instruction.opcode))
                 .ok_or(VmError::MissingMethodContext)?;
             if scopes
                 .insert((context.func_id, context.pc as usize), context.scope)
                 .is_some()
             {
                 return Err(VmError::MissingMethodContext);
+            }
+        }
+        for index in 0..self.state.bytecode.function_count() {
+            let func_id = nsbc::FuncId(index as u32);
+            let function = self.state.bytecode.get_function(func_id);
+            for (pc, &word) in function.instructions.iter().enumerate() {
+                if Instruction::decode(word)
+                    .is_some_and(|instruction| nsbc::instruction_requires_scope(instruction.opcode))
+                    && !scopes.contains_key(&(func_id, pc))
+                {
+                    return Err(VmError::MissingMethodContext);
+                }
             }
         }
         self.state.method_call_scopes = scopes;
@@ -81,12 +93,13 @@ impl Vm {
                     .type_pool
                     .method_accessible(method, scope)
                     .map_err(VmError::MethodAccess)?,
-                None if method.access == MethodAccess::LegacyUnknown => {
-                    return Err(VmError::MethodAccess(MethodAccessError::UnknownAccess));
-                }
-                // Explicit public host methods need no lexical authority. An
-                // artifact with a complete table is validated before loading.
-                None if method.access == MethodAccess::Public && method.visible_scope.is_none() => {
+                // Explicit public host methods on un-scoped intrinsic pools need
+                // no lexical authority; any pool with lexical scopes requires
+                // an installed instruction scope.
+                None if method.access == MethodAccess::Public
+                    && method.visible_scope.is_none()
+                    && self.state.type_pool.scopes().is_empty() =>
+                {
                     true
                 }
                 None => return Err(VmError::MissingMethodContext),
@@ -107,7 +120,7 @@ impl Vm {
 
 #[cfg(test)]
 mod tests {
-    use nsbc::{FuncId, Reg};
+    use nsbc::{FuncId, FunctionAbi, Reg};
     use runtime::FunctionCode;
     use type_pool::{Intrinsic, MethodSlot, ScopeContext};
 
@@ -180,7 +193,7 @@ mod tests {
         ] {
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: FunctionAbi::value_only(parameters as usize),
                 func_id: FuncId(id),
                 instructions: instructions.into_iter().map(Instruction::encode).collect(),
                 register_count: 6,
@@ -230,21 +243,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_missing_and_ambiguous_authority_are_not_silently_selected() {
-        let mut legacy = vm(MethodAccess::LegacyUnknown, None, Some(0));
-        legacy.spawn_root(FuncId(0));
+    fn missing_and_ambiguous_authority_are_not_silently_selected() {
+        for access in [MethodAccess::Private(1), MethodAccess::Public] {
+            let mut missing = vm(access, None, None);
+            missing.spawn_root(FuncId(0));
+            assert!(matches!(
+                missing.run(),
+                VmResult::Error(VmError::MissingMethodContext)
+            ));
+        }
+        let mut incomplete = vm(MethodAccess::Public, None, None);
         assert!(matches!(
-            legacy.run(),
-            VmResult::Error(VmError::MethodAccess(MethodAccessError::UnknownAccess))
+            incomplete.install_method_call_scopes(vec![]),
+            Err(VmError::MissingMethodContext)
         ));
-        drop(legacy);
-        let mut missing = vm(MethodAccess::Private(1), None, None);
-        missing.spawn_root(FuncId(0));
-        assert!(matches!(
-            missing.run(),
-            VmResult::Error(VmError::MissingMethodContext)
-        ));
-        drop(missing);
+        drop(incomplete);
         let mut ambiguous = vm(MethodAccess::Public, None, Some(0));
         ambiguous.state.type_pool.add_method(
             Intrinsic::Bool.type_index(),

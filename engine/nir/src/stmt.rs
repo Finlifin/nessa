@@ -2,7 +2,7 @@
 //! within basic blocks.
 
 use ast::{Ast, NodeIndex, NodeKind};
-use resolution::ResolvedAst;
+use resolution::{ForLoopPlan, ResolvedAst};
 
 use crate::builder::{FunctionBuilder, LoopTargets};
 use crate::expr::lower_expr;
@@ -347,16 +347,38 @@ fn lower_for_loop(
         .clone();
     let iterable = lower_expr(resolved, children[2], builder, block);
     let iter_local = builder.alloc_local();
-    let iter_expression = if let Some(call) = plan.into_iter {
-        let function = builder.func_map[&call.function.expect("checked into_iter target")];
-        NirExpr::Call(function, vec![iterable])
-    } else {
-        NirExpr::Use(iterable)
-    };
-    builder.blocks[block.0 as usize]
-        .stmts
-        .push(NirStmt::Assign(iter_local, iter_expression));
     let iter_val = NirValue::Local(iter_local);
+    // A static plan knows the exact IterationStep type; a dynamic one tests
+    // whichever concrete step the selected implementation returns.
+    let (next_expression, step_type) = match &plan {
+        ForLoopPlan::Static(plan) => {
+            let iter_expression = if let Some(call) = &plan.into_iter {
+                let function = builder.func_map[&call.function.expect("checked into_iter target")];
+                NirExpr::Call(function, vec![iterable])
+            } else {
+                NirExpr::Use(iterable)
+            };
+            builder.blocks[block.0 as usize]
+                .stmts
+                .push(NirStmt::Assign(iter_local, iter_expression));
+            let function = builder.func_map[&plan.next.function.expect("checked next target")];
+            (
+                NirExpr::Call(function, vec![iter_val]),
+                Some(plan.step_type),
+            )
+        }
+        ForLoopPlan::Dynamic { query_scope } => {
+            let next = crate::dynamic_loops::prepare(
+                resolved,
+                iterable,
+                iter_local,
+                query_scope.0,
+                builder,
+                block,
+            );
+            (next, None)
+        }
+    };
     let header_block = builder.new_block();
     let payload_block = builder.new_block();
     let body_block = builder.new_block();
@@ -366,24 +388,18 @@ fn lower_for_loop(
     // Each visit consumes exactly one next result. Only the explicit done tag
     // terminates; yielded null/Unit is still an element.
     let step_local = builder.alloc_local();
-    let function = builder.func_map[&plan.next.function.expect("checked next target")];
     builder.blocks[header_block.0 as usize]
         .stmts
-        .push(NirStmt::Assign(
-            step_local,
-            NirExpr::Call(function, vec![iter_val]),
-        ));
+        .push(NirStmt::Assign(step_local, next_expression));
+    let step = NirValue::Local(step_local);
+    let done_expression = match step_type {
+        Some(step_type) => NirExpr::EnumIs(step, step_type, type_pool::ITERATION_DONE_TAG),
+        None => NirExpr::CallBuiltin(runtime::ids::ITERATION_STEP_DONE, vec![step]),
+    };
     let done = builder.alloc_local();
     builder.blocks[header_block.0 as usize]
         .stmts
-        .push(NirStmt::Assign(
-            done,
-            NirExpr::EnumIs(
-                NirValue::Local(step_local),
-                plan.step_type,
-                type_pool::ITERATION_DONE_TAG,
-            ),
-        ));
+        .push(NirStmt::Assign(done, done_expression));
     builder.blocks[header_block.0 as usize].terminator =
         Terminator::Branch(NirValue::Local(done), exit_block, payload_block);
     let item = builder.alloc_local();

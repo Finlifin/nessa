@@ -1,8 +1,8 @@
 use ast::{Ast, NodeIndex};
 use diagnostic::{Diagnostic, DiagnosticContext};
-use runtime::{BUILTIN_FN_META, BuiltinFnId, BuiltinKind, catalog_lookup};
+use runtime::{BUILTIN_FN_META, BuiltinFnId, lookup_builtin_fn_id};
 use str_interner::StrId;
-use type_pool::{TypeId, TypeIndex, TypeInfo, TypeKind, TypePool};
+use type_pool::{Intrinsic, TypeId, TypeIndex, TypeInfo, TypeKind, TypePool, WellKnownTraits};
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,6 +47,7 @@ pub(crate) struct Resolver<'a> {
     pub(crate) default_methods: Vec<crate::DefaultMethodPlan>,
     pub(crate) default_body_context: Option<crate::default_methods::DefaultBodyContext>,
     pub(crate) concat_calls: HashMap<NodeIndex, SymbolId>,
+    pub(crate) equality_calls: HashMap<NodeIndex, SymbolId>,
     pub(crate) instance_methods: HashMap<NodeIndex, SymbolId>,
     pub(crate) application_calls: HashMap<NodeIndex, SymbolId>,
     pub(crate) update_calls: HashMap<NodeIndex, SymbolId>,
@@ -109,6 +110,7 @@ impl<'a> Resolver<'a> {
             default_methods: Vec::new(),
             default_body_context: None,
             concat_calls: HashMap::new(),
+            equality_calls: HashMap::new(),
             instance_methods: HashMap::new(),
             application_calls: HashMap::new(),
             update_calls: HashMap::new(),
@@ -156,22 +158,16 @@ impl<'a> Resolver<'a> {
 
     /// Pre-register all intrinsic type names in the root scope.
     fn register_builtin_types(&mut self) {
-        use type_pool::Intrinsic;
-        for &intr in Intrinsic::ALL {
-            if matches!(intr, Intrinsic::Closure) {
-                continue;
-            }
-            if !self.options.expose_root_types {
-                continue;
-            }
-            let name = str_interner::intern(intr.name());
-            let sym_id =
-                self.define_symbol(name, SymbolKind::Type, NodeIndex::NULL, Visibility::Public);
-            self.symbol_mut(sym_id).type_index = intr.type_index();
-        }
-        // Also ensure catalog has type entries for `'builtin` type views.
-        runtime::catalog_register_intrinsic_types(&self.type_pool);
         if self.options.expose_root_types {
+            for &intr in Intrinsic::ALL {
+                if matches!(intr, Intrinsic::Closure) {
+                    continue;
+                }
+                let name = str_interner::intern(intr.name());
+                let sym_id =
+                    self.define_symbol(name, SymbolKind::Type, NodeIndex::NULL, Visibility::Public);
+                self.symbol_mut(sym_id).type_index = intr.type_index();
+            }
             self.define_symbol(
                 str_interner::intern("IterationStep"),
                 SymbolKind::TypeFactory(crate::TypeFactory::IterationStep),
@@ -182,11 +178,9 @@ impl<'a> Resolver<'a> {
         self.register_well_known_traits();
     }
 
-    /// Pre-register well-known trait names in the root scope.
-    fn register_well_known_traits(&mut self) {
-        use type_pool::WellKnownTraits;
+    fn well_known_trait_indices(&self) -> [TypeIndex; 8] {
         let wk = self.type_pool.well_known;
-        let indices = [
+        [
             wk.display,
             wk.hash,
             wk.eq,
@@ -195,13 +189,17 @@ impl<'a> Resolver<'a> {
             wk.partial_ord,
             wk.iterator,
             wk.into_iterator,
-        ];
+        ]
+    }
+
+    /// Pre-register well-known trait names in the root scope.
+    fn register_well_known_traits(&mut self) {
+        if !self.options.expose_root_types {
+            return;
+        }
+        let indices = self.well_known_trait_indices();
         for (i, &name) in WellKnownTraits::NAMES.iter().enumerate() {
             let name_str = str_interner::intern(name);
-            runtime::catalog_register_type(name, indices[i]);
-            if !self.options.expose_root_types {
-                continue;
-            }
             let sym_id = self.define_symbol(
                 name_str,
                 SymbolKind::Trait,
@@ -278,6 +276,7 @@ impl<'a> Resolver<'a> {
             display_derivations: self.display_derivations,
             default_methods: self.default_methods,
             concat_calls: self.concat_calls,
+            equality_calls: self.equality_calls,
             instance_methods: self.instance_methods,
             application_calls: self.application_calls,
             update_calls: self.update_calls,
@@ -463,49 +462,47 @@ impl<'a> Resolver<'a> {
         self.type_pool.intern_structural(kind)
     }
 
-    /// Resolve a `'builtin` view against the shared catalog.
+    /// Resolve a `'builtin` view from the local type pool and static builtin metadata.
     pub(crate) fn resolve_builtin_view(
         &mut self,
         view_node: NodeIndex,
         symbol_name: &str,
     ) -> Option<SymbolId> {
+        let name = str_interner::intern(symbol_name);
         if symbol_name == "IterationStep" {
             return Some(self.alloc_unbound_symbol(
-                str_interner::intern(symbol_name),
+                name,
                 SymbolKind::TypeFactory(crate::TypeFactory::IterationStep),
                 view_node,
             ));
         }
-        if matches!(symbol_name, "List" | "Map") {
-            let ty = if symbol_name == "List" {
-                self.type_pool.list_type()?
-            } else {
-                self.type_pool.map_type()?
-            };
-            let symbol = self.alloc_unbound_symbol(
-                str_interner::intern(symbol_name),
-                SymbolKind::Type,
-                view_node,
-            );
-            self.symbol_mut(symbol).type_index = ty;
-            return Some(symbol);
+        let builtin_type = match symbol_name {
+            "List" => Some(self.type_pool.list_type()?),
+            "Map" => Some(self.type_pool.map_type()?),
+            _ => Intrinsic::ALL
+                .iter()
+                .copied()
+                .find(|&intr| !matches!(intr, Intrinsic::Closure) && intr.name() == symbol_name)
+                .map(|intr| self.type_pool.intrinsic(intr))
+                .or_else(|| {
+                    let indices = self.well_known_trait_indices();
+                    WellKnownTraits::NAMES
+                        .iter()
+                        .position(|&trait_name| trait_name == symbol_name)
+                        .map(|i| indices[i])
+                }),
+        };
+        if let Some(ty) = builtin_type {
+            let sym_id = self.alloc_unbound_symbol(name, SymbolKind::Type, view_node);
+            self.symbol_mut(sym_id).type_index = ty;
+            return Some(sym_id);
         }
-        match catalog_lookup(symbol_name) {
-            Some(BuiltinKind::Fn(id)) => {
-                let name = str_interner::intern(symbol_name);
-                let sym_id =
-                    self.alloc_unbound_symbol(name, SymbolKind::BuiltinFunction(id), view_node);
-                self.builtin_fns.insert(sym_id, id);
-                Some(sym_id)
-            }
-            Some(BuiltinKind::Type(ti)) => {
-                let name = str_interner::intern(symbol_name);
-                let sym_id = self.alloc_unbound_symbol(name, SymbolKind::Type, view_node);
-                self.symbol_mut(sym_id).type_index = ti;
-                Some(sym_id)
-            }
-            Some(BuiltinKind::Effect(_)) => None,
-            None => None,
+        if let Some(id) = lookup_builtin_fn_id(symbol_name) {
+            let sym_id =
+                self.alloc_unbound_symbol(name, SymbolKind::BuiltinFunction(id), view_node);
+            self.builtin_fns.insert(sym_id, id);
+            return Some(sym_id);
         }
+        None
     }
 }

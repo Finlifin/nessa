@@ -377,6 +377,7 @@ fn test_string_escapes() {
     assert_eq!(kinds_ok(r#""a\"b""#), vec![TokenKind::String]);
     assert_eq!(kinds_ok(r#""a\'b""#), vec![TokenKind::String]);
     assert_eq!(kinds_ok(r#""a\rb""#), vec![TokenKind::String]);
+    assert_eq!(kinds_ok(r#""a\0b""#), vec![TokenKind::String]);
 }
 
 #[test]
@@ -419,6 +420,8 @@ fn test_string_with_newline() {
 #[test]
 fn test_char_literal() {
     assert_eq!(kinds_ok("'a'"), vec![TokenKind::Char]);
+    assert_eq!(kinds_ok("' '"), vec![TokenKind::Char]);
+    assert_eq!(kinds_ok("'\t'"), vec![TokenKind::Char]);
 }
 
 #[test]
@@ -426,6 +429,23 @@ fn test_char_escape() {
     assert_eq!(kinds_ok("'\\n'"), vec![TokenKind::Char]);
     assert_eq!(kinds_ok("'\\t'"), vec![TokenKind::Char]);
     assert_eq!(kinds_ok("'\\''"), vec![TokenKind::Char]);
+    assert_eq!(kinds_ok("'\\0'"), vec![TokenKind::Char]);
+    assert_eq!(kinds_ok("'\\x41'"), vec![TokenKind::Char]);
+    assert_eq!(kinds_ok("'\\u00e9'"), vec![TokenKind::Char]);
+}
+
+#[test]
+fn test_char_numeric_escape_rejects_surrogates_and_braces() {
+    for source in ["'\\uD800'", "'\\u{41}'", "'\\x'"] {
+        let (kinds, errors) = lex(source);
+        assert_eq!(kinds, vec![TokenKind::Invalid], "{source}");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == LexErrorKind::InvalidCharLiteral),
+            "{source}: {errors:?}"
+        );
+    }
 }
 
 #[test]

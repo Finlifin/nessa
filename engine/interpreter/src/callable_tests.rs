@@ -140,7 +140,7 @@ fn apply_and_update_dispatch_for_heap_and_immediate_receiver_types() {
         ] {
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(parameters as usize),
                 func_id: FuncId(id),
                 instructions: instructions.into_iter().map(Instruction::encode).collect(),
                 register_count: 32,
@@ -192,7 +192,7 @@ fn dynamic_callers_reject_missing_methods_and_incomplete_full_arity() {
         ] {
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(parameters as usize),
                 func_id: FuncId(id),
                 instructions: instructions.into_iter().map(Instruction::encode).collect(),
                 register_count: 32,

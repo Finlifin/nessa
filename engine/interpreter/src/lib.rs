@@ -1,8 +1,8 @@
 use gc::{GC_FLAGS, GcConfig, Heap, NessaSlot, ObjectHeader};
-use nsbc::{AddrMode, FuncId, Instruction, InstructionData, Opcode, Reg};
+use nsbc::{AddrMode, FuncId, Instruction, InstructionData, Opcode, ParameterAbi, Reg};
 use runtime::{
-    BuiltinFnId, BytecodeStore, CallFrame, ClosureEnv, ConstantPool, EffectHandler, FunctionCode,
-    GlobalTable, Number, TaggedValue, TaskId,
+    BuiltinFnId, BytecodeStore, CallFrame, ClosureEnv, ConstantPool, FunctionCode, GlobalTable,
+    Number, TaggedValue, TaskId,
 };
 use scheduler::Scheduler;
 use stack_pool::StackPool;
@@ -17,13 +17,12 @@ mod builtin_ctx;
 mod callable_tests;
 mod closures;
 mod collections;
-mod continuation;
 #[cfg(test)]
 mod continuation_gc_tests;
 mod continuation_roots;
-mod derived;
 mod display;
 mod display_frames;
+mod dynamic_equality;
 #[cfg(test)]
 mod effect_contract_tests;
 mod effects;
@@ -114,14 +113,28 @@ impl Vm {
 
     pub fn constant_string(&mut self, index: u32) -> Result<String, VmError> {
         let _operation = self.operation();
-        let value = self
-            .roots
+        let value = self.constant_value(index)?;
+        builtin_ctx::heap_string_to_owned(value).ok_or(VmError::TypeError)
+    }
+
+    fn constant_value(&self, index: u32) -> Result<TaggedValue, VmError> {
+        self.roots
             .constants
             .values()
             .get(index as usize)
             .copied()
-            .ok_or(VmError::InvalidConstant(index))?;
-        builtin_ctx::heap_string_to_owned(value).ok_or(VmError::TypeError)
+            .ok_or(VmError::InvalidConstant(index))
+    }
+
+    fn constant_u32(&self, index: u32) -> Result<u32, VmError> {
+        let value = self.constant_value(index)?;
+        if let Some(raw) = value.as_u64() {
+            u32::try_from(raw).map_err(|_| VmError::TypeError)
+        } else if let Some(raw) = value.as_i64() {
+            u32::try_from(raw).map_err(|_| VmError::TypeError)
+        } else {
+            Err(VmError::TypeError)
+        }
     }
 
     fn operation(&self) -> gc::MutatorSession<'static> {
@@ -166,7 +179,6 @@ impl Vm {
                 type_index,
                 variant,
             } => self.enum_constant(*type_index, *variant)?,
-            nsbc::Constant::BigInt(_) => return Err(VmError::UnsupportedConstant),
         };
         Ok(self.roots.constants.push(value))
     }
@@ -233,13 +245,17 @@ impl Vm {
 
     /// Allocate a heap string and return its TaggedValue.
     /// The string bytes are laid out as: [len:u64][...UTF-8 bytes...].
+    /// Payload words of a String object: an eight-byte length prefix plus UTF-8 bytes.
+    fn string_payload_words(byte_len: usize) -> Result<u16, VmError> {
+        let payload_bytes = 8usize
+            .checked_add(byte_len)
+            .ok_or(VmError::ObjectTooLarge)?;
+        u16::try_from(payload_bytes.div_ceil(8)).map_err(|_| VmError::ObjectTooLarge)
+    }
+
     fn alloc_string(&mut self, s: &str) -> Result<TaggedValue, VmError> {
         let bytes = s.as_bytes();
-        let payload_bytes = 8usize
-            .checked_add(bytes.len())
-            .ok_or(VmError::ObjectTooLarge)?;
-        let payload_words =
-            u16::try_from(payload_bytes.div_ceil(8)).map_err(|_| VmError::ObjectTooLarge)?;
+        let payload_words = Self::string_payload_words(bytes.len())?;
         let str_type = self.state.type_pool.intrinsic(Intrinsic::Str);
         // SAFETY: callers hold an operation, and publish the initialized value
         // before ending it. There is no managed allocation during initialization.
@@ -283,7 +299,10 @@ impl Vm {
                     .get_task(task_id)
                     .expect("scheduled task exists")
                     .current_func;
-                if let Err(error) = self.check_user_argument_abi(function, 0) {
+                if let Err(error) = self
+                    .check_entry_environment(function, None)
+                    .and_then(|()| self.check_user_argument_abi(function, 0))
+                {
                     self.roots.scheduler.finish(task_id);
                     return VmResult::Error(error);
                 }
@@ -306,6 +325,9 @@ impl Vm {
 
     /// Execute one task until it finishes, suspends, errors, or yields.
     fn execute_task(&mut self, task_id: TaskId) -> ExecOutcome {
+        // Bytecode is immutable while a task runs, so a function's checked
+        // entry contract only needs revalidation when control changes function.
+        let mut validated_func = None;
         loop {
             // No instruction temporaries or mutable task borrows survive here.
             self.state.heap.safe_point();
@@ -318,24 +340,19 @@ impl Vm {
                 (task.pc, task.current_func)
             };
 
-            if pc == 0 {
-                let task = self
-                    .roots
-                    .scheduler
-                    .get_task(task_id)
-                    .expect("dispatched task exists");
-                let environment = match task.call_stack.last() {
-                    Some(frame) => frame.closure_env,
-                    None => task.stacks.active().entry_closure_env,
-                };
-                if let Err(error) = self.check_entry_environment(func_id, environment) {
-                    return ExecOutcome::Error(error);
-                }
-            }
-            let func = match self.checked_function(func_id) {
+            let checked = if validated_func == Some(func_id) {
+                self.state
+                    .bytecode
+                    .try_get_function(func_id)
+                    .ok_or(VmError::InvalidFunction(func_id))
+            } else {
+                self.checked_function(func_id)
+            };
+            let func = match checked {
                 Ok(function) => function,
                 Err(error) => return ExecOutcome::Error(error),
             };
+            validated_func = Some(func_id);
             if pc as usize >= func.instructions.len() {
                 return ExecOutcome::Finished;
             }
@@ -395,14 +412,23 @@ impl Vm {
     fn dispatch(&mut self, task_id: TaskId, instr: Instruction) -> DispatchResult {
         // PC belongs to the executing frame, including after continuation resume.
         // Restore the ambient query context even on yield or a language error.
-        let scope = self.roots.scheduler.get_task(task_id).and_then(|task| {
-            task.pc.checked_sub(1).and_then(|pc| {
-                self.state
-                    .method_call_scopes
-                    .get(&(task.current_func, pc as usize))
-                    .copied()
-            })
-        });
+        // Installation admits scope entries only for covered opcodes.
+        let scope = if nsbc::instruction_requires_scope(instr.opcode) {
+            let found = self.roots.scheduler.get_task(task_id).and_then(|task| {
+                task.pc.checked_sub(1).and_then(|pc| {
+                    self.state
+                        .method_call_scopes
+                        .get(&(task.current_func, pc as usize))
+                        .copied()
+                })
+            });
+            if found.is_none() && !self.state.type_pool.scopes().is_empty() {
+                return DispatchResult::Error(VmError::MissingMethodContext);
+            }
+            found
+        } else {
+            None
+        };
         let previous = self.state.type_query_scope;
         self.state.type_query_scope = scope;
         let result = self.dispatch_in_scope(task_id, instr);
@@ -489,34 +515,16 @@ impl Vm {
                 DispatchResult::Continue
             }
             Opcode::Load => {
-                let (dst, base, imm12) = a_fields(&instr);
+                let (dst, _, imm12) = a_fields(&instr);
                 let val = match instr.amode {
                     AddrMode::Imm => {
                         // Sign-extend 12-bit immediate to i64.
                         TaggedValue::from_i64(Instruction::sext_imm12(imm12) as i64)
                     }
-                    AddrMode::Const => self.roots.constants.get(imm12 as u32),
-                    AddrMode::RegOff => {
-                        let t = task!();
-                        let base_val = t.registers.get(base);
-                        let off = Instruction::sext_imm12(imm12) as i64;
-                        // SAFETY: the execution operation and base register keep
-                        // the value live; copy scalar data before allocation.
-                        let Some(base) = (unsafe { Number::from_tagged(base_val) }) else {
-                            return DispatchResult::Error(VmError::TypeError);
-                        };
-                        let result = base
-                            .binary(Number::I64(off), Opcode::Add)
-                            .map_err(VmError::from)
-                            .and_then(|number| self.number_value(number));
-                        match result {
-                            Ok(value) => value,
-                            Err(error) => return DispatchResult::Error(error),
-                        }
-                    }
-                    AddrMode::Reserved => {
-                        return DispatchResult::Error(VmError::InvalidInstruction(instr.encode()));
-                    }
+                    AddrMode::Const => match self.constant_value(imm12 as u32) {
+                        Ok(value) => value,
+                        Err(error) => return DispatchResult::Error(error),
+                    },
                 };
                 if val.as_enum().is_some()
                     && let Err(error) = self.enum_layout(val)
@@ -529,7 +537,10 @@ impl Vm {
             Opcode::LoadConstWide => {
                 let (dst, base, imm12) = a_fields(&instr);
                 let idx = Instruction::wide_const_index(base, imm12);
-                let val = self.roots.constants.get(idx);
+                let val = match self.constant_value(idx) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchResult::Error(error),
+                };
                 if val.as_enum().is_some()
                     && let Err(error) = self.enum_layout(val)
                 {
@@ -617,6 +628,9 @@ impl Vm {
             }
             Opcode::LoadGlobal | Opcode::LoadGlobalWide => {
                 let (dst, base, imm12) = a_fields(&instr);
+                if instr.opcode == Opcode::LoadGlobal && base.0 != 0 {
+                    return DispatchResult::Error(VmError::InvalidInstruction(instr.encode()));
+                }
                 let gidx = if instr.opcode == Opcode::LoadGlobalWide {
                     Instruction::wide_const_index(base, imm12)
                 } else {
@@ -630,34 +644,20 @@ impl Vm {
                 DispatchResult::Continue
             }
             Opcode::StoreGlobal | Opcode::StoreGlobalWide => {
-                let (val_reg, base, imm12) = a_fields(&instr);
+                let (dst, base, imm12) = a_fields(&instr);
+                if instr.opcode == Opcode::StoreGlobal && base.0 != 0 {
+                    return DispatchResult::Error(VmError::InvalidInstruction(instr.encode()));
+                }
                 let gidx = if instr.opcode == Opcode::StoreGlobalWide {
                     Instruction::wide_const_index(base, imm12)
                 } else {
-                    // Narrow: value in base (src), index in imm12; val_reg unused.
-                    // Keep compatibility with store_global encoding: a_type(dst=0, base=src, imm=gidx)
-                    // Prefer value from base for narrow StoreGlobal.
                     imm12 as u32
                 };
-                let val = if instr.opcode == Opcode::StoreGlobalWide {
-                    task!().registers.get(val_reg)
-                } else {
-                    task!().registers.get(base)
-                };
+                let val = task!().registers.get(dst);
                 if let Err(error) = self.store_global(gidx, val) {
                     return DispatchResult::Error(error);
                 }
                 DispatchResult::Continue
-            }
-            Opcode::LoadCapture => {
-                let (dst, _, imm12) = a_fields(&instr);
-                match self.load_capture_value(task_id, imm12 as u32) {
-                    Ok(value) => {
-                        task!().registers.set(dst, value);
-                        DispatchResult::Continue
-                    }
-                    Err(error) => DispatchResult::Error(error),
-                }
             }
 
             // ── Object creation (A-type) ──────────────────────────
@@ -712,12 +712,16 @@ impl Vm {
                 let value = task!().registers.get(source);
                 let result = match instr.opcode {
                     Opcode::ErrorOk | Opcode::ErrorErr => {
-                        match self.roots.constants.get(index as u32).as_type() {
-                            Some(target) => {
-                                self.construct_error(value, target, instr.opcode == Opcode::ErrorOk)
+                        self.constant_value(index as u32).and_then(|constant| {
+                            match constant.as_type() {
+                                Some(target) => self.construct_error(
+                                    value,
+                                    target,
+                                    instr.opcode == Opcode::ErrorOk,
+                                ),
+                                None => Err(VmError::TypeError),
                             }
-                            None => Err(VmError::TypeError),
-                        }
+                        })
                     }
                     _ if index != 0 => Err(VmError::TypeError),
                     _ => self.error_layout(value, 0).and_then(|layout| {
@@ -741,9 +745,12 @@ impl Vm {
                 let (destination, source, index) = a_fields(&instr);
                 let value = task!().registers.get(source);
                 let result = match instr.opcode {
-                    Opcode::NewEnum => self.new_enum(self.roots.constants.get(index as u32), value),
+                    Opcode::NewEnum => self
+                        .constant_value(index as u32)
+                        .and_then(|constant| self.new_enum(constant, value)),
                     Opcode::EnumIs => self
-                        .enum_is(value, self.roots.constants.get(index as u32))
+                        .constant_value(index as u32)
+                        .and_then(|constant| self.enum_is(value, constant))
                         .map(TaggedValue::from_bool),
                     _ => self.enum_field(value, index as u32),
                 };
@@ -794,16 +801,9 @@ impl Vm {
             Opcode::NewClosureWide => {
                 let (dst, base, imm12) = a_fields(&instr);
                 let capture_count = base.0 as u16;
-                let const_idx = imm12 as u32;
-                let func_id = match self.roots.constants.get(const_idx).as_u64() {
-                    Some(id) => FuncId(id as u32),
-                    None => {
-                        // Also try as i64
-                        match self.roots.constants.get(const_idx).as_i64() {
-                            Some(id) => FuncId(id as u32),
-                            None => return DispatchResult::Error(VmError::TypeError),
-                        }
-                    }
+                let func_id = match self.constant_u32(imm12 as u32) {
+                    Ok(id) => FuncId(id),
+                    Err(error) => return DispatchResult::Error(error),
                 };
                 self.exec_new_closure(task_id, dst, func_id, capture_count)
             }
@@ -866,16 +866,15 @@ impl Vm {
             Opcode::CallFar => {
                 let payload = c_payload(&instr);
                 let (arg_count, const_idx) = Instruction::c_arg_count_func_id(payload);
-                let tv = self.roots.constants.get(const_idx);
-                let func_id_raw = tv
-                    .as_u64()
-                    .or_else(|| tv.as_i64().map(|v| v as u64))
-                    .unwrap_or(0);
+                let func_id_raw = match self.constant_u32(const_idx) {
+                    Ok(id) => id,
+                    Err(error) => return DispatchResult::Error(error),
+                };
                 if arg_count as usize > runtime::GP_REGISTER_COUNT {
                     return DispatchResult::Error(VmError::TypeError);
                 }
                 let arguments = task!().registers.regs[..arg_count as usize].to_vec();
-                self.invoke_closure_physical(task_id, FuncId(func_id_raw as u32), None, &arguments)
+                self.invoke_closure_physical(task_id, FuncId(func_id_raw), None, &arguments)
             }
 
             Opcode::CallIndirect | Opcode::CallIndirectProof => {
@@ -887,14 +886,17 @@ impl Vm {
                     Some(p) => p,
                     None => {
                         // Callable nominal values can use immediate storage,
-                        // notably nullary Enum variants. Their actual type and
-                        // method metadata are checked by ordinary apply dispatch.
-                        return self.exec_call_method(
-                            task_id,
-                            closure_reg,
-                            str_interner::intern("apply"),
-                            arg_count,
-                        );
+                        // notably nullary Enum variants.
+                        return if instr.opcode == Opcode::CallIndirectProof {
+                            self.exec_call_apply_proof(task_id, closure_reg, arg_count)
+                        } else {
+                            self.exec_call_method(
+                                task_id,
+                                closure_reg,
+                                str_interner::intern("apply"),
+                                arg_count,
+                            )
+                        };
                     }
                 };
 
@@ -905,14 +907,17 @@ impl Vm {
                     return DispatchResult::Error(VmError::TypeError);
                 }
                 if header.type_index != Intrinsic::Closure.type_index() {
-                    // Dynamic calls include continuations and callable objects;
-                    // their existing apply dispatch retains their own ABI.
-                    return self.exec_call_method(
-                        task_id,
-                        closure_reg,
-                        str_interner::intern("apply"),
-                        arg_count,
-                    );
+                    // Dynamic calls include continuations and callable objects.
+                    return if instr.opcode == Opcode::CallIndirectProof {
+                        self.exec_call_apply_proof(task_id, closure_reg, arg_count)
+                    } else {
+                        self.exec_call_method(
+                            task_id,
+                            closure_reg,
+                            str_interner::intern("apply"),
+                            arg_count,
+                        )
+                    };
                 }
                 if header.payload_words() < 2 || arg_count as usize > runtime::GP_REGISTER_COUNT {
                     return DispatchResult::Error(VmError::TypeError);
@@ -975,24 +980,11 @@ impl Vm {
             Opcode::CallMethodFar => {
                 let payload = c_payload(&instr);
                 let (arg_count, recv_reg, const_idx) = Instruction::c_call_method(payload);
-                let tv = self.roots.constants.get(const_idx);
-                let method_id = tv
-                    .as_u64()
-                    .or_else(|| tv.as_i64().map(|v| v as u64))
-                    .unwrap_or(0) as u32;
+                let method_id = match self.constant_u32(const_idx) {
+                    Ok(id) => id,
+                    Err(error) => return DispatchResult::Error(error),
+                };
                 self.exec_call_method(task_id, recv_reg, StrId::from_raw(method_id), arg_count)
-            }
-            Opcode::CallWasm => {
-                // TODO: WASM FFI call
-                DispatchResult::Continue
-            }
-            Opcode::TailCall => {
-                let payload = c_payload(&instr);
-                let (_arg_count, func_id_raw) = Instruction::c_arg_count_func_id(payload);
-                let t = task!();
-                t.current_func = FuncId(func_id_raw);
-                t.pc = 0;
-                DispatchResult::Continue
             }
             Opcode::CallBuiltin => {
                 let payload = c_payload(&instr);
@@ -1007,10 +999,6 @@ impl Vm {
             Opcode::ReturnUnit => DispatchResult::Return(TaggedValue::UNIT),
 
             // ── Effects (E-type) ──────────────────────────────────
-            Opcode::EffectCall => {
-                // TODO: static effect call via evidence
-                DispatchResult::Continue
-            }
             Opcode::EffectCallDyn => self.dispatch_effect(task_id, &instr),
             Opcode::PushHandlerClosure | Opcode::PushCapturingHandler => {
                 self.dispatch_push_handler_closure(task_id, &instr)
@@ -1019,47 +1007,9 @@ impl Vm {
             Opcode::ResumeContinuation | Opcode::ResumeContinuationOnce => {
                 self.dispatch_language_resume(task_id, &instr)
             }
-            Opcode::PushHandler => {
-                // payload: effect_type(11) | handler_func(11)
-                let payload = e_payload(&instr);
-                let effect_type = TypeIndex::from_raw((payload >> 11) & 0x7FF);
-                let handler_func = FuncId(payload & 0x7FF);
-                let t = task!();
-                t.handler_stack.push(EffectHandler {
-                    effect_type,
-                    handler_func,
-                    is_async: false,
-                    closure_env: None,
-                    continuation_param: None,
-                });
-                DispatchResult::Continue
-            }
-            Opcode::PushHandlerWide => {
-                let payload = e_payload(&instr);
-                let const_idx = payload & 0x3FFFFF;
-                let tv = self.roots.constants.get(const_idx);
-                let packed = tv.as_u64().unwrap_or(0);
-                let effect_type = TypeIndex::from_raw((packed >> 32) as u32);
-                let handler_func = FuncId(packed as u32);
-                let t = task!();
-                t.handler_stack.push(EffectHandler {
-                    effect_type,
-                    handler_func,
-                    is_async: false,
-                    closure_env: None,
-                    continuation_param: None,
-                });
-                DispatchResult::Continue
-            }
             Opcode::PopHandler => {
                 task!().handler_stack.pop();
                 DispatchResult::Continue
-            }
-            Opcode::Shift => self.dispatch_shift(task_id, &instr),
-            Opcode::Reset => self.dispatch_reset(task_id, &instr),
-            Opcode::Resume => self.dispatch_resume(task_id, &instr),
-            Opcode::CloneContinuation | Opcode::DropContinuation => {
-                self.dispatch_continuation_lifecycle(task_id, &instr)
             }
 
             // ── System (E-type) ───────────────────────────────────
@@ -1073,10 +1023,7 @@ impl Vm {
                 }
                 DispatchResult::Continue
             }
-            Opcode::DebugBreak => {
-                // No-op in normal execution.
-                DispatchResult::Continue
-            }
+            Opcode::Unreachable => DispatchResult::Error(VmError::UnreachableExecuted),
             Opcode::Nop => DispatchResult::Continue,
         }
     }
@@ -1086,12 +1033,8 @@ impl Vm {
         &mut self,
         task_id: TaskId,
         target: FuncId,
-        closure_env: Option<TaggedValue>,
         arguments: &[TaggedValue],
     ) -> DispatchResult {
-        if let Err(error) = self.check_entry_environment(target, closure_env) {
-            return DispatchResult::Error(error);
-        }
         let (display_state, cycle) = match self.display_call_state(task_id, target, arguments) {
             Ok(state) => state,
             Err(error) => return DispatchResult::Error(error),
@@ -1107,8 +1050,6 @@ impl Vm {
             func_id: t.current_func,
             saved_regs: saved,
             local_slots: std::mem::take(&mut t.local_slots),
-            evidence: Vec::new(),
-            closure_env,
         };
         t.call_stack.push(frame);
         t.current_func = target;
@@ -1148,37 +1089,13 @@ impl Vm {
             Err(error) => return DispatchResult::Error(error),
         };
         if let Some(method) = selected {
-            let function_id = method.func_id;
-            if function_id == type_pool::DERIVE_FUNC_ID {
-                if self
-                    .state
-                    .type_pool
-                    .check_native_derived_slot(recv_type, &method)
-                    .is_err()
-                {
-                    return DispatchResult::Error(VmError::UnsupportedDerivedMethod(
-                        "untrusted native contract",
-                    ));
-                }
-                return self.dispatch_derived_method(
-                    task_id,
-                    receiver,
-                    recv_type,
-                    method_str_id,
-                    arg_count,
-                );
-            }
-
-            let target_func_id = FuncId(function_id);
+            let target_func_id = FuncId(method.func_id);
             let function = match self.checked_function(target_func_id) {
                 Ok(function) => function,
                 Err(error) => return DispatchResult::Error(error),
             };
+            let logical_count = function.abi.logical_parameter_count();
             if let Err(error) = self.check_entry_environment(target_func_id, None) {
-                return DispatchResult::Error(error);
-            }
-            if let Err(error) = self.check_user_argument_abi(target_func_id, arg_count as usize + 1)
-            {
                 return DispatchResult::Error(error);
             }
             // A normal instance method takes self before its explicit arguments.
@@ -1190,12 +1107,6 @@ impl Vm {
                     got: arg_count,
                 });
             }
-            let logical_count = function
-                .abi
-                .as_ref()
-                .map_or(function.param_count as usize, |abi| {
-                    abi.logical_parameter_count()
-                });
             let Some(expected) = logical_count.checked_sub(1) else {
                 return DispatchResult::Error(VmError::TypeError);
             };
@@ -1259,6 +1170,119 @@ impl Vm {
         }
     }
 
+    fn exec_call_apply_proof(
+        &mut self,
+        task_id: TaskId,
+        recv_reg: Reg,
+        arg_count: u8,
+    ) -> DispatchResult {
+        let receiver = self
+            .roots
+            .scheduler
+            .get_task(task_id)
+            .expect("dispatched task exists")
+            .registers
+            .get(recv_reg);
+        let recv_type = match self.reflected_type(receiver) {
+            Ok(ty) => ty,
+            Err(error) => return DispatchResult::Error(error),
+        };
+        let apply_name = str_interner::intern("apply");
+        let selected = match self.selected_method(task_id, recv_type, apply_name) {
+            Ok(selected) => selected,
+            Err(error) => return DispatchResult::Error(error),
+        };
+        if let Some(method) = selected {
+            let target_func_id = FuncId(method.func_id);
+            let abi = match self.checked_function(target_func_id) {
+                Ok(function) => function.abi.clone(),
+                Err(error) => return DispatchResult::Error(error),
+            };
+            if let Err(error) = self.check_entry_environment(target_func_id, None) {
+                return DispatchResult::Error(error);
+            }
+            let Some(self_param) = abi.parameters.first() else {
+                return DispatchResult::Error(VmError::TypeError);
+            };
+            let expected_explicit: usize = abi.parameters[1..]
+                .iter()
+                .map(|parameter| match parameter {
+                    ParameterAbi::Value => 1,
+                    ParameterAbi::Trait { .. } | ParameterAbi::TraitSelf { .. } => 2,
+                })
+                .sum();
+            if arg_count as usize != expected_explicit {
+                return DispatchResult::Error(VmError::ArityError {
+                    expected: expected_explicit as u8,
+                    got: arg_count,
+                });
+            }
+            let mut physical = match self_param {
+                ParameterAbi::Value => vec![receiver],
+                ParameterAbi::Trait { view } | ParameterAbi::TraitSelf { view } => {
+                    let proof = match self.acquire_trait_proof(receiver, *view) {
+                        Ok(proof) => proof,
+                        Err(error) => return DispatchResult::Error(error),
+                    };
+                    vec![proof, receiver]
+                }
+            };
+            let t = self.roots.scheduler.get_task(task_id).unwrap();
+            physical.extend_from_slice(&t.registers.regs[..arg_count as usize]);
+            if let Err(error) = self.prepare_indirect_arguments(target_func_id, &mut physical) {
+                return DispatchResult::Error(error);
+            }
+            self.invoke_closure_physical(task_id, target_func_id, None, &physical)
+        } else if recv_type == Intrinsic::Continuation.type_index() {
+            let handle = match Self::language_continuation_handle(receiver) {
+                Ok(handle) => handle,
+                Err(error) => return DispatchResult::Error(error),
+            };
+            let contract = match self.continuation_input_contract(task_id, handle) {
+                Ok(contract) => contract,
+                Err(error) => return DispatchResult::Error(error),
+            };
+            let input_ty = match self.canonical_type(contract.input) {
+                Ok(ty) => ty,
+                Err(error) => return DispatchResult::Error(error),
+            };
+            if matches!(
+                self.state.type_pool.get(input_ty).kind,
+                type_pool::TypeKind::Trait { .. }
+            ) {
+                if arg_count != 2 {
+                    return DispatchResult::Error(VmError::ArityError {
+                        expected: 2,
+                        got: arg_count,
+                    });
+                }
+                let t = self.roots.scheduler.get_task(task_id).unwrap();
+                let proof = t.registers.get(Reg(0));
+                let value = t.registers.get(Reg(1));
+                if let Err(error) = self.assert_trait_pair(proof, value, input_ty) {
+                    return DispatchResult::Error(error);
+                }
+                return self.resume_language_value(task_id, receiver, value);
+            }
+            if arg_count != 1 {
+                return DispatchResult::Error(VmError::ArityError {
+                    expected: 1,
+                    got: arg_count,
+                });
+            }
+            let value = self
+                .roots
+                .scheduler
+                .get_task(task_id)
+                .expect("dispatched task exists")
+                .registers
+                .get(Reg(0));
+            self.resume_language_value(task_id, receiver, value)
+        } else {
+            DispatchResult::Error(VmError::MethodNotFound)
+        }
+    }
+
     fn exec_new_closure(
         &mut self,
         task_id: TaskId,
@@ -1303,80 +1327,6 @@ impl Vm {
                 DispatchResult::Continue
             }
             None => DispatchResult::Error(VmError::OutOfMemory),
-        }
-    }
-
-    /// Dispatch a compiler-derived (synthesized) method.
-    /// For `derive Eq for Point`, the method `eq` does field-wise comparison.
-    fn dispatch_derived_method(
-        &mut self,
-        task_id: TaskId,
-        receiver: TaggedValue,
-        recv_type: TypeIndex,
-        method_name: StrId,
-        arg_count: u8,
-    ) -> DispatchResult {
-        let method_str = match str_interner::try_get(method_name) {
-            Some(method) => method,
-            None => return DispatchResult::Error(VmError::MethodNotFound),
-        };
-        let expected = match method_str.as_str() {
-            "eq" | "cmp" => Some(1),
-            "to_string" => Some(0),
-            _ => None,
-        };
-        if let Some(expected) = expected
-            && arg_count != expected
-        {
-            return DispatchResult::Error(VmError::ArityError {
-                expected,
-                got: arg_count,
-            });
-        }
-        let t = self.roots.scheduler.get_task_mut(task_id).unwrap();
-
-        match method_str.as_str() {
-            "eq" => {
-                // Derived eq: compare all fields of a struct.
-                // arg r0 = other (first explicit arg)
-                let other = t.registers.get(Reg(0));
-
-                let result = match self.derived_struct_eq(receiver, other, recv_type) {
-                    Ok(value) => value,
-                    Err(error) => return DispatchResult::Error(error),
-                };
-                let t = self.roots.scheduler.get_task_mut(task_id).unwrap();
-                t.registers.set(Reg(0), TaggedValue::from_bool(result));
-                DispatchResult::Continue
-            }
-            "cmp" => {
-                // Derived cmp: lexicographic field comparison returning -1/0/1.
-                let other = t.registers.get(Reg(0));
-
-                let result = match self.derived_struct_cmp(receiver, other, recv_type) {
-                    Ok(value) => value,
-                    Err(error) => return DispatchResult::Error(error),
-                };
-                let t = self.roots.scheduler.get_task_mut(task_id).unwrap();
-                t.registers.set(Reg(0), TaggedValue::from_i64(result));
-                DispatchResult::Continue
-            }
-            "hash" => DispatchResult::Error(VmError::UnsupportedDerivedMethod("hash")),
-            "to_string" => {
-                // Derived to_string (Display): produce "TypeName { field: val, ... }".
-                let s = match self.derived_struct_to_string(receiver, recv_type) {
-                    Ok(value) => value,
-                    Err(error) => return DispatchResult::Error(error),
-                };
-                let result = match self.alloc_string(&s) {
-                    Ok(value) => value,
-                    Err(error) => return DispatchResult::Error(error),
-                };
-                let t = self.roots.scheduler.get_task_mut(task_id).unwrap();
-                t.registers.set(Reg(0), result);
-                DispatchResult::Continue
-            }
-            _ => DispatchResult::Error(VmError::MethodNotFound),
         }
     }
 
@@ -1498,10 +1448,12 @@ pub enum VmError {
     InvalidField(u32),
     InvalidEnumVariant(u32),
     UnsupportedEnumEquality,
-    UnsupportedDerivedMethod(&'static str),
     UnsupportedEquality,
     NoMatchingCase,
+    UnreachableExecuted,
     InvalidIndex,
+    /// A native argument has the right type but violates the operation's domain.
+    InvalidArgument(&'static str),
     DisplayDepthExceeded,
     DisplaySizeExceeded,
     InvalidConstant(u32),
@@ -1514,7 +1466,6 @@ pub enum VmError {
     UnhandledEffect(TypeIndex),
     OutOfMemory,
     ObjectTooLarge,
-    UnsupportedConstant,
     UnsupportedFunctionAbi,
     InvalidTraitProof,
     TraitProofLimit,
@@ -1525,7 +1476,10 @@ pub enum VmError {
     NumericOverflow,
     DivisionByZero,
     InvalidShift,
-    ArityError { expected: u8, got: u8 },
+    ArityError {
+        expected: u8,
+        got: u8,
+    },
     UnknownBuiltin(u32),
     MethodNotFound,
     MethodAccess(type_pool::MethodAccessError),
@@ -1537,6 +1491,63 @@ pub enum VmError {
     Panic(String),
 }
 
+impl std::fmt::Display for VmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInstruction(word) => write!(f, "invalid instruction {word:#010x}"),
+            Self::InvalidTask => f.write_str("invalid task"),
+            Self::InvalidFunction(id) => write!(f, "invalid function id {}", id.0),
+            Self::InvalidSlot(index) => write!(f, "invalid local slot {index}"),
+            Self::InvalidField(index) => write!(f, "invalid field index {index}"),
+            Self::InvalidEnumVariant(tag) => write!(f, "invalid enum variant {tag}"),
+            Self::UnsupportedEnumEquality => f.write_str("unsupported payload enum equality"),
+            Self::UnsupportedEquality => f.write_str("unsupported scalar equality operand"),
+            Self::NoMatchingCase => f.write_str("non-exhaustive match failed"),
+            Self::UnreachableExecuted => f.write_str("entered unreachable code"),
+            Self::InvalidIndex => f.write_str("index out of bounds"),
+            Self::InvalidArgument(reason) => write!(f, "invalid argument: {reason}"),
+            Self::DisplayDepthExceeded => f.write_str("display formatting depth exceeded"),
+            Self::DisplaySizeExceeded => f.write_str("display formatting size exceeded"),
+            Self::InvalidConstant(index) => write!(f, "invalid constant index {index}"),
+            Self::InvalidGlobal(index) => write!(f, "invalid global index {index}"),
+            Self::UninitializedGlobal(index) => write!(f, "uninitialized global {index}"),
+            Self::ImmutableGlobal(index) => write!(f, "cannot mutate immutable global {index}"),
+            Self::GlobalsAlreadyInitialized => f.write_str("globals already initialized"),
+            Self::InvalidType(ty) => write!(f, "invalid type index {}", ty.as_u32()),
+            Self::Stack(error) => write!(f, "stack error: {error:?}"),
+            Self::UnhandledEffect(ty) => write!(f, "unhandled effect {}", ty.as_u32()),
+            Self::OutOfMemory => f.write_str("out of memory"),
+            Self::ObjectTooLarge => f.write_str("object exceeds maximum size"),
+            Self::UnsupportedFunctionAbi => f.write_str("unsupported function ABI"),
+            Self::InvalidTraitProof => f.write_str("invalid trait proof"),
+            Self::TraitProofLimit => f.write_str("trait proof registry limit reached"),
+            Self::TraitProofMetadata(error) => write!(f, "invalid trait proof metadata: {error:?}"),
+            Self::CrossVmOperation => f.write_str("cross-VM reentry is not permitted"),
+            Self::TypeError => f.write_str("type error"),
+            Self::UnsupportedLegacyErrorLayout(ty) => {
+                write!(f, "unsupported error layout for type {}", ty.as_u32())
+            }
+            Self::NumericOverflow => f.write_str("numeric overflow"),
+            Self::DivisionByZero => f.write_str("division by zero"),
+            Self::InvalidShift => f.write_str("invalid bit shift"),
+            Self::ArityError { expected, got } => {
+                write!(f, "arity mismatch: expected {expected}, got {got}")
+            }
+            Self::UnknownBuiltin(id) => write!(f, "unknown builtin {id}"),
+            Self::MethodNotFound => f.write_str("method not found"),
+            Self::MethodAccess(error) => write!(f, "invalid method access metadata: {error:?}"),
+            Self::MethodAccessDenied => f.write_str("method access denied"),
+            Self::AmbiguousMethod => f.write_str("ambiguous method call"),
+            Self::MissingMethodContext => f.write_str("missing lexical method call context"),
+            Self::TraitLookup(error) => write!(f, "trait lookup error: {error:?}"),
+            Self::MissingTraitContext => f.write_str("missing lexical trait context"),
+            Self::Panic(message) => write!(f, "panic: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for VmError {}
+
 // ---------------------------------------------------------------------------
 // GC root scanning — enumerates all roots in the VM for MMTk
 // ---------------------------------------------------------------------------
@@ -1544,10 +1555,9 @@ pub enum VmError {
 /// Root scan callback owned by Vm's lifetime-bound registration.
 ///
 /// Walks all root sources in the Vm:
-///   1. Registers (per task)
-///   2. Call stack saved_regs (per frame per task)
-///   3. Global variable table
-///   4. Constant pool
+///   1. Global variable table, constant pool, and temporary value roots
+///   2. Active and pending-delimiter stack contexts across all scheduled tasks
+///   3. Native pinning roots
 ///
 /// Each TaggedValue that might hold a heap pointer is presented to the
 /// visitor as a `NessaSlot` pointing at the memory location of the value.
@@ -1582,42 +1592,8 @@ unsafe fn scan_vm_roots(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) 
             .scheduler
             .get_task_mut(task_id)
             .expect("enumerated task remains alive under STW");
-        for context in task.stacks.root_contexts_mut() {
-            if let Some(state) = &mut context.display_state {
-                for value in &mut state.ancestors {
-                    visit(value);
-                }
-            }
-            if let Some(environment) = &mut context.entry_closure_env {
-                visit(environment);
-            }
-            for handler in &mut context.handler_stack {
-                if let Some(environment) = &mut handler.closure_env {
-                    visit(environment);
-                }
-            }
-            for value in &mut context.local_slots {
-                visit(value);
-            }
-            for value in &mut context.registers.regs {
-                visit(value);
-            }
-            for frame in &mut context.call_stack {
-                if let Some(state) = &mut frame.display_state {
-                    for value in &mut state.ancestors {
-                        visit(value);
-                    }
-                }
-                for value in &mut frame.local_slots {
-                    visit(value);
-                }
-                for (_, value) in &mut frame.saved_regs {
-                    visit(value);
-                }
-                if let Some(environment) = &mut frame.closure_env {
-                    visit(environment);
-                }
-            }
+        for stack_context in task.stacks.root_contexts_mut() {
+            continuation_roots::visit_stack_slots(stack_context, visitor);
         }
     }
     for value in vm.native_pins.get_mut() {
@@ -1628,15 +1604,13 @@ unsafe fn scan_vm_roots(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) 
 }
 
 // ---------------------------------------------------------------------------
-// Value type introspection
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use nsbc::FunctionAbi;
+
     use super::*;
 
     pub(super) struct TestVm {
@@ -1687,7 +1661,7 @@ mod tests {
         ]);
         let func = FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: code,
             register_count: 3,
@@ -1714,7 +1688,7 @@ mod tests {
         let mut vm = make_vm();
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: encode_instrs(&[
                 Instruction::allocate_slots(70001),
@@ -1745,7 +1719,7 @@ mod tests {
             let mut vm = make_vm();
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: FunctionAbi::value_only(0),
                 func_id: FuncId(0),
                 instructions: encode_instrs(&[Instruction::allocate_slots(1), access]),
                 register_count: 32,
@@ -1778,7 +1752,7 @@ mod tests {
             };
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: FunctionAbi::value_only(0),
                 func_id: FuncId(0),
                 instructions: encode_instrs(&[Instruction::new_object(Reg(1), ty), access]),
                 register_count: 32,
@@ -1807,7 +1781,7 @@ mod tests {
         ]);
         let func = FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: code,
             register_count: 2,
@@ -1832,23 +1806,16 @@ mod tests {
     #[test]
     fn function_call_and_return() {
         let mut vm = make_vm();
-        // func 0 (main): r0 = 5, call func 1, return r0
-        // func 1: r0 = r0 * 2, return r0  (BUT calling convention puts return in r0)
-        //
-        // Simplified: main loads r0=5, calls func1 which loads r1=10 and returns r1.
         let main_code = encode_instrs(&[
-            Instruction::load_imm(Reg(0), 5), // r0 = 5
-            Instruction::call(1, 1),          // call func 1 with 1 arg
-            Instruction::ret(Reg(0)),         // return r0 (which is return val from func 1)
+            Instruction::load_imm(Reg(0), 5),
+            Instruction::call(1, 1),
+            Instruction::ret(Reg(0)),
         ]);
-        let func1_code = encode_instrs(&[
-            Instruction::load_imm(Reg(1), 10), // r1 = 10
-            Instruction::ret(Reg(1)),          // return r1
-        ]);
+        let func1_code = encode_instrs(&[Instruction::load_imm(Reg(1), 10), Instruction::ret(Reg(1))]);
 
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: main_code,
             register_count: 2,
@@ -1858,7 +1825,7 @@ mod tests {
         });
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(1),
             func_id: FuncId(1),
             instructions: func1_code,
             register_count: 2,
@@ -1885,7 +1852,7 @@ mod tests {
         let code = encode_instrs(&[Instruction::return_unit()]);
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: code,
             register_count: 0,
@@ -1910,35 +1877,23 @@ mod tests {
         let mut vm = make_vm();
         let gidx = vm.roots.globals.alloc(TaggedValue::UNIT);
         let code = encode_instrs(&[
-            Instruction::load_imm(Reg(0), 99),
-            Instruction::a_type(
-                Opcode::StoreGlobal,
-                AddrMode::Imm,
-                Reg(0),
-                Reg(0),
-                gidx as u16,
-            ),
-            Instruction::a_type(
-                Opcode::LoadGlobal,
-                AddrMode::Imm,
-                Reg(1),
-                Reg(0),
-                gidx as u16,
-            ),
+            Instruction::load_imm(Reg(2), 99),
+            Instruction::store_global(gidx as u16, Reg(2)),
+            Instruction::load_global(Reg(1), gidx as u16),
             Instruction::ret(Reg(1)),
         ]);
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: code,
-            register_count: 2,
+            register_count: 3,
             param_count: 0,
             is_closure: false,
             function_type: type_pool::TypeIndex::INVALID,
         });
         let task_id = vm.spawn_root(FuncId(0));
-        vm.run();
+        assert!(matches!(vm.run(), VmResult::Finished));
         let val = vm
             .roots
             .scheduler
@@ -1960,7 +1915,7 @@ mod tests {
         ]);
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: code,
             register_count: 3,
@@ -1983,7 +1938,6 @@ mod tests {
     #[test]
     fn call_builtin_to_i64() {
         let mut vm = make_vm();
-        // Register only to_i64 for this unit test.
         vm.register_builtin(runtime::ids::TO_I64, |ctx| {
             let v = ctx.arg(0)?;
             let i = v.as_i64().ok_or(VmError::TypeError)?;
@@ -1997,7 +1951,7 @@ mod tests {
         ]);
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: code,
             register_count: 1,
@@ -2016,5 +1970,115 @@ mod tests {
             .registers
             .get(Reg(0));
         assert_eq!(val.as_i64(), Some(7));
+    }
+
+    #[test]
+    fn unreachable_opcode_reports_clear_error() {
+        let mut vm = make_vm();
+        vm.add_function(FunctionCode {
+            display_owner: None,
+            abi: FunctionAbi::value_only(0),
+            func_id: FuncId(0),
+            instructions: encode_instrs(&[Instruction::unreachable()]),
+            register_count: 1,
+            param_count: 0,
+            is_closure: false,
+            function_type: type_pool::TypeIndex::INVALID,
+        });
+        vm.spawn_root(FuncId(0));
+        let VmResult::Error(error) = vm.run() else {
+            panic!("expected unreachable error");
+        };
+        assert!(matches!(error, VmError::UnreachableExecuted));
+        assert_eq!(error.to_string(), "entered unreachable code");
+    }
+
+    #[test]
+    fn far_calls_reject_invalid_and_non_integer_constants() {
+        for call in [
+            Instruction::call_far(0, 0),
+            Instruction::call_method_far(Reg(0), 0, 0),
+        ] {
+            let mut missing = make_vm();
+            missing.add_function(FunctionCode {
+                display_owner: None,
+                abi: FunctionAbi::value_only(0),
+                func_id: FuncId(0),
+                instructions: encode_instrs(&[Instruction::load_true(Reg(0)), call]),
+                register_count: 2,
+                param_count: 0,
+                is_closure: false,
+                function_type: type_pool::TypeIndex::INVALID,
+            });
+            missing.spawn_root(FuncId(0));
+            assert!(matches!(
+                missing.run(),
+                VmResult::Error(VmError::InvalidConstant(0))
+            ));
+            drop(missing);
+
+            let mut non_int = make_vm();
+            non_int.roots.constants.push(TaggedValue::TRUE);
+            non_int.add_function(FunctionCode {
+                display_owner: None,
+                abi: FunctionAbi::value_only(0),
+                func_id: FuncId(0),
+                instructions: encode_instrs(&[Instruction::load_true(Reg(0)), call]),
+                register_count: 2,
+                param_count: 0,
+                is_closure: false,
+                function_type: type_pool::TypeIndex::INVALID,
+            });
+            non_int.spawn_root(FuncId(0));
+            assert!(matches!(non_int.run(), VmResult::Error(VmError::TypeError)));
+        }
+    }
+
+    #[test]
+    fn scalar_cmp_eq_rejects_non_scalar_heap_tuples() {
+        let mut vm = make_vm();
+        let tuple_ty = vm
+            .state
+            .type_pool
+            .intern_structural(type_pool::TypeKind::Tuple {
+                elements: vec![Intrinsic::I64.type_index()],
+            });
+        vm.add_function(FunctionCode {
+            display_owner: None,
+            abi: FunctionAbi::value_only(0),
+            func_id: FuncId(0),
+            instructions: encode_instrs(&[
+                Instruction::new_object(Reg(0), tuple_ty),
+                Instruction::new_object(Reg(1), tuple_ty),
+                Instruction::r_type(Opcode::CmpEq, Reg(2), Reg(0), Reg(1)),
+                Instruction::ret(Reg(2)),
+            ]),
+            register_count: 3,
+            param_count: 0,
+            is_closure: false,
+            function_type: type_pool::TypeIndex::INVALID,
+        });
+        vm.spawn_root(FuncId(0));
+        assert!(matches!(
+            vm.run(),
+            VmResult::Error(VmError::UnsupportedEquality)
+        ));
+    }
+
+    #[test]
+    fn root_entry_rejects_capturing_closure_function() {
+        let mut vm = make_vm();
+        vm.add_function(FunctionCode {
+            display_owner: None,
+            abi: FunctionAbi::closure_values(1, 0),
+            func_id: FuncId(0),
+            instructions: encode_instrs(&[Instruction::ret(Reg(0))]),
+            register_count: 1,
+            param_count: 1,
+            is_closure: true,
+            function_type: type_pool::TypeIndex::INVALID,
+        });
+        vm.spawn_root(FuncId(0));
+        assert!(matches!(vm.run(), VmResult::Error(VmError::TypeError)));
     }
 }

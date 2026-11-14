@@ -1,13 +1,13 @@
 # NSBC Archive 文件格式
 
-NSBC Archive (`.nsbc`) 是 Nessa 的编译产物容器。当前完整产物是已经合并依赖并编排
-初始化的自包含编译单元，可在新进程中独立加载执行；跨包链接和 TypeIndex 重定位
-尚未实现。下文区分当前可执行格式与保留的旧低层格式，不能按文件后缀假定可执行。
+NSBC Archive (`.nsbc`) 是 Nessa 的自包含可执行编译产物容器。当前完整产物已经合并依赖并编排
+初始化，可在新进程中独立加载执行；跨包链接和 TypeIndex 重定位尚未实现。引擎仅支持单一当前
+基线（Container `VERSION = 4`、非零 SHA-256、`TPOL` `revision = 11`、`NSAM` `revision = 6`、
+`BUILTIN_ABI_VERSION = 9`）；历史过渡版本或损坏输入均在执行前明确拒绝。
 
-`nsbc_io::write_artifact/read_artifact` 读写完整 `CompiledArtifact`：CodegenOutput、
-exact-index TypePool、入口、builtin ABI revision 和 ID/名字 manifest。
-旧 `write_archive` 仅保存 CODE/CONSTANTS/占位 STACK_MAPS，不具有执行所需元数据；
-遇非空 global schema 返回 Unsupported，完整 loader 拒绝缺少完整 METADATA 的文件。
+`nsbc_io::write_artifact/read_artifact` 读写完整 `CompiledArtifact`：`CodegenOutput`、
+已 finalize 的 `TypePool`、入口、`builtin_abi_version` 和 ID/名字 manifest。旧低层
+`write_archive` 路径已移除。
 
 ## 文件结构总览
 
@@ -48,8 +48,8 @@ exact-index TypePool、入口、builtin ABI revision 和 ID/名字 manifest。
 ```
 FileHeader (60 bytes):
   magic:          [4 bytes]   "NSBC"                            → 魔数
-  version:        [4 bytes]   u32（当前 = 4，受检Error envelope）    → archive 格式版本
-  checksum:       [32 bytes]  SHA-256 of (header 以外所有数据)    → 完整性校验
+  version:        [4 bytes]   u32（必须 = 4）                    → archive 容器版本
+  checksum:       [32 bytes]  SHA-256 of (header 以外所有数据)    → 完整性校验（禁止全零）
   target_arch:    [2 bytes]   0=Any 1=X86_64 2=ARM64 3=RV64     → 目标架构
   target_os:      [2 bytes]   0=Any 1=Linux 2=Darwin 3=Win      → 目标 OS
   flags:          [4 bytes]   bit0=debug bit1=compress ...       → 标志位
@@ -58,16 +58,14 @@ FileHeader (60 bytes):
 ```
 
 所有多字节整数均为 little-endian。header 实际写入 60 字节。
-当前writer生成VERSION4；reader兼容普通VERSION3产物。Error的新执行能力
-要求VERSION4，不能仅通过改header版本把新布局混入旧格式。下文较早阶段的
-NSBC3记录保留其当时的兼容性背景；TYPE_METADATA仍使用TPOL11。
+容器层与完整加载器统一要求 `version == 4`，其它版本直接报 `UnsupportedVersion`。
 
 `target_arch` 和 `target_os` 为 `Any(0)` 时表示平台无关字节码；完整 loader 要求非零
 目标与当前执行平台匹配。writer 当前写 portable 目标。
 
 writer 对 header 之后的全部字节计算 SHA-256，包含 section table 和 alignment
-padding；reader 校验非零 checksum。低层容器仍允许 zero checksum 以检查旧文件，
-但完整 loader 拒绝 zero checksum。checksum 用于发现损坏，不是认证签名；它不覆盖
+padding；容器读取器强制要求 `checksum != [0; 32]` 并校验实际 SHA-256（全零或不匹配
+均报 `ChecksumMismatch`）。checksum 用于发现损坏，不是认证签名；它不覆盖
 header，目标、版本、flags 等 header 字段仍需分别校验。
 
 读写总大小限额为 `MAX_ARCHIVE_SIZE = 64 MiB`，section 数量上限 1024。
@@ -104,9 +102,9 @@ Section type 枚举值：
 
 ## 完整格式标识与 CODE Section
 
-外层 VERSION 仍为 3。完整 METADATA 以 `NSAM` magic 和独立 revision 1 开头，
-这是解释以下 CODE/STACK_MAPS 布局的必要条件。缺少 magic、未知 revision 或缺少
-任一必需 section 都不能执行；不得将旧 CODE 当成这个布局静默解释。
+外层容器 `VERSION = 4`。完整 METADATA 以 `NSAM` magic 和固定 `revision = 6` 开头，
+这是解释以下 CODE/STACK_MAPS 布局的必要条件。缺少 magic、非 6 revision 或缺少
+任一必需 section 都不能执行。
 
 ```
 CODE:
@@ -125,10 +123,7 @@ CODE:
 函数字节区域必须完整覆盖表之后的数据，不重叠、不留未声明字节，保持指令对齐。
 FuncId 必须从 0 连续；entry、签名、stack-map 元数据必须对应同一组函数。
 
-旧 `write_archive` 的 CODE offset 相对于 code blob，closure flag 使用 bit0。
-它属于不完整低层输出，不能由完整 loader 按新布局执行。
-
-## METADATA Section（NSAM revision 4/5/6，兼容 revision 1/2/3）
+## METADATA Section（单一基线 NSAM revision 6 / TPOL revision 11）
 
 `string` 为 `u32` UTF-8 字节数加字节，`blob` 为 `u32` 字节数加字节，
 `list` 为 `u32` 元素数加元素。名称采用内联 UTF-8，不保存进程 StrId。
@@ -136,28 +131,24 @@ FuncId 必须从 0 连续；entry、签名、stack-map 元数据必须对应同�
 ```
 METADATA:
   magic: [u8;4] = "NSAM"
-  revision: u32 = 4/5/6 # 有Display owner时为6，否则有TraitSelf时为5
-  root_scan_mode: u32 = 0  # 扫描全部 TaggedValue 根，非精确 bitmap
-  builtin_abi_version: u32
+  revision: u32 = 6       # 仅接受 revision 6
+  root_scan_mode: u32 = 0 # 扫描全部 TaggedValue 根，非精确 bitmap
+  builtin_abi_version: u32 # 安装执行要求精确等于 runtime::BUILTIN_ABI_VERSION (9)
   entry: u32              # 0xFFFFFFFF=None；可能是 __startup
-  type_pool: blob         # 有IterationStep结构来源时TPOL8；否则默认模板TPOL7/关联数据TPOL6/普通TPOL5；兼容读取1–8
+  type_pool: blob         # 固定为已 finalize 的 TPOL revision 11（拒绝 1..=10 及 DERIVE_FUNC_ID）
   globals: list<(type_index:u32, is_mutable:u8)>
   functions: list<(func_id:u32, name:string, function_type:u32)>
   methods: list<(constant_slot:u32, name:string)>
   builtins: list<(id:u32, name:string)>
-  scope_coverage: u8      # 0=Calls，1=CallsAndTypes；revision 4 显式保存
-  scopes_present: u8
-  method_call_scopes: list<(func_id:u32, pc:u32, scope:u32)> # 仅 presence=1
-  function_abis: list<(func_id:u32, abi:option<FunctionAbi>)>
-  display_owners: list<(func_id:u32, owner:option<u32>)> # 仅revision6，覆盖全部函数
+  method_call_scopes: list<(func_id:u32, pc:u32, scope:u32)> # 必需，按 nsbc::instruction_requires_scope 校验
+  function_abis: list<(func_id:u32, abi:FunctionAbi)>        # 必需，覆盖全部函数
+  display_owners: list<(func_id:u32, owner:option<u32>)>     # 覆盖全部函数
 
 FunctionAbi:
   captures: list<CaptureAbi>
   parameters: list<ParameterAbi>
 CaptureAbi: tag:u8，0=Value，1=TraitProof 后接 view:u32
-ParameterAbi: tag:u8，0=Value，1=Trait 后接 view:u32，
-  revision5/6另允许2=TraitSelf 后接view:u32（具体Self签名，proof/data入口）
-option<FunctionAbi>: presence:u8，然后仅 presence=1 时保存 FunctionAbi
+ParameterAbi: tag:u8，0=Value，1=Trait 后接 view:u32，2=TraitSelf 后接 view:u32（具体Self签名，proof/data入口）
 ```
 
 bool 只接受 0/1。functions 不接受重复 ID。globals 按原 GlobalId 顺序保存 schema，
@@ -166,40 +157,144 @@ bool 只接受 0/1。functions 不接受重复 ID。globals 按原 GlobalId 顺�
 Function 签名不包含 captures；内部 handler/initializer 可使用 INVALID，源码函数
 和 typed native adapter 的真实签名用于 reflection 与动态类型检查。
 
-源码函数保存显式 FunctionAbi：capture 为物理入口前缀，parameters 表示用户
+所有可执行函数都保存必需的 `FunctionAbi`：capture 为物理入口前缀，parameters 表示用户
 逻辑参数，不以总参数数减签名参数数推断 captures。Value 占一个入口槽；Trait
 占 proof、data 两槽，proof 在 data 前；capture 项各占一个环境槽，TraitProof
 必须紧跟其 Value 数据槽。描述符
 的物理数量必须匹配 CODE.param_count，逻辑数量匹配有效 Function 签名，普通
 函数不得含 captures。ABI table 必须精确覆盖所有函数，无重复或未知 ID。
-计数、标签、presence、view 类型和分配预算受检。裸 trait 参数及其闭包 capture
+计数、标签、view 类型和分配预算受检。裸 trait 参数及其闭包 capture
 已执行 proof/data 检查。默认方法 adapter 的逻辑 Self 为 concrete implementor，
 对应参数用 TraitSelf 描述隐藏 proof/data；validator 要求具体签名和相应实现
-table，VM 检查数据与声明 concrete 类型一致。新版本5仅增加此参数标签；
+table，VM 检查数据与声明 concrete 类型一致。
 含关联声明的内部 TraitSelf 及闭包证明要求所选根实现具有完整、精确的具体关联
 绑定；投影保留原根 table 的方法覆盖。参数及调用签名按该实现 trait 和 scope
 实例化，关联 Item 使用普通 Value，即使它与 concrete Self 类型相同。
 bare Trait 参数的关联视图仍拒绝，不据此引入用户动态关联 trait carrier。
-这些检查沿用现有描述符、绑定及指令，未新增归档标签。
-revision4仍拒绝tag2。无Display owner且无TraitSelf的Some仍写4，旧None仍按
-1/2/3保存，reader兼容1–6。trait返回与嵌套存储carrier尚未完成。
+trait返回与嵌套存储carrier尚未完成。
 
-NSAM6在完整ABI表后追加Display owner表。表计数必须等于函数表计数，ID唯一
-且精确覆盖；owner presence只能为0/1，Some随后保存TypeIndex u32。owner需
-对应可信bootstrap Display的全局派生实现及实际FuncId，接收者为具体聚合类型，
-签名为fn(Self)->String、无capture且入口为Value。错误身份、类型、ABI、表覆盖、
-截断及降版后遗留尾部均拒绝。旧NSAM1–5读入owner全为None，重写不补造。
-writer仅在存在Some owner时选择6；NSBC3及TPOL修订独立于此扩展。
+NSAM6 在完整 ABI 表后保存 Display owner 表。表计数必须等于函数表计数，ID 唯一
+且精确覆盖；owner presence 只能为 0/1，Some 随后保存 TypeIndex u32。Struct、Enum 与
+Tuple 的 `@derive(Display)` 均组合降级为带 `display_owner` 的普通 NIR 函数，owner 需
+对应可信 bootstrap Display 的全局派生实现及实际 FuncId，接收者为具体聚合类型，
+签名为 `fn(Self)->String`、无 capture 且入口为 Value。旧原生 `120 (__derived_display)`
+及未降级的 `DERIVE_FUNC_ID` 已彻底移除。
 
-builtin ABI7新增123 __display_quote、124 __display_enter_tuple、125
-__display_exit_tuple。旧ABI6仅在全部import ID小于123时允许；旧5小于122、
-4小于121、3小于120、2小于110、1小于100的限制保持。所有import精确检查
-ID与名称，不能声称旧ABI却导入新helper。旧struct派生120的格式与行为保持。
+运行时安装只接受 `builtin_abi_version == 9`，并精确核对每个 `BuiltinImport` 的 ID 与名称，
+以及所有涉及 `List`/`Buffer` 或 `Map`/`MapBuffer` 的内建函数的受检类型角色。以下保留 ABI7–ABI9
+各批内建能力的引入说明（旧 ABI 版本兼容分支已统一移除）：
 
-builtin ABI8 追加126 `__map_keys`，调用契约为一个Map参数、返回键引用的独立
-List快照。旧ABI7只接受ID小于126；1–6的原阈值不变。安装新helper前必须具备
-Map、MapBuffer、List和Buffer四个受检角色。旧归档不补造新native能力；Map和
-List的对象布局、TPOL、NSAM及外层NSBC不因本helper改变。
+builtin 123 `__display_quote`、124 `__display_enter_tuple`、125 `__display_exit_tuple`
+用于组合式聚合 `Display` 派生。126 `__map_keys` 调用契约为一个 Map 参数、返回键引用的独立
+List 快照。
+
+builtin ABI9 包含 127–138 String 文本操作（contains/starts_with/ends_with、trim 三种、
+大小写、repeat、replace、split、chars）。
+导入137 `str_split`或138 `str_chars`必须具备List和Buffer角色。ABI9 同时追加139
+`__iteration_step_done`（Any 输入的动态 for 循环用于判断任意 `IterationStep(T)`
+的 done 标签），以及140–142 `__native_equal`、`__tuple_len`、`__tuple_get`
+（Any 与元组 `==` 的原生判定和元组元素访问），以及143–146 `str_char_len`、
+`str_char_at`、`str_find`、`str_slice`（按 Unicode 标量索引的长度、取值、查找和
+切片），以及147–158 的 `char` 分类与 ASCII 大小写转换，以及159–161 `min`、`max`、
+`clamp`，以及162–163 `str_parse_i64`、`str_parse_f64`，以及164 `sign`，以及165–166 `str_pad_start`、`str_pad_end`，以及167–168 `char_to_code`、
+`char_from_code`，以及169–172 `str_rfind`、`str_count`、`str_is_ascii`、
+`char_into_string`，以及173–184 的 `exp`、`log2`、`log10`、`trunc`、`fract`、
+`copysign`、`atan2`、`hypot`、`tan`、`asin`、`acos`、`atan`，以及185–195 的 `is_nan`、
+`is_infinite`、`is_finite`、`is_sign_negative`、`sinh`、`cosh`、`tanh`、`cbrt`、
+`exp2`、`expm1`、`log1p`，以及196–200 的 `str_to_ascii_uppercase`、
+`str_to_ascii_lowercase`、`str_split_whitespace`、`char_to_uppercase`、
+`char_to_lowercase`，以及201–212 的 `count_ones`、`count_zeros`、`leading_zeros`、
+`trailing_zeros`、`leading_ones`、`trailing_ones`、`reverse_bits`、`swap_bytes`、
+`rotate_left`、`rotate_right`、`is_power_of_two`、`ilog2`，以及213–227 的其余 ASCII
+`char` 分类、`char_is_control`、`str_trim_start_matches`、`str_trim_end_matches`、
+`str_trim_matches`、`str_replacen`、`str_splitn`、`str_rsplit`、`str_rsplitn`，以及228–242 的 `signum`、`recip`、`mul_add`、
+`div_euclid`、`rem_euclid`、`char_utf8_len`、`char_utf16_len`、字符与字符串转义、
+`str_split_inclusive`、`str_find_all`，以及243–257 的 `to_radians`、`to_degrees`、
+`next_up`、`next_down`、`midpoint`、`round_ties_even`、`char_is_digit`、
+`char_to_digit`、`str_split_ascii_whitespace`、`str_eq_ignore_ascii_case`、
+`str_trim_ascii`、`str_trim_ascii_start`、`str_trim_ascii_end`、`ilog10`、
+`abs_diff`，以及258–272 的 `wrapping_add`、`wrapping_sub`、`wrapping_mul`、
+`wrapping_neg`、`saturating_add`、`saturating_sub`、`saturating_mul`、
+`saturating_neg`、`checked_add`、`checked_sub`、`checked_mul`、`checked_div`、
+`checked_rem`、`checked_neg`、`char_from_digit`，以及273–287 的 `int_div_euclid`、
+`int_rem_euclid`、`unsigned_abs`、`int_midpoint`、`checked_shl`、`checked_shr`、
+`wrapping_shl`、`wrapping_shr`、`checked_pow`、`wrapping_pow`、`saturating_pow`、
+`asinh`、`acosh`、`atanh`、`is_normal`，以及288–302 的 `wrapping_div`、
+`wrapping_rem`、`saturating_abs`、`checked_abs`、`wrapping_abs`、`int_signum`、
+`checked_ilog`、`cast_unsigned`、`cast_signed`、`is_subnormal`、`to_bits`、
+`from_bits`、`powi`、`char_encode_utf8`、`char_encode_utf16`，以及303–317 的
+`checked_div_euclid`、`checked_rem_euclid`、`widening_mul`、`next_power_of_two`、
+`checked_next_power_of_two`、`checked_add_signed`、`checked_sub_signed`、
+`is_multiple_of`、`log_base`、`str_encode_utf8`、`str_encode_utf16`、
+`str_from_utf8`、`str_from_utf16`、`str_from_utf8_lossy`、`str_from_utf16_lossy`，以及318–332 的
+`str_is_char_boundary`、`str_floor_char_boundary`、`str_ceil_char_boundary`、
+`pi`、`euler`、`tau`、`ln_2`、`ln_10`、`log2_e`、`log10_e`、`sqrt_2`、`infinity`、
+`neg_infinity`、`nan`、`epsilon`，以及333–347 的 `strict_add`、`strict_sub`、
+`strict_mul`、`strict_div`、`strict_rem`、`strict_neg`、`strict_shl`、
+`strict_shr`、`strict_pow`、`min_positive`、`frac_pi_2`、`frac_pi_4`、
+`frac_1_sqrt_2`、`log2_10`、`log10_2`，以及348–362 的 `saturating_div`、
+`saturating_div_euclid`、`trunc_i64`、`trunc_u64`、`trunc_i128`、`trunc_u128`、
+`char_is_ascii_octdigit`、`frac_1_pi`、`frac_2_pi`、`frac_2_sqrt_pi`、
+`frac_pi_3`、`frac_pi_6`、`frac_pi_8`、`f64_min`、`f64_max`，以及363–377 的
+`checked_add_unsigned`、`checked_sub_unsigned`、`saturating_add_unsigned`、
+`saturating_sub_unsigned`、`wrapping_add_unsigned`、`wrapping_sub_unsigned`、
+`strict_add_unsigned`、`strict_sub_unsigned`、`int_to_str_radix`、
+`i64_from_str_radix`、`u64_from_str_radix`、`i128_from_str_radix`、
+`u128_from_str_radix`、`str_char_at_byte`、`str_split_at`，以及378–392 的
+`div_ceil`、`checked_div_ceil`、`next_multiple_of`、`checked_next_multiple_of`、
+`int_to_be_bytes`、`int_to_le_bytes`、`i64_from_be_bytes`、`i64_from_le_bytes`、
+`u64_from_be_bytes`、`u64_from_le_bytes`、`i128_from_be_bytes`、
+`i128_from_le_bytes`、`u128_from_be_bytes`、`u128_from_le_bytes`、`total_cmp`，以及393–407 的 `div_floor`、
+`checked_div_floor`、`is_sign_positive`、`f64_to_be_bytes`、`f64_to_le_bytes`、
+`f64_from_be_bytes`、`f64_from_le_bytes`、`f64_radix`、`f64_mantissa_digits`、
+`f64_digits`、`f64_min_exp`、`f64_max_exp`、`str_byte_at`、`str_get`、
+`str_split_at_checked`，以及408–422 的 `str_parse_u64`、`str_parse_i128`、
+`str_parse_u128`、`f64_min_10_exp`、`f64_max_10_exp`、`str_split_terminator`、
+`str_rsplit_terminator`、`int_gcd`、`int_lcm`、`checked_int_lcm`、
+`str_byte_find`、`str_byte_rfind`、`str_byte_count`、`char_replacement`、
+`char_max`，以及423–437 的 `saturating_add_signed`、`saturating_sub_signed`、
+`wrapping_add_signed`、`wrapping_sub_signed`、`strict_add_signed`、
+`strict_sub_signed`、`unbounded_shl`、`unbounded_shr`、`i64_min`、`i64_max`、
+`u64_max`、`i128_min`、`i128_max`、`u128_max`、`char_eq_ignore_ascii_case`，以及438–452 的 `highest_one`、
+`lowest_one`、`isolate_highest_one`、`isolate_lowest_one`、`int_bit_width`、
+`i64_bits`、`i128_bits`、`isize_bits`、`u128_bits`、`usize_bits`、`char_min`、
+`str_find_indices`、`str_rfind_indices`、`str_byte_find_indices`、
+`str_byte_rfind_indices`，以及453–467 的 `isqrt`、`checked_isqrt`、
+`strict_abs`、`wrapping_div_euclid`、`wrapping_rem_euclid`、
+`checked_signed_diff`、`checked_div_exact`、`strict_div_exact`、
+`checked_shl_exact`、`strict_shl_exact`、`checked_shr_exact`、
+`strict_shr_exact`、`str_trim_prefix`、`str_trim_suffix`、
+`str_strip_circumfix`，以及468–482 的 `list_windows`、`list_chunks_exact`、
+`list_rchunks`、`list_rchunks_exact`、`list_chunks_remainder`、
+`list_rchunks_remainder`、`list_split_at`、`list_rotate_left`、
+`list_rotate_right`、`list_repeat`、`list_truncate`、`list_fill`、
+`list_swap_remove`、`list_split_off`、`list_resize`，以及483–497 的 `map_values`、
+`map_clear`、`map_merge`、`map_get_or_insert`、`map_insert_absent`、
+`golden_ratio`、`euler_gamma`、`f64_classify`、`str_is_ascii_digit`、
+`str_is_ascii_alphabetic`、`str_is_ascii_alphanumeric`、`str_is_ascii_lowercase`、
+`str_is_ascii_uppercase`、`str_is_ascii_whitespace`、`str_is_ascii_hexdigit`，
+以及498–512 的 `str_is_numeric`、`str_is_alphabetic`、`str_is_alphanumeric`、
+`str_is_lowercase`、`str_is_uppercase`、`str_is_whitespace`、`str_is_control`、
+`str_is_ascii_graphic`、`str_is_ascii_punctuation`、`str_is_ascii_control`、
+`list_copy`、`list_reverse`、`list_concat`、`list_swap`、`list_clear`，
+以及513–527 的 `list_insert`、`list_remove`、`list_take`、`list_drop`、
+`list_first`、`list_last`、`range_len`、`range_inclusive_len`、
+`range_is_empty`、`range_inclusive_is_empty`、`range_contains`、
+`range_inclusive_contains`、`range_from_contains`、`range_to_contains`、
+`range_to_inclusive_contains`，以及528–542 的 `f64_to_ne_bytes`、
+`f64_from_ne_bytes`、`algebraic_add`、`algebraic_sub`、`algebraic_mul`、
+`algebraic_div`、`algebraic_rem`、`f64_nan_to`、`f64_abs_diff`、
+`f64_is_zero`、`bool_not`、`bool_and`、`bool_or`、`bool_xor`、`bool_then`，
+以及543–557 的 `str_bytes`、`str_char_indices`、`str_is_empty`、
+`str_repeat_char`、`str_take`、`str_drop`、`str_first`、`str_last`、
+`str_starts_with_char`、`str_ends_with_char`、`str_contains_char`、
+`str_replace_char`、`list_append`、`list_join`、`list_is_empty`，
+以及558–572 的 `str_lines`、`str_split_once`、`str_rsplit_once`、
+`str_strip_prefix`、`str_strip_suffix`、`map_entries`、`map_is_empty`、
+`list_chunks`、`list_enumerate`、`list_flatten`、`list_zip`、
+`str_find_char`、`str_rfind_char`、`str_count_char`、`map_copy`，
+旧ABI8同样不能导入。对象布局、
+TPOL、NSAM及外层NSBC不变。
 
 新证明指令要求显式 ABI。A-type 0x6A TraitProof、0x6B TraitAssert、0x6C
 TraitProject 的 view 是12-bit TypeIndex；TraitAssert 的旧 dst 保存待检查 data。

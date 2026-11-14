@@ -302,6 +302,7 @@ pub struct DefaultBodyFacts {
     pub application_calls: HashMap<NodeIndex, SymbolId>,
     pub update_calls: HashMap<NodeIndex, SymbolId>,
     pub concat_calls: HashMap<NodeIndex, SymbolId>,
+    pub equality_calls: HashMap<NodeIndex, SymbolId>,
 }
 
 impl DefaultBodyFacts {
@@ -328,6 +329,7 @@ impl DefaultBodyFacts {
             application_calls: r.application_calls.clone(),
             update_calls: r.update_calls.clone(),
             concat_calls: r.concat_calls.clone(),
+            equality_calls: r.equality_calls.clone(),
         }
     }
     fn for_body(r: &Resolver<'_>, nodes: &[NodeIndex]) -> Self {
@@ -373,6 +375,9 @@ impl DefaultBodyFacts {
             .concat_calls
             .retain(|node, _| facts.nodes.contains(node));
         facts
+            .equality_calls
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
             .error_constructions
             .retain(|node, _| facts.nodes.contains(node));
         facts
@@ -415,6 +420,7 @@ impl DefaultBodyFacts {
         r.application_calls = self.application_calls.clone();
         r.update_calls = self.update_calls.clone();
         r.concat_calls = self.concat_calls.clone();
+        r.equality_calls = self.equality_calls.clone();
     }
 }
 
@@ -500,6 +506,7 @@ pub(crate) fn check_body(
     r.application_calls.retain(|node, _| !domain.contains(node));
     r.update_calls.retain(|node, _| !domain.contains(node));
     r.concat_calls.retain(|node, _| !domain.contains(node));
+    r.equality_calls.retain(|node, _| !domain.contains(node));
     r.default_body_context = Some(DefaultBodyContext {
         implementor,
         trait_owner: owner,

@@ -191,6 +191,72 @@ fn parse_precedence_mul_over_add() {
 }
 
 #[test]
+fn parse_all_range_forms() {
+    let cases = [
+        ("0..10", r#"(RangeFromTo (Int "0") (Int "10"))"#),
+        ("0..=10", r#"(RangeFromToInclusive (Int "0") (Int "10"))"#),
+        ("(0..=3)", r#"(RangeFromToInclusive (Int "0") (Int "3"))"#),
+        ("3..", r#"(RangeFrom (Int "3"))"#),
+        ("..4", r#"(RangeTo (Int "4"))"#),
+        ("..=5", r#"(RangeToInclusive (Int "5"))"#),
+        (
+            "x.y..z",
+            r#"(RangeFromTo (Projection (Id "x") (Id "y")) (Id "z"))"#,
+        ),
+    ];
+    for (src, expected) in cases {
+        let dump = parse_dump(src);
+        assert!(
+            dump.contains(expected),
+            "`{src}` should contain {expected}, got: {dump}"
+        );
+    }
+    assert!(parse_dump("..").contains("(RangeFull"));
+}
+
+#[test]
+fn parse_range_binds_looser_than_binary_operators() {
+    let dump = parse_dump("a + 1..=b * 2");
+    assert!(
+        dump.contains(
+            r#"(RangeFromToInclusive (Add (Id "a") (Int "1")) (Mul (Id "b") (Int "2")))"#
+        ),
+        "got: {dump}"
+    );
+    let dump = parse_dump("..n - 1");
+    assert!(
+        dump.contains(r#"(RangeTo (Sub (Id "n") (Int "1")))"#),
+        "got: {dump}"
+    );
+}
+
+#[test]
+fn parse_open_range_before_loop_body() {
+    let dump = parse_dump("for i in 3.. { break }");
+    assert!(
+        dump.contains(r#"(ForLoop nil (Id "i") (RangeFrom (Int "3")) (Block"#),
+        "got: {dump}"
+    );
+    let dump = parse_dump("for i in .. { break }");
+    assert!(
+        dump.contains(r#"(ForLoop nil (Id "i") (RangeFull"#),
+        "got: {dump}"
+    );
+}
+
+#[test]
+fn parse_inclusive_range_requires_end() {
+    for src in ["0..=", "..=", "for i in 0..= { break }"] {
+        let (tokens, _) = tokenize(src);
+        let sm = SourceMap::new(FilePathMapping::empty());
+        let sf = sm.new_source_file(FileName::Custom("test".into()), src.to_string());
+        let diag = DiagnosticContext::new(&sm);
+        Parser::new(&tokens, src, &diag, sf.start_pos).parse();
+        assert!(diag.has_errors(), "`{src}` should be rejected");
+    }
+}
+
+#[test]
 fn parse_parenthesized_changes_precedence() {
     // (1 + 2) * 3  ⟶  Mul(Add(...), Int "3")
     let dump = parse_dump("(1 + 2) * 3");
@@ -974,4 +1040,85 @@ fn parse_mixed_postfix() {
         dump.contains("ErrorPropagation"),
         "Expected ErrorPropagation in: {dump}"
     );
+}
+
+// ===========================================================================
+// Typed patterns
+// ===========================================================================
+
+fn nodes_of_kind(ast: &ast::Ast, kind: NodeKind) -> Vec<NodeIndex> {
+    (1..ast.nodes.len())
+        .map(|index| NodeIndex(index as u32))
+        .filter(|&node| ast.node(node).kind == kind)
+        .collect()
+}
+
+#[test]
+fn typed_patterns_bind_tighter_than_or_and_guards() {
+    let ast = parse_ast("fn f(v: Any) { v match { x: A or _: B if c => 1, g: i64 -> i64 => 2 } }");
+    let guard = nodes_of_kind(&ast, NodeKind::PatternIfGuard)[0];
+    let alternatives = ast.fixed_children(guard)[0];
+    assert_eq!(ast.node(alternatives).kind, NodeKind::PatternOr);
+    let typed = nodes_of_kind(&ast, NodeKind::PatternTyped);
+    assert_eq!(typed.len(), 3);
+    assert_eq!(ast.fixed_children(alternatives), &typed[..2]);
+    let binders: Vec<_> = typed
+        .iter()
+        .map(|&node| ast.node(ast.fixed_children(node)[0]).kind)
+        .collect();
+    assert_eq!(binders, [NodeKind::Id, NodeKind::Underscore, NodeKind::Id]);
+    assert_eq!(
+        ast.node(ast.fixed_children(typed[2])[1]).kind,
+        NodeKind::Arrow
+    );
+}
+
+#[test]
+fn typed_patterns_parse_in_matches_and_for_but_not_declarations() {
+    let ast = parse_ast(
+        "fn f(v: Any, xs: List) { let ok = v matches n: i64; for s: String in xs { s }; let y: i64 = 1; let g = |z: i64| z }",
+    );
+    assert_eq!(nodes_of_kind(&ast, NodeKind::PatternTyped).len(), 2);
+    assert!(!nodes_of_kind(&ast, NodeKind::LetDecl).is_empty());
+}
+
+#[test]
+fn definitions_without_their_block_are_diagnosed_instead_of_dropping_the_file() {
+    for (source, message) in [
+        (
+            "struct P derive(Eq) { x: i64 }\nfn main() { 1 }",
+            "Expected `{` or an indented block after struct name",
+        ),
+        (
+            "fn main() { 1 }\nenum E x",
+            "Expected `{` or an indented block after enum name",
+        ),
+        (
+            "trait T x",
+            "Expected `{` or an indented block after trait header",
+        ),
+        (
+            "struct P {}\nextend P x",
+            "Expected `{` or an indented block after extend header",
+        ),
+        (
+            "fn main() { 1 match 2 }",
+            "Expected `{` or an indented block after `match`",
+        ),
+        (
+            "fn main() { when 1 }",
+            "Expected `{` or an indented block after `when`",
+        ),
+    ] {
+        let compiled = driver::Driver::new().compile(source);
+        assert!(compiled.has_errors, "{source} should be rejected");
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == message),
+            "{source}: {:?}",
+            compiled.diagnostics
+        );
+    }
 }

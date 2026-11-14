@@ -267,9 +267,17 @@ pub(crate) fn resolve_types_expected(
         NodeKind::Real => Some(contextual_float_type(&r.type_pool, expected)),
         NodeKind::Str => Some(Intrinsic::Str.type_index()),
         NodeKind::FStringConcat => {
-            // Resolve all children (literal segments + interpolated expressions).
+            // Interpolated values are converted with Display; Any is checked
+            // when the value is converted.
+            let display = r.type_pool.well_known.display;
             for &child in ast.multi_children(node_idx) {
                 resolve_types(r, ast, child);
+                if ast.node(child).kind != NodeKind::Str
+                    && let Some(&ty) = r.node_types.get(&child)
+                    && ty != TypeIndex::INVALID
+                {
+                    crate::trait_typing::is_subtype(r, ast, child, ty, display);
+                }
             }
             Some(Intrinsic::Str.type_index())
         }
@@ -350,6 +358,9 @@ pub(crate) fn resolve_types_expected(
         | NodeKind::BoolLtEq => {
             for &child in ast.fixed_children(node_idx) {
                 resolve_types(r, ast, child);
+            }
+            if matches!(kind, NodeKind::BoolEq | NodeKind::BoolNotEq) {
+                crate::equality::plan(r, ast, node_idx);
             }
             Some(Intrinsic::Bool.type_index())
         }
@@ -508,6 +519,7 @@ pub(crate) fn resolve_types_expected(
                 return;
             }
             resolve_types(r, ast, children[0]);
+            crate::assignments::check_place(r, ast, children[0], "assignment");
             let target = r.node_types.get(&children[0]).copied();
             resolve_types_expected(r, ast, children[1], target);
             if let Some(target) = target {
@@ -522,8 +534,13 @@ pub(crate) fn resolve_types_expected(
         | NodeKind::DivAssign
         | NodeKind::ModAssign => {
             let children = ast.fixed_children(node_idx);
-            resolve_types(r, ast, children[0]);
-            let target = r.node_types.get(&children[0]).copied();
+            let target = if ast.node(children[0]).kind == NodeKind::Call {
+                crate::assignments::compound_index(r, ast, children[0])
+            } else {
+                resolve_types(r, ast, children[0]);
+                crate::assignments::check_place(r, ast, children[0], "compound assignment");
+                r.node_types.get(&children[0]).copied()
+            };
             resolve_types_expected(r, ast, children[1], target);
             if let Some(target) = target {
                 check_expected_type(r, ast, children[1], target, "compound assignment");
@@ -538,12 +555,6 @@ pub(crate) fn resolve_types_expected(
                         .with_primary_span(ast.node(node_idx).span)
                         .emit(r.diag_ctx);
                 }
-            }
-            if !r.node_symbols.contains_key(&children[0]) {
-                r.diag_ctx
-                    .error("compound assignment target must be a variable".into())
-                    .with_primary_span(ast.node(children[0]).span)
-                    .emit(r.diag_ctx);
             }
             Some(Intrinsic::Unit.type_index())
         }
@@ -647,6 +658,12 @@ pub(crate) fn resolve_types_expected(
             payload_inner_expected(&r.type_pool, expected),
         ),
         NodeKind::ListOf => crate::lists::literal(r, ast, node_idx),
+        NodeKind::RangeFull
+        | NodeKind::RangeFrom
+        | NodeKind::RangeTo
+        | NodeKind::RangeToInclusive
+        | NodeKind::RangeFromTo
+        | NodeKind::RangeFromToInclusive => crate::ranges::literal(r, ast, node_idx),
         NodeKind::Object => {
             r.diag_ctx
                 .error("anonymous Object construction is not implemented; use explicit collection APIs".into())
@@ -1969,17 +1986,235 @@ fn builtin_return_type(pool: &type_pool::TypePool, id: runtime::BuiltinFnId) -> 
         | ids::PANIC
         | ids::LIST_SET
         | ids::LIST_PUSH
-        | ids::MAP_SET => Intrinsic::Unit.type_index(),
+        | ids::LIST_TRUNCATE
+        | ids::LIST_FILL
+        | ids::LIST_RESIZE
+        | ids::MAP_SET
+        | ids::MAP_CLEAR
+        | ids::MAP_MERGE
+        | ids::LIST_SWAP
+        | ids::LIST_CLEAR
+        | ids::LIST_INSERT
+        | ids::LIST_APPEND => Intrinsic::Unit.type_index(),
         ids::TYPE_OF => Intrinsic::Type.type_index(),
-        ids::LIST_INIT => pool.list_type().unwrap_or(TypeIndex::INVALID),
-        ids::MAP_INIT => pool.map_type().unwrap_or(TypeIndex::INVALID),
+        ids::LIST_INIT
+        | ids::STR_SPLIT
+        | ids::STR_SPLIT_WHITESPACE
+        | ids::STR_SPLITN
+        | ids::STR_RSPLIT
+        | ids::STR_RSPLITN
+        | ids::STR_SPLIT_INCLUSIVE
+        | ids::STR_FIND_ALL
+        | ids::STR_FIND_INDICES
+        | ids::STR_RFIND_INDICES
+        | ids::STR_BYTE_FIND_INDICES
+        | ids::STR_BYTE_RFIND_INDICES
+        | ids::STR_SPLIT_TERMINATOR
+        | ids::STR_RSPLIT_TERMINATOR
+        | ids::STR_SPLIT_ASCII_WHITESPACE
+        | ids::CHAR_ENCODE_UTF8
+        | ids::CHAR_ENCODE_UTF16
+        | ids::STR_ENCODE_UTF8
+        | ids::STR_ENCODE_UTF16
+        | ids::STR_SPLIT_AT
+        | ids::INT_TO_BE_BYTES
+        | ids::INT_TO_LE_BYTES
+        | ids::F64_TO_BE_BYTES
+        | ids::F64_TO_LE_BYTES
+        | ids::F64_TO_NE_BYTES
+        | ids::STR_CHARS
+        | ids::STR_BYTES
+        | ids::STR_CHAR_INDICES
+        | ids::LIST_WINDOWS
+        | ids::LIST_CHUNKS_EXACT
+        | ids::LIST_RCHUNKS
+        | ids::LIST_RCHUNKS_EXACT
+        | ids::LIST_CHUNKS_REMAINDER
+        | ids::LIST_RCHUNKS_REMAINDER
+        | ids::LIST_SPLIT_AT
+        | ids::LIST_ROTATE_LEFT
+        | ids::LIST_ROTATE_RIGHT
+        | ids::LIST_REPEAT
+        | ids::LIST_SPLIT_OFF
+        | ids::MAP_VALUES
+        | ids::LIST_COPY
+        | ids::LIST_REVERSE
+        | ids::LIST_CONCAT
+        | ids::LIST_TAKE
+        | ids::LIST_DROP
+        | ids::STR_LINES
+        | ids::MAP_ENTRIES
+        | ids::LIST_CHUNKS
+        | ids::LIST_ENUMERATE
+        | ids::LIST_FLATTEN
+        | ids::LIST_ZIP => pool.list_type().unwrap_or(TypeIndex::INVALID),
+        ids::MAP_INIT | ids::MAP_COPY => pool.map_type().unwrap_or(TypeIndex::INVALID),
         ids::LIST_LEN | ids::MAP_LEN => Intrinsic::I64.type_index(),
-        ids::LIST_GET | ids::LIST_POP | ids::MAP_GET | ids::MAP_REMOVE => {
-            Intrinsic::Any.type_index()
-        }
-        ids::MAP_CONTAINS => Intrinsic::Bool.type_index(),
-        ids::TO_STRING | ids::STR_CONCAT => Intrinsic::Str.type_index(),
-        ids::TO_I64 | ids::STR_LEN => Intrinsic::I64.type_index(),
+        ids::LIST_GET
+        | ids::LIST_POP
+        | ids::LIST_SWAP_REMOVE
+        | ids::LIST_REMOVE
+        | ids::LIST_FIRST
+        | ids::LIST_LAST
+        | ids::MAP_GET
+        | ids::MAP_REMOVE => Intrinsic::Any.type_index(),
+        ids::MAP_CONTAINS
+        | ids::STR_CONTAINS
+        | ids::STR_STARTS_WITH
+        | ids::STR_ENDS_WITH
+        | ids::CHAR_IS_WHITESPACE
+        | ids::CHAR_IS_ALPHABETIC
+        | ids::CHAR_IS_NUMERIC
+        | ids::CHAR_IS_ALPHANUMERIC
+        | ids::CHAR_IS_UPPERCASE
+        | ids::CHAR_IS_LOWERCASE
+        | ids::CHAR_IS_ASCII
+        | ids::CHAR_IS_ASCII_OCTDIGIT
+        | ids::CHAR_IS_ASCII_DIGIT
+        | ids::CHAR_IS_ASCII_ALPHABETIC
+        | ids::CHAR_IS_ASCII_HEXDIGIT
+        | ids::CHAR_IS_ASCII_CONTROL
+        | ids::CHAR_IS_ASCII_GRAPHIC
+        | ids::CHAR_IS_ASCII_PUNCTUATION
+        | ids::CHAR_IS_ASCII_WHITESPACE
+        | ids::CHAR_IS_ASCII_ALPHANUMERIC
+        | ids::CHAR_IS_ASCII_UPPERCASE
+        | ids::CHAR_IS_ASCII_LOWERCASE
+        | ids::CHAR_IS_CONTROL
+        | ids::STR_IS_ASCII
+        | ids::IS_NAN
+        | ids::IS_INFINITE
+        | ids::IS_FINITE
+        | ids::IS_SIGN_NEGATIVE
+        | ids::IS_SIGN_POSITIVE
+        | ids::IS_POWER_OF_TWO
+        | ids::CHAR_IS_DIGIT
+        | ids::STR_EQ_IGNORE_ASCII_CASE
+        | ids::IS_NORMAL
+        | ids::IS_SUBNORMAL
+        | ids::IS_MULTIPLE_OF
+        | ids::STR_IS_CHAR_BOUNDARY
+        | ids::CHAR_EQ_IGNORE_ASCII_CASE
+        | ids::MAP_INSERT_ABSENT
+        | ids::STR_IS_ASCII_DIGIT
+        | ids::STR_IS_ASCII_ALPHABETIC
+        | ids::STR_IS_ASCII_ALPHANUMERIC
+        | ids::STR_IS_ASCII_LOWERCASE
+        | ids::STR_IS_ASCII_UPPERCASE
+        | ids::STR_IS_ASCII_WHITESPACE
+        | ids::STR_IS_ASCII_HEXDIGIT
+        | ids::STR_IS_ASCII_GRAPHIC
+        | ids::STR_IS_ASCII_PUNCTUATION
+        | ids::STR_IS_ASCII_CONTROL
+        | ids::STR_IS_NUMERIC
+        | ids::STR_IS_ALPHABETIC
+        | ids::STR_IS_ALPHANUMERIC
+        | ids::STR_IS_LOWERCASE
+        | ids::STR_IS_UPPERCASE
+        | ids::STR_IS_WHITESPACE
+        | ids::STR_IS_CONTROL
+        | ids::RANGE_IS_EMPTY
+        | ids::RANGE_INCLUSIVE_IS_EMPTY
+        | ids::RANGE_CONTAINS
+        | ids::RANGE_INCLUSIVE_CONTAINS
+        | ids::RANGE_FROM_CONTAINS
+        | ids::RANGE_TO_CONTAINS
+        | ids::RANGE_TO_INCLUSIVE_CONTAINS
+        | ids::F64_IS_ZERO
+        | ids::BOOL_NOT
+        | ids::BOOL_AND
+        | ids::BOOL_OR
+        | ids::BOOL_XOR
+        | ids::STR_IS_EMPTY
+        | ids::STR_STARTS_WITH_CHAR
+        | ids::STR_ENDS_WITH_CHAR
+        | ids::STR_CONTAINS_CHAR
+        | ids::LIST_IS_EMPTY
+        | ids::MAP_IS_EMPTY => Intrinsic::Bool.type_index(),
+        ids::CHAR_TO_ASCII_UPPERCASE
+        | ids::CHAR_TO_ASCII_LOWERCASE
+        | ids::CHAR_REPLACEMENT
+        | ids::CHAR_MAX
+        | ids::CHAR_MIN => Intrinsic::Char.type_index(),
+        ids::TO_STRING
+        | ids::STR_CONCAT
+        | ids::STR_TRIM
+        | ids::STR_TRIM_START
+        | ids::STR_TRIM_END
+        | ids::STR_TO_UPPER
+        | ids::STR_TO_LOWER
+        | ids::STR_REPEAT
+        | ids::STR_REPLACE
+        | ids::STR_SLICE
+        | ids::CHAR_INTO_STRING
+        | ids::STR_TO_ASCII_UPPERCASE
+        | ids::STR_TO_ASCII_LOWERCASE
+        | ids::CHAR_TO_UPPERCASE
+        | ids::CHAR_TO_LOWERCASE
+        | ids::STR_TRIM_START_MATCHES
+        | ids::STR_TRIM_END_MATCHES
+        | ids::STR_TRIM_MATCHES
+        | ids::STR_REPLACEN
+        | ids::CHAR_ESCAPE_DEBUG
+        | ids::CHAR_ESCAPE_UNICODE
+        | ids::CHAR_ESCAPE_DEFAULT
+        | ids::STR_ESCAPE_DEBUG
+        | ids::STR_ESCAPE_UNICODE
+        | ids::STR_ESCAPE_DEFAULT
+        | ids::STR_TRIM_ASCII
+        | ids::STR_TRIM_ASCII_START
+        | ids::STR_TRIM_ASCII_END
+        | ids::STR_FROM_UTF8_LOSSY
+        | ids::STR_FROM_UTF16_LOSSY
+        | ids::INT_TO_STR_RADIX
+        | ids::STR_TRIM_PREFIX
+        | ids::STR_TRIM_SUFFIX
+        | ids::F64_CLASSIFY
+        | ids::STR_REPEAT_CHAR
+        | ids::STR_TAKE
+        | ids::STR_DROP
+        | ids::STR_REPLACE_CHAR
+        | ids::LIST_JOIN => Intrinsic::Str.type_index(),
+        ids::TO_I64
+        | ids::STR_LEN
+        | ids::STR_CHAR_LEN
+        | ids::CHAR_TO_CODE
+        | ids::STR_COUNT
+        | ids::STR_COUNT_CHAR
+        | ids::RANGE_LEN
+        | ids::RANGE_INCLUSIVE_LEN
+        | ids::COUNT_ONES
+        | ids::COUNT_ZEROS
+        | ids::LEADING_ZEROS
+        | ids::TRAILING_ZEROS
+        | ids::LEADING_ONES
+        | ids::TRAILING_ONES
+        | ids::CHAR_UTF8_LEN
+        | ids::CHAR_UTF16_LEN
+        | ids::INT_SIGNUM
+        | ids::STR_FLOOR_CHAR_BOUNDARY
+        | ids::STR_CEIL_CHAR_BOUNDARY
+        | ids::TOTAL_CMP
+        | ids::F64_RADIX
+        | ids::F64_MANTISSA_DIGITS
+        | ids::F64_DIGITS
+        | ids::F64_MIN_EXP
+        | ids::F64_MAX_EXP
+        | ids::STR_BYTE_AT
+        | ids::F64_MIN_10_EXP
+        | ids::F64_MAX_10_EXP
+        | ids::STR_BYTE_COUNT
+        | ids::I64_MIN
+        | ids::I64_MAX
+        | ids::INT_BIT_WIDTH
+        | ids::I64_BITS
+        | ids::I128_BITS
+        | ids::ISIZE_BITS
+        | ids::U128_BITS
+        | ids::USIZE_BITS => Intrinsic::I64.type_index(),
+        ids::U64_MAX => Intrinsic::U64.type_index(),
+        ids::I128_MIN | ids::I128_MAX => Intrinsic::I128.type_index(),
+        ids::U128_MAX => Intrinsic::U128.type_index(),
         ids::TO_F64
         | ids::SIN
         | ids::COS
@@ -1987,7 +2222,81 @@ fn builtin_return_type(pool: &type_pool::TypePool, id: runtime::BuiltinFnId) -> 
         | ids::FLOOR
         | ids::CEIL
         | ids::ROUND
-        | ids::LOG => Intrinsic::F64.type_index(),
+        | ids::LOG
+        | ids::EXP
+        | ids::LOG2
+        | ids::LOG10
+        | ids::TRUNC
+        | ids::FRACT
+        | ids::COPY_SIGN
+        | ids::ATAN2
+        | ids::HYPOT
+        | ids::TAN
+        | ids::ASIN
+        | ids::ACOS
+        | ids::ATAN
+        | ids::SINH
+        | ids::COSH
+        | ids::TANH
+        | ids::CBRT
+        | ids::EXP2
+        | ids::EXPM1
+        | ids::LOG1P
+        | ids::SIGNUM
+        | ids::RECIP
+        | ids::MUL_ADD
+        | ids::DIV_EUCLID
+        | ids::REM_EUCLID
+        | ids::TO_RADIANS
+        | ids::TO_DEGREES
+        | ids::NEXT_UP
+        | ids::NEXT_DOWN
+        | ids::MIDPOINT
+        | ids::ROUND_TIES_EVEN
+        | ids::ASINH
+        | ids::ACOSH
+        | ids::ATANH
+        | ids::FROM_BITS
+        | ids::POWI
+        | ids::LOG_BASE
+        | ids::PI
+        | ids::E
+        | ids::TAU
+        | ids::LN_2
+        | ids::LN_10
+        | ids::LOG2_E
+        | ids::LOG10_E
+        | ids::SQRT_2
+        | ids::INFINITY
+        | ids::NEG_INFINITY
+        | ids::NAN
+        | ids::EPSILON
+        | ids::MIN_POSITIVE
+        | ids::FRAC_PI_2
+        | ids::FRAC_PI_4
+        | ids::FRAC_1_SQRT_2
+        | ids::LOG2_10
+        | ids::LOG10_2
+        | ids::FRAC_1_PI
+        | ids::FRAC_2_PI
+        | ids::FRAC_2_SQRT_PI
+        | ids::FRAC_PI_3
+        | ids::FRAC_PI_6
+        | ids::FRAC_PI_8
+        | ids::F64_MIN
+        | ids::F64_MAX
+        | ids::GOLDEN_RATIO
+        | ids::EULER_GAMMA
+        | ids::F64_FROM_BE_BYTES
+        | ids::F64_FROM_LE_BYTES
+        | ids::F64_FROM_NE_BYTES
+        | ids::ALGEBRAIC_ADD
+        | ids::ALGEBRAIC_SUB
+        | ids::ALGEBRAIC_MUL
+        | ids::ALGEBRAIC_DIV
+        | ids::ALGEBRAIC_REM
+        | ids::F64_NAN_TO
+        | ids::F64_ABS_DIFF => Intrinsic::F64.type_index(),
         _ => Intrinsic::Any.type_index(),
     }
 }
@@ -2061,6 +2370,7 @@ fn resolve_pattern_literals(
         | NodeKind::PatternErrorOk
         | NodeKind::PatternTypeFamily
         | NodeKind::PatternAsBind
+        | NodeKind::PatternTyped
         | NodeKind::PatternIfGuard
         | NodeKind::PatternNot
         | NodeKind::PatternAndIs
@@ -2242,7 +2552,7 @@ fn propagate_type_to_pattern(r: &mut Resolver, ast: &Ast, pat: NodeIndex, ty: Ty
 }
 
 /// Get a human-readable name for a type, for use in diagnostic messages.
-fn type_display_name(pool: &type_pool::TypePool, ti: TypeIndex) -> String {
+pub(crate) fn type_display_name(pool: &type_pool::TypePool, ti: TypeIndex) -> String {
     if ti == TypeIndex::INVALID {
         return "<unknown>".to_string();
     }

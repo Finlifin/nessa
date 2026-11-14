@@ -18,121 +18,113 @@ impl Vm {
                 id,
                 owner,
                 function.function_type,
-                function.abi.as_ref(),
+                &function.abi,
                 function.param_count,
                 function.is_closure,
             )
             .map_err(|_| VmError::TypeError)?;
         }
-        if let Some(abi) = &function.abi {
-            for parameter in &abi.parameters {
-                if let nsbc::ParameterAbi::Trait { view } = parameter
-                    && self
-                        .state
-                        .type_pool
-                        .trait_has_associated_types(*view)
-                        .map_err(|_| VmError::InvalidTraitProof)?
-                {
-                    return Err(VmError::UnsupportedFunctionAbi);
-                }
-            }
-            for view in abi
-                .captures
-                .iter()
-                .filter_map(|capture| match capture {
-                    nsbc::CaptureAbi::TraitProof { view } => Some(view),
-                    _ => None,
-                })
-                .chain(
-                    abi.parameters
-                        .iter()
-                        .filter_map(|parameter| match parameter {
-                            nsbc::ParameterAbi::Trait { view }
-                            | nsbc::ParameterAbi::TraitSelf { view } => Some(view),
-                            _ => None,
-                        }),
-                )
-            {
-                let view = self
+        let abi = &function.abi;
+        for parameter in &abi.parameters {
+            if let nsbc::ParameterAbi::Trait { view } = parameter
+                && self
                     .state
                     .type_pool
-                    .canonical_type(*view)
-                    .ok_or(VmError::InvalidTraitProof)?;
-                if !matches!(
-                    self.state.type_pool.get(view).kind,
-                    type_pool::TypeKind::Trait { .. }
-                ) {
+                    .trait_has_associated_types(*view)
+                    .map_err(|_| VmError::InvalidTraitProof)?
+            {
+                return Err(VmError::UnsupportedFunctionAbi);
+            }
+        }
+        for view in abi
+            .captures
+            .iter()
+            .filter_map(|capture| match capture {
+                nsbc::CaptureAbi::TraitProof { view } => Some(view),
+                _ => None,
+            })
+            .chain(
+                abi.parameters
+                    .iter()
+                    .filter_map(|parameter| match parameter {
+                        nsbc::ParameterAbi::Trait { view }
+                        | nsbc::ParameterAbi::TraitSelf { view } => Some(view),
+                        _ => None,
+                    }),
+            )
+        {
+            let view = self
+                .state
+                .type_pool
+                .canonical_type(*view)
+                .ok_or(VmError::InvalidTraitProof)?;
+            if !matches!(
+                self.state.type_pool.get(view).kind,
+                type_pool::TypeKind::Trait { .. }
+            ) {
+                return Err(VmError::InvalidTraitProof);
+            }
+        }
+        if function.function_type != type_pool::TypeIndex::INVALID {
+            let ty = self
+                .state
+                .type_pool
+                .canonical_type(function.function_type)
+                .ok_or(VmError::TypeError)?;
+            let type_pool::TypeKind::Function { params, .. } = &self.state.type_pool.get(ty).kind
+            else {
+                return Err(VmError::TypeError);
+            };
+            for (parameter, &ty) in abi.parameters.iter().zip(params) {
+                if let nsbc::ParameterAbi::Trait { view } = parameter
+                    && self.state.type_pool.canonical_type(*view)
+                        != self.state.type_pool.canonical_type(ty)
+                {
                     return Err(VmError::InvalidTraitProof);
                 }
             }
-            if function.function_type != type_pool::TypeIndex::INVALID {
-                let ty = self
-                    .state
-                    .type_pool
-                    .canonical_type(function.function_type)
-                    .ok_or(VmError::TypeError)?;
-                let type_pool::TypeKind::Function { params, .. } =
-                    &self.state.type_pool.get(ty).kind
-                else {
-                    return Err(VmError::TypeError);
-                };
-                for (parameter, &ty) in abi.parameters.iter().zip(params) {
-                    if let nsbc::ParameterAbi::Trait { view } = parameter
-                        && self.state.type_pool.canonical_type(*view)
-                            != self.state.type_pool.canonical_type(ty)
-                    {
-                        return Err(VmError::InvalidTraitProof);
+            for (parameter, &ty) in abi.parameters.iter().zip(params) {
+                if matches!(parameter, nsbc::ParameterAbi::TraitSelf { .. }) {
+                    let concrete = self
+                        .state
+                        .type_pool
+                        .canonical_type(ty)
+                        .ok_or(VmError::TypeError)?;
+                    if matches!(
+                        self.state.type_pool.get(concrete).kind,
+                        type_pool::TypeKind::Trait { .. }
+                    ) {
+                        return Err(VmError::TypeError);
                     }
                 }
-                for (parameter, &ty) in abi.parameters.iter().zip(params) {
-                    if matches!(parameter, nsbc::ParameterAbi::TraitSelf { .. }) {
-                        let concrete = self
-                            .state
-                            .type_pool
-                            .canonical_type(ty)
-                            .ok_or(VmError::TypeError)?;
-                        if matches!(
-                            self.state.type_pool.get(concrete).kind,
-                            type_pool::TypeKind::Trait { .. }
-                        ) {
-                            return Err(VmError::TypeError);
-                        }
-                    }
-                }
-                if params.len() != abi.logical_parameter_count() {
-                    return Err(VmError::TypeError);
-                }
             }
-            if function.function_type == type_pool::TypeIndex::INVALID
-                && abi
-                    .parameters
-                    .iter()
-                    .any(|parameter| matches!(parameter, nsbc::ParameterAbi::TraitSelf { .. }))
-            {
+            if params.len() != abi.logical_parameter_count() {
                 return Err(VmError::TypeError);
             }
-            if abi.capture_count() > runtime::GP_REGISTER_COUNT
-                || abi.logical_parameter_count() > runtime::GP_REGISTER_COUNT
-                || abi.physical_parameter_count() != function.param_count as usize
-                || function.param_count as usize > runtime::GP_REGISTER_COUNT
-                || function.param_count > function.register_count
-                || (!function.is_closure && abi.capture_count() != 0)
-            {
-                return Err(VmError::TypeError);
-            }
+        }
+        if function.function_type == type_pool::TypeIndex::INVALID
+            && abi
+                .parameters
+                .iter()
+                .any(|parameter| matches!(parameter, nsbc::ParameterAbi::TraitSelf { .. }))
+        {
+            return Err(VmError::TypeError);
+        }
+        if abi.capture_count() > runtime::GP_REGISTER_COUNT
+            || abi.logical_parameter_count() > runtime::GP_REGISTER_COUNT
+            || abi.physical_parameter_count() != function.param_count as usize
+            || function.param_count as usize > runtime::GP_REGISTER_COUNT
+            || function.param_count > function.register_count
+            || (!function.is_closure && abi.capture_count() != 0)
+        {
+            return Err(VmError::TypeError);
         }
         Ok(function)
     }
 
-    /// Only explicit descriptors assert a capture count. Legacy callers retain
-    /// their existing physical-count/signature interpretation.
     pub(super) fn check_capture_abi(&self, id: FuncId, count: usize) -> Result<(), VmError> {
         let function = self.checked_function(id)?;
-        if function
-            .abi
-            .as_ref()
-            .is_some_and(|abi| abi.capture_count() != count)
-        {
+        if function.abi.capture_count() != count {
             return Err(VmError::TypeError);
         }
         Ok(())
@@ -169,11 +161,9 @@ impl Vm {
 
     pub(super) fn check_user_argument_abi(&self, id: FuncId, count: usize) -> Result<(), VmError> {
         let function = self.checked_function(id)?;
-        if let Some(abi) = &function.abi
-            && abi.logical_parameter_count() != count
-        {
+        if function.abi.logical_parameter_count() != count {
             return Err(VmError::ArityError {
-                expected: abi.logical_parameter_count() as u8,
+                expected: function.abi.logical_parameter_count() as u8,
                 got: u8::try_from(count).unwrap_or(u8::MAX),
             });
         }
@@ -200,7 +190,7 @@ mod tests {
     fn add(vm: &mut Vm, id: u32, instructions: &[Instruction], captures: usize, parameters: usize) {
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(descriptor(captures, parameters)),
+            abi: descriptor(captures, parameters),
             func_id: FuncId(id),
             instructions: instructions
                 .iter()
@@ -359,7 +349,7 @@ mod tests {
             };
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: Some(abi),
+                abi,
                 func_id: FuncId(0),
                 instructions: vec![Instruction::ret(Reg(0)).encode()],
                 register_count: 32,
@@ -382,7 +372,7 @@ mod tests {
         });
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(descriptor(0, 0)),
+            abi: descriptor(0, 0),
             func_id: FuncId(0),
             instructions: vec![],
             register_count: 32,

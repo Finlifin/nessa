@@ -51,6 +51,7 @@ fn malformed_struct_constructions_and_defaults_are_rejected() {
         "fn main() { i64 { value: 42 } }",
         "struct Pair { a: i64 = if true { return 42 } else { 0 } }\nfn main() { 42 }",
         "struct Recursive { child: Recursive = Recursive {} }\nfn main() { Recursive {} }",
+        "struct Pair { a: Missing }\nfn main() { Pair { a: 0 } }",
     ] {
         let result = driver::Driver::new().compile(source);
         assert!(result.has_errors, "{source}");

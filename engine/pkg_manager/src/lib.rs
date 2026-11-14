@@ -17,7 +17,7 @@ mod foundation_tests;
 pub use error::PackageError;
 pub use identity::PackageIdentity;
 pub use manifest::ManifestDocument;
-pub use resolver::{PackageResolver, ResolvedPackageGraph, ResolvedPackages};
+pub use resolver::{PackageResolver, ResolvedPackageGraph};
 pub use source::{
     ModuleSources, PackageSourceError, PackageSources, SourceFile, SourceLoadLimits,
     discover_modules, discover_modules_with_limits, load_package_sources,
@@ -146,49 +146,53 @@ mod tests {
     fn package_resolver_simple() {
         let mut resolver = PackageResolver::new();
 
-        let dep = PackageManifest {
-            name: "utils".into(),
-            domain: "com.test".into(),
-            version: Version::new(1, 0, 0),
-            package_type: PackageType::Lib,
-            dependencies: vec![],
-        };
-        resolver.register(dep);
+        let dep = ManifestDocument::parse(
+            r#"[package]
+name = "utils"
+domain = "com.test"
+version = "1.0.0"
+type = "lib"
+"#,
+        )
+        .unwrap();
+        resolver.register_document(dep).unwrap();
 
-        let root = PackageManifest {
-            name: "app".into(),
-            domain: "com.test".into(),
-            version: Version::new(0, 1, 0),
-            package_type: PackageType::Exe,
-            dependencies: vec![Dependency {
-                domain: "com.test".into(),
-                name: "utils".into(),
-                constraint: VersionConstraint::parse("1.0.0").unwrap(),
-            }],
-        };
+        let root = ManifestDocument::parse(
+            r#"[package]
+name = "app"
+domain = "com.test"
+version = "0.1.0"
+type = "exe"
 
-        let resolved = resolver.resolve(&root).unwrap();
-        assert_eq!(resolved.packages.len(), 2);
+[dependencies]
+"com.test/utils" = "1.0.0"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolver.resolve_document(&root).unwrap();
+        assert_eq!(resolved.packages().len(), 2);
         // Dependency comes first.
-        assert_eq!(resolved.packages[0].name, "utils");
-        assert_eq!(resolved.packages[1].name, "app");
+        assert_eq!(resolved.packages()[0].name, "utils");
+        assert_eq!(resolved.packages()[1].name, "app");
     }
 
     #[test]
     fn package_resolver_missing_dep() {
         let resolver = PackageResolver::new();
-        let root = PackageManifest {
-            name: "app".into(),
-            domain: "com.test".into(),
-            version: Version::new(0, 1, 0),
-            package_type: PackageType::Exe,
-            dependencies: vec![Dependency {
-                domain: "com.test".into(),
-                name: "missing".into(),
-                constraint: VersionConstraint::parse("1.0.0").unwrap(),
-            }],
-        };
-        assert!(resolver.resolve(&root).is_err());
+        let root = ManifestDocument::parse(
+            r#"[package]
+name = "app"
+domain = "com.test"
+version = "0.1.0"
+type = "exe"
+
+[dependencies]
+"com.test/missing" = "1.0.0"
+"#,
+        )
+        .unwrap();
+        assert!(resolver.resolve_document(&root).is_err());
     }
 
     #[test]

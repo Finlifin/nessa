@@ -430,6 +430,702 @@ impl Vm {
             Ok(value)
         }
     }
+
+    fn list_slot(&self, list: TaggedValue, index: usize) -> Result<TaggedValue, VmError> {
+        let layout = self.list_layout(list)?;
+        if index >= layout.length {
+            return Err(VmError::InvalidIndex);
+        }
+        // SAFETY: the index is inside the occupied prefix, and this read does not allocate.
+        Ok(TaggedValue::from_raw(unsafe {
+            layout.buffer.add(index).read()
+        }))
+    }
+
+    /// Shallow copy of `start..end`. The source must already be rooted.
+    fn copy_list_range(
+        &mut self,
+        source: TaggedValue,
+        start: usize,
+        end: usize,
+    ) -> Result<TaggedValue, VmError> {
+        if start > end {
+            return Err(VmError::InvalidIndex);
+        }
+        let length = end - start;
+        let copy = self.new_list(length)?;
+        if length == 0 {
+            return Ok(copy);
+        }
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[source, copy], |vm| {
+            for offset in 0..length {
+                let source = vm.roots.temporary_values.borrow()[root];
+                let value = vm.list_slot(source, start + offset)?;
+                let copy = vm.roots.temporary_values.borrow()[root + 1];
+                vm.list_set(copy, TaggedValue::from_u64(offset as u64), value)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    fn list_of_ranges(
+        &mut self,
+        source: TaggedValue,
+        ranges: &[(usize, usize)],
+    ) -> Result<TaggedValue, VmError> {
+        let outer = self.new_list(ranges.len())?;
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[source, outer], |vm| {
+            for (index, &(start, end)) in ranges.iter().enumerate() {
+                let source = vm.roots.temporary_values.borrow()[root];
+                let piece = vm.copy_list_range(source, start, end)?;
+                let outer = vm.roots.temporary_values.borrow()[root + 1];
+                vm.list_set(outer, TaggedValue::from_u64(index as u64), piece)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    fn require_chunk_size(size: usize) -> Result<(), VmError> {
+        if size == 0 {
+            Err(VmError::InvalidArgument("chunk size must not be zero"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn list_windows(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let size = Self::list_index(size)?;
+        if size == 0 {
+            return Err(VmError::InvalidArgument("window size must not be zero"));
+        }
+        let len = self.list_len(list)?;
+        let count = if size > len { 0 } else { len - size + 1 };
+        let mut ranges = Vec::with_capacity(count);
+        for start in 0..count {
+            ranges.push((start, start + size));
+        }
+        self.list_of_ranges(list, &ranges)
+    }
+
+    pub(super) fn list_chunks(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let size = Self::list_index(size)?;
+        Self::require_chunk_size(size)?;
+        let len = self.list_len(list)?;
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        while start < len {
+            let end = start.saturating_add(size).min(len);
+            ranges.push((start, end));
+            start = end;
+        }
+        self.list_of_ranges(list, &ranges)
+    }
+
+    pub(super) fn list_chunks_exact(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let size = Self::list_index(size)?;
+        Self::require_chunk_size(size)?;
+        let len = self.list_len(list)?;
+        let count = len / size;
+        let mut ranges = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = index * size;
+            ranges.push((start, start + size));
+        }
+        self.list_of_ranges(list, &ranges)
+    }
+
+    pub(super) fn list_rchunks(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let size = Self::list_index(size)?;
+        Self::require_chunk_size(size)?;
+        let len = self.list_len(list)?;
+        let mut ranges = Vec::new();
+        let mut end = len;
+        while end > 0 {
+            let start = end.saturating_sub(size);
+            ranges.push((start, end));
+            end = start;
+        }
+        self.list_of_ranges(list, &ranges)
+    }
+
+    pub(super) fn list_rchunks_exact(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let size = Self::list_index(size)?;
+        Self::require_chunk_size(size)?;
+        let len = self.list_len(list)?;
+        let remainder = len % size;
+        let mut ranges = Vec::new();
+        let mut end = len;
+        while end > remainder {
+            let start = end - size;
+            ranges.push((start, end));
+            end = start;
+        }
+        self.list_of_ranges(list, &ranges)
+    }
+
+    pub(super) fn list_chunks_remainder(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let size = Self::list_index(size)?;
+        Self::require_chunk_size(size)?;
+        let len = self.list_len(list)?;
+        let start = len - (len % size);
+        self.copy_list_range(list, start, len)
+    }
+
+    pub(super) fn list_rchunks_remainder(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let size = Self::list_index(size)?;
+        Self::require_chunk_size(size)?;
+        let len = self.list_len(list)?;
+        self.copy_list_range(list, 0, len % size)
+    }
+
+    pub(super) fn list_split_at(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let index = Self::list_index(index)?;
+        let len = self.list_len(list)?;
+        if index > len {
+            return Err(VmError::InvalidIndex);
+        }
+        self.list_of_ranges(list, &[(0, index), (index, len)])
+    }
+
+    fn rotated_list(
+        &mut self,
+        list: TaggedValue,
+        distance: usize,
+        right: bool,
+    ) -> Result<TaggedValue, VmError> {
+        let len = self.list_len(list)?;
+        if distance > len {
+            return Err(VmError::InvalidArgument("rotate distance is out of range"));
+        }
+        let start = if !right || distance == 0 {
+            distance
+        } else {
+            len - distance
+        };
+        if len == 0 || start == 0 || start == len {
+            return self.copy_list_range(list, 0, len);
+        }
+        let copy = self.new_list(len)?;
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, copy], |vm| {
+            for index in 0..len {
+                let source_index = (start + index) % len;
+                let source = vm.roots.temporary_values.borrow()[root];
+                let value = vm.list_slot(source, source_index)?;
+                let copy = vm.roots.temporary_values.borrow()[root + 1];
+                vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn list_rotate_left(
+        &mut self,
+        list: TaggedValue,
+        distance: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let distance = Self::list_index(distance)?;
+        self.rotated_list(list, distance, false)
+    }
+
+    pub(super) fn list_rotate_right(
+        &mut self,
+        list: TaggedValue,
+        distance: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let distance = Self::list_index(distance)?;
+        self.rotated_list(list, distance, true)
+    }
+
+    pub(super) fn list_repeat(
+        &mut self,
+        list: TaggedValue,
+        count: usize,
+    ) -> Result<TaggedValue, VmError> {
+        let len = self.list_len(list)?;
+        let total = len.checked_mul(count).ok_or(VmError::ObjectTooLarge)?;
+        if total > MAX_CAPACITY {
+            return Err(VmError::ObjectTooLarge);
+        }
+        let copy = self.new_list(total)?;
+        if total == 0 {
+            return Ok(copy);
+        }
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, copy], |vm| {
+            for block in 0..count {
+                for offset in 0..len {
+                    let source = vm.roots.temporary_values.borrow()[root];
+                    let value = vm.list_slot(source, offset)?;
+                    let copy = vm.roots.temporary_values.borrow()[root + 1];
+                    let index = block * len + offset;
+                    vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
+                }
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn list_truncate(
+        &mut self,
+        list: TaggedValue,
+        len: TaggedValue,
+    ) -> Result<(), VmError> {
+        let new_len = Self::list_index(len)?;
+        let layout = self.list_layout(list)?;
+        if new_len >= layout.length {
+            return Ok(());
+        }
+        // SAFETY: both indexes are inside the occupied prefix. Clearing the tail
+        // drops GC edges that truncate removed. No allocation follows.
+        unsafe {
+            for index in new_len..layout.length {
+                layout.buffer.add(index).write(TaggedValue::UNIT.raw());
+            }
+            layout
+                .wrapper
+                .write(TaggedValue::from_u64(new_len as u64).raw());
+        }
+        Ok(())
+    }
+
+    pub(super) fn list_fill(
+        &mut self,
+        list: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<(), VmError> {
+        let len = self.list_len(list)?;
+        for index in 0..len {
+            self.list_set(list, TaggedValue::from_u64(index as u64), value)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn list_swap_remove(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let index = Self::list_index(index)?;
+        let len = self.list_len(list)?;
+        if index >= len {
+            return Err(VmError::InvalidIndex);
+        }
+        let removed = self.list_slot(list, index)?;
+        if index + 1 != len {
+            let last = self.list_slot(list, len - 1)?;
+            self.list_set(list, TaggedValue::from_u64(index as u64), last)?;
+        }
+        self.list_pop(list)?;
+        Ok(removed)
+    }
+
+    pub(super) fn list_split_off(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let index = Self::list_index(index)?;
+        let len = self.list_len(list)?;
+        if index > len {
+            return Err(VmError::InvalidIndex);
+        }
+        let tail = self.copy_list_range(list, index, len)?;
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, tail], |vm| {
+            let list = vm.roots.temporary_values.borrow()[root];
+            vm.list_truncate(list, TaggedValue::from_u64(index as u64))?;
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn list_resize(
+        &mut self,
+        list: TaggedValue,
+        len: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<(), VmError> {
+        let new_len = Self::list_index(len)?;
+        if new_len > MAX_CAPACITY {
+            return Err(VmError::ObjectTooLarge);
+        }
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, value], |vm| {
+            let list = vm.roots.temporary_values.borrow()[root];
+            let current = vm.list_len(list)?;
+            if new_len <= current {
+                return vm.list_truncate(list, TaggedValue::from_u64(new_len as u64));
+            }
+            for _ in current..new_len {
+                let list = vm.roots.temporary_values.borrow()[root];
+                let value = vm.roots.temporary_values.borrow()[root + 1];
+                vm.list_push(list, value)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn list_copy(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        let len = self.list_len(list)?;
+        self.copy_list_range(list, 0, len)
+    }
+
+    pub(super) fn list_reverse(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        let len = self.list_len(list)?;
+        let copy = self.new_list(len)?;
+        if len == 0 {
+            return Ok(copy);
+        }
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, copy], |vm| {
+            for index in 0..len {
+                let source = vm.roots.temporary_values.borrow()[root];
+                let value = vm.list_slot(source, len - 1 - index)?;
+                let copy = vm.roots.temporary_values.borrow()[root + 1];
+                vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn list_concat(
+        &mut self,
+        left: TaggedValue,
+        right: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let left_len = self.list_len(left)?;
+        let right_len = self.list_len(right)?;
+        let total = left_len
+            .checked_add(right_len)
+            .ok_or(VmError::ObjectTooLarge)?;
+        if total > MAX_CAPACITY {
+            return Err(VmError::ObjectTooLarge);
+        }
+        let copy = self.new_list(total)?;
+        if total == 0 {
+            return Ok(copy);
+        }
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[left, right, copy], |vm| {
+            for index in 0..total {
+                let source_is_left = index < left_len;
+                let source_index = if source_is_left {
+                    index
+                } else {
+                    index - left_len
+                };
+                let source =
+                    vm.roots.temporary_values.borrow()[root + usize::from(!source_is_left)];
+                let value = vm.list_slot(source, source_index)?;
+                let copy = vm.roots.temporary_values.borrow()[root + 2];
+                vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 2])
+        })
+    }
+
+    pub(super) fn list_swap(
+        &mut self,
+        list: TaggedValue,
+        left: TaggedValue,
+        right: TaggedValue,
+    ) -> Result<(), VmError> {
+        let left = Self::list_index(left)?;
+        let right = Self::list_index(right)?;
+        let len = self.list_len(list)?;
+        if left >= len || right >= len {
+            return Err(VmError::InvalidIndex);
+        }
+        if left == right {
+            return Ok(());
+        }
+        let first = self.list_slot(list, left)?;
+        let second = self.list_slot(list, right)?;
+        self.list_set(list, TaggedValue::from_u64(left as u64), second)?;
+        self.list_set(list, TaggedValue::from_u64(right as u64), first)?;
+        Ok(())
+    }
+
+    pub(super) fn list_clear(&mut self, list: TaggedValue) -> Result<(), VmError> {
+        self.list_truncate(list, TaggedValue::from_u64(0))
+    }
+
+    pub(super) fn list_insert(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<(), VmError> {
+        let index = Self::list_index(index)?;
+        let len = self.list_len(list)?;
+        if index > len {
+            return Err(VmError::InvalidIndex);
+        }
+        if index == len {
+            return self.list_push(list, value);
+        }
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, value], |vm| {
+            let list = vm.roots.temporary_values.borrow()[root];
+            let last = vm.list_slot(list, len - 1)?;
+            vm.list_push(list, last)?;
+            for cursor in (index + 1..len).rev() {
+                let list = vm.roots.temporary_values.borrow()[root];
+                let previous = vm.list_slot(list, cursor - 1)?;
+                vm.list_set(list, TaggedValue::from_u64(cursor as u64), previous)?;
+            }
+            let list = vm.roots.temporary_values.borrow()[root];
+            let value = vm.roots.temporary_values.borrow()[root + 1];
+            vm.list_set(list, TaggedValue::from_u64(index as u64), value)?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn list_remove(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let index = Self::list_index(index)?;
+        let len = self.list_len(list)?;
+        if index >= len {
+            return Err(VmError::InvalidIndex);
+        }
+        let removed = self.list_slot(list, index)?;
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, removed], |vm| {
+            for cursor in index + 1..len {
+                let list = vm.roots.temporary_values.borrow()[root];
+                let next = vm.list_slot(list, cursor)?;
+                vm.list_set(list, TaggedValue::from_u64((cursor - 1) as u64), next)?;
+            }
+            let list = vm.roots.temporary_values.borrow()[root];
+            vm.list_pop(list)?;
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn list_take(
+        &mut self,
+        list: TaggedValue,
+        count: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let count = Self::list_index(count)?;
+        let len = self.list_len(list)?;
+        self.copy_list_range(list, 0, count.min(len))
+    }
+
+    pub(super) fn list_drop(
+        &mut self,
+        list: TaggedValue,
+        count: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let count = Self::list_index(count)?;
+        let len = self.list_len(list)?;
+        self.copy_list_range(list, count.min(len), len)
+    }
+
+    pub(super) fn list_first(&self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        if self.list_len(list)? == 0 {
+            Ok(TaggedValue::NULL)
+        } else {
+            self.list_slot(list, 0)
+        }
+    }
+
+    pub(super) fn list_last(&self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        let len = self.list_len(list)?;
+        if len == 0 {
+            Ok(TaggedValue::NULL)
+        } else {
+            self.list_slot(list, len - 1)
+        }
+    }
+
+    pub(super) fn list_append(
+        &mut self,
+        list: TaggedValue,
+        other: TaggedValue,
+    ) -> Result<(), VmError> {
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, other], |vm| {
+            let other = vm.roots.temporary_values.borrow()[root + 1];
+            let extra = vm.list_len(other)?;
+            for index in 0..extra {
+                let other = vm.roots.temporary_values.borrow()[root + 1];
+                let value = vm.list_slot(other, index)?;
+                let list = vm.roots.temporary_values.borrow()[root];
+                vm.list_push(list, value)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn list_enumerate(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        let len = self.list_len(list)?;
+        let out = self.new_list(len)?;
+        let i64_ty = type_pool::Intrinsic::I64.type_index();
+        let any_ty = type_pool::Intrinsic::Any.type_index();
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, out], |vm| {
+            for index in 0..len {
+                let list = vm.roots.temporary_values.borrow()[root];
+                let value = vm.list_slot(list, index)?;
+                let pair = vm.alloc_tuple(
+                    &[i64_ty, any_ty],
+                    &[
+                        TaggedValue::from_i64(
+                            i64::try_from(index).map_err(|_| VmError::NumericOverflow)?,
+                        ),
+                        value,
+                    ],
+                )?;
+                let out = vm.roots.temporary_values.borrow()[root + 1];
+                vm.list_set(out, TaggedValue::from_u64(index as u64), pair)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn list_flatten(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        let len = self.list_len(list)?;
+        let out = self.new_list(0)?;
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list, out], |vm| {
+            for index in 0..len {
+                let list = vm.roots.temporary_values.borrow()[root];
+                let inner = vm.list_slot(list, index)?;
+                let out = vm.roots.temporary_values.borrow()[root + 1];
+                vm.list_append(out, inner)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        })
+    }
+
+    pub(super) fn list_zip(
+        &mut self,
+        left: TaggedValue,
+        right: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[left, right], |vm| {
+            let left_len = vm.list_len(vm.roots.temporary_values.borrow()[root])?;
+            let right_len = vm.list_len(vm.roots.temporary_values.borrow()[root + 1])?;
+            let end = left_len.min(right_len);
+            let out = vm.new_list(end)?;
+            vm.with_temporary_roots(&[out], |vm| {
+                for index in 0..end {
+                    let left = vm.roots.temporary_values.borrow()[root];
+                    let right = vm.roots.temporary_values.borrow()[root + 1];
+                    let left_value = vm.list_slot(left, index)?;
+                    let right_value = vm.list_slot(right, index)?;
+                    let pair = vm.alloc_tuple(
+                        &[
+                            vm.reflected_type(left_value)?,
+                            vm.reflected_type(right_value)?,
+                        ],
+                        &[left_value, right_value],
+                    )?;
+                    let out = vm.roots.temporary_values.borrow()[root + 2];
+                    vm.list_set(out, TaggedValue::from_u64(index as u64), pair)?;
+                }
+                Ok(vm.roots.temporary_values.borrow()[root + 2])
+            })
+        })
+    }
+
+    pub(super) fn list_join(
+        &self,
+        list: TaggedValue,
+        separator: TaggedValue,
+    ) -> Result<String, VmError> {
+        let separator =
+            crate::builtin_ctx::heap_string_to_owned(separator).ok_or(VmError::TypeError)?;
+        let len = self.list_len(list)?;
+        let mut pieces = Vec::with_capacity(len);
+        for index in 0..len {
+            let value = self.list_slot(list, index)?;
+            let piece =
+                crate::builtin_ctx::heap_string_to_owned(value).ok_or(VmError::TypeError)?;
+            pieces.push(piece);
+        }
+        Ok(pieces.join(&separator))
+    }
+
+    /// Build a fresh List holding a new String for each piece, in order.
+    pub(super) fn new_string_list(&mut self, pieces: &[&str]) -> Result<TaggedValue, VmError> {
+        let list = self.new_list(pieces.len())?;
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(&[list], |vm| {
+            for (index, piece) in pieces.iter().enumerate() {
+                let text = vm.alloc_string(piece)?;
+                // Reload after the allocation; list_set itself does not allocate.
+                let list = vm.roots.temporary_values.borrow()[root];
+                vm.list_set(list, TaggedValue::from_u64(index as u64), text)?;
+            }
+            Ok(vm.roots.temporary_values.borrow()[root])
+        })
+    }
+
+    /// Build a fresh List of immediate char values; only the List allocates.
+    pub(super) fn new_char_list(&mut self, text: &str) -> Result<TaggedValue, VmError> {
+        let list = self.new_list(text.chars().count())?;
+        for (index, ch) in text.chars().enumerate() {
+            self.list_set(
+                list,
+                TaggedValue::from_u64(index as u64),
+                TaggedValue::from_char(ch),
+            )?;
+        }
+        Ok(list)
+    }
+
+    /// Build a fresh List of immediate i64 values; only the List allocates.
+    pub(super) fn new_i64_list(&mut self, values: &[i64]) -> Result<TaggedValue, VmError> {
+        let list = self.new_list(values.len())?;
+        for (index, value) in values.iter().enumerate() {
+            self.list_set(
+                list,
+                TaggedValue::from_u64(index as u64),
+                TaggedValue::from_i64(*value),
+            )?;
+        }
+        Ok(list)
+    }
 }
 
 #[cfg(test)]
@@ -555,7 +1251,7 @@ mod tests {
             });
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(0),
                 func_id: FuncId(0),
                 instructions: instructions.into_iter().map(Instruction::encode).collect(),
                 register_count: 32,
@@ -579,7 +1275,7 @@ mod tests {
         let mut vm = make_vm();
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: nsbc::FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: [
                 Instruction::a_type(Opcode::NewList, AddrMode::Imm, Reg(10), Reg(0), 1),
@@ -613,7 +1309,7 @@ mod tests {
             let mut vm = make_vm();
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(0),
                 func_id: FuncId(0),
                 instructions: [
                     Instruction::a_type(Opcode::NewList, AddrMode::Imm, Reg(10), Reg(0), 1),

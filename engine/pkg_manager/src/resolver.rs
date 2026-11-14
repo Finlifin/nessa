@@ -3,12 +3,6 @@ use std::sync::Arc;
 
 use crate::{ManifestDocument, PackageError, PackageIdentity, PackageManifest, VersionConstraint};
 
-/// Legacy dependency-order projection, including the root package.
-#[derive(Debug)]
-pub struct ResolvedPackages {
-    pub packages: Vec<PackageManifest>,
-}
-
 /// An immutable, validated DAG with exact version selections and Merkle identities.
 #[derive(Debug, Clone)]
 pub struct ResolvedPackageGraph {
@@ -37,7 +31,6 @@ impl ResolvedPackageGraph {
 #[derive(Default)]
 pub struct PackageResolver {
     pub(crate) registry: BTreeMap<String, BTreeMap<String, Arc<ManifestDocument>>>,
-    legacy_error: Option<PackageError>,
     registry_bytes: usize,
     registry_versions: usize,
 }
@@ -45,16 +38,6 @@ pub struct PackageResolver {
 impl PackageResolver {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Legacy registration cannot return errors; invalid registry input is
-    /// retained as an error and reported by subsequent resolution.
-    pub fn register(&mut self, manifest: PackageManifest) {
-        if let Err(error) = ManifestDocument::from_manifest(manifest)
-            .and_then(|document| self.register_document(document))
-        {
-            self.legacy_error = Some(error);
-        }
     }
 
     pub fn register_document(&mut self, document: ManifestDocument) -> Result<(), PackageError> {
@@ -85,16 +68,6 @@ impl PackageResolver {
             .or_default()
             .insert(version, Arc::new(document));
         Ok(())
-    }
-
-    pub fn resolve(&self, root: &PackageManifest) -> Result<ResolvedPackages, String> {
-        let root =
-            ManifestDocument::from_manifest(root.clone()).map_err(|error| error.to_string())?;
-        self.resolve_document(&root)
-            .map(|graph| ResolvedPackages {
-                packages: graph.packages,
-            })
-            .map_err(|error| error.to_string())
     }
 
     pub fn resolve_document(
@@ -211,9 +184,6 @@ impl PackageResolver {
     }
 
     fn check_root(&self, root: &ManifestDocument) -> Result<(), PackageError> {
-        if let Some(error) = &self.legacy_error {
-            return Err(error.clone());
-        }
         if let Some(previous) = self
             .registry
             .get(&root.manifest.qualified_name())

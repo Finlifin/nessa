@@ -140,6 +140,29 @@ pub fn try_multi_in_block(
     try_multi_with_bracket(p, rules, open, close)
 }
 
+/// Parse the mandatory block of `construct`, reporting a missing block.
+pub fn try_required_block(
+    p: &mut Parser,
+    construct: &str,
+    rules: &[Rule],
+) -> Result<Vec<NodeIndex>, ParseErrorKind> {
+    match try_multi_in_block(p, rules) {
+        Err(ParseErrorKind::InvalidBlockPrefix) => {
+            let span = p.next_token_span();
+            let found = format!("found `{}`", p.peek_token().kind.lexeme());
+            p.err_with_label(
+                ParseErrorKind::InvalidBlockPrefix,
+                span,
+                format!("Expected `{{` or an indented block after {construct}"),
+                span,
+                found,
+            )
+            .map(|()| Vec::new())
+        }
+        result => result,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Atomic parsers
 // ---------------------------------------------------------------------------
@@ -365,7 +388,7 @@ pub fn try_block_or_statement(p: &mut Parser) -> ParseResult {
 pub fn try_pattern_arm(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    let pat = pattern::try_pattern(p)?;
+    let pat = pattern::try_refutable_pattern(p)?;
     if pat.is_null() {
         return Ok(NULL);
     }

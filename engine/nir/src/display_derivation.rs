@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use nsbc::FuncId;
-use resolution::{DerivedDisplayPlan, DisplayDerivationMode, ResolvedAst, SymbolId};
+use resolution::{DerivedDisplayPlan, ResolvedAst, SymbolId};
 use str_interner::StrId;
 use type_pool::{Intrinsic, TypeIndex, TypeKind};
 
@@ -19,9 +19,6 @@ pub(crate) fn lower(
     functions: &HashMap<SymbolId, FuncId>,
     derived: &HashMap<(TypeIndex, TypeIndex, StrId), FuncId>,
 ) -> NirFunction {
-    if plan.mode == DisplayDerivationMode::LegacyStruct {
-        return crate::native_derivation::lower(resolved, plan, function);
-    }
     let mut builder = FunctionBuilder::new(function, plan.method_name);
     builder.function_type = plan.signature;
     builder.return_type = Intrinsic::Str.type_index();
@@ -299,11 +296,45 @@ impl DisplayEmitter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use type_pool::{TypeId, TypeInfo, VariantInfo};
+    use type_pool::{
+        FieldInfo, MethodAccess, MethodSlot, TraitImplRecord, TypeId, TypeInfo, VariantInfo,
+    };
 
     #[test]
-    fn tuple_and_enum_bodies_publish_authenticated_ordinary_functions() {
+    fn struct_tuple_and_enum_bodies_publish_authenticated_ordinary_functions() {
         let (mut resolved, node) = crate::literal::tests::resolved_integer("42", false, "i64");
+        let i64_to_string_sym = SymbolId(0);
+        let i64_to_string_fn = FuncId(3);
+        let mut func_map = HashMap::new();
+        func_map.insert(i64_to_string_sym, i64_to_string_fn);
+        let display = resolved.type_pool.well_known.display;
+        resolved.type_pool.add_trait_impl(TraitImplRecord {
+            visible_scope: None,
+            trait_type: display,
+            implementor: Intrinsic::I64.type_index(),
+            methods: vec![MethodSlot {
+                access: MethodAccess::Public,
+                name: str_interner::intern("to_string"),
+                func_id: i64_to_string_sym.0,
+                trait_impl: Some(display),
+                visible_scope: None,
+            }],
+        });
+
+        let structure = resolved.type_pool.register(TypeInfo {
+            kind: TypeKind::Struct {
+                name: str_interner::intern("Point"),
+                fields: vec![FieldInfo {
+                    name: str_interner::intern("x"),
+                    ty: Intrinsic::I64.type_index(),
+                    has_default: false,
+                    offset: 0,
+                }],
+            },
+            type_id: TypeId::ZERO,
+            size: 8,
+            align: 8,
+        });
         let tuple = resolved
             .type_pool
             .intern_structural(TypeKind::Tuple { elements: vec![] });
@@ -320,41 +351,39 @@ mod tests {
             size: 0,
             align: 8,
         });
-        for owner in [tuple, enumeration] {
+        for owner in [structure, tuple, enumeration] {
             let signature = resolved.type_pool.intern_structural(TypeKind::Function {
                 params: vec![owner],
                 ret: Intrinsic::Str.type_index(),
             });
             let plan = DerivedDisplayPlan {
-                mode: DisplayDerivationMode::FieldCalls,
                 node,
                 implementor: owner,
-                trait_type: resolved.type_pool.well_known.display,
+                trait_type: display,
                 method_name: str_interner::intern("to_string"),
                 signature,
             };
-            let function = lower(
-                &resolved,
-                &plan,
-                FuncId(7),
-                &HashMap::new(),
-                &HashMap::new(),
-            );
+            let function = lower(&resolved, &plan, FuncId(7), &func_map, &HashMap::new());
             assert_eq!(function.display_owner, Some(owner));
             assert_eq!(function.function_type, signature);
             assert_eq!(
                 function.entry_abi().parameters,
                 vec![nsbc::ParameterAbi::Value]
             );
-            assert!(function.blocks.iter().flat_map(|block| &block.stmts).all(|statement| {
-                !matches!(statement, NirStmt::Assign(_, expression) if matches!(expression.unscoped(), NirExpr::CallBuiltin(id, _) if *id == runtime::ids::DERIVED_DISPLAY))
-            }));
             assert!(
                 function
                     .blocks
                     .iter()
                     .any(|block| matches!(block.terminator, Terminator::Return(_)))
             );
+            if owner == structure {
+                assert!(function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+                    matches!(statement, NirStmt::Assign(_, expression) if matches!(expression.unscoped(), NirExpr::FieldAccess(_, 0)))
+                }));
+                assert!(function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+                    matches!(statement, NirStmt::Assign(_, expression) if matches!(expression.unscoped(), NirExpr::Call(callee, _) if *callee == i64_to_string_fn))
+                }));
+            }
             if owner == enumeration {
                 assert!(function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
                     matches!(statement, NirStmt::Assign(_, expression) if matches!(expression.unscoped(), NirExpr::EnumIs(_, ty, 0) if *ty == owner))

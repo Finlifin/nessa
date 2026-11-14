@@ -24,15 +24,28 @@ pub enum ParameterAbi {
     },
 }
 
-/// Captures and logical parameters are explicitly separated. A legacy function
-/// has no descriptor; loading it must not invent proof slots from count gaps.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Explicit physical entry layout separating closure captures from source parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionAbi {
     pub captures: Vec<CaptureAbi>,
     pub parameters: Vec<ParameterAbi>,
 }
 
 impl FunctionAbi {
+    pub fn value_only(parameter_count: usize) -> Self {
+        Self {
+            captures: Vec::new(),
+            parameters: vec![ParameterAbi::Value; parameter_count],
+        }
+    }
+
+    pub fn closure_values(capture_count: usize, parameter_count: usize) -> Self {
+        Self {
+            captures: vec![CaptureAbi::Value; capture_count],
+            parameters: vec![ParameterAbi::Value; parameter_count],
+        }
+    }
+
     pub fn capture_count(&self) -> usize {
         self.captures.len()
     }

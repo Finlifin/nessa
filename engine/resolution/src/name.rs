@@ -1571,28 +1571,21 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
                 r.node_symbols.insert(pat_idx, symbol);
                 return;
             }
-            if matches!(
-                _decl_kind,
-                NodeKind::ConstDecl
-                    | NodeKind::LetDecl
-                    | NodeKind::VarDecl
-                    | NodeKind::CaseArm
-                    | NodeKind::ForLoop
-            ) && let Some(&symbol) = r.node_symbols.get(&pat_idx)
-                && r.symbols[symbol.0 as usize].scope == r.current_scope
-            {
-                r.scopes[r.current_scope.0 as usize]
-                    .bindings
-                    .insert(str_id, symbol);
-                return;
+            bind_pattern_identifier(r, ast, pat_idx, _decl_kind);
+        }
+        NodeKind::PatternTyped => {
+            if !matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop) {
+                r.diag_ctx
+                    .error("typed patterns are supported in match, matches and for".into())
+                    .with_primary_span(ast.node(pat_idx).span)
+                    .emit(r.diag_ctx);
             }
-            let kind = if _decl_kind == NodeKind::ConstDecl {
-                SymbolKind::Constant
-            } else {
-                SymbolKind::Variable
-            };
-            let sym_id = r.define_symbol(str_id, kind, pat_idx, Visibility::Private);
-            r.node_symbols.insert(pat_idx, sym_id);
+            let children = ast.fixed_children(pat_idx);
+            resolve_names(r, ast, children[1]);
+            if ast.node(children[0]).kind == NodeKind::Id {
+                r.node_scopes.insert(children[0], r.current_scope);
+                bind_pattern_identifier(r, ast, children[0], _decl_kind);
+            }
         }
 
         // Literal patterns — nothing to bind.
@@ -1765,6 +1758,34 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
             resolve_names(r, ast, pat_idx);
         }
     }
+}
+
+/// Binds a pattern identifier that is not an enum variant reference. Refutable
+/// patterns reuse the symbol prepared for alternative paths in this scope.
+fn bind_pattern_identifier(r: &mut Resolver, ast: &Ast, node: NodeIndex, declaration: NodeKind) {
+    let name = ast.node(node).str_id;
+    if matches!(
+        declaration,
+        NodeKind::ConstDecl
+            | NodeKind::LetDecl
+            | NodeKind::VarDecl
+            | NodeKind::CaseArm
+            | NodeKind::ForLoop
+    ) && let Some(&symbol) = r.node_symbols.get(&node)
+        && r.symbols[symbol.0 as usize].scope == r.current_scope
+    {
+        r.scopes[r.current_scope.0 as usize]
+            .bindings
+            .insert(name, symbol);
+        return;
+    }
+    let kind = if declaration == NodeKind::ConstDecl {
+        SymbolKind::Constant
+    } else {
+        SymbolKind::Variable
+    };
+    let symbol = r.define_symbol(name, kind, node, Visibility::Private);
+    r.node_symbols.insert(node, symbol);
 }
 
 fn check_composite_pattern_context(

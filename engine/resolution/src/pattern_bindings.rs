@@ -82,6 +82,14 @@ fn collect(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> Bindings {
             }
             bindings
         }
+        NodeKind::PatternTyped => {
+            let binder = children[0];
+            if ast.node(binder).kind == NodeKind::Id {
+                HashMap::from([(ast.node(binder).str_id, vec![binder])])
+            } else {
+                Bindings::new()
+            }
+        }
         NodeKind::PatternIfGuard
         | NodeKind::PatternOptionSome
         | NodeKind::PatternError

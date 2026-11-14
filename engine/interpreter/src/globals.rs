@@ -61,7 +61,7 @@ mod tests {
     fn run_code(vm: &mut Vm, instructions: &[Instruction]) -> VmResult {
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi: nsbc::FunctionAbi::value_only(0),
             func_id: FuncId(0),
             instructions: instructions
                 .iter()
@@ -90,7 +90,7 @@ mod tests {
             let result = run_code(
                 &mut vm,
                 &[
-                    Instruction::a_type(Opcode::LoadGlobal, AddrMode::Imm, Reg(0), Reg(0), index),
+                    Instruction::load_global(Reg(0), index),
                     Instruction::ret(Reg(0)),
                 ],
             );
@@ -120,9 +120,9 @@ mod tests {
             &mut vm,
             &[
                 Instruction::load_imm(Reg(1), 42),
-                Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(1), 0),
+                Instruction::store_global(0, Reg(1)),
                 Instruction::load_imm(Reg(1), 99),
-                Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(1), 0),
+                Instruction::store_global(0, Reg(1)),
                 Instruction::ret(Reg(1)),
             ],
         );
@@ -252,26 +252,32 @@ mod tests {
             });
         let main = [
             Instruction::load_imm(Reg(0), 41),
-            Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(0), 0),
+            Instruction::store_global(0, Reg(0)),
             Instruction::load_imm(Reg(0), 1),
             Instruction::new_closure(Reg(1), 1, 1),
             Instruction::call_indirect(Reg(1), 0),
-            Instruction::a_type(Opcode::LoadGlobal, AddrMode::Imm, Reg(2), Reg(0), 0),
+            Instruction::load_global(Reg(2), 0),
             Instruction::ret(Reg(2)),
         ];
         let closure = [
-            Instruction::a_type(Opcode::LoadGlobal, AddrMode::Imm, Reg(1), Reg(0), 0),
+            Instruction::load_global(Reg(1), 0),
             Instruction::r_type(Opcode::Add, Reg(2), Reg(0), Reg(1)),
-            Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(2), 0),
+            Instruction::store_global(0, Reg(2)),
             Instruction::ret(Reg(2)),
         ];
-        for (id, code, is_closure, param_count) in [
-            (0, main.as_slice(), false, 0),
-            (1, closure.as_slice(), true, 1),
+        for (id, code, is_closure, param_count, abi) in [
+            (0, main.as_slice(), false, 0, nsbc::FunctionAbi::value_only(0)),
+            (
+                1,
+                closure.as_slice(),
+                true,
+                1,
+                nsbc::FunctionAbi::closure_values(1, 0),
+            ),
         ] {
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi,
                 func_id: FuncId(id),
                 instructions: code
                     .iter()

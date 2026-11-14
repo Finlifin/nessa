@@ -12,18 +12,39 @@ use crate::parser::{NULL, Parser};
 #[derive(Debug, Clone, Copy)]
 pub struct PatternOption {
     pub no_extended_call: bool,
+    /// `name: Type` is a runtime type test. Declarations and parameters read
+    /// `: Type` as their own annotation, so only refutable positions enable it.
+    pub typed_bindings: bool,
 }
 
 impl PatternOption {
     pub fn new() -> Self {
         Self {
             no_extended_call: false,
+            typed_bindings: false,
         }
     }
 
     pub fn without_extended_call() -> Self {
         Self {
             no_extended_call: true,
+            typed_bindings: false,
+        }
+    }
+
+    pub fn refutable(self) -> Self {
+        Self {
+            typed_bindings: true,
+            ..self
+        }
+    }
+
+    /// Nested element patterns keep the type-test permission of their parent.
+    fn element_parser(self) -> fn(&mut Parser) -> ParseResult {
+        if self.typed_bindings {
+            try_refutable_pattern
+        } else {
+            try_pattern
         }
     }
 }
@@ -109,6 +130,15 @@ pub fn try_pattern_without_extended_call(p: &mut Parser) -> ParseResult {
     try_pattern_with_option(p, PatternOption::without_extended_call())
 }
 
+/// Patterns of `match`, `matches`, `case` and `for`, which may test types.
+pub fn try_refutable_pattern(p: &mut Parser) -> ParseResult {
+    try_pattern_with_option(p, PatternOption::new().refutable())
+}
+
+pub fn try_refutable_pattern_without_extended_call(p: &mut Parser) -> ParseResult {
+    try_pattern_with_option(p, PatternOption::without_extended_call().refutable())
+}
+
 pub fn try_pattern_with_option(p: &mut Parser, option: PatternOption) -> ParseResult {
     let _g = p.enter();
     try_pattern_pratt(p, 0, option)
@@ -151,7 +181,11 @@ fn try_pattern_pratt(p: &mut Parser, min_prec: i32, option: PatternOption) -> Pa
             continue;
         }
         let right = if op.node_kind == NodeKind::PatternIfGuard {
-            crate::expr::try_expr(p)?
+            if option.no_extended_call {
+                crate::expr::try_expr_without_extended_call(p)?
+            } else {
+                crate::expr::try_expr(p)?
+            }
         } else {
             try_pattern_pratt(p, op.prec + 1, option)?
         };
@@ -234,11 +268,15 @@ fn try_prefix_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
         | TokenKind::KwTrue
         | TokenKind::KwNull => basic::try_atomic(p),
 
-        TokenKind::Id => basic::try_id(p),
+        TokenKind::Id => {
+            let binder = basic::try_id(p)?;
+            try_typed_binding(p, binder, option)
+        }
         TokenKind::Underscore => {
             p.next_token();
             let span = p.current_span();
-            Ok(p.ast().builder(NodeKind::Underscore, span).build())
+            let binder = p.ast().builder(NodeKind::Underscore, span).build();
+            try_typed_binding(p, binder, option)
         }
 
         TokenKind::Dot => {
@@ -260,6 +298,28 @@ fn try_prefix_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
 
         _ => Ok(NULL),
     }
+}
+
+/// `binder: Type` — the type stops before pattern operators such as `or`,
+/// `and`, `as`, `if` and `=>`.
+fn try_typed_binding(p: &mut Parser, binder: NodeIndex, option: PatternOption) -> ParseResult {
+    if !option.typed_bindings || binder.is_null() || !p.eat_token(TokenKind::Colon) {
+        return Ok(binder);
+    }
+    let ty = crate::expr::try_pattern_type(p)?;
+    if ty.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected type after `:` in typed pattern",
+        );
+    }
+    let span = p.ast().node(binder).span.to(p.current_span());
+    Ok(p.ast()
+        .builder(NodeKind::PatternTyped, span)
+        .add_child(binder)
+        .add_child(ty)
+        .build())
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +373,13 @@ fn try_paren_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
 
     if p.eat_token(TokenKind::Comma) {
         let mut elems = vec![first];
-        let rest = basic::try_multi(p, &[Rule::comma("tuple pattern element", try_pattern)])?;
+        let rest = basic::try_multi(
+            p,
+            &[Rule::comma(
+                "tuple pattern element",
+                option.element_parser(),
+            )],
+        )?;
         elems.extend(rest);
         p.expect_token(TokenKind::RParen)?;
         let span = p.current_span();
@@ -330,7 +396,7 @@ fn try_paren_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
 }
 
 /// `[pat, pat, ...]`
-fn try_list_pattern(p: &mut Parser, _option: PatternOption) -> ParseResult {
+fn try_list_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
     let _g = p.enter();
 
     if !p.peek(&[TokenKind::LBracket]) {
@@ -339,7 +405,7 @@ fn try_list_pattern(p: &mut Parser, _option: PatternOption) -> ParseResult {
 
     let elems = try_multi_with_bracket(
         p,
-        &[Rule::comma("list pattern element", try_pattern)],
+        &[Rule::comma("list pattern element", option.element_parser())],
         TokenKind::LBracket,
         TokenKind::RBracket,
     )?;
@@ -573,12 +639,12 @@ fn try_async_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
 }
 
 /// Postfix: `name(pat, ...)` - destructuring call
-fn parse_des_call_paren(p: &mut Parser, left: NodeIndex, _option: PatternOption) -> ParseResult {
+fn parse_des_call_paren(p: &mut Parser, left: NodeIndex, option: PatternOption) -> ParseResult {
     let _g = p.enter();
 
     let args = try_multi_with_bracket(
         p,
-        &[Rule::comma("destructor argument", try_pattern)],
+        &[Rule::comma("destructor argument", option.element_parser())],
         TokenKind::LParen,
         TokenKind::RParen,
     )?;

@@ -60,10 +60,8 @@ impl<'a> Parser<'a> {
     /// returning.  Callers that need to inspect errors programmatically should
     /// use [`finish`] instead.
     pub fn parse(mut self) -> Ast {
-        if self.source_mapper.is_ok()
-            && let Ok(root) = crate::basic::try_file_scope(&mut self)
-        {
-            self.ast.root = root;
+        if self.source_mapper.is_ok() {
+            self.parse_file_scope();
         }
         let context = self.diag_ctx;
         let base = self.file_base_pos;
@@ -72,6 +70,20 @@ impl<'a> Parser<'a> {
             error.emit(context, base);
         }
         ast
+    }
+
+    /// A failed parse always leaves a diagnostic, so it cannot pass as an
+    /// empty file.
+    fn parse_file_scope(&mut self) {
+        match crate::basic::try_file_scope(self) {
+            Ok(root) => self.ast.root = root,
+            Err(kind) if self.errors.is_empty() => {
+                let span = self.next_token_span();
+                let found = format!("found `{}`", self.peek_token().kind.lexeme());
+                let _ = self.err_with_label(kind, span, "Unexpected token", span, found);
+            }
+            Err(_) => {}
+        }
     }
 
     /// Convert raw parser positions once while retaining original source bytes.

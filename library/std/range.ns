@@ -1,0 +1,152 @@
+-- std.range — i64 range values produced by the `..` and `..=` operators.
+-- Ranges are ordinary struct values. Iteration copies the bounds into a fresh
+-- cursor, so one range can be traversed any number of times.
+use .builtin.*
+
+-- `start..end`: start inclusive, end exclusive.
+pub struct Range {
+    pub start: i64,
+    pub end: i64
+}
+
+const native_range_len: fn(i64, i64) -> i64 = .range_len'builtin
+const native_range_inclusive_len: fn(i64, i64) -> i64 = .range_inclusive_len'builtin
+const native_range_is_empty: fn(i64, i64) -> bool = .range_is_empty'builtin
+const native_range_inclusive_is_empty: fn(i64, i64) -> bool = .range_inclusive_is_empty'builtin
+const native_range_contains: fn(i64, i64, i64) -> bool = .range_contains'builtin
+const native_range_inclusive_contains: fn(i64, i64, i64) -> bool = .range_inclusive_contains'builtin
+const native_range_from_contains: fn(i64, i64) -> bool = .range_from_contains'builtin
+const native_range_to_contains: fn(i64, i64) -> bool = .range_to_contains'builtin
+const native_range_to_inclusive_contains: fn(i64, i64) -> bool = .range_to_inclusive_contains'builtin
+
+impl Range {
+    pub fn contains(self, value: i64) -> bool { native_range_contains(self.start, self.end, value) }
+    pub fn is_empty(self) -> bool { native_range_is_empty(self.start, self.end) }
+    -- Overflow of a span that does not fit in i64 is NumericOverflow.
+    pub fn len(self) -> i64 { native_range_len(self.start, self.end) }
+}
+
+pub struct RangeIterator {
+    cursor: i64,
+    end: i64
+}
+
+impl Iterator for RangeIterator {
+    assoc Item: Type = i64
+    pub fn next(self) -> IterationStep(i64) {
+        if self.cursor < self.end {
+            let value = self.cursor
+            self.cursor = value + 1
+            IterationStep(i64).yielded(value)
+        } else {
+            IterationStep(i64).done
+        }
+    }
+}
+
+impl IntoIterator for Range {
+    assoc Iter: Type = RangeIterator
+    pub fn into_iter(self) -> RangeIterator {
+        RangeIterator { cursor: self.start, end: self.end }
+    }
+}
+
+-- `start..=end`: both bounds inclusive.
+pub struct RangeInclusive {
+    pub start: i64,
+    pub end: i64
+}
+
+impl RangeInclusive {
+    pub fn contains(self, value: i64) -> bool { native_range_inclusive_contains(self.start, self.end, value) }
+    pub fn is_empty(self) -> bool { native_range_inclusive_is_empty(self.start, self.end) }
+    pub fn len(self) -> i64 { native_range_inclusive_len(self.start, self.end) }
+}
+
+-- `exhausted` lets `..=i64::MAX` finish without computing `end + 1`.
+pub struct RangeInclusiveIterator {
+    cursor: i64,
+    end: i64,
+    exhausted: bool
+}
+
+impl Iterator for RangeInclusiveIterator {
+    assoc Item: Type = i64
+    pub fn next(self) -> IterationStep(i64) {
+        if self.exhausted or self.end < self.cursor {
+            IterationStep(i64).done
+        } else {
+            let value = self.cursor
+            if value == self.end {
+                self.exhausted = true
+            } else {
+                self.cursor = value + 1
+            }
+            IterationStep(i64).yielded(value)
+        }
+    }
+}
+
+impl IntoIterator for RangeInclusive {
+    assoc Iter: Type = RangeInclusiveIterator
+    pub fn into_iter(self) -> RangeInclusiveIterator {
+        RangeInclusiveIterator { cursor: self.start, end: self.end, exhausted: false }
+    }
+}
+
+-- `start..`: unbounded above. The cursor advances before yielding, so reaching
+-- i64::MAX raises the `+` overflow error, as in Rust's overflow-checked builds.
+pub struct RangeFrom {
+    pub start: i64
+}
+
+impl RangeFrom {
+    pub fn contains(self, value: i64) -> bool { native_range_from_contains(self.start, value) }
+}
+
+pub struct RangeFromIterator {
+    cursor: i64
+}
+
+impl Iterator for RangeFromIterator {
+    assoc Item: Type = i64
+    pub fn next(self) -> IterationStep(i64) {
+        let value = self.cursor
+        self.cursor = value + 1
+        IterationStep(i64).yielded(value)
+    }
+}
+
+impl IntoIterator for RangeFrom {
+    assoc Iter: Type = RangeFromIterator
+    pub fn into_iter(self) -> RangeFromIterator {
+        RangeFromIterator { cursor: self.start }
+    }
+}
+
+-- The ranges below have no starting point and therefore are not iterable.
+
+-- `..end`
+pub struct RangeTo {
+    pub end: i64
+}
+
+impl RangeTo {
+    pub fn contains(self, value: i64) -> bool { native_range_to_contains(self.end, value) }
+}
+
+-- `..=end`
+pub struct RangeToInclusive {
+    pub end: i64
+}
+
+impl RangeToInclusive {
+    pub fn contains(self, value: i64) -> bool { native_range_to_inclusive_contains(self.end, value) }
+}
+
+-- `..`
+pub struct RangeFull {}
+
+impl RangeFull {
+    pub fn contains(self, value: i64) -> bool { true }
+}

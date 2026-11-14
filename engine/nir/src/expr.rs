@@ -3,6 +3,7 @@
 use ast::{Ast, NodeIndex, NodeKind};
 use nsbc::FuncId;
 use resolution::{ResolvedAst, SymbolKind};
+use type_pool::{Intrinsic, TypeIndex};
 
 use crate::builder::FunctionBuilder;
 use crate::{BinOp, BlockId, NirExpr, NirLocal, NirParam, NirStmt, NirValue, Terminator, UnaryOp};
@@ -164,28 +165,13 @@ fn lower_expr_uncoerced(
                     .node_type(resolved, node_idx)
                     .expect("resolved cast type")
             });
-            let local = builder.alloc_local();
-            if let Some(view) = crate::trait_parameters::bare_trait(resolved, target) {
-                let proof = crate::trait_parameters::proof_for(
-                    resolved, node_idx, source, view, builder, *block,
-                );
-                let NirValue::Local(proof_local) = proof else {
-                    unreachable!("proof construction returns a local")
-                };
-                builder.value_proofs.insert(local, (proof_local, view));
-                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
-                    local,
-                    NirExpr::TraitAssert(source, proof, view).in_source_scope(resolved, node_idx),
-                ));
-                return NirValue::Local(local);
+            let converted = lower_cast(resolved, node_idx, source, target, builder, *block);
+            if specialized_self.is_some()
+                && crate::trait_parameters::bare_trait(resolved, target).is_none()
+            {
+                crate::trait_parameters::copy_proof(converted, source, builder, *block);
             }
-            builder.blocks[block.0 as usize]
-                .stmts
-                .push(NirStmt::Assign(local, NirExpr::TypeCast(source, target)));
-            if specialized_self.is_some() {
-                crate::trait_parameters::copy_proof(local, source, builder, *block);
-            }
-            NirValue::Local(local)
+            NirValue::Local(converted)
         }
 
         NodeKind::View
@@ -217,6 +203,14 @@ fn lower_expr_uncoerced(
             } else {
                 crate::construction::lower_construction(resolved, node_idx, builder, block)
             }
+        }
+        NodeKind::RangeFull
+        | NodeKind::RangeFrom
+        | NodeKind::RangeTo
+        | NodeKind::RangeToInclusive
+        | NodeKind::RangeFromTo
+        | NodeKind::RangeFromToInclusive => {
+            crate::construction::lower_construction(resolved, node_idx, builder, block)
         }
 
         // ── Projection (field access / enum variant construction) ──
@@ -289,19 +283,7 @@ fn lower_expr_uncoerced(
             }
 
             let val = lower_expr(resolved, children[1], builder, block);
-            // If LHS is a resolved local, assign to it.
-            if let Some(global) = resolved_symbol_in(resolved, children[0], builder)
-                .and_then(|symbol| builder.global_map.get(&symbol))
-                .copied()
-            {
-                builder.blocks[block.0 as usize]
-                    .stmts
-                    .push(NirStmt::StoreGlobal(global, val));
-            } else if let Some(local) = resolve_local(resolved, children[0], builder) {
-                builder.blocks[block.0 as usize]
-                    .stmts
-                    .push(NirStmt::Assign(local, NirExpr::Use(val)));
-            }
+            store_variable(resolved, children[0], val, builder, *block);
             NirValue::Unit
         }
 
@@ -309,40 +291,7 @@ fn lower_expr_uncoerced(
         | NodeKind::SubAssign
         | NodeKind::MulAssign
         | NodeKind::DivAssign
-        | NodeKind::ModAssign => {
-            let children = ast.fixed_children(node_idx);
-            let kind = match node.kind {
-                NodeKind::AddAssign => NodeKind::Add,
-                NodeKind::SubAssign => NodeKind::Sub,
-                NodeKind::MulAssign => NodeKind::Mul,
-                NodeKind::DivAssign => NodeKind::Div,
-                NodeKind::ModAssign => NodeKind::Mod,
-                _ => unreachable!("compound assignment branch"),
-            };
-            let mut value = lower_arith(resolved, ast, node_idx, kind, builder, block);
-            if let Some(target) = builder.node_type(resolved, children[0])
-                && resolved.type_pool.as_intrinsic(target) != Some(type_pool::Intrinsic::Any)
-            {
-                let local = builder.alloc_local();
-                builder.blocks[block.0 as usize]
-                    .stmts
-                    .push(NirStmt::Assign(local, NirExpr::TypeCast(value, target)));
-                value = NirValue::Local(local);
-            }
-            if let Some(global) = resolved_symbol_in(resolved, children[0], builder)
-                .and_then(|symbol| builder.global_map.get(&symbol))
-                .copied()
-            {
-                builder.blocks[block.0 as usize]
-                    .stmts
-                    .push(NirStmt::StoreGlobal(global, value));
-            } else if let Some(local) = resolve_local(resolved, children[0], builder) {
-                builder.blocks[block.0 as usize]
-                    .stmts
-                    .push(NirStmt::Assign(local, NirExpr::Use(value)));
-            }
-            NirValue::Unit
-        }
+        | NodeKind::ModAssign => crate::compound::lower(resolved, node_idx, builder, block),
 
         NodeKind::ErrorConstruction => crate::errors::construct(resolved, node_idx, builder, block),
         NodeKind::ErrorPropagation => crate::errors::propagate(resolved, node_idx, builder, block),
@@ -411,13 +360,40 @@ fn lower_str_literal(node: &ast::Node) -> NirValue {
     }
 }
 
-/// Lower an f-string (FStringConcat) node.
-///
-/// Strategy:
-///   - `Str` parts → lowered as string constants (already have type String)
-///   - non-`Str` parts → call `to_string()` method on the value
-///   - chain all parts with `StrConcat` intrinsic calls left-to-right
-///   - if there are zero parts, produce an empty string constant
+/// Converts `source` to `target` as `.as(target)` does: bare trait targets
+/// assert a proof found in `node`'s scope, other targets use a checked cast.
+pub(crate) fn lower_cast(
+    resolved: &ResolvedAst,
+    node: NodeIndex,
+    source: NirValue,
+    target: TypeIndex,
+    builder: &mut FunctionBuilder,
+    block: BlockId,
+) -> NirLocal {
+    let local = builder.alloc_local();
+    if let Some(view) = crate::trait_parameters::bare_trait(resolved, target) {
+        let proof =
+            crate::trait_parameters::proof_for(resolved, node, source, view, builder, block);
+        let NirValue::Local(proof_local) = proof else {
+            unreachable!("proof construction returns a local")
+        };
+        builder.value_proofs.insert(local, (proof_local, view));
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::TraitAssert(source, proof, view).in_source_scope(resolved, node),
+        ));
+    } else {
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::TypeCast(source, target).in_source_scope(resolved, node),
+        ));
+    }
+    local
+}
+
+/// Lower an interpolated string: literal segments are String constants, each
+/// interpolated value is converted to its Display text, and the parts are
+/// concatenated left to right.
 fn lower_fstring_concat(
     resolved: &ResolvedAst,
     ast: &Ast,
@@ -427,40 +403,27 @@ fn lower_fstring_concat(
 ) -> NirValue {
     use runtime::ids;
 
-    let parts = ast.multi_children(node_idx);
-    if parts.is_empty() {
-        // Empty string constant.
-        let empty_id = str_interner::intern("\"\"");
-        return NirValue::ConstStr(empty_id);
-    }
-
-    // Lower each part to a String-typed NirValue.
-    let to_string_name = str_interner::intern("to_string");
-    let mut string_vals: Vec<NirValue> = Vec::with_capacity(parts.len());
-
-    for &part in parts {
-        if part.is_null() {
-            continue;
-        }
+    let mut string_vals: Vec<NirValue> = Vec::new();
+    for &part in ast.multi_children(node_idx) {
         let part_node = ast.node(part);
         if part_node.kind == NodeKind::Str {
-            // Literal segment — already a String constant.
             string_vals.push(lower_str_literal(part_node));
         } else {
-            // Interpolated expression — lower then call to_string().
-            let val = lower_expr(resolved, part, builder, block);
-            let local = builder.alloc_local();
-            builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
-                local,
-                NirExpr::MethodCall(val, to_string_name, Vec::new()),
+            let value = lower_expr(resolved, part, builder, block);
+            let ty = builder.node_type(resolved, part);
+            string_vals.push(crate::display_text::lower(
+                resolved, node_idx, value, ty, builder, *block,
             ));
-            string_vals.push(NirValue::Local(local));
         }
     }
 
-    // Fold left with str_concat: result = concat(concat(a, b), c) ...
-    let mut acc = string_vals[0];
-    for part_val in string_vals.into_iter().skip(1) {
+    // The lexer emits an interpolated string only around an interpolation,
+    // and the parser rejects empty ones.
+    let (&first, rest) = string_vals
+        .split_first()
+        .expect("interpolated strings contain an interpolated value");
+    let mut acc = first;
+    for &part_val in rest {
         let local = builder.alloc_local();
         builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
             local,
@@ -965,6 +928,28 @@ fn resolve_local(
         .map(|sym_id| builder.local_for_symbol(sym_id))
 }
 
+/// Store into a checked variable target: a module global or a local slot.
+pub(crate) fn store_variable(
+    resolved: &ResolvedAst,
+    target: NodeIndex,
+    value: NirValue,
+    builder: &mut FunctionBuilder,
+    block: BlockId,
+) {
+    if let Some(global) = resolved_symbol_in(resolved, target, builder)
+        .and_then(|symbol| builder.global_map.get(&symbol))
+        .copied()
+    {
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::StoreGlobal(global, value));
+    } else if let Some(local) = resolve_local(resolved, target, builder) {
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(local, NirExpr::Use(value)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Arithmetic
 // ---------------------------------------------------------------------------
@@ -1012,6 +997,11 @@ fn lower_comparison(
     let lhs = lower_expr(resolved, children[0], builder, block);
     let lhs = crate::arguments::snapshot(lhs, builder, *block);
     let rhs = lower_expr(resolved, children[1], builder, block);
+    if let Some(function) = builder.equality_call(resolved, node_idx) {
+        return crate::dynamic_equality::lower(
+            resolved, node_idx, function, lhs, rhs, builder, block,
+        );
+    }
 
     // Check if the LHS operand's type has a trait impl for this comparison.
     let lhs_ti = builder
@@ -1034,6 +1024,18 @@ fn lower_comparison(
                 .type_pool
                 .as_intrinsic(right)
                 .is_some_and(|ty| ty.is_numeric())
+    });
+    // The standard Eq/Ord implementations of scalar intrinsics delegate to the
+    // same native kernels as the comparison instructions.
+    let same_scalar = lhs_ti.zip(rhs_ti).is_some_and(|(left, right)| {
+        left == right
+            && resolved.type_pool.as_intrinsic(left).is_some_and(|ty| {
+                ty.is_numeric()
+                    || matches!(
+                        ty,
+                        Intrinsic::Bool | Intrinsic::Char | Intrinsic::Str | Intrinsic::Unit
+                    )
+            })
     });
     let wk = &resolved.type_pool.well_known;
 
@@ -1065,9 +1067,10 @@ fn lower_comparison(
 
     // Mixed numeric operators retain the exact cross-kind numeric kernel;
     // converting both sides to float can erase large integer distinctions.
+    // Same-type scalars use that kernel directly instead of a call chain.
     // An explicitly selected lexical implementation retains its prior dispatch.
     let trait_dispatch = trait_dispatch.filter(|&(owner, view, _)| {
-        !mixed_numeric
+        !(mixed_numeric || same_scalar)
             || resolved
                 .type_pool
                 .find_trait_impl_scoped(owner, view, resolved.node_scopes[&node_idx].0)
@@ -2378,8 +2381,36 @@ mod comparison_coercion_tests {
     use crate::builder::FunctionBuilder;
     use crate::{NirExpr, NirStmt};
 
+    fn register_global_numeric_eq(
+        resolved: &mut resolution::ResolvedAst,
+        builder: &mut FunctionBuilder,
+    ) {
+        let eq = resolved.type_pool.well_known.eq;
+        let name = str_interner::intern("eq");
+        for (owner, function) in [
+            (Intrinsic::I64.type_index(), FuncId(7)),
+            (Intrinsic::F64.type_index(), FuncId(8)),
+        ] {
+            resolved.type_pool.add_trait_impl(TraitImplRecord {
+                trait_type: eq,
+                implementor: owner,
+                visible_scope: None,
+                methods: vec![MethodSlot {
+                    access: MethodAccess::Public,
+                    name,
+                    func_id: type_pool::DERIVE_FUNC_ID,
+                    trait_impl: Some(eq),
+                    visible_scope: None,
+                }],
+            });
+            builder
+                .derived_functions
+                .insert((owner, eq, name), function);
+        }
+    }
+
     #[test]
-    fn mixed_numeric_comparison_selects_the_converted_receiver_implementation() {
+    fn converted_scalar_comparison_uses_the_native_kernel() {
         let (mut resolved, left) = crate::literal::tests::resolved_integer("1", false, "i64");
         let right = resolved
             .ast
@@ -2408,58 +2439,67 @@ mod comparison_coercion_tests {
                 kind: resolution::CoercionKind::Convert,
             },
         );
-        let eq = resolved.type_pool.well_known.eq;
-        let name = str_interner::intern("eq");
         let mut builder = FunctionBuilder::new(FuncId(0), str_interner::intern("compare"));
-        for (owner, function) in [
-            (Intrinsic::I64.type_index(), FuncId(7)),
-            (Intrinsic::F64.type_index(), FuncId(8)),
-        ] {
-            resolved.type_pool.add_trait_impl(TraitImplRecord {
-                trait_type: eq,
-                implementor: owner,
-                visible_scope: None,
-                methods: vec![MethodSlot {
-                    access: MethodAccess::Public,
-                    name,
-                    func_id: type_pool::DERIVE_FUNC_ID,
-                    trait_impl: Some(eq),
-                    visible_scope: None,
-                }],
-            });
-            builder
-                .derived_functions
-                .insert((owner, eq, name), function);
-        }
+        register_global_numeric_eq(&mut resolved, &mut builder);
+        // The converted operands share one scalar type whose global standard
+        // implementation is the native kernel, so no call is emitted.
         let mut block = builder.new_block();
         lower_expr(&resolved, comparison, &mut builder, &mut block);
-        assert!(builder.blocks[0].stmts.iter().any(|statement| matches!(statement,
-            NirStmt::Assign(_, expression) if matches!(expression.unscoped(), NirExpr::TypeCast(_, ty) if *ty == Intrinsic::F64.type_index()))));
-        let calls: Vec<_> = builder.blocks[0]
+        let expressions: Vec<_> = builder.blocks[0]
             .stmts
             .iter()
             .filter_map(|statement| match statement {
-                NirStmt::Assign(_, expression) => match expression.unscoped() {
-                    NirExpr::Call(function, _) => Some(*function),
-                    _ => None,
-                },
+                NirStmt::Assign(_, expression) => Some(expression.unscoped()),
                 _ => None,
             })
             .collect();
-        assert_eq!(calls, vec![FuncId(8)]);
+        assert!(expressions.iter().any(|expression| matches!(expression,
+            NirExpr::TypeCast(_, ty) if *ty == Intrinsic::F64.type_index())));
+        assert!(
+            expressions
+                .iter()
+                .any(|expression| matches!(expression, NirExpr::BinOp(crate::BinOp::Eq, _, _)))
+        );
+        assert!(
+            !expressions
+                .iter()
+                .any(|expression| matches!(expression, NirExpr::Call(..)))
+        );
+    }
 
+    #[test]
+    fn unconverted_mixed_numeric_comparison_keeps_the_numeric_kernel() {
+        let (mut resolved, left) = crate::literal::tests::resolved_integer("1", false, "i64");
+        let right = resolved
+            .ast
+            .builder(NodeKind::Real, DUMMY_SP)
+            .set_str_id(str_interner::intern("1.0"))
+            .build();
+        let comparison = resolved
+            .ast
+            .builder(NodeKind::BoolEq, DUMMY_SP)
+            .add_child(left)
+            .add_child(right)
+            .build();
+        let scope = resolved.node_scopes[&left];
+        resolved.node_scopes.insert(right, scope);
+        resolved.node_scopes.insert(comparison, scope);
+        resolved
+            .node_types
+            .insert(right, Intrinsic::F64.type_index());
+        resolved
+            .node_types
+            .insert(comparison, Intrinsic::Bool.type_index());
         // Without a conversion these are distinct numeric representations.
         // The homogeneous Eq bridge cannot accept both; retain the numeric
         // kernel instead of narrowing the real operand or rounding the integer.
-        resolved.node_coercions.remove(&left);
-        let mut mixed_builder =
-            FunctionBuilder::new(FuncId(0), str_interner::intern("mixed_compare"));
-        mixed_builder.derived_functions = builder.derived_functions.clone();
-        let mut mixed_block = mixed_builder.new_block();
-        lower_expr(&resolved, comparison, &mut mixed_builder, &mut mixed_block);
-        assert!(mixed_builder.blocks[0].stmts.iter().any(|statement| matches!(statement,
+        let mut builder = FunctionBuilder::new(FuncId(0), str_interner::intern("mixed_compare"));
+        register_global_numeric_eq(&mut resolved, &mut builder);
+        let mut block = builder.new_block();
+        lower_expr(&resolved, comparison, &mut builder, &mut block);
+        assert!(builder.blocks[0].stmts.iter().any(|statement| matches!(statement,
             NirStmt::Assign(_, expression) if matches!(expression.unscoped(), NirExpr::BinOp(crate::BinOp::Eq, _, _)))));
-        assert!(!mixed_builder.blocks[0].stmts.iter().any(|statement| matches!(statement,
+        assert!(!builder.blocks[0].stmts.iter().any(|statement| matches!(statement,
             NirStmt::Assign(_, expression) if matches!(expression.unscoped(), NirExpr::Call(_, _) | NirExpr::TypeCast(_, _)))));
     }
 }

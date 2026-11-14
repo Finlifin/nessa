@@ -9,8 +9,7 @@ pub use numeric::{Number, NumericError};
 pub mod builtin;
 pub use builtin::ids;
 pub use builtin::{
-    BUILTIN_ABI_VERSION, BUILTIN_FN_META, BuiltinCatalog, BuiltinFnId, BuiltinFnMeta, BuiltinKind,
-    catalog_lookup, catalog_register_intrinsic_types, catalog_register_type, lookup_builtin_fn_id,
+    BUILTIN_ABI_VERSION, BUILTIN_FN_META, BuiltinFnId, BuiltinFnMeta, lookup_builtin_fn_id,
     lookup_builtin_fn_meta,
 };
 
@@ -45,7 +44,6 @@ const IMM_I_SMALL: u64 = 0x0;
 const IMM_U_SMALL: u64 = 0x1;
 const IMM_F64: u64 = 0x2;
 const IMM_BOOL: u64 = 0x3;
-const IMM_SYMBOL: u64 = 0x4;
 const IMM_NULL: u64 = 0x5;
 const IMM_UNIT: u64 = 0x6;
 const IMM_CHAR: u64 = 0x7;
@@ -132,7 +130,7 @@ impl TaggedValue {
         })
     }
 
-    /// Decode enum representation only; legacy symbols are never enum values.
+    /// Decode enum representation only; non-enum immediates are rejected.
     pub fn as_enum(self) -> Option<(TypeIndex, u32)> {
         if !self.is_immediate() || self.imm_sub() != IMM_ENUM {
             return None;
@@ -152,10 +150,6 @@ impl TaggedValue {
         (self.is_immediate() && self.imm_sub() == IMM_TRAIT_PROOF)
             .then(|| self.imm_data())
             .filter(|&id| id != 0)
-    }
-
-    pub fn from_symbol(sym: u64) -> Self {
-        Self::make_imm(IMM_SYMBOL, sym)
     }
 
     /// Create a HeapObject tagged value from a raw object pointer.
@@ -351,10 +345,6 @@ pub struct CallFrame {
     pub saved_regs: Vec<(Reg, TaggedValue)>,
     /// Caller-local values, moved into the frame while the callee executes.
     pub local_slots: Vec<TaggedValue>,
-    /// Evidence chain for effect handlers.
-    pub evidence: Vec<HandlerRef>,
-    /// Closure environment pointer (for LoadCapture), None if not a closure call.
-    pub closure_env: Option<TaggedValue>,
 }
 
 /// Traversal state is owned by a frame/segment; cloning a continuation copies
@@ -365,15 +355,6 @@ pub struct DisplayState {
     pub ancestors: Vec<TaggedValue>,
     pub current_target: bool,
     pub inline_count: usize,
-}
-
-/// A reference to an installed effect handler.
-#[derive(Debug, Clone, Copy)]
-pub struct HandlerRef {
-    /// Which effect this handles.
-    pub effect_type: TypeIndex,
-    /// Index in the handler stack.
-    pub handler_idx: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -443,10 +424,8 @@ pub struct EffectHandler {
     pub effect_type: TypeIndex,
     /// Function to call when the effect is invoked.
     pub handler_func: FuncId,
-    /// Whether this is an async handler (spawns child task).
-    pub is_async: bool,
     /// Closure and its captures, retained as a GC root while installed.
-    pub closure_env: Option<TaggedValue>,
+    pub closure_env: TaggedValue,
     /// Runtime-provided continuation argument position for capturing handlers.
     pub continuation_param: Option<u8>,
 }
@@ -469,8 +448,8 @@ pub struct FunctionCode {
     pub param_count: u8,
     pub is_closure: bool,
     pub function_type: type_pool::TypeIndex,
-    /// Explicit entry layout; None retains legacy value-only interpretation.
-    pub abi: Option<nsbc::FunctionAbi>,
+    /// Mandatory physical entry layout separating captures and parameters.
+    pub abi: nsbc::FunctionAbi,
 }
 
 impl BytecodeStore {
@@ -829,14 +808,14 @@ mod tests {
     }
 
     #[test]
-    fn enum_immediates_preserve_identity_and_reject_legacy_symbols() {
+    fn enum_immediates_preserve_identity_and_reject_other_immediates() {
         for ty in [0, 1, u32::MAX - 1] {
             for variant in [0, (1 << 25) - 1] {
                 let ty = TypeIndex::from_raw(ty);
                 let value = TaggedValue::from_enum(ty, variant).unwrap();
                 assert_eq!(value.as_enum(), Some((ty, variant)));
                 assert_eq!(value.as_type(), None);
-                assert_eq!(TaggedValue::from_symbol(value.imm_data()).as_enum(), None);
+                assert_eq!(TaggedValue::from_u64(value.imm_data()).as_enum(), None);
             }
         }
         assert_eq!(TaggedValue::from_enum(TypeIndex::INVALID, 0), None);

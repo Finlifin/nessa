@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use type_pool::{DERIVE_FUNC_ID, TypeIndex, TypeKind, TypePool};
+use type_pool::{TypeIndex, TypeKind, TypePool};
 
 use crate::{
     AddrMode, CaptureAbi, CodegenOutput, CompiledArtifact, CompiledFunction, Constant, Instruction,
@@ -89,50 +89,16 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
         .type_pool
         .validate()
         .map_err(|error| ArtifactError::new("type pool", error.to_string()))?;
-    let mut layouts = BTreeMap::new();
-    for function in &output.functions {
-        for (pc, &word) in function.instructions.iter().enumerate() {
-            let context = format!("function {} PC {pc}", function.func_id.0);
-            let instruction = decode(word, &context)?;
-            if matches!(
-                instruction.opcode,
-                Opcode::NewClosure | Opcode::NewClosureWide
-            ) && let InstructionData::A { base, imm12, .. } = instruction.data
-            {
-                let id = if instruction.opcode == Opcode::NewClosureWide {
-                    let raw = match output.constants.get(imm12 as usize) {
-                        Some(Constant::UInt(value)) => *value,
-                        Some(Constant::Int(value)) if *value >= 0 => *value as u64,
-                        _ => {
-                            return Err(ArtifactError::new(
-                                &context,
-                                "invalid closure metadata constant",
-                            ));
-                        }
-                    };
-                    u32::try_from(raw).map_err(|_| {
-                        ArtifactError::new(&context, "closure function ID exceeds u32")
-                    })?
-                } else {
-                    imm12 as u32
-                };
-                if layouts
-                    .insert(id, base.0)
-                    .is_some_and(|previous| previous != base.0)
-                {
-                    return Err(ArtifactError::new(
-                        &context,
-                        "inconsistent closure capture layouts",
-                    ));
-                }
-            }
-        }
+    if artifact.type_pool.has_unresolved_derived_methods() {
+        return Err(ArtifactError::new(
+            "type pool",
+            "unresolved derived method sentinel in executable artifact",
+        ));
     }
     let validator = Validator {
         artifact,
         pool: &artifact.type_pool,
         functions,
-        layouts,
     };
     let mut names = BTreeSet::new();
     let mut builtins = BTreeSet::new();
@@ -171,12 +137,6 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
             } => {
                 validator.enum_variant(*type_index, *variant, &format!("enum constant {index}"))?;
             }
-            Constant::BigInt(_) => {
-                return Err(ArtifactError::new(
-                    format!("constant {index}"),
-                    "BigInt execution is not implemented",
-                ));
-            }
             _ => {}
         }
     }
@@ -197,85 +157,6 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
     Ok(())
 }
 
-/// Detect executable Error capability independently of instruction spelling.
-/// Metadata-only Type constants do not select a payload representation.
-pub fn uses_error_envelopes(artifact: &CompiledArtifact) -> Result<bool, ArtifactError> {
-    let pool = &artifact.type_pool;
-    let mut pending: Vec<TypeIndex> = artifact
-        .codegen_output
-        .globals
-        .iter()
-        .map(|global| global.type_index)
-        .collect();
-    for function in &artifact.codegen_output.functions {
-        if function.function_type != TypeIndex::INVALID {
-            pending.push(function.function_type);
-        }
-        for &word in &function.instructions {
-            let instruction = decode(word, "Error capability")?;
-            if matches!(
-                instruction.opcode,
-                Opcode::ErrorOk | Opcode::ErrorErr | Opcode::ErrorIsOk | Opcode::ErrorPayload
-            ) {
-                return Ok(true);
-            }
-            if let InstructionData::A { imm12, .. } = instruction.data {
-                if matches!(
-                    instruction.opcode,
-                    Opcode::TypeCast
-                        | Opcode::TypeAssert
-                        | Opcode::TypeCheck
-                        | Opcode::TypeCastSafe
-                        | Opcode::NewObject
-                ) {
-                    pending.push(TypeIndex::from_raw(imm12 as u32));
-                }
-                if matches!(instruction.opcode, Opcode::NewEnum | Opcode::EnumIs)
-                    && let Some(Constant::Enum { type_index, .. }) =
-                        artifact.codegen_output.constants.get(imm12 as usize)
-                {
-                    pending.push(*type_index);
-                }
-            }
-        }
-    }
-    let mut seen = BTreeSet::new();
-    while let Some(ty) = pending.pop() {
-        let ty = pool
-            .canonical_type(ty)
-            .ok_or_else(|| ArtifactError::new("Error capability", "invalid type reference"))?;
-        if !seen.insert(ty) {
-            continue;
-        }
-        let info = pool.get(ty);
-        match &info.kind {
-            TypeKind::ErrorQualified { .. } if info.size == 24 && info.align == 8 => {
-                return Ok(true);
-            }
-            TypeKind::ErrorQualified { errors, inner } => {
-                pending.extend(errors);
-                pending.push(*inner);
-            }
-            TypeKind::Optional { inner }
-            | TypeKind::Newtype { inner, .. }
-            | TypeKind::EffectQualified { inner, .. } => pending.push(*inner),
-            TypeKind::Tuple { elements } => pending.extend(elements),
-            TypeKind::Function { params, ret } | TypeKind::Effect { params, ret, .. } => {
-                pending.extend(params);
-                pending.push(*ret);
-            }
-            TypeKind::Struct { fields, .. } => pending.extend(fields.iter().map(|field| field.ty)),
-            TypeKind::Enum { variants, .. } => pending.extend(
-                variants
-                    .iter()
-                    .flat_map(|variant| variant.fields.iter().map(|field| field.ty)),
-            ),
-            _ => {}
-        }
-    }
-    Ok(false)
-}
-
 fn decode(word: u32, context: &str) -> Result<Instruction, ArtifactError> {
     let instruction = Instruction::decode(word)
         .ok_or_else(|| ArtifactError::new(context, format!("invalid instruction {word:#010x}")))?;
@@ -292,7 +173,6 @@ struct Validator<'a> {
     artifact: &'a CompiledArtifact,
     pool: &'a TypePool,
     functions: BTreeMap<u32, &'a CompiledFunction>,
-    layouts: BTreeMap<u32, u8>,
 }
 
 impl Validator<'_> {
@@ -495,7 +375,7 @@ impl Validator<'_> {
 
     fn call(&self, id: u32, count: u8, context: &str) -> Result<(), ArtifactError> {
         let target = self.target(id, context)?;
-        if target.is_closure && self.captures(target, context)? != Some(0) {
+        if target.is_closure && self.captures(target, context)? != 0 {
             return Err(ArtifactError::new(
                 context,
                 "direct call target requires a closure environment",
@@ -524,175 +404,145 @@ impl Validator<'_> {
         }
     }
 
-    fn captures(
-        &self,
-        function: &CompiledFunction,
-        context: &str,
-    ) -> Result<Option<u8>, ArtifactError> {
+    fn captures(&self, function: &CompiledFunction, context: &str) -> Result<u8, ArtifactError> {
         if let Some(owner) = function.display_owner {
             crate::validate_display_owner(
                 self.pool(),
                 function.func_id,
                 owner,
                 function.function_type,
-                function.abi.as_ref(),
+                &function.abi,
                 function.param_count,
                 function.is_closure,
             )
             .map_err(|message| ArtifactError::new(context, message))?;
         }
-        if let Some(abi) = &function.abi {
-            if abi.physical_parameter_count() != function.param_count as usize
-                || (!function.is_closure && abi.capture_count() != 0)
-            {
+        let abi = &function.abi;
+        if abi.physical_parameter_count() != function.param_count as usize
+            || (!function.is_closure && abi.capture_count() != 0)
+        {
+            return Err(ArtifactError::new(
+                context,
+                "explicit function ABI disagrees with physical entry",
+            ));
+        }
+        if function.function_type != TypeIndex::INVALID {
+            let ty = self.runtime_type(function.function_type, context)?;
+            let TypeKind::Function { params, .. } = &self.pool().get(ty).kind else {
                 return Err(ArtifactError::new(
                     context,
-                    "explicit function ABI disagrees with physical entry",
+                    "function metadata is not a Function type",
+                ));
+            };
+            if params.len() != abi.logical_parameter_count() {
+                return Err(ArtifactError::new(
+                    context,
+                    "explicit function ABI disagrees with logical signature",
                 ));
             }
-            if function.function_type != TypeIndex::INVALID {
-                let ty = self.runtime_type(function.function_type, context)?;
-                let TypeKind::Function { params, .. } = &self.pool().get(ty).kind else {
-                    return Err(ArtifactError::new(
-                        context,
-                        "function metadata is not a Function type",
-                    ));
-                };
-                if params.len() != abi.logical_parameter_count() {
-                    return Err(ArtifactError::new(
-                        context,
-                        "explicit function ABI disagrees with logical signature",
-                    ));
-                }
-                for (&parameter, &ty) in abi.parameters.iter().zip(params) {
-                    match parameter {
-                        ParameterAbi::Value => {}
-                        ParameterAbi::Trait { view } => {
-                            if self.pool().canonical_type(view) != self.pool().canonical_type(ty) {
-                                return Err(ArtifactError::new(
-                                    context,
-                                    "trait proof view disagrees with logical parameter",
-                                ));
-                            }
+            for (&parameter, &ty) in abi.parameters.iter().zip(params) {
+                match parameter {
+                    ParameterAbi::Value => {}
+                    ParameterAbi::Trait { view } => {
+                        if self.pool().canonical_type(view) != self.pool().canonical_type(ty) {
+                            return Err(ArtifactError::new(
+                                context,
+                                "trait proof view disagrees with logical parameter",
+                            ));
                         }
-                        ParameterAbi::TraitSelf { view } => {
-                            let concrete = self.type_index(ty, context)?;
-                            let view = self.type_index(view, context)?;
-                            if matches!(self.pool().get(concrete).kind, TypeKind::Trait { .. })
-                                || !self.pool().vtables_snapshot().iter().any(|table| {
-                                    table.implementor == concrete
-                                        && table.trait_type == view
-                                        && self
-                                            .pool()
-                                            .check_associated_implementation_bindings(
-                                                concrete,
-                                                view,
-                                                table.visible_scope,
-                                            )
-                                            .is_ok()
-                                })
-                            {
-                                return Err(ArtifactError::new(
-                                    context,
-                                    "specialized Self proof requires a concrete implementation",
-                                ));
-                            }
+                    }
+                    ParameterAbi::TraitSelf { view } => {
+                        let concrete = self.type_index(ty, context)?;
+                        let view = self.type_index(view, context)?;
+                        if matches!(self.pool().get(concrete).kind, TypeKind::Trait { .. })
+                            || !self.pool().vtables_snapshot().iter().any(|table| {
+                                table.implementor == concrete
+                                    && table.trait_type == view
+                                    && self
+                                        .pool()
+                                        .check_associated_implementation_bindings(
+                                            concrete,
+                                            view,
+                                            table.visible_scope,
+                                        )
+                                        .is_ok()
+                            })
+                        {
+                            return Err(ArtifactError::new(
+                                context,
+                                "specialized Self proof requires a concrete implementation",
+                            ));
                         }
                     }
                 }
-            } else if abi
-                .parameters
-                .iter()
-                .any(|parameter| matches!(parameter, ParameterAbi::TraitSelf { .. }))
+            }
+        } else if abi
+            .parameters
+            .iter()
+            .any(|parameter| matches!(parameter, ParameterAbi::TraitSelf { .. }))
+        {
+            return Err(ArtifactError::new(
+                context,
+                "specialized Self proof requires a logical signature",
+            ));
+        }
+        let views = abi
+            .captures
+            .iter()
+            .filter_map(|capture| match capture {
+                CaptureAbi::Value => None,
+                CaptureAbi::TraitProof { view } => Some(*view),
+            })
+            .chain(
+                abi.parameters
+                    .iter()
+                    .filter_map(|parameter| match parameter {
+                        ParameterAbi::Value => None,
+                        ParameterAbi::Trait { view } | ParameterAbi::TraitSelf { view } => {
+                            Some(*view)
+                        }
+                    }),
+            );
+        for view in views {
+            let view = self.type_index(view, context)?;
+            if !matches!(self.pool().get(view).kind, TypeKind::Trait { .. }) {
+                return Err(ArtifactError::new(
+                    context,
+                    "proof view must be a trait type",
+                ));
+            }
+        }
+        for parameter in &abi.parameters {
+            if let ParameterAbi::Trait { view } = parameter
+                && self
+                    .pool()
+                    .trait_has_associated_types(*view)
+                    .map_err(|error| ArtifactError::new(context, error.to_string()))?
             {
                 return Err(ArtifactError::new(
                     context,
-                    "specialized Self proof requires a logical signature",
+                    "associated trait proof ABI is not supported",
                 ));
             }
-            let views = abi
-                .captures
-                .iter()
-                .filter_map(|capture| match capture {
-                    CaptureAbi::Value => None,
-                    CaptureAbi::TraitProof { view } => Some(*view),
-                })
-                .chain(
-                    abi.parameters
-                        .iter()
-                        .filter_map(|parameter| match parameter {
-                            ParameterAbi::Value => None,
-                            ParameterAbi::Trait { view } | ParameterAbi::TraitSelf { view } => {
-                                Some(*view)
-                            }
-                        }),
-                );
-            for view in views {
-                let view = self.type_index(view, context)?;
-                if !matches!(self.pool().get(view).kind, TypeKind::Trait { .. }) {
-                    return Err(ArtifactError::new(
-                        context,
-                        "proof view must be a trait type",
-                    ));
-                }
-            }
-            for parameter in &abi.parameters {
-                if let ParameterAbi::Trait { view } = parameter
-                    && self
-                        .pool()
-                        .trait_has_associated_types(*view)
-                        .map_err(|error| ArtifactError::new(context, error.to_string()))?
-                {
-                    return Err(ArtifactError::new(
-                        context,
-                        "associated trait proof ABI is not supported",
-                    ));
-                }
-            }
-            for (index, capture) in abi.captures.iter().enumerate() {
-                if matches!(capture, CaptureAbi::TraitProof { .. })
-                    && (index == 0 || abi.captures[index - 1] != CaptureAbi::Value)
-                {
-                    return Err(ArtifactError::new(
-                        context,
-                        "trait proof capture must follow its data capture",
-                    ));
-                }
-            }
-            return Ok(Some(abi.capture_count() as u8));
         }
-        // Only legacy layouts retain the old count-gap interpretation.
-        if function.function_type == TypeIndex::INVALID {
-            return Ok(self.layouts.get(&function.func_id.0).copied());
+        for (index, capture) in abi.captures.iter().enumerate() {
+            if matches!(capture, CaptureAbi::TraitProof { .. })
+                && (index == 0 || abi.captures[index - 1] != CaptureAbi::Value)
+            {
+                return Err(ArtifactError::new(
+                    context,
+                    "trait proof capture must follow its data capture",
+                ));
+            }
         }
-        let ty = self.runtime_type(function.function_type, context)?;
-        let TypeKind::Function { params, .. } = &self.pool().get(ty).kind else {
-            return Err(ArtifactError::new(
-                context,
-                "function metadata is not a Function type",
-            ));
-        };
-        let captures = (function.param_count as usize)
-            .checked_sub(params.len())
-            .ok_or_else(|| {
-                ArtifactError::new(context, "signature has more parameters than function ABI")
-            })?;
-        if !function.is_closure && captures != 0 {
-            return Err(ArtifactError::new(
-                context,
-                "ordinary function signature disagrees with ABI",
-            ));
-        }
-        Ok(Some(captures as u8))
+        Ok(abi.capture_count() as u8)
     }
 
     fn closure(&self, id: u32, count: u8, context: &str) -> Result<(), ArtifactError> {
         let target = self.target(id, context)?;
         if count > target.param_count
             || (!target.is_closure && count != 0)
-            || self
-                .captures(target, context)?
-                .is_some_and(|expected| expected != count)
+            || self.captures(target, context)? != count
         {
             return Err(ArtifactError::new(
                 context,
@@ -710,33 +560,15 @@ impl Validator<'_> {
         }
         for index in 0..self.pool().len() {
             for method in self.pool().methods_of(TypeIndex::from_raw(index as u32)) {
-                if method.func_id != DERIVE_FUNC_ID {
-                    let target = self.target(method.func_id, "method table")?;
-                    self.call(method.func_id, target.param_count, "method table")?;
-                }
-                if method.func_id == DERIVE_FUNC_ID {
-                    self.pool()
-                        .check_native_derived_slot(TypeIndex::from_raw(index as u32), method)
-                        .map_err(|error| {
-                            ArtifactError::new("native derived interface", error.to_string())
-                        })?;
-                }
+                let target = self.target(method.func_id, "method table")?;
+                self.call(method.func_id, target.param_count, "method table")?;
                 self.string(method.name.as_u32(), "method table")?;
             }
         }
         for implementation in self.pool().trait_impls_snapshot() {
             for method in &implementation.methods {
-                if method.func_id == DERIVE_FUNC_ID {
-                    self.pool()
-                        .check_native_derived_slot(implementation.implementor, method)
-                        .map_err(|error| {
-                            ArtifactError::new("native derived interface", error.to_string())
-                        })?;
-                }
-                if method.func_id != DERIVE_FUNC_ID {
-                    let target = self.target(method.func_id, "trait implementation")?;
-                    self.call(method.func_id, target.param_count, "trait implementation")?;
-                }
+                let target = self.target(method.func_id, "trait implementation")?;
+                self.call(method.func_id, target.param_count, "trait implementation")?;
             }
         }
         for (index, table) in self.pool().vtables_snapshot().iter().enumerate() {
@@ -754,22 +586,6 @@ impl Validator<'_> {
                         name: descriptor.name,
                         signature: descriptor.signature,
                     };
-                    if descriptor.func_id == DERIVE_FUNC_ID {
-                        if self.pool().canonical_type(descriptor.implementation_trait)
-                            != self.pool().canonical_type(key.trait_owner)
-                        {
-                            return Err(ArtifactError::new(
-                                "native derived interface",
-                                "untrusted implementation trait",
-                            ));
-                        }
-                        self.pool()
-                            .check_native_derived_method(&key, table.implementor)
-                            .map_err(|error| {
-                                ArtifactError::new("native derived interface", error.to_string())
-                            })?;
-                        continue;
-                    }
                     let target = self.target(descriptor.func_id, "vtable interface")?;
                     self.pool()
                         .check_trait_method_signature_in_impl(
@@ -785,10 +601,8 @@ impl Validator<'_> {
                 }
             }
             for &id in &table.entries {
-                if id != DERIVE_FUNC_ID {
-                    let target = self.target(id, "vtable")?;
-                    self.call(id, target.param_count, "vtable")?;
-                }
+                let target = self.target(id, "vtable")?;
+                self.call(id, target.param_count, "vtable")?;
             }
         }
         Ok(())
@@ -809,7 +623,7 @@ impl Validator<'_> {
         if function.function_type != TypeIndex::INVALID {
             self.runtime_type(function.function_type, &context)?;
         }
-        let captures = self.captures(function, &context)?;
+        self.captures(function, &context)?;
         let slots = match decode(function.instructions[0], &context)?.data {
             InstructionData::E { payload }
                 if function.instructions[0] >> 24 == Opcode::AllocateSlots as u32 =>
@@ -838,14 +652,7 @@ impl Validator<'_> {
         }
         for (pc, &word) in function.instructions.iter().enumerate() {
             let context = format!("function {} PC {pc}", function.func_id.0);
-            self.instruction(
-                function,
-                pc,
-                slots,
-                captures,
-                decode(word, &context)?,
-                &context,
-            )?;
+            self.instruction(function, pc, slots, decode(word, &context)?, &context)?;
         }
         self.control_flow(function)?;
         Ok(())
@@ -871,10 +678,7 @@ impl Validator<'_> {
             let instruction = decode(function.instructions[pc], &context)?;
             let mut depth = depth;
             match instruction.opcode {
-                Opcode::PushHandler
-                | Opcode::PushHandlerWide
-                | Opcode::PushHandlerClosure
-                | Opcode::PushCapturingHandler => {
+                Opcode::PushHandlerClosure | Opcode::PushCapturingHandler => {
                     depth += 1;
                 }
                 Opcode::PopHandler => {
@@ -896,7 +700,7 @@ impl Validator<'_> {
             }
             if matches!(
                 instruction.opcode,
-                Opcode::Return | Opcode::ReturnUnit | Opcode::TailCall | Opcode::MatchFail
+                Opcode::Return | Opcode::ReturnUnit | Opcode::Unreachable | Opcode::MatchFail
             ) {
                 continue;
             }
@@ -922,7 +726,6 @@ impl Validator<'_> {
         function: &CompiledFunction,
         pc: usize,
         slots: u32,
-        captures: Option<u8>,
         instruction: Instruction,
         context: &str,
     ) -> Result<(), ArtifactError> {
@@ -960,13 +763,14 @@ impl Validator<'_> {
                 match instruction.opcode {
                     Load => {
                         register(dst)?;
+                        if base.0 != 0 {
+                            return Err(fail("unused load base register is nonzero"));
+                        }
                         match instruction.amode {
                             AddrMode::Const => {
                                 self.load_constant(index, context)?;
                             }
-                            AddrMode::RegOff => register(base)?,
                             AddrMode::Imm => {}
-                            AddrMode::Reserved => return Err(fail("reserved addressing mode")),
                         }
                     }
                     LoadConstWide => {
@@ -987,11 +791,6 @@ impl Validator<'_> {
                     TraitProof | TraitAssert | TraitProject => {
                         register(dst)?;
                         register(base)?;
-                        if function.abi.is_none() {
-                            return Err(fail(
-                                "trait proof instructions require an explicit function ABI",
-                            ));
-                        }
                         let view = self.runtime_type(TypeIndex::from_raw(index), context)?;
                         if !matches!(self.pool().get(view).kind, TypeKind::Trait { .. }) {
                             return Err(fail("trait proof operand must name a trait view"));
@@ -1054,33 +853,24 @@ impl Validator<'_> {
                         register(base)?;
                     }
                     LoadGlobal | LoadGlobalWide | StoreGlobal | StoreGlobalWide => {
+                        register(dst)?;
                         let index =
                             if matches!(instruction.opcode, LoadGlobalWide | StoreGlobalWide) {
                                 wide
                             } else {
+                                if base.0 != 0 {
+                                    return Err(fail("unused global base register is nonzero"));
+                                }
                                 index
                             };
                         if index as usize >= self.artifact.codegen_output.globals.len() {
                             return Err(fail("global slot outside schema"));
-                        }
-                        if instruction.opcode == StoreGlobal {
-                            register(base)?;
-                        } else {
-                            register(dst)?;
                         }
                     }
                     LoadSlot | StoreSlot => {
                         register(dst)?;
                         if wide >= slots {
                             return Err(fail("local slot outside entry allocation"));
-                        }
-                    }
-                    LoadCapture => {
-                        register(dst)?;
-                        if !function.is_closure
-                            || captures.is_none_or(|count| index >= count as u32)
-                        {
-                            return Err(fail("capture read lacks a matching closure layout"));
                         }
                     }
                     NewObject => {
@@ -1171,7 +961,7 @@ impl Validator<'_> {
                 }
             }
             InstructionData::C { payload } => match instruction.opcode {
-                Call | CallFar | TailCall | CallBuiltin => {
+                Call | CallFar | CallBuiltin => {
                     let (count, id) = Instruction::c_arg_count_func_id(payload);
                     arguments(count)?;
                     if instruction.opcode != CallBuiltin {
@@ -1190,11 +980,9 @@ impl Validator<'_> {
                     if payload & 0x1ff != 0 {
                         return Err(fail("unused indirect call bits are nonzero"));
                     }
-                    if instruction.opcode == CallIndirectProof
-                        && (function.abi.is_none() || closure.0 < count)
-                    {
+                    if instruction.opcode == CallIndirectProof && closure.0 < count {
                         return Err(fail(
-                            "physical indirect calls require an explicit ABI and separate callee register",
+                            "physical indirect calls require a separate callee register",
                         ));
                     }
                 }
@@ -1202,9 +990,9 @@ impl Validator<'_> {
                     let (count, proof, slot) = Instruction::c_call_method(payload);
                     arguments(count)?;
                     register(proof)?;
-                    if function.abi.is_none() || count == 0 || proof.0 < count {
+                    if count == 0 || proof.0 < count {
                         return Err(fail(
-                            "trait call requires receiver data and a separate proof register under an explicit ABI",
+                            "trait call requires receiver data and a separate proof register",
                         ));
                     }
                     if !self
@@ -1215,8 +1003,6 @@ impl Validator<'_> {
                     {
                         return Err(fail("trait call slot is outside every interface schema"));
                     }
-                    // The exact handle view is dynamic. The VM additionally
-                    // checks this slot against the proof's frozen interface.
                 }
                 CallMethod | CallMethodFar => {
                     let (count, receiver, method) = Instruction::c_call_method(payload);
@@ -1245,7 +1031,6 @@ impl Validator<'_> {
                         return Err(fail("unused return payload is nonzero"));
                     }
                 }
-                CallWasm => return Err(fail("WASM execution is not implemented")),
                 _ => return Err(fail("unexpected call opcode")),
             },
             InstructionData::E { payload } => match instruction.opcode {
@@ -1260,20 +1045,6 @@ impl Validator<'_> {
                     if self.effect(payload & 0x1ffff, context)? != count as usize {
                         return Err(fail("effect argument count mismatch"));
                     }
-                }
-                PushHandler | PushHandlerWide => {
-                    let (effect, handler) = if instruction.opcode == PushHandlerWide {
-                        let packed = self.integer(payload, context)?;
-                        ((packed >> 32) as u32, packed as u32)
-                    } else {
-                        ((payload >> 11) & 0x7ff, payload & 0x7ff)
-                    };
-                    let count = self.effect(effect, context)?;
-                    let count = u8::try_from(count)
-                        .ok()
-                        .filter(|&count| count <= Reg::MAX_GP)
-                        .ok_or_else(|| fail("effect parameter limit exceeded"))?;
-                    self.call(handler, count, context)?;
                 }
                 PushHandlerClosure | PushCapturingHandler => {
                     register(Reg((payload >> 17) as u8))?;
@@ -1290,41 +1061,25 @@ impl Validator<'_> {
                         self.effect(payload & 0x1ffff, context)?;
                     }
                 }
-                Reset => {
-                    let (prompt, count) = Instruction::e_control_regs(payload);
-                    register(prompt)?;
-                    arguments(count.0)?;
-                    self.call(payload & 0xfff, count.0, context)?;
-                }
                 ResetClosure => {
                     register(Instruction::e_control_regs(payload).0)?;
                     if payload & 0xfff != 0 {
                         return Err(fail("unused reset bits are nonzero"));
                     }
                 }
-                Shift
-                | Resume
-                | ResumeContinuation
-                | ResumeContinuationOnce
-                | CloneContinuation
-                | DropContinuation => {
+                ResumeContinuation | ResumeContinuationOnce => {
                     let (first, second) = Instruction::e_control_regs(payload);
                     register(first)?;
-                    if instruction.opcode != DropContinuation {
-                        register(second)?;
-                    }
-                    if payload & 0xfff != 0
-                        || (instruction.opcode == DropContinuation && second.0 != 0)
-                    {
+                    register(second)?;
+                    if payload & 0xfff != 0 {
                         return Err(fail("unused continuation bits are nonzero"));
                     }
                 }
-                PopHandler | Safepoint | DebugBreak | Nop | MatchFail => {
+                PopHandler | Safepoint | Unreachable | Nop | MatchFail => {
                     if payload != 0 {
                         return Err(fail("unused system payload is nonzero"));
                     }
                 }
-                EffectCall => return Err(fail("static effect execution is not implemented")),
                 _ => return Err(fail("unexpected effect/system opcode")),
             },
         }
@@ -1335,14 +1090,41 @@ impl Validator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BuiltinImport, FuncId, FunctionAbi, GlobalInfo};
+    use crate::{BuiltinImport, FuncId, FunctionAbi, GlobalInfo, MethodCallScope};
     use type_pool::Intrinsic;
 
+    fn refresh_scopes(artifact: &mut CompiledArtifact) {
+        artifact.codegen_output.method_call_scopes.clear();
+        for function in &artifact.codegen_output.functions {
+            for (pc, &word) in function.instructions.iter().enumerate() {
+                if Instruction::decode(word)
+                    .is_some_and(|inst| crate::instruction_requires_scope(inst.opcode))
+                {
+                    artifact
+                        .codegen_output
+                        .method_call_scopes
+                        .push(MethodCallScope {
+                            func_id: function.func_id,
+                            pc: pc as u32,
+                            scope: 0,
+                        });
+                }
+            }
+        }
+    }
+
     fn artifact(instructions: Vec<Instruction>) -> CompiledArtifact {
-        CompiledArtifact {
+        let mut type_pool = TypePool::with_intrinsics();
+        type_pool
+            .install_scopes(vec![type_pool::ScopeContext {
+                parent: None,
+                package: 0,
+                assoc_type: None,
+            }])
+            .unwrap();
+        let mut artifact = CompiledArtifact {
             codegen_output: CodegenOutput {
-                scope_coverage: crate::ScopeCoverage::Calls,
-                method_call_scopes: None,
+                method_call_scopes: vec![],
                 functions: vec![CompiledFunction {
                     display_owner: None,
                     func_id: FuncId(0),
@@ -1352,17 +1134,19 @@ mod tests {
                     param_count: 0,
                     is_closure: false,
                     function_type: TypeIndex::INVALID,
-                    abi: None,
+                    abi: FunctionAbi::default(),
                     safepoint_pcs: vec![],
                 }],
                 constants: vec![],
                 globals: vec![],
             },
-            type_pool: TypePool::with_intrinsics(),
+            type_pool,
             entry: Some(FuncId(0)),
-            builtin_abi_version: 1,
+            builtin_abi_version: 9,
             builtins: vec![],
-        }
+        };
+        refresh_scopes(&mut artifact);
+        artifact
     }
 
     fn rejected(artifact: &CompiledArtifact, message: &str) {
@@ -1449,20 +1233,15 @@ mod tests {
             constant.codegen_output.constants.push(Constant::Type(ty));
             rejected(&constant, "unresolved associated type");
 
-            for explicit in [false, true] {
-                let mut function = executable();
-                let signature = function.type_pool.intern_structural(TypeKind::Function {
-                    params: vec![],
-                    ret: ty,
-                });
-                let entry = &mut function.codegen_output.functions[0];
-                entry.function_type = signature;
-                entry.abi = explicit.then(|| FunctionAbi {
-                    captures: vec![],
-                    parameters: vec![],
-                });
-                rejected(&function, "unresolved associated type");
-            }
+            let mut function = executable();
+            let signature = function.type_pool.intern_structural(TypeKind::Function {
+                params: vec![],
+                ret: ty,
+            });
+            let entry = &mut function.codegen_output.functions[0];
+            entry.function_type = signature;
+            entry.abi = FunctionAbi::default();
+            rejected(&function, "unresolved associated type");
 
             let mut operand = executable();
             operand.codegen_output.functions[0].instructions.insert(
@@ -1476,6 +1255,7 @@ mod tests {
                 )
                 .encode(),
             );
+            refresh_scopes(&mut operand);
             rejected(&operand, "unresolved associated type");
         }
     }
@@ -1487,7 +1267,7 @@ mod tests {
             Instruction::load_imm(Reg(0), 42),
             Instruction::store_slot(0, Reg(0)),
             Instruction::load_slot(Reg(0), 0),
-            Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(0), 0),
+            Instruction::store_global(0, Reg(0)),
             Instruction::call_builtin(0, 1),
             Instruction::return_unit(),
         ]);
@@ -1504,6 +1284,11 @@ mod tests {
             builtin_references(&artifact.codegen_output).unwrap(),
             BTreeSet::from([0])
         );
+        artifact.codegen_output.functions[0].instructions[4] =
+            Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(1), 0).encode();
+        rejected(&artifact, "unused global base register");
+        artifact.codegen_output.functions[0].instructions[4] =
+            Instruction::store_global(0, Reg(0)).encode();
         artifact.builtins.clear();
         rejected(&artifact, "undeclared builtin");
     }
@@ -1552,15 +1337,19 @@ mod tests {
             Instruction::enum_field(Reg(3), Reg(0), 0).encode(),
             Instruction::match_fail().encode(),
         ];
+        refresh_scopes(&mut artifact);
         validate_artifact(&artifact).unwrap();
         artifact.codegen_output.functions[0].instructions[0] =
             Instruction::load_const(Reg(0), 0).encode();
+        refresh_scopes(&mut artifact);
         rejected(&artifact, "payload enum descriptor cannot be loaded");
         artifact.codegen_output.functions[0].instructions[0] =
             Instruction::load_const_wide(Reg(0), 0).encode();
+        refresh_scopes(&mut artifact);
         rejected(&artifact, "payload enum descriptor cannot be loaded");
         artifact.codegen_output.functions[0].instructions[0] =
             Instruction::load_const(Reg(0), 1).encode();
+        refresh_scopes(&mut artifact);
         validate_artifact(&artifact).unwrap();
         artifact.codegen_output.constants[0] = Constant::Enum {
             type_index: ty,
@@ -1576,20 +1365,13 @@ mod tests {
         rejected(&artifact, "requires an enum descriptor");
         artifact.codegen_output.functions[0].instructions =
             vec![Instruction::e_type(Opcode::MatchFail, 1).encode()];
+        refresh_scopes(&mut artifact);
         rejected(&artifact, "unused system payload");
     }
 
     #[test]
     fn proof_operands_require_explicit_layout_schema_and_separate_registers() {
         let mut artifact = artifact(vec![Instruction::return_unit()]);
-        artifact
-            .type_pool
-            .install_scopes(vec![type_pool::ScopeContext {
-                parent: None,
-                package: 0,
-                assoc_type: None,
-            }])
-            .unwrap();
         let view = artifact.type_pool.register(type_pool::TypeInfo {
             kind: TypeKind::Trait {
                 name: str_interner::intern("ProofInterface"),
@@ -1620,21 +1402,11 @@ mod tests {
                 }],
             })
             .unwrap();
-        artifact.codegen_output.scope_coverage = crate::ScopeCoverage::CallsAndTypes;
-        artifact.codegen_output.method_call_scopes = Some(vec![crate::MethodCallScope {
-            func_id: FuncId(0),
-            pc: 0,
-            scope: 0,
-        }]);
         artifact.codegen_output.functions[0].instructions = vec![
             Instruction::trait_proof(Reg(1), Reg(0), view).encode(),
             Instruction::return_unit().encode(),
         ];
-        rejected(&artifact, "explicit function ABI");
-        artifact.codegen_output.functions[0].abi = Some(FunctionAbi {
-            captures: vec![],
-            parameters: vec![],
-        });
+        refresh_scopes(&mut artifact);
         validate_artifact(&artifact).unwrap();
         artifact.codegen_output.functions[0].instructions[0] =
             Instruction::trait_proof(Reg(1), Reg(0), Intrinsic::I64.type_index()).encode();
@@ -1693,10 +1465,10 @@ mod tests {
         let function = &mut artifact.codegen_output.functions[0];
         function.function_type = signature;
         function.param_count = 2;
-        function.abi = Some(FunctionAbi {
+        function.abi = FunctionAbi {
             captures: vec![],
             parameters: vec![ParameterAbi::TraitSelf { view }],
-        });
+        };
         validate_artifact(&artifact).unwrap();
         let name = str_interner::intern("Item");
         let TypeKind::Trait { assoc_types, .. } = &mut artifact.type_pool.get_mut(view).kind else {
@@ -1717,7 +1489,7 @@ mod tests {
             });
         artifact.type_pool = TypePool::restore(snapshot).unwrap();
         // An internal concrete entry has a fixed binding environment; a bare
-        // associated interface parameter remains rejected by its separate test.
+        // associated associated-interface parameter remains rejected by its separate test.
         validate_artifact(&artifact).unwrap();
         artifact.codegen_output.functions[0].function_type =
             artifact.type_pool.intern_structural(TypeKind::Function {
@@ -1728,11 +1500,7 @@ mod tests {
         artifact.codegen_output.functions[0].function_type = TypeIndex::INVALID;
         rejected(&artifact, "logical signature");
         artifact.codegen_output.functions[0].function_type = signature;
-        artifact.codegen_output.functions[0]
-            .abi
-            .as_mut()
-            .unwrap()
-            .parameters[0] = ParameterAbi::TraitSelf {
+        artifact.codegen_output.functions[0].abi.parameters[0] = ParameterAbi::TraitSelf {
             view: artifact.type_pool.well_known.eq,
         };
         rejected(&artifact, "concrete implementation");
@@ -1750,52 +1518,38 @@ mod tests {
         function.is_closure = true;
         function.param_count = 2;
         function.function_type = signature;
-        function.abi = Some(FunctionAbi {
+        function.abi = FunctionAbi {
             captures: vec![CaptureAbi::Value],
             parameters: vec![ParameterAbi::Value],
-        });
+        };
         validate_artifact(&artifact).unwrap();
-        artifact.codegen_output.functions[0]
-            .abi
-            .as_mut()
-            .unwrap()
-            .captures
-            .clear();
+        artifact.codegen_output.functions[0].abi.captures.clear();
         rejected(&artifact, "physical entry");
         let function = &mut artifact.codegen_output.functions[0];
-        function
-            .abi
-            .as_mut()
-            .unwrap()
-            .parameters
-            .push(ParameterAbi::Value);
+        function.abi.parameters.push(ParameterAbi::Value);
         rejected(&artifact, "logical signature");
         let function = &mut artifact.codegen_output.functions[0];
-        function.abi = Some(FunctionAbi {
+        function.abi = FunctionAbi {
             captures: vec![CaptureAbi::Value],
             parameters: vec![ParameterAbi::Value],
-        });
+        };
         function.is_closure = false;
         rejected(&artifact, "physical entry");
         let function = &mut artifact.codegen_output.functions[0];
         function.is_closure = true;
         function.function_type = TypeIndex::INVALID;
-        function.abi = Some(FunctionAbi {
+        function.abi = FunctionAbi {
             captures: vec![],
             parameters: vec![ParameterAbi::Trait {
                 view: Intrinsic::I64.type_index(),
             }],
-        });
+        };
         rejected(&artifact, "proof view must be a trait");
-        artifact.codegen_output.functions[0]
-            .abi
-            .as_mut()
-            .unwrap()
-            .parameters[0] = ParameterAbi::Trait {
+        artifact.codegen_output.functions[0].abi.parameters[0] = ParameterAbi::Trait {
             view: artifact.type_pool.well_known.eq,
         };
         validate_artifact(&artifact).unwrap();
-        artifact.codegen_output.functions[0].abi = Some(FunctionAbi {
+        artifact.codegen_output.functions[0].abi = FunctionAbi {
             captures: vec![
                 CaptureAbi::Value,
                 CaptureAbi::TraitProof {
@@ -1803,9 +1557,9 @@ mod tests {
                 },
             ],
             parameters: vec![],
-        });
+        };
         rejected(&artifact, "invalid type index");
-        artifact.codegen_output.functions[0].abi = Some(FunctionAbi {
+        artifact.codegen_output.functions[0].abi = FunctionAbi {
             captures: vec![
                 CaptureAbi::TraitProof {
                     view: artifact.type_pool.well_known.eq,
@@ -1813,7 +1567,7 @@ mod tests {
                 CaptureAbi::Value,
             ],
             parameters: vec![],
-        });
+        };
         rejected(&artifact, "must follow its data capture");
     }
 
@@ -1827,6 +1581,7 @@ mod tests {
         rejected(&artifact, "unknown function");
         artifact.entry = Some(FuncId(0));
         artifact.codegen_output.functions[0].param_count = 1;
+        artifact.codegen_output.functions[0].abi = FunctionAbi::value_only(1);
         rejected(&artifact, "entry must");
     }
 
@@ -1842,10 +1597,10 @@ mod tests {
         let function = &mut artifact.codegen_output.functions[0];
         function.function_type = signature;
         function.param_count = 2;
-        function.abi = Some(FunctionAbi {
+        function.abi = FunctionAbi {
             captures: vec![],
             parameters: vec![ParameterAbi::Trait { view }],
-        });
+        };
         validate_artifact(&artifact).unwrap();
         let TypeKind::Trait { assoc_types, .. } = &mut artifact.type_pool.get_mut(view).kind else {
             panic!();
@@ -1936,7 +1691,7 @@ mod tests {
             param_count: 1,
             is_closure: false,
             function_type: TypeIndex::INVALID,
-            abi: None,
+            abi: FunctionAbi::value_only(1),
             safepoint_pcs: vec![],
         };
         artifact.codegen_output.functions.push(callee);
@@ -1963,15 +1718,12 @@ mod tests {
             display_owner: None,
             func_id: FuncId(1),
             name: str_interner::intern("checked_closure"),
-            instructions: vec![
-                Instruction::load_capture(Reg(0), 0).encode(),
-                Instruction::return_unit().encode(),
-            ],
+            instructions: vec![Instruction::ret(Reg(0)).encode()],
             register_count: 32,
             param_count: 2,
             is_closure: true,
             function_type: signature,
-            abi: None,
+            abi: FunctionAbi::closure_values(1, 1),
             safepoint_pcs: vec![],
         });
         validate_artifact(&artifact).unwrap();
@@ -1980,13 +1732,12 @@ mod tests {
         rejected(&artifact, "capture count");
         artifact.codegen_output.functions[0].instructions[0] =
             Instruction::new_closure(Reg(2), 1, 1).encode();
-        artifact.codegen_output.functions[1].instructions[0] =
-            Instruction::load_capture(Reg(0), 1).encode();
-        rejected(&artifact, "capture read");
+        artifact.codegen_output.functions[1].abi = FunctionAbi::closure_values(2, 0);
+        rejected(&artifact, "logical signature");
     }
 
     #[test]
-    fn methods_use_checked_string_handles_and_derived_sentinel() {
+    fn methods_use_checked_string_handles_and_reject_unresolved_derived_sentinel() {
         let mut artifact = artifact(vec![
             Instruction::call_method_far(Reg(0), 0, 0),
             Instruction::return_unit(),
@@ -1999,7 +1750,7 @@ mod tests {
             Intrinsic::I64.type_index(),
             type_pool::MethodSlot {
                 name: str_interner::intern("eq"),
-                func_id: DERIVE_FUNC_ID,
+                func_id: 0,
                 trait_impl: None,
                 visible_scope: None,
                 access: type_pool::MethodAccess::Public,
@@ -2008,10 +1759,17 @@ mod tests {
         validate_artifact(&artifact).unwrap();
         artifact.codegen_output.constants[0] = Constant::UInt(u32::MAX as u64);
         rejected(&artifact, "invalid string ID");
+        artifact.codegen_output.constants[0] =
+            Constant::UInt(str_interner::intern("eq").as_u32() as u64);
+        let mut snapshot = artifact.type_pool.snapshot();
+        snapshot.methods[Intrinsic::I64.type_index().as_u32() as usize][0].func_id =
+            type_pool::DERIVE_FUNC_ID;
+        artifact.type_pool = TypePool::restore(snapshot).unwrap();
+        rejected(&artifact, "unresolved derived method sentinel");
     }
 
     #[test]
-    fn rejects_handler_stack_growth_underflow_and_unimplemented_operations() {
+    fn rejects_handler_stack_growth_underflow_and_validates_unreachable_terminator() {
         let mut artifact = artifact(vec![
             Instruction::e_type(Opcode::PopHandler, 0),
             Instruction::return_unit(),
@@ -2027,13 +1785,12 @@ mod tests {
             Instruction::jmp(-1).encode(),
         ];
         rejected(&artifact, "inconsistent handler depth");
-        for opcode in [Opcode::CallWasm, Opcode::EffectCall] {
-            artifact.codegen_output.functions[0].instructions = vec![
-                Instruction::a_type(opcode, AddrMode::Imm, Reg(0), Reg(0), 0).encode(),
-                Instruction::return_unit().encode(),
-            ];
-            rejected(&artifact, "not implemented");
-        }
+        artifact.codegen_output.functions[0].instructions =
+            vec![Instruction::unreachable().encode()];
+        validate_artifact(&artifact).unwrap();
+        artifact.codegen_output.functions[0].instructions =
+            vec![Instruction::e_type(Opcode::Unreachable, 1).encode()];
+        rejected(&artifact, "unused system payload");
     }
 
     #[test]
@@ -2121,21 +1878,22 @@ mod tests {
             param_count: 1,
             is_closure: true,
             function_type: signature,
-            abi: None,
+            abi: FunctionAbi::closure_values(0, 1),
             safepoint_pcs: vec![],
         });
         validate_artifact(&artifact).unwrap();
         artifact.codegen_output.functions[1].function_type = TypeIndex::INVALID;
         validate_artifact(&artifact).unwrap();
+        artifact.codegen_output.functions[1].abi = FunctionAbi::closure_values(1, 0);
         artifact.codegen_output.functions[0].instructions[0] =
             Instruction::new_closure(Reg(2), 1, 1).encode();
         rejected(&artifact, "requires a closure environment");
     }
 
     #[test]
-    fn checks_far_handler_metadata_and_continuation_positions() {
+    fn checks_capturing_handler_metadata_and_continuation_positions() {
         let mut artifact = artifact(vec![
-            Instruction::e_type(Opcode::PushHandlerWide, 0),
+            Instruction::push_capturing_handler(Reg(0), 0),
             Instruction::e_type(Opcode::PopHandler, 0),
             Instruction::return_unit(),
         ]);
@@ -2147,60 +1905,17 @@ mod tests {
         artifact
             .codegen_output
             .constants
-            .push(Constant::UInt((effect.as_u32() as u64) << 32));
+            .push(Constant::UInt(effect.as_u32() as u64));
         validate_artifact(&artifact).unwrap();
-        artifact.codegen_output.constants[0] = Constant::UInt(((effect.as_u32() as u64) << 32) | 1);
-        rejected(&artifact, "unknown function");
-        artifact.codegen_output.functions[0].instructions[0] =
-            Instruction::push_capturing_handler(Reg(0), 0).encode();
         artifact.codegen_output.constants[0] =
             Constant::UInt(effect.as_u32() as u64 | (32u64 << 32));
         rejected(&artifact, "continuation parameter");
+        artifact.codegen_output.constants[0] = Constant::Int(-1);
+        rejected(&artifact, "nonnegative");
     }
 
     #[test]
-    fn legacy_handlers_cannot_invoke_a_function_requiring_a_closure_environment() {
-        let mut artifact = artifact(vec![
-            Instruction::e_type(Opcode::PushHandlerWide, 0),
-            Instruction::e_type(Opcode::PopHandler, 0),
-            Instruction::return_unit(),
-        ]);
-        let effect = artifact.type_pool.intern_structural(TypeKind::Effect {
-            params: vec![Intrinsic::I64.type_index()],
-            ret: Intrinsic::Unit.type_index(),
-            is_async: false,
-        });
-        let signature = artifact.type_pool.intern_structural(TypeKind::Function {
-            params: vec![],
-            ret: Intrinsic::Unit.type_index(),
-        });
-        artifact.codegen_output.functions.push(CompiledFunction {
-            display_owner: None,
-            func_id: FuncId(1),
-            name: str_interner::intern("capturing_handler"),
-            instructions: vec![
-                Instruction::load_capture(Reg(0), 0).encode(),
-                Instruction::return_unit().encode(),
-            ],
-            register_count: 32,
-            param_count: 1,
-            is_closure: true,
-            function_type: signature,
-            abi: None,
-            safepoint_pcs: vec![],
-        });
-        artifact
-            .codegen_output
-            .constants
-            .push(Constant::UInt((effect.as_u32() as u64) << 32 | 1));
-        rejected(&artifact, "requires a closure environment");
-        artifact.codegen_output.functions[0].instructions[0] =
-            Instruction::e_type(Opcode::PushHandler, effect.as_u32() << 11 | 1).encode();
-        rejected(&artifact, "requires a closure environment");
-    }
-
-    #[test]
-    fn checks_vtable_function_ids_without_treating_derived_sentinel_as_a_function() {
+    fn checks_vtable_function_ids_and_rejects_unresolved_derived_sentinels() {
         let mut artifact = artifact(vec![Instruction::return_unit()]);
         let trait_type = artifact.type_pool.well_known.eq;
         artifact
@@ -2219,84 +1934,20 @@ mod tests {
         });
         rejected(&artifact, "vtable: unknown function");
         let mut snapshot = artifact.type_pool.snapshot();
-        snapshot.vtables[0].entries[0] = DERIVE_FUNC_ID;
+        snapshot.vtables[0].entries[0] = type_pool::DERIVE_FUNC_ID;
         artifact.type_pool = TypePool::restore(snapshot).unwrap();
-        validate_artifact(&artifact).unwrap();
-    }
-    #[test]
-    fn signed_native_sentinel_rejects_custom_same_named_trait_and_wrong_contract() {
-        let mut artifact = artifact(vec![Instruction::return_unit()]);
-        let receiver = artifact.type_pool.register(type_pool::TypeInfo {
-            kind: type_pool::TypeKind::Struct {
-                name: str_interner::intern("NativeEmpty"),
-                fields: vec![],
-            },
-            type_id: type_pool::TypeId(931, 1),
-            size: 0,
-            align: 8,
-        });
-        let fake = artifact.type_pool.register(type_pool::TypeInfo {
-            kind: type_pool::TypeKind::Trait {
-                name: str_interner::intern("Eq"),
-                parents: vec![],
-                assoc_types: vec![],
-            },
-            type_id: type_pool::TypeId(931, 2),
-            size: 0,
-            align: 0,
-        });
-        let declaration = artifact
-            .type_pool
-            .intern_structural(type_pool::TypeKind::Function {
-                params: vec![fake, fake],
-                ret: Intrinsic::Bool.type_index(),
-            });
-        let name = str_interner::intern("eq");
-        artifact
-            .type_pool
-            .register_trait_schema(type_pool::TraitDispatchSchema {
-                trait_type: fake,
-                slots: vec![type_pool::TraitMethodKey {
-                    trait_owner: fake,
-                    name,
-                    signature: Some(type_pool::TraitMethodSignature {
-                        associated_paths: Vec::new(),
-                        declaration,
-                        self_paths: vec![
-                            vec![type_pool::TraitTypeStep::Parameter(0)],
-                            vec![type_pool::TraitTypeStep::Parameter(1)],
-                        ],
-                        parameter_kinds: vec![
-                            type_pool::TraitParameterKind::Receiver,
-                            type_pool::TraitParameterKind::Required,
-                        ],
-                    }),
-                }],
-            })
-            .unwrap();
-        let method = type_pool::MethodSlot {
-            name,
-            func_id: DERIVE_FUNC_ID,
-            trait_impl: Some(fake),
+        rejected(&artifact, "unresolved derived method sentinel");
+        let mut snapshot = artifact.type_pool.snapshot();
+        snapshot.vtables[0].entries[0] = 0;
+        snapshot.trait_impls[0].methods.push(type_pool::MethodSlot {
+            name: str_interner::intern("eq"),
+            func_id: type_pool::DERIVE_FUNC_ID,
+            trait_impl: Some(trait_type),
             visible_scope: None,
             access: type_pool::MethodAccess::Public,
-        };
-        artifact.type_pool.add_method(receiver, method.clone());
-        artifact
-            .type_pool
-            .add_trait_impl(type_pool::TraitImplRecord {
-                implementor: receiver,
-                trait_type: fake,
-                visible_scope: None,
-                methods: vec![method],
-            });
-        artifact.type_pool.add_vtable(type_pool::VTable {
-            implementor: receiver,
-            trait_type: fake,
-            visible_scope: None,
-            entries: vec![DERIVE_FUNC_ID],
         });
-        rejected(&artifact, "unsupported native derived interface");
+        artifact.type_pool = TypePool::restore(snapshot).unwrap();
+        rejected(&artifact, "unresolved derived method sentinel");
     }
 
     #[test]
@@ -2373,7 +2024,7 @@ mod tests {
                 param_count: 0,
                 is_closure: false,
                 function_type: TypeIndex::INVALID,
-                abi: None,
+                abi: FunctionAbi::default(),
                 safepoint_pcs: vec![],
             });
             if target == 0 {
@@ -2424,6 +2075,7 @@ mod tests {
             });
             artifact.codegen_output.functions[0].function_type = implementation;
             artifact.codegen_output.functions[0].param_count = parameters.len() as u8;
+            artifact.codegen_output.functions[0].abi = FunctionAbi::value_only(parameters.len());
             artifact
                 .type_pool
                 .register_trait_schema(type_pool::TraitDispatchSchema {

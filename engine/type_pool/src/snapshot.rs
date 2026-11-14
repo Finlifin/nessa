@@ -99,6 +99,7 @@ impl TypePool {
             identity_input: snapshot.identity_input,
             identity_dirty: std::sync::atomic::AtomicBool::new(false),
             identity_known: [TypeIndex::INVALID; 8],
+            concrete_types: std::sync::Mutex::new(Vec::new()),
         };
         pool.identity_known = crate::identity::known_traits(&pool);
         let ids = pool
@@ -643,13 +644,21 @@ mod tests {
                 target: Intrinsic::Bool.type_index(),
             },
         );
+        let scopes = (0u32..14)
+            .map(|index| crate::ScopeContext {
+                parent: index.checked_sub(1),
+                package: 0,
+                assoc_type: None,
+            })
+            .collect();
+        pool.install_scopes(scopes).unwrap();
         let trait_type = pool.well_known.display;
         let method = MethodSlot {
             name: str_interner::intern("display"),
             func_id: crate::DERIVE_FUNC_ID,
             trait_impl: Some(trait_type),
             visible_scope: Some(13),
-            access: crate::MethodAccess::LegacyUnknown,
+            access: crate::MethodAccess::Public,
         };
         pool.add_method(nominal, method.clone());
         pool.add_trait_impl(TraitImplRecord {

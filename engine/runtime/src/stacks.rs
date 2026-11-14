@@ -44,9 +44,6 @@ pub enum StackError {
 #[derive(Clone)]
 pub struct StackContext {
     pub display_state: Option<crate::DisplayState>,
-    /// Environment of the segment's entry function, retained across capture.
-    /// Nested calls use their immediate call frame's environment instead.
-    pub entry_closure_env: Option<TaggedValue>,
     pub registers: RegisterFile,
     /// Local values for the current function, including spilled temporaries.
     pub local_slots: Vec<TaggedValue>,
@@ -60,13 +57,43 @@ impl StackContext {
     fn new(func_id: FuncId) -> Self {
         Self {
             display_state: None,
-            entry_closure_env: None,
             registers: RegisterFile::new(),
             local_slots: Vec::new(),
             call_stack: Vec::new(),
             pc: 0,
             current_func: func_id,
             handler_stack: Vec::new(),
+        }
+    }
+
+    /// Visit every `TaggedValue` slot owned by this stack segment for GC root tracing.
+    pub fn visit_slots_mut(&mut self, mut visit: impl FnMut(&mut TaggedValue)) {
+        if let Some(state) = &mut self.display_state {
+            for slot in &mut state.ancestors {
+                visit(slot);
+            }
+        }
+        for slot in &mut self.registers.regs {
+            visit(slot);
+        }
+        for slot in &mut self.local_slots {
+            visit(slot);
+        }
+        for frame in &mut self.call_stack {
+            if let Some(state) = &mut frame.display_state {
+                for slot in &mut state.ancestors {
+                    visit(slot);
+                }
+            }
+            for (_, slot) in &mut frame.saved_regs {
+                visit(slot);
+            }
+            for slot in &mut frame.local_slots {
+                visit(slot);
+            }
+        }
+        for handler in &mut self.handler_stack {
+            visit(&mut handler.closure_env);
         }
     }
 }
@@ -515,7 +542,6 @@ impl TaskStacks {
         root.context.call_stack.clear();
         root.context.local_slots = Vec::new();
         root.context.handler_stack.clear();
-        root.context.entry_closure_env = None;
         root.context.display_state = None;
         self.active = 0;
     }
@@ -694,8 +720,6 @@ mod tests {
             func_id: FuncId(2),
             saved_regs: vec![(Reg(20), TaggedValue::from_i64(123))],
             local_slots: vec![TaggedValue::from_i64(88)],
-            evidence: vec![],
-            closure_env: None,
         });
         let context_address = stacks.active() as *const StackContext;
         let frame_address = stacks.active().call_stack.as_ptr();
@@ -830,8 +854,6 @@ mod tests {
             func_id: FuncId(1),
             saved_regs: vec![(Reg(20), TaggedValue::from_i64(10))],
             local_slots: vec![TaggedValue::from_i64(30)],
-            evidence: vec![],
-            closure_env: None,
         });
         stacks.active_mut().local_slots = vec![TaggedValue::from_i64(40)];
         let original_locals = stacks.active().local_slots.as_ptr();
@@ -952,8 +974,7 @@ mod tests {
         stacks.active_mut().handler_stack.push(EffectHandler {
             effect_type: effect,
             handler_func: FuncId(1),
-            is_async: false,
-            closure_env: None,
+            closure_env: TaggedValue::UNIT,
             continuation_param: None,
         });
         for depth in 2..20 {
@@ -966,13 +987,70 @@ mod tests {
             stacks.active_mut().handler_stack.push(EffectHandler {
                 effect_type: effect,
                 handler_func: FuncId(depth),
-                is_async: false,
-                closure_env: None,
+                closure_env: TaggedValue::UNIT,
                 continuation_param: None,
             });
             let retained = stacks.effective_handlers();
             assert_eq!(retained.len(), 1);
             assert_eq!(retained[0].handler_func, FuncId(depth));
         }
+    }
+
+    #[test]
+    fn visit_slots_mut_traverses_display_registers_locals_frames_and_handlers() {
+        let (mut stacks, _) = stacks();
+        let context = stacks.active_mut();
+        context.display_state = Some(crate::DisplayState {
+            depth: 1,
+            ancestors: vec![TaggedValue::from_i64(1)],
+            current_target: false,
+            inline_count: 0,
+        });
+        context.registers.set(Reg(0), TaggedValue::from_i64(2));
+        context.local_slots = vec![TaggedValue::from_i64(3)];
+        context.call_stack.push(CallFrame {
+            display_state: Some(crate::DisplayState {
+                depth: 1,
+                ancestors: vec![TaggedValue::from_i64(4)],
+                current_target: false,
+                inline_count: 0,
+            }),
+            return_pc: 0,
+            func_id: FuncId(0),
+            saved_regs: vec![(Reg(1), TaggedValue::from_i64(5))],
+            local_slots: vec![TaggedValue::from_i64(6)],
+        });
+        context.handler_stack.push(EffectHandler {
+            effect_type: type_pool::TypeIndex::from_raw(1),
+            handler_func: FuncId(0),
+            closure_env: TaggedValue::from_i64(7),
+            continuation_param: None,
+        });
+        let mut seen = Vec::new();
+        context.visit_slots_mut(|slot| {
+            if let Some(v) = slot.as_i64() {
+                seen.push(v);
+                *slot = TaggedValue::from_i64(v * 10);
+            }
+        });
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            context.display_state.as_ref().unwrap().ancestors[0].as_i64(),
+            Some(10)
+        );
+        assert_eq!(context.registers.get(Reg(0)).as_i64(), Some(20));
+        assert_eq!(context.local_slots[0].as_i64(), Some(30));
+        assert_eq!(
+            context.call_stack[0]
+                .display_state
+                .as_ref()
+                .unwrap()
+                .ancestors[0]
+                .as_i64(),
+            Some(40)
+        );
+        assert_eq!(context.call_stack[0].saved_regs[0].1.as_i64(), Some(50));
+        assert_eq!(context.call_stack[0].local_slots[0].as_i64(), Some(60));
+        assert_eq!(context.handler_stack[0].closure_env.as_i64(), Some(70));
     }
 }

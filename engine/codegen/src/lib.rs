@@ -75,7 +75,7 @@ impl Emitter {
     }
 
     fn emit(&mut self, instr: Instruction) {
-        if nsbc::ScopeCoverage::CallsAndTypes.covers(instr.opcode)
+        if nsbc::instruction_requires_scope(instr.opcode)
             && let Some(scope) = self.call_scope
         {
             self.method_call_scopes.push((self.current_pc(), scope));
@@ -181,11 +181,10 @@ impl Codegen {
             return Err(self.encoding_errors);
         }
         Ok(CodegenOutput {
-            scope_coverage: nsbc::ScopeCoverage::CallsAndTypes,
             functions,
             constants: self.output_constants,
             globals: module.globals.clone(),
-            method_call_scopes: Some(self.method_call_scopes),
+            method_call_scopes: self.method_call_scopes,
         })
     }
 
@@ -333,7 +332,7 @@ impl Codegen {
             is_closure: func.is_closure,
             function_type: func.function_type,
             display_owner: func.display_owner,
-            abi: Some(func.entry_abi()),
+            abi: func.entry_abi(),
             safepoint_pcs: emitter.safepoint_pcs,
         }
     }
@@ -378,30 +377,15 @@ impl Codegen {
             NirStmt::StoreGlobal(global, value) => {
                 let source = self.value_to_reg(value, emitter, layout);
                 let instruction = if global.0 < (1 << 12) {
-                    Instruction::a_type(
-                        Opcode::StoreGlobal,
-                        nsbc::AddrMode::Imm,
-                        Reg(0),
-                        source,
-                        global.0 as u16,
-                    )
+                    Instruction::store_global(global.0 as u16, source)
                 } else {
-                    Instruction::a_type(
-                        Opcode::StoreGlobalWide,
-                        nsbc::AddrMode::Imm,
-                        source,
-                        Reg((global.0 >> 12) as u8),
-                        (global.0 & 0xfff) as u16,
-                    )
+                    Instruction::store_global_wide(global.0, source)
                 };
                 emitter.emit(instruction);
             }
             NirStmt::Assign(local, expr) => {
                 self.emit_expr(expr, RESULT, emitter, layout);
                 emitter.emit(Instruction::store_slot(layout.slot(*local), RESULT));
-            }
-            NirStmt::Drop(_local) => {
-                // For now, GC handles collection. No explicit drop instruction.
             }
             NirStmt::PushHandler {
                 effect,
@@ -419,16 +403,6 @@ impl Codegen {
                 }
             }
             NirStmt::PopHandler => emitter.emit(Instruction::e_type(Opcode::PopHandler, 0)),
-            NirStmt::EffectCall {
-                evidence: _,
-                operation: _,
-                args: _,
-                result,
-            } => {
-                // TODO: emit effect call via evidence
-                emitter.emit(Instruction::load_unit(RESULT));
-                emitter.emit(Instruction::store_slot(layout.slot(*result), RESULT));
-            }
             NirStmt::Nop => {
                 emitter.emit(Instruction::nop());
             }
@@ -671,14 +645,14 @@ impl Codegen {
                 self.emit_new_closure(emitter, dst, func_id.0, captures.len() as u8);
             }
             NirExpr::CallIndirect(callee, args) | NirExpr::CallIndirectProof(callee, args) => {
-                // Load the closure value first, before args clobber r0..rN-1.
-                let closure_reg = Reg(args.len() as u8);
-                self.load_value(callee, closure_reg, emitter, layout);
-                // Place explicit args in r0..r(N-1).
+                // Place explicit args in r0..r(N-1) before loading the callee so
+                // argument materialization cannot clobber `closure_reg` (e.g. r16).
                 for (i, arg) in args.iter().enumerate() {
                     let r = Reg(i as u8);
                     self.load_value(arg, r, emitter, layout);
                 }
+                let closure_reg = Reg(args.len() as u8);
+                self.load_value(callee, closure_reg, emitter, layout);
                 emitter.emit(if matches!(expr, NirExpr::CallIndirectProof(..)) {
                     Instruction::call_indirect_proof(closure_reg, args.len() as u8)
                 } else {
@@ -856,10 +830,7 @@ impl Codegen {
                     emitter.emit(Instruction::ret(src));
                 }
             },
-            Terminator::Unreachable => {
-                // Emit a trap / debug break.
-                emitter.emit(Instruction::e_type(Opcode::DebugBreak, 0));
-            }
+            Terminator::Unreachable => emitter.emit(Instruction::unreachable()),
             Terminator::MatchFail => emitter.emit(Instruction::match_fail()),
         }
     }
@@ -964,16 +935,21 @@ impl Default for Codegen {
     }
 }
 
-/// Process Nessa string escape sequences: \n \t \r \\ \" \' \xHH \uHHHH.
+/// Process Nessa string escape sequences: \n \t \r \0 \\ \" \' \xHH \uHHHH, and
+/// the doubled braces `{{` and `}}`. The lexer has validated the literal.
 fn process_string_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' {
+        if matches!(c, '{' | '}') && chars.peek() == Some(&c) {
+            chars.next();
+            out.push(c);
+        } else if c == '\\' {
             match chars.next() {
                 Some('n') => out.push('\n'),
                 Some('t') => out.push('\t'),
                 Some('r') => out.push('\r'),
+                Some('0') => out.push('\0'),
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
                 Some('\'') => out.push('\''),
@@ -1072,7 +1048,7 @@ mod tests {
     fn entry_abi_is_explicit_for_ordinary_functions_and_closure_captures() {
         let mut module = make_simple_nir();
         let output = try_codegen(&module).unwrap();
-        let abi = output.functions[0].abi.as_ref().unwrap();
+        let abi = &output.functions[0].abi;
         assert_eq!(
             abi,
             &nsbc::FunctionAbi {
@@ -1098,7 +1074,7 @@ mod tests {
         ];
         let output = try_codegen(&module).unwrap();
         let function = &output.functions[0];
-        let abi = function.abi.as_ref().unwrap();
+        let abi = &function.abi;
         assert_eq!(abi.captures, vec![nsbc::CaptureAbi::Value]);
         assert_eq!(abi.parameters, vec![nsbc::ParameterAbi::Value]);
         assert_eq!(
@@ -1140,7 +1116,7 @@ mod tests {
         ];
         let output = try_codegen(&module).unwrap();
         assert_eq!(
-            output.functions[0].abi.as_ref().unwrap().parameters,
+            output.functions[0].abi.parameters,
             vec![nsbc::ParameterAbi::Trait { view }]
         );
         let instructions: Vec<_> = output.functions[0]
@@ -1165,7 +1141,7 @@ mod tests {
         module.functions[0].params[1].type_index = type_pool::Intrinsic::I64.type_index();
         let output = try_codegen(&module).unwrap();
         assert_eq!(
-            output.functions[0].abi.as_ref().unwrap().parameters,
+            output.functions[0].abi.parameters,
             vec![nsbc::ParameterAbi::TraitSelf { view }]
         );
         let checks: Vec<_> = output.functions[0]
@@ -1192,8 +1168,6 @@ mod tests {
         assert!(
             output
                 .method_call_scopes
-                .as_ref()
-                .unwrap()
                 .iter()
                 .any(|entry| entry.pc as usize == assert && entry.scope == 0)
         );
@@ -1257,8 +1231,6 @@ mod tests {
         assert_eq!(Instruction::c_call_indirect(payload), (2, Reg(2)));
         let scopes: Vec<_> = output
             .method_call_scopes
-            .as_ref()
-            .unwrap()
             .iter()
             .map(|entry| entry.scope)
             .collect();
@@ -1337,7 +1309,6 @@ mod tests {
             ),
         ];
         let output = try_codegen(&module).unwrap();
-        assert_eq!(output.scope_coverage, nsbc::ScopeCoverage::CallsAndTypes);
         let pcs: Vec<_> = output.functions[0]
             .instructions
             .iter()
@@ -1354,16 +1325,14 @@ mod tests {
         assert_eq!(pcs.len(), 4);
         assert_eq!(
             output.method_call_scopes,
-            Some(
-                pcs.into_iter()
-                    .zip([42, 7, 8, 9])
-                    .map(|(pc, scope)| MethodCallScope {
-                        func_id: FuncId(0),
-                        pc,
-                        scope
-                    })
-                    .collect()
-            )
+            pcs.into_iter()
+                .zip([42, 7, 8, 9])
+                .map(|(pc, scope)| MethodCallScope {
+                    func_id: FuncId(0),
+                    pc,
+                    scope
+                })
+                .collect::<Vec<_>>()
         );
         module.functions[0].entry_scope = None;
         assert!(
@@ -1443,21 +1412,19 @@ mod tests {
         );
         assert_eq!(
             output.method_call_scopes,
-            Some(
-                calls
-                    .iter()
-                    .zip([7, 8, 9])
-                    .map(|(&(pc, _), scope)| MethodCallScope {
-                        func_id: FuncId(0),
-                        pc,
-                        scope
-                    })
-                    .collect()
-            )
+            calls
+                .iter()
+                .zip([7, 8, 9])
+                .map(|(&(pc, _), scope)| MethodCallScope {
+                    func_id: FuncId(0),
+                    pc,
+                    scope
+                })
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             try_codegen(&make_simple_nir()).unwrap().method_call_scopes,
-            Some(vec![])
+            vec![]
         );
     }
 
@@ -1621,6 +1588,19 @@ mod tests {
                     Opcode::LoadGlobal
                 }
             );
+            let store = instructions[0];
+            let InstructionData::A {
+                dst: store_dst,
+                base: store_base,
+                ..
+            } = store.data
+            else {
+                panic!("global store must use A format");
+            };
+            assert_eq!(store_dst, SCRATCH);
+            if !wide {
+                assert_eq!(store_base, Reg(0));
+            }
             for instruction in instructions {
                 let InstructionData::A { base, imm12, .. } = instruction.data else {
                     panic!("global instructions must use A format");
@@ -1849,5 +1829,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unreachable_store_global_dst_and_sixteen_arg_indirect_call_preserve_contracts() {
+        let mut module = make_simple_nir();
+        module.globals = vec![
+            nsbc::GlobalInfo {
+                type_index: type_pool::Intrinsic::I64.type_index(),
+                is_mutable: true,
+            };
+            4097
+        ];
+        let function = &mut module.functions[0];
+        function.local_count = 2;
+        let args: Vec<_> = (0..16).map(NirValue::ConstInt).collect();
+        function.blocks[0].stmts = vec![
+            NirStmt::StoreGlobal(nsbc::GlobalId(7), NirValue::Local(NirLocal(0))).in_scope(3),
+            NirStmt::StoreGlobal(nsbc::GlobalId(4096), NirValue::Local(NirLocal(0))).in_scope(4),
+            NirStmt::Assign(
+                NirLocal(1),
+                NirExpr::CallIndirect(NirValue::Local(NirLocal(0)), args).in_scope(5),
+            ),
+        ];
+        function.blocks[0].terminator = Terminator::Unreachable;
+
+        let output = try_codegen(&module).unwrap();
+        let decoded: Vec<_> = output.functions[0]
+            .instructions
+            .iter()
+            .map(|&word| Instruction::decode(word).unwrap())
+            .collect();
+
+        // 1. Terminator::Unreachable emits Instruction::unreachable() (Opcode::Unreachable).
+        assert_eq!(decoded.last(), Some(&Instruction::unreachable()));
+
+        // 2. StoreGlobal and StoreGlobalWide place the value register in `dst`.
+        let narrow_pc = decoded
+            .iter()
+            .position(|instruction| instruction.opcode == Opcode::StoreGlobal)
+            .unwrap();
+        assert_eq!(decoded[narrow_pc], Instruction::store_global(7, SCRATCH));
+
+        let wide_pc = decoded
+            .iter()
+            .position(|instruction| instruction.opcode == Opcode::StoreGlobalWide)
+            .unwrap();
+        assert_eq!(
+            decoded[wide_pc],
+            Instruction::store_global_wide(4096, SCRATCH)
+        );
+
+        // 3. 16-argument CallIndirect loads r0..r15 first, then callee into r16 = Reg(16) last.
+        let call_pc = decoded
+            .iter()
+            .position(|instruction| instruction.opcode == Opcode::CallIndirect)
+            .unwrap();
+        assert_eq!(decoded[call_pc], Instruction::call_indirect(Reg(16), 16));
+        assert_eq!(decoded[call_pc - 1], Instruction::load_slot(Reg(16), 0));
+        for index in 0..16 {
+            assert_eq!(
+                decoded[call_pc - 17 + index],
+                Instruction::load_imm(Reg(index as u8), index as u16)
+            );
+        }
+
+        assert_eq!(
+            output.method_call_scopes,
+            vec![
+                MethodCallScope {
+                    func_id: FuncId(0),
+                    pc: narrow_pc as u32,
+                    scope: 3,
+                },
+                MethodCallScope {
+                    func_id: FuncId(0),
+                    pc: wide_pc as u32,
+                    scope: 4,
+                },
+                MethodCallScope {
+                    func_id: FuncId(0),
+                    pc: call_pc as u32,
+                    scope: 5,
+                },
+            ]
+        );
     }
 }

@@ -43,12 +43,8 @@ impl Engine {
         // Create the shared task stack pool.
         let stack_pool = Arc::new(StackPool::new());
 
-        // Install the SIGSEGV handler for guard page detection.
-        // Safety: the leaked Arc ensures the pool lives for the program's lifetime.
-        unsafe {
-            let static_ref: &'static StackPool = &*Arc::into_raw(Arc::clone(&stack_pool));
-            stack_pool::install_guard_page_handler(static_ref);
-        }
+        // Install the SIGSEGV handler for guard page detection across live pools.
+        stack_pool::install_guard_page_handler();
 
         // Create the VM with MMTk-backed GC and shared stack pool.
         let mut vm = Vm::new(type_pool, &config.gc, Arc::clone(&stack_pool));

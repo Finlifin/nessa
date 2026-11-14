@@ -39,27 +39,21 @@
 捕获的查找成本取决于 delimiter 深度；重新连接的恢复不遍历或复制调用帧。
 克隆成本取决于捕获的状态大小。这里是操作范围说明，尚无性能基准支持倍率结论。
 
-## NSBC v3 编码
+## NSBC v4 编码
 
-沿用 32-bit 指令：opcode 位于 `[31:24]`，`amode` 为零，payload 位于 `[21:0]`。
+沿用 32-bit 指令：opcode 位于 `[31:24]`，`amode` 为零，payload 位于 `[21:0]`。早期直接暴露内部整数句柄的低层指令（`RESET`、`SHIFT`、`RESUME`、`CLONE_CONTINUATION`、`DROP_CONTINUATION`）与非闭包 handler 指令已移除，统一收敛到闭包与语言级 `Continuation` 对象 ABI：
 
 | 指令 | opcode | payload `[21:17]` | `[16:12]` | `[11:0]` |
 | --- | --- | --- | --- | --- |
-| RESET | 0xC5 | prompt 寄存器 | 参数数量 | body FuncId |
-| SHIFT | 0xC4 | prompt 寄存器 | 恢复值目标寄存器 | 必须为零 |
-| RESUME | 0xC6 | 执行句柄寄存器 | 恢复值寄存器 | 必须为零 |
-| CLONE_CONTINUATION | 0xC8 | 新句柄目标寄存器 | 原句柄寄存器 | 必须为零 |
-| DROP_CONTINUATION | 0xC9 | 执行句柄寄存器 | 必须为零 | 必须为零 |
+| EFFECT_CALL_DYN | 0xC1 | 参数数量 | `[16:0]` effect `TypeIndex` | 见左 |
+| POP_HANDLER | 0xC3 | 必须为零 | 必须为零 | 必须为零 |
+| PUSH_HANDLER_CLOSURE | 0xCA | closure 寄存器 | `[16:0]` effect `TypeIndex` | 见左 |
+| PUSH_CAPTURING_HANDLER | 0xCB | closure 寄存器 | `[16:0]` metadata 常量索引 | 见左 |
 | RESET_CLOSURE | 0xCC | body 闭包寄存器 | 已安装 handler 数量 | 必须为零 |
 | RESUME_CONTINUATION | 0xCD | 语言 Continuation 寄存器 | 恢复值寄存器 | 必须为零 |
 | RESUME_CONTINUATION_ONCE | 0xCE | 语言 Continuation 寄存器 | 恢复值寄存器 | 必须为零 |
 
-- prompt 为非负 32-bit 整数。重复 prompt 匹配最近的动态边界。
-- RESET 将 r0 开始的参数传入 body；数量须与 body 的声明一致。此窄指令支持
-  12-bit FuncId 和最多 31 个参数，更宽编码需要后续配套实现。
-- SHIFT 将内部执行句柄作为 delimiter 的结果写入父计算的 r0；恢复值写入
-  捕获段指定的寄存器，继续执行 SHIFT 后的指令。
-- RESUME 消费一个分支的内部句柄；计算返回值写入 resume 调用者的 r0。
+- prompt 在 delimiter 建立时由每个可捕获 handler 绑定到对应栈段；重复效应匹配最近的动态边界。
 - 内部句柄以 unsigned immediate 编码，进程内不重复分配；外来、伪造的未知或
   已消费句柄返回运行时错误。语言层使用具有 `Continuation` 类型头的堆对象，
   payload 为带 unsigned immediate tag 的内部句柄，避免被通用 GC 槽扫描误认为
@@ -69,14 +63,14 @@
   metadata 为 UInt，低 32 位为 effect TypeIndex，高 32 位为 catch 参数位置。
 - `RESET_CLOSURE` 传入闭包捕获参数并保留可见 handler 环境；重复的祖先绑定被
   去除。多次恢复默认先 fork 模板；`RESUME_CONTINUATION_ONCE` 直接消费模板。
-- v1/v2 及未知版本 archive 被拒绝，避免按新的 ABI 解释旧的控制指令；旧产物需重新编译。
+- 非 v4 容器版本或零校验和 archive 被拒绝；旧产物需使用当前编译器重新编译。
 
 ## GC 与安全约束
 
-活动栈、被暂停的父调用者、原始 ABI 句柄及尚未发布为语言值的捕获链是强根。
+活动栈、被暂停的父调用者及尚未发布为语言值的捕获链是强根。
 语言 continuation 模板通过其堆对象的弱所有者登记；只有该对象已被 GC 到达，
 才扫描模板中的寄存器、调用帧保存值、当前与保存帧的 local slots、display 状态、
-闭包环境和 handler 环境。扫描写回移动对象的新地址。
+以及 handler 闭包环境。栈段槽位统一通过 `StackContext::visit_slots_mut` 扫描并写回移动对象的新地址。
 
 弱处理采用不动点：新到达的所有者暴露暂停栈中的引用，完成这些引用的传递闭包后，
 继续发现其他所有者。直到一轮没有新增所有者，才释放剩余不可达的模板。因此外部

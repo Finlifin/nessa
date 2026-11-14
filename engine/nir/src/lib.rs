@@ -2,12 +2,16 @@ mod arguments;
 mod builder;
 mod characters;
 mod collections;
+mod compound;
 mod concat;
 mod construction;
 mod continuation;
 mod defaults;
 mod derivation;
 mod display_derivation;
+mod display_text;
+mod dynamic_equality;
+mod dynamic_loops;
 mod enums;
 mod errors;
 mod expr;
@@ -17,7 +21,6 @@ mod lists;
 mod literal;
 mod lowering;
 mod named_functions;
-mod native_derivation;
 mod optional;
 mod ordering;
 mod ordering_derivation;
@@ -261,8 +264,6 @@ pub enum NirStmt {
     StoreField(NirValue, u32, NirValue),
     /// Assign an expression to a local.
     Assign(NirLocal, NirExpr),
-    /// Drop a local (explicit release for move semantics).
-    Drop(NirLocal),
     /// Initialize or update a shared module value.
     StoreGlobal(GlobalId, NirValue),
     PushHandler {
@@ -271,13 +272,6 @@ pub enum NirStmt {
         continuation_param: Option<u8>,
     },
     PopHandler,
-    /// Effect call via evidence: evidence_local, operation_index, args, result_local.
-    EffectCall {
-        evidence: NirLocal,
-        operation: u32,
-        args: Vec<NirValue>,
-        result: NirLocal,
-    },
     /// No operation.
     Nop,
 }

@@ -19,14 +19,32 @@ impl std::fmt::Display for DerivedMethodError {
 impl std::error::Error for DerivedMethodError {}
 
 impl TypePool {
+    /// Return `true` if any method, trait implementation, or vtable still
+    /// carries the compile-time-only [`DERIVE_FUNC_ID`] placeholder.
+    pub fn has_unresolved_derived_methods(&self) -> bool {
+        self.methods
+            .iter()
+            .flatten()
+            .any(|method| method.func_id == DERIVE_FUNC_ID)
+            || self.trait_impls.iter().any(|record| {
+                record
+                    .methods
+                    .iter()
+                    .any(|method| method.func_id == DERIVE_FUNC_ID)
+            })
+            || self
+                .vtables
+                .iter()
+                .any(|table| table.entries.contains(&DERIVE_FUNC_ID))
+    }
+
     /// Publish generated bodies for compiler-derived methods atomically.
-    /// Alias owners are canonicalized; ordinary method identities and omitted
-    /// legacy derived sentinels remain unchanged. Vtables without method names
-    /// must identify the derived slot uniquely, otherwise publication fails.
+    /// Alias owners are canonicalized; ordinary method identities remain
+    /// unchanged, and no [`DERIVE_FUNC_ID`] sentinel may remain unresolved.
     ///
     /// # Errors
-    /// Invalid, duplicate, missing or ambiguous method plans return an error
-    /// without changing any dispatch table.
+    /// Invalid, duplicate, missing, unreplaced, or schema-less derived method
+    /// plans return an error without changing any dispatch table.
     pub fn resolve_derived_methods(
         &mut self,
         mapping: impl IntoIterator<Item = (TypeIndex, TypeIndex, StrId, u32)>,
@@ -122,51 +140,45 @@ impl TypePool {
                 if self.canonical_type(table.implementor) != Some(owner) {
                     continue;
                 }
-                if self.trait_schema(table.trait_type).is_some() {
-                    let descriptors = self
-                        .checked_vtable_descriptors(index)
-                        .map_err(|error| fail(&error.to_string()))?;
-                    for (slot, descriptor) in descriptors.iter().enumerate() {
-                        if descriptor.implementation_scope.is_none()
-                            && descriptor.implementation_trait == trait_type
-                            && descriptor.name == name
-                        {
-                            if descriptor.func_id != DERIVE_FUNC_ID {
-                                return Err(fail("generated inherited method is not a sentinel"));
-                            }
-                            table_updates.push((index, slot, function));
+                let descriptors = self
+                    .checked_vtable_descriptors(index)
+                    .map_err(|error| fail(&error.to_string()))?;
+                for (slot, descriptor) in descriptors.iter().enumerate() {
+                    if descriptor.implementation_scope.is_none()
+                        && descriptor.implementation_trait == trait_type
+                        && descriptor.name == name
+                    {
+                        if descriptor.func_id != DERIVE_FUNC_ID {
+                            return Err(fail("generated inherited method is not a sentinel"));
                         }
+                        table_updates.push((index, slot, function));
                     }
-                    continue;
                 }
-                // Legacy tables have no slot identities. Preserve the old
-                // unambiguous, exact-global publication rule without guessing
-                // which inherited slot shares this sentinel value.
-                if table.visible_scope.is_some()
-                    || self.canonical_type(table.trait_type) != Some(trait_type)
-                {
-                    continue;
-                }
-                let slots: Vec<_> = table
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, id)| **id == DERIVE_FUNC_ID)
-                    .collect();
-                if slots.len() != 1
-                    || record
-                        .methods
-                        .iter()
-                        .filter(|method| method.func_id == DERIVE_FUNC_ID)
-                        .count()
-                        != 1
-                {
-                    return Err(fail(
-                        "generated derived method has an ambiguous vtable slot",
-                    ));
-                }
-                table_updates.push((index, slots[0].0, function));
             }
+        }
+        let method_sentinel_count = self
+            .methods
+            .iter()
+            .flatten()
+            .filter(|method| method.func_id == DERIVE_FUNC_ID)
+            .count();
+        let impl_sentinel_count = self
+            .trait_impls
+            .iter()
+            .flat_map(|record| &record.methods)
+            .filter(|method| method.func_id == DERIVE_FUNC_ID)
+            .count();
+        let vtable_sentinel_count = self
+            .vtables
+            .iter()
+            .flat_map(|table| &table.entries)
+            .filter(|&&entry| entry == DERIVE_FUNC_ID)
+            .count();
+        if method_updates.len() != method_sentinel_count
+            || impl_updates.len() != impl_sentinel_count
+            || table_updates.len() != vtable_sentinel_count
+        {
+            return Err(fail("unresolved derived method sentinel remains in TypePool"));
         }
         for (owner, slot, function) in method_updates {
             self.methods[owner][slot].func_id = function;
@@ -280,8 +292,20 @@ mod tests {
         );
     }
     fn add_derived(pool: &mut TypePool, owner: TypeIndex, trait_type: TypeIndex) {
+        let name = str_interner::intern("eq");
+        if pool.trait_schema(trait_type).is_none() {
+            pool.register_trait_schema(crate::TraitDispatchSchema {
+                trait_type,
+                slots: vec![crate::TraitMethodKey {
+                    trait_owner: trait_type,
+                    name,
+                    signature: None,
+                }],
+            })
+            .unwrap();
+        }
         let method = MethodSlot {
-            name: str_interner::intern("eq"),
+            name,
             func_id: DERIVE_FUNC_ID,
             trait_impl: Some(trait_type),
             visible_scope: None,
@@ -310,6 +334,7 @@ mod tests {
         let partial_eq = pool.well_known.partial_eq;
         add_derived(&mut pool, owner, eq);
         add_derived(&mut pool, owner, partial_eq);
+        assert!(pool.has_unresolved_derived_methods());
         let alias = pool.register(crate::TypeInfo {
             kind: TypeKind::Typealias {
                 name: str_interner::intern("DerivedOwner"),
@@ -332,6 +357,7 @@ mod tests {
         let name = str_interner::intern("eq");
         pool.resolve_derived_methods([(alias, eq, name, 5), (owner, partial_eq, name, 6)])
             .unwrap();
+        assert!(!pool.has_unresolved_derived_methods());
         let restored = TypePool::restore(pool.snapshot()).unwrap();
         for (trait_type, id) in [(eq, 5), (partial_eq, 6)] {
             assert_eq!(
@@ -376,6 +402,7 @@ mod tests {
             pool.resolve_derived_methods([(owner, eq, name, 5), (owner, partial_eq, name, 6)])
                 .is_err()
         );
+        assert!(pool.resolve_derived_methods([]).is_err());
         assert_eq!(
             pool.find_trait_method(owner, eq, name).unwrap().func_id,
             DERIVE_FUNC_ID
@@ -398,7 +425,6 @@ mod tests {
             pool.resolve_derived_methods([(owner, eq, name, 5), (owner, eq, name, 6)])
                 .is_err()
         );
-        pool.resolve_derived_methods([]).unwrap();
         assert_eq!(pool.methods_of(owner)[0].func_id, DERIVE_FUNC_ID);
     }
 }

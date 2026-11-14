@@ -108,7 +108,7 @@ mod tests {
             };
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: None,
+                abi: nsbc::FunctionAbi::value_only(0),
                 func_id: FuncId(0),
                 instructions: [
                     Instruction::new_object(Reg(1), ty),

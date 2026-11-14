@@ -68,8 +68,7 @@ impl CompileResult {
     fn failed(diagnostics: Vec<Diagnostic>, type_pool: type_pool::TypePool) -> Self {
         Self {
             codegen_output: CodegenOutput {
-                scope_coverage: nsbc::ScopeCoverage::Calls,
-                method_call_scopes: None,
+                method_call_scopes: Vec::new(),
                 functions: Vec::new(),
                 constants: Vec::new(),
                 globals: Vec::new(),
@@ -475,11 +474,13 @@ mod tests {
     #[test]
     fn driver_roundtrip_archive() {
         let driver = Driver::new();
-        let result = driver.compile("");
-        let bytes = nsbc_io::write_archive(&result.codegen_output).unwrap();
+        let artifact = driver.compile("").into_artifact().unwrap();
+        let bytes = nsbc_io::write_artifact(&artifact).unwrap();
         let archive = nsbc_io::Archive::read_from(&mut &bytes[..]).unwrap();
-        // Should have 3 sections: code, constants, stack_maps.
-        assert_eq!(archive.sections.len(), 3);
+        // Should have 4 sections: code, constants, stack_maps, metadata.
+        assert_eq!(archive.sections.len(), 4);
+        let restored = nsbc_io::read_artifact(&bytes).unwrap();
+        assert_eq!(restored.builtin_abi_version, runtime::BUILTIN_ABI_VERSION);
     }
 
     #[test]

@@ -28,6 +28,7 @@
 
 use std::ptr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -108,6 +109,8 @@ struct Segment {
     slot_count: usize,
     /// Total mmap'd size in bytes.
     mmap_size: usize,
+    /// Slot in the lock-free signal guard table.
+    guard_slot: Option<usize>,
 }
 
 // SAFETY: Segment exclusively owns its mmap reservation, which has no thread
@@ -151,10 +154,13 @@ impl Segment {
             libc::madvise(base as *mut libc::c_void, mmap_size, libc::MADV_DONTNEED);
         }
 
+        let guard_slot = register_guard_segment(base as usize, mmap_size);
+
         Self {
             base,
             slot_count,
             mmap_size,
+            guard_slot,
         }
     }
 
@@ -178,6 +184,7 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        unregister_guard_segment(self.guard_slot);
         unsafe {
             libc::munmap(self.base as *mut libc::c_void, self.mmap_size);
         }
@@ -357,30 +364,88 @@ impl PoolInner {
 
 use std::sync::Once;
 
+const MAX_GUARD_SEGMENTS: usize = 1024;
+
+struct GuardRegion {
+    base: AtomicUsize,
+    size: AtomicUsize,
+}
+
+impl GuardRegion {
+    const fn empty() -> Self {
+        Self {
+            base: AtomicUsize::new(0),
+            size: AtomicUsize::new(0),
+        }
+    }
+}
+
+static GUARD_REGIONS: [GuardRegion; MAX_GUARD_SEGMENTS] =
+    [const { GuardRegion::empty() }; MAX_GUARD_SEGMENTS];
+static CACHED_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 static SIGACTION_INIT: Once = Once::new();
 static mut PREV_SIGACTION: libc::sigaction = unsafe { std::mem::zeroed() };
 
-/// Wrapper to allow storing a raw pointer in a `Mutex` inside a `static`.
-struct PoolPtr(*const StackPool);
-unsafe impl Send for PoolPtr {}
+fn register_guard_segment(base: usize, size: usize) -> Option<usize> {
+    if base == 0 {
+        return None;
+    }
+    for (idx, region) in GUARD_REGIONS.iter().enumerate() {
+        if region
+            .base
+            .compare_exchange(0, usize::MAX, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            region.size.store(size, Ordering::Relaxed);
+            region.base.store(base, Ordering::Release);
+            return Some(idx);
+        }
+    }
+    None
+}
 
-static STACK_POOL_PTR: Mutex<Option<PoolPtr>> = Mutex::new(None);
+fn unregister_guard_segment(slot: Option<usize>) {
+    if let Some(idx) = slot {
+        let region = &GUARD_REGIONS[idx];
+        region.size.store(0, Ordering::Relaxed);
+        region.base.store(0, Ordering::Release);
+    }
+}
 
-/// Install the SIGSEGV handler for stack overflow detection.
+/// Async-signal-safe check across all live registered stack segments.
+fn is_registered_guard_page(addr: usize) -> bool {
+    let ps = CACHED_PAGE_SIZE.load(Ordering::Relaxed);
+    if ps == 0 {
+        return false;
+    }
+    for region in &GUARD_REGIONS {
+        let base = region.base.load(Ordering::Acquire);
+        if base == 0 || base == usize::MAX {
+            continue;
+        }
+        let size = region.size.load(Ordering::Relaxed);
+        if let Some(end) = base.checked_add(size)
+            && addr >= base
+            && addr < end
+        {
+            let slot_offset = (addr - base) % SLOT_SIZE;
+            return slot_offset < ps;
+        }
+    }
+    false
+}
+
+/// Install the SIGSEGV handler for stack overflow guard-page detection.
 ///
-/// This must be called once during engine initialization after creating
-/// the `StackPool`.  The `pool` reference must live for the program's
-/// lifetime (typically `&'static StackPool` or leaked `Box`).
-///
-/// # Safety
-/// The `pool` pointer must remain valid for the lifetime of the program.
-pub unsafe fn install_guard_page_handler(pool: &StackPool) {
+/// Idempotent across multiple engines; live `StackPool` segments register and
+/// unregister themselves automatically in the lock-free guard region table.
+pub fn install_guard_page_handler() {
+    let _ = page_size();
     SIGACTION_INIT.call_once(|| {
-        *STACK_POOL_PTR.lock().unwrap() = Some(PoolPtr(pool as *const StackPool));
-
         // Set up an alternate signal stack so we can handle overflow
         // even when the regular stack is exhausted.
         let alt_stack_size = libc::SIGSTKSZ * 2;
+        // SAFETY: anonymous private mapping for alternate signal stack.
         let alt_stack_mem = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -401,13 +466,16 @@ pub unsafe fn install_guard_page_handler(pool: &StackPool) {
             ss_flags: 0,
             ss_size: alt_stack_size,
         };
+        // SAFETY: `ss` points to a valid freshly-mapped region of `alt_stack_size` bytes.
         let rc = unsafe { libc::sigaltstack(&ss, ptr::null_mut()) };
         assert!(rc == 0, "sigaltstack failed");
 
         // Install SIGSEGV handler.
+        // SAFETY: `sigaction` struct is zero-initialized and populated with valid flags/handler;
+        // `Once` guarantees `PREV_SIGACTION` is written before any signal handler reads it.
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        sa.sa_sigaction = guard_page_sigsegv_handler as *const () as usize;
+        sa.sa_sigaction = guard_page_sigsegv_handler as *const () as libc::sighandler_t;
         unsafe { libc::sigemptyset(&mut sa.sa_mask) };
 
         let rc = unsafe { libc::sigaction(libc::SIGSEGV, &sa, &raw mut PREV_SIGACTION) };
@@ -420,23 +488,13 @@ extern "C" fn guard_page_sigsegv_handler(
     info: *mut libc::siginfo_t,
     ctx: *mut libc::c_void,
 ) {
+    // SAFETY: `SA_SIGINFO` guarantees `info` is non-null when delivered by the kernel.
     let fault_addr = unsafe { (*info).si_addr() as usize };
 
-    let is_guard = {
-        let pool_opt = STACK_POOL_PTR.lock().ok();
-        pool_opt
-            .and_then(|guard| {
-                (*guard).as_ref().map(|pp| {
-                    let pool = unsafe { &*pp.0 };
-                    pool.is_guard_page(fault_addr)
-                })
-            })
-            .unwrap_or(false)
-    };
-
-    if is_guard {
-        // Stack overflow detected — abort with a clear message.
+    if is_registered_guard_page(fault_addr) {
+        // Stack overflow detected — abort with an async-signal-safe write.
         let msg = b"fatal: Nessa task stack overflow (guard page hit)\n";
+        // SAFETY: `write` and `abort` are async-signal-safe POSIX primitives.
         unsafe {
             libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
             libc::abort();
@@ -444,6 +502,7 @@ extern "C" fn guard_page_sigsegv_handler(
     }
 
     // Not our guard page — chain to previous handler.
+    // SAFETY: `PREV_SIGACTION` was initialized once before this handler was installed.
     unsafe {
         let prev = (&raw const PREV_SIGACTION).read();
         if prev.sa_flags & libc::SA_SIGINFO != 0 {
@@ -451,7 +510,6 @@ extern "C" fn guard_page_sigsegv_handler(
                 std::mem::transmute(prev.sa_sigaction);
             handler(sig, info, ctx);
         } else if prev.sa_sigaction == libc::SIG_DFL {
-            // Re-raise with default action.
             libc::signal(libc::SIGSEGV, libc::SIG_DFL);
             libc::raise(libc::SIGSEGV);
         } else if prev.sa_sigaction != libc::SIG_IGN {
@@ -466,9 +524,14 @@ extern "C" fn guard_page_sigsegv_handler(
 // ---------------------------------------------------------------------------
 
 fn page_size() -> usize {
-    // Cache the page size to avoid repeated syscalls.
-    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
+    let cached = CACHED_PAGE_SIZE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    // SAFETY: `sysconf(_SC_PAGESIZE)` has no preconditions.
+    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    CACHED_PAGE_SIZE.store(ps, Ordering::Relaxed);
+    ps
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +645,30 @@ mod tests {
         assert!(!pool.is_guard_page(0x1234_5678));
 
         pool.dealloc(&handle);
+    }
+
+    #[test]
+    fn multiple_pools_register_and_unregister_guard_pages_on_drop() {
+        let pool1 = StackPool::new();
+        let pool2 = StackPool::new();
+        let h1 = pool1.alloc();
+        let h2 = pool2.alloc();
+        let guard1 = h1.guard as usize;
+        let guard2 = h2.guard as usize;
+        let base1 = h1.base as usize;
+
+        assert!(is_registered_guard_page(guard1));
+        assert!(is_registered_guard_page(guard2));
+        assert!(!is_registered_guard_page(base1));
+
+        pool1.dealloc(&h1);
+        drop(pool1);
+        assert!(!is_registered_guard_page(guard1));
+        assert!(is_registered_guard_page(guard2));
+
+        pool2.dealloc(&h2);
+        drop(pool2);
+        assert!(!is_registered_guard_page(guard2));
     }
 
     #[test]

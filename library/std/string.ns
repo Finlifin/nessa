@@ -5,8 +5,431 @@ use .builtin.*
 pub const str_len: fn(String) -> i64 = .str_len'builtin
 pub const str_concat: fn(String, String) -> String = .str_concat'builtin
 
+const native_contains: fn(String, String) -> bool = .str_contains'builtin
+const native_starts_with: fn(String, String) -> bool = .str_starts_with'builtin
+const native_ends_with: fn(String, String) -> bool = .str_ends_with'builtin
+const native_trim: fn(String) -> String = .str_trim'builtin
+const native_trim_start: fn(String) -> String = .str_trim_start'builtin
+const native_trim_end: fn(String) -> String = .str_trim_end'builtin
+const native_trim_ascii: fn(String) -> String = .str_trim_ascii'builtin
+const native_trim_ascii_start: fn(String) -> String = .str_trim_ascii_start'builtin
+const native_trim_ascii_end: fn(String) -> String = .str_trim_ascii_end'builtin
+const native_eq_ignore_ascii_case: fn(String, String) -> bool = .str_eq_ignore_ascii_case'builtin
+const native_split_ascii_whitespace: fn(String) -> List = .str_split_ascii_whitespace'builtin
+const native_to_upper: fn(String) -> String = .str_to_upper'builtin
+const native_to_lower: fn(String) -> String = .str_to_lower'builtin
+const native_str_to_ascii_uppercase: fn(String) -> String = .str_to_ascii_uppercase'builtin
+const native_str_to_ascii_lowercase: fn(String) -> String = .str_to_ascii_lowercase'builtin
+const native_split_whitespace: fn(String) -> List = .str_split_whitespace'builtin
+const native_repeat: fn(String, i64) -> String = .str_repeat'builtin
+const native_pad_start: fn(String, i64, String) -> String = .str_pad_start'builtin
+const native_pad_end: fn(String, i64, String) -> String = .str_pad_end'builtin
+const native_replace: fn(String, String, String) -> String = .str_replace'builtin
+const native_replacen: fn(String, String, String, i64) -> String = .str_replacen'builtin
+const native_trim_start_matches: fn(String, String) -> String = .str_trim_start_matches'builtin
+const native_trim_end_matches: fn(String, String) -> String = .str_trim_end_matches'builtin
+const native_trim_matches: fn(String, String) -> String = .str_trim_matches'builtin
+const native_split: fn(String, String) -> List = .str_split'builtin
+const native_splitn: fn(String, String, i64) -> List = .str_splitn'builtin
+const native_rsplit: fn(String, String) -> List = .str_rsplit'builtin
+const native_rsplitn: fn(String, String, i64) -> List = .str_rsplitn'builtin
+const native_split_inclusive: fn(String, String) -> List = .str_split_inclusive'builtin
+const native_split_terminator: fn(String, String) -> List = .str_split_terminator'builtin
+const native_rsplit_terminator: fn(String, String) -> List = .str_rsplit_terminator'builtin
+const native_find_all: fn(String, String) -> List = .str_find_all'builtin
+const native_find_indices: fn(String, String) -> List = .str_find_indices'builtin
+const native_rfind_indices: fn(String, String) -> List = .str_rfind_indices'builtin
+const native_byte_find_indices: fn(String, String) -> List = .str_byte_find_indices'builtin
+const native_byte_rfind_indices: fn(String, String) -> List = .str_byte_rfind_indices'builtin
+const native_trim_prefix: fn(String, String) -> String = .str_trim_prefix'builtin
+const native_trim_suffix: fn(String, String) -> String = .str_trim_suffix'builtin
+const native_strip_circumfix: fn(String, String, String) -> Any = .str_strip_circumfix'builtin
+const native_str_encode_utf8: fn(String) -> List = .str_encode_utf8'builtin
+const native_str_encode_utf16: fn(String) -> List = .str_encode_utf16'builtin
+const native_from_utf8: fn(List) -> Any = .str_from_utf8'builtin
+const native_from_utf16: fn(List) -> Any = .str_from_utf16'builtin
+const native_from_utf8_lossy: fn(List) -> String = .str_from_utf8_lossy'builtin
+const native_from_utf16_lossy: fn(List) -> String = .str_from_utf16_lossy'builtin
+const native_is_char_boundary: fn(String, i64) -> bool = .str_is_char_boundary'builtin
+const native_floor_char_boundary: fn(String, i64) -> i64 = .str_floor_char_boundary'builtin
+const native_ceil_char_boundary: fn(String, i64) -> i64 = .str_ceil_char_boundary'builtin
+const native_char_at_byte: fn(String, i64) -> ?char = .str_char_at_byte'builtin
+const native_split_at: fn(String, i64) -> List = .str_split_at'builtin
+const native_byte_at: fn(String, i64) -> i64 = .str_byte_at'builtin
+const native_str_get: fn(String, i64, i64) -> Any = .str_get'builtin
+const native_split_at_checked: fn(String, i64) -> Any = .str_split_at_checked'builtin
+const native_str_escape_debug: fn(String) -> String = .str_escape_debug'builtin
+const native_str_escape_unicode: fn(String) -> String = .str_escape_unicode'builtin
+const native_str_escape_default: fn(String) -> String = .str_escape_default'builtin
+const native_chars: fn(String) -> List = .str_chars'builtin
+const native_str_bytes: fn(String) -> List = .str_bytes'builtin
+const native_str_char_indices: fn(String) -> List = .str_char_indices'builtin
+const native_str_is_empty: fn(String) -> bool = .str_is_empty'builtin
+const native_str_take: fn(String, i64) -> String = .str_take'builtin
+const native_str_drop: fn(String, i64) -> String = .str_drop'builtin
+const native_str_first: fn(String) -> ?char = .str_first'builtin
+const native_str_last: fn(String) -> ?char = .str_last'builtin
+const native_starts_with_char: fn(String, char) -> bool = .str_starts_with_char'builtin
+const native_ends_with_char: fn(String, char) -> bool = .str_ends_with_char'builtin
+const native_contains_char: fn(String, char) -> bool = .str_contains_char'builtin
+const native_replace_char: fn(String, char, char) -> String = .str_replace_char'builtin
+const native_repeat_char: fn(i64, char) -> String = .str_repeat_char'builtin
+const native_str_lines: fn(String) -> List = .str_lines'builtin
+const native_split_once: fn(String, String) -> Any = .str_split_once'builtin
+const native_rsplit_once: fn(String, String) -> Any = .str_rsplit_once'builtin
+const native_strip_prefix: fn(String, String) -> Any = .str_strip_prefix'builtin
+const native_strip_suffix: fn(String, String) -> Any = .str_strip_suffix'builtin
+const native_find_char: fn(String, char) -> ?i64 = .str_find_char'builtin
+const native_rfind_char: fn(String, char) -> ?i64 = .str_rfind_char'builtin
+const native_count_char: fn(String, char) -> i64 = .str_count_char'builtin
+const native_char_len: fn(String) -> i64 = .str_char_len'builtin
+const native_char_at: fn(String, i64) -> ?char = .str_char_at'builtin
+const native_find: fn(String, String) -> ?i64 = .str_find'builtin
+const native_rfind: fn(String, String) -> ?i64 = .str_rfind'builtin
+const native_count: fn(String, String) -> i64 = .str_count'builtin
+const native_byte_find: fn(String, String) -> ?i64 = .str_byte_find'builtin
+const native_byte_rfind: fn(String, String) -> ?i64 = .str_byte_rfind'builtin
+const native_byte_count: fn(String, String) -> i64 = .str_byte_count'builtin
+const native_str_is_ascii: fn(String) -> bool = .str_is_ascii'builtin
+const native_str_is_ascii_digit: fn(String) -> bool = .str_is_ascii_digit'builtin
+const native_str_is_ascii_alphabetic: fn(String) -> bool = .str_is_ascii_alphabetic'builtin
+const native_str_is_ascii_alphanumeric: fn(String) -> bool = .str_is_ascii_alphanumeric'builtin
+const native_str_is_ascii_lowercase: fn(String) -> bool = .str_is_ascii_lowercase'builtin
+const native_str_is_ascii_uppercase: fn(String) -> bool = .str_is_ascii_uppercase'builtin
+const native_str_is_ascii_whitespace: fn(String) -> bool = .str_is_ascii_whitespace'builtin
+const native_str_is_ascii_hexdigit: fn(String) -> bool = .str_is_ascii_hexdigit'builtin
+const native_str_is_ascii_graphic: fn(String) -> bool = .str_is_ascii_graphic'builtin
+const native_str_is_ascii_punctuation: fn(String) -> bool = .str_is_ascii_punctuation'builtin
+const native_str_is_ascii_control: fn(String) -> bool = .str_is_ascii_control'builtin
+const native_str_is_numeric: fn(String) -> bool = .str_is_numeric'builtin
+const native_str_is_alphabetic: fn(String) -> bool = .str_is_alphabetic'builtin
+const native_str_is_alphanumeric: fn(String) -> bool = .str_is_alphanumeric'builtin
+const native_str_is_lowercase: fn(String) -> bool = .str_is_lowercase'builtin
+const native_str_is_uppercase: fn(String) -> bool = .str_is_uppercase'builtin
+const native_str_is_whitespace: fn(String) -> bool = .str_is_whitespace'builtin
+const native_str_is_control: fn(String) -> bool = .str_is_control'builtin
+const native_slice: fn(String, i64, i64) -> String = .str_slice'builtin
+const native_parse_i64: fn(String) -> ?i64 = .str_parse_i64'builtin
+const native_parse_u64: fn(String) -> ?u64 = .str_parse_u64'builtin
+const native_parse_i128: fn(String) -> ?i128 = .str_parse_i128'builtin
+const native_parse_u128: fn(String) -> ?u128 = .str_parse_u128'builtin
+const native_parse_f64: fn(String) -> ?f64 = .str_parse_f64'builtin
+
 impl String {
     pub fn concat(self, other: String) -> String { str_concat(self, other) }
     -- Length follows str_len and counts UTF-8 bytes.
     pub fn len(self) -> i64 { str_len(self) }
+    pub fn is_empty(self) -> bool { native_str_is_empty(self) }
+
+    pub fn contains(self, pattern: String) -> bool { native_contains(self, pattern) }
+    pub fn starts_with(self, prefix: String) -> bool { native_starts_with(self, prefix) }
+    pub fn ends_with(self, suffix: String) -> bool { native_ends_with(self, suffix) }
+
+    -- Trimming removes Unicode White_Space characters.
+    pub fn trim(self) -> String { native_trim(self) }
+    pub fn trim_start(self) -> String { native_trim_start(self) }
+    pub fn trim_end(self) -> String { native_trim_end(self) }
+    -- ASCII whitespace only. A non-breaking space is not removed.
+    pub fn trim_ascii(self) -> String { native_trim_ascii(self) }
+    pub fn trim_ascii_start(self) -> String { native_trim_ascii_start(self) }
+    pub fn trim_ascii_end(self) -> String { native_trim_ascii_end(self) }
+    pub fn eq_ignore_ascii_case(self, other: String) -> bool { native_eq_ignore_ascii_case(self, other) }
+
+    -- Case mapping is full Unicode mapping and may change the byte length.
+    pub fn to_upper(self) -> String { native_to_upper(self) }
+    pub fn to_lower(self) -> String { native_to_lower(self) }
+    -- ASCII letters only. `é` and every other non-ASCII scalar stay unchanged,
+    -- and the byte length does not change.
+    pub fn to_ascii_uppercase(self) -> String { native_str_to_ascii_uppercase(self) }
+    pub fn to_ascii_lowercase(self) -> String { native_str_to_ascii_lowercase(self) }
+
+    -- A negative count is a runtime error.
+    pub fn repeat(self, count: i64) -> String { native_repeat(self, count) }
+    -- `width` counts Unicode scalars. A string that is already long enough is
+    -- returned unchanged. `fill` is repeated and cut to the missing width.
+    -- A negative width, or an empty fill when padding is required, is a runtime error.
+    pub fn pad_start(self, width: i64, fill: String) -> String { native_pad_start(self, width, fill) }
+    pub fn pad_end(self, width: i64, fill: String) -> String { native_pad_end(self, width, fill) }
+    -- Replaces every non-overlapping match; an empty pattern matches between characters.
+    pub fn replace(self, from: String, to: String) -> String { native_replace(self, from, to) }
+    -- Replaces the first `count` non-overlapping matches. A negative count is a
+    -- runtime error. Zero returns the original string.
+    pub fn replacen(self, from: String, to: String, count: i64) -> String { native_replacen(self, from, to, count) }
+    -- Removes `pattern` repeatedly. An empty pattern returns the original string.
+    pub fn trim_start_matches(self, pattern: String) -> String { native_trim_start_matches(self, pattern) }
+    pub fn trim_end_matches(self, pattern: String) -> String { native_trim_end_matches(self, pattern) }
+    pub fn trim_matches(self, pattern: String) -> String { native_trim_matches(self, pattern) }
+
+    -- Returns a List of String pieces; an empty separator is a runtime error.
+    pub fn split(self, separator: String) -> List { native_split(self, separator) }
+    -- At most `count` pieces, from the left. The remainder stays in the last piece.
+    -- A negative count is a runtime error. Zero returns an empty list.
+    pub fn splitn(self, separator: String, count: i64) -> List { native_splitn(self, separator, count) }
+    -- Pieces are ordered from the end of the string.
+    pub fn rsplit(self, separator: String) -> List { native_rsplit(self, separator) }
+    -- At most `count` pieces, from the right. A negative count is a runtime error.
+    pub fn rsplitn(self, separator: String, count: i64) -> List { native_rsplitn(self, separator, count) }
+    -- Keeps the separator at the end of every piece except a tail with no separator.
+    pub fn split_inclusive(self, separator: String) -> List { native_split_inclusive(self, separator) }
+    -- A trailing separator does not produce a final empty piece.
+    pub fn split_terminator(self, separator: String) -> List { native_split_terminator(self, separator) }
+    pub fn rsplit_terminator(self, separator: String) -> List { native_rsplit_terminator(self, separator) }
+    -- Non-overlapping matches. Named to avoid the `matches` keyword.
+    -- An empty pattern matches at every scalar boundary.
+    pub fn find_all(self, pattern: String) -> List { native_find_all(self, pattern) }
+    pub fn find_indices(self, pattern: String) -> List { native_find_indices(self, pattern) }
+    pub fn rfind_indices(self, pattern: String) -> List { native_rfind_indices(self, pattern) }
+    pub fn byte_find_indices(self, pattern: String) -> List { native_byte_find_indices(self, pattern) }
+    pub fn byte_rfind_indices(self, pattern: String) -> List { native_byte_rfind_indices(self, pattern) }
+    pub fn escape_debug(self) -> String { native_str_escape_debug(self) }
+    pub fn escape_unicode(self) -> String { native_str_escape_unicode(self) }
+    pub fn escape_default(self) -> String { native_str_escape_default(self) }
+    -- Unicode White_Space, the same set `trim` removes. Empty pieces are omitted.
+    pub fn split_whitespace(self) -> List { native_split_whitespace(self) }
+    -- ASCII whitespace only. Empty pieces are omitted.
+    pub fn split_ascii_whitespace(self) -> List { native_split_ascii_whitespace(self) }
+    -- Returns a List of the char values (Unicode scalar values) in order.
+    pub fn chars(self) -> List { native_chars(self) }
+    -- UTF-8 bytes as i64 values in `0..=255`, the same payload as `encode_utf8`.
+    pub fn bytes(self) -> List { native_str_bytes(self) }
+    -- Byte offsets of each Unicode scalar, in order. Empty strings return `[]`.
+    pub fn char_indices(self) -> List { native_str_char_indices(self) }
+    -- The first `count` Unicode scalars. A larger count returns the whole string.
+    -- A negative count is a runtime error.
+    pub fn take(self, count: i64) -> String { native_str_take(self, count) }
+    -- Drops the first `count` Unicode scalars. A larger count returns the empty string.
+    -- A negative count is a runtime error.
+    pub fn drop(self, count: i64) -> String { native_str_drop(self, count) }
+    -- The first Unicode scalar, or null when empty.
+    pub fn first(self) -> ?char { native_str_first(self) }
+    -- The last Unicode scalar, or null when empty.
+    pub fn last(self) -> ?char { native_str_last(self) }
+    pub fn starts_with_char(self, value: char) -> bool { native_starts_with_char(self, value) }
+    pub fn ends_with_char(self, value: char) -> bool { native_ends_with_char(self, value) }
+    pub fn contains_char(self, value: char) -> bool { native_contains_char(self, value) }
+    pub fn replace_char(self, from: char, to: char) -> String { native_replace_char(self, from, to) }
+
+    -- Indexes below count Unicode scalar values, the same unit as `chars`.
+    -- `len` stays a UTF-8 byte count and is not a valid index here.
+    pub fn char_len(self) -> i64 { native_char_len(self) }
+    -- A negative or past-the-end index returns null.
+    pub fn char_at(self, index: i64) -> ?char { native_char_at(self, index) }
+    -- Empty patterns match at the start. An absent pattern returns null.
+    pub fn find(self, pattern: String) -> ?i64 { native_find(self, pattern) }
+    -- Last scalar index of `pattern`. An empty pattern matches at `char_len`.
+    pub fn rfind(self, pattern: String) -> ?i64 { native_rfind(self, pattern) }
+    -- Non-overlapping matches. An empty pattern matches between characters,
+    -- so the result is `char_len + 1`.
+    pub fn count(self, pattern: String) -> i64 { native_count(self, pattern) }
+    -- Indexes are UTF-8 bytes. An empty pattern starts at 0, and `byte_rfind` of an empty pattern is `len`.
+    pub fn byte_find(self, pattern: String) -> ?i64 { native_byte_find(self, pattern) }
+    pub fn byte_rfind(self, pattern: String) -> ?i64 { native_byte_rfind(self, pattern) }
+    -- An empty pattern is counted once at every byte boundary, so the result is `len + 1`.
+    pub fn byte_count(self, pattern: String) -> i64 { native_byte_count(self, pattern) }
+    -- True when every byte is in U+0000–U+007F, including an embedded NUL.
+    pub fn is_ascii(self) -> bool { native_str_is_ascii(self) }
+    -- True when every byte is in the named ASCII class. An empty string is true.
+    pub fn is_ascii_digit(self) -> bool { native_str_is_ascii_digit(self) }
+    pub fn is_ascii_alphabetic(self) -> bool { native_str_is_ascii_alphabetic(self) }
+    pub fn is_ascii_alphanumeric(self) -> bool { native_str_is_ascii_alphanumeric(self) }
+    pub fn is_ascii_lowercase(self) -> bool { native_str_is_ascii_lowercase(self) }
+    pub fn is_ascii_uppercase(self) -> bool { native_str_is_ascii_uppercase(self) }
+    pub fn is_ascii_whitespace(self) -> bool { native_str_is_ascii_whitespace(self) }
+    pub fn is_ascii_hexdigit(self) -> bool { native_str_is_ascii_hexdigit(self) }
+    pub fn is_ascii_graphic(self) -> bool { native_str_is_ascii_graphic(self) }
+    pub fn is_ascii_punctuation(self) -> bool { native_str_is_ascii_punctuation(self) }
+    pub fn is_ascii_control(self) -> bool { native_str_is_ascii_control(self) }
+    -- True when every Unicode scalar is in the named class. An empty string is true.
+    pub fn is_numeric(self) -> bool { native_str_is_numeric(self) }
+    pub fn is_alphabetic(self) -> bool { native_str_is_alphabetic(self) }
+    pub fn is_alphanumeric(self) -> bool { native_str_is_alphanumeric(self) }
+    pub fn is_lowercase(self) -> bool { native_str_is_lowercase(self) }
+    pub fn is_uppercase(self) -> bool { native_str_is_uppercase(self) }
+    pub fn is_whitespace(self) -> bool { native_str_is_whitespace(self) }
+    pub fn is_control(self) -> bool { native_str_is_control(self) }
+    -- A matching prefix or suffix is removed. An empty affix matches and
+    -- returns the original string. A missing affix returns null.
+    pub fn strip_prefix(self, prefix: String) -> ?String { optional_string(native_strip_prefix(self, prefix)) }
+    -- `trim_*` removes one affix and otherwise returns the original string.
+    -- `strip_circumfix` removes both once. Overlap or a missing affix is null.
+    pub fn trim_prefix(self, prefix: String) -> String { native_trim_prefix(self, prefix) }
+    pub fn trim_suffix(self, suffix: String) -> String { native_trim_suffix(self, suffix) }
+    pub fn strip_circumfix(self, prefix: String, suffix: String) -> ?String { optional_string(native_strip_circumfix(self, prefix, suffix)) }
+    pub fn strip_suffix(self, suffix: String) -> ?String { optional_string(native_strip_suffix(self, suffix)) }
+    -- `end` is exclusive. A negative index, reversed range, or index past
+    -- `char_len` is a runtime error.
+    pub fn slice(self, start: i64, end: i64) -> String { native_slice(self, start, end) }
+
+    -- The whole string must be a number. Whitespace is not skipped.
+    -- `parse_i64` accepts an optional sign and decimal, `0b`, `0o`, or `0x` digits.
+    -- `parse_f64` accepts an optional sign, a decimal or dotted form with digits
+    -- on both sides of `.`, and an exponent. A malformed string is null.
+    -- A value outside `i64`, or a non-finite float, is a runtime overflow.
+    pub fn parse_i64(self) -> ?i64 { native_parse_i64(self) }
+    pub fn parse_u64(self) -> ?u64 { native_parse_u64(self) }
+    pub fn parse_i128(self) -> ?i128 { native_parse_i128(self) }
+    pub fn parse_u128(self) -> ?u128 { native_parse_u128(self) }
+    pub fn parse_isize(self) -> ?isize { optional_isize(native_parse_i64(self)) }
+    pub fn parse_usize(self) -> ?usize { optional_usize(native_parse_u64(self)) }
+    pub fn parse_f64(self) -> ?f64 { native_parse_f64(self) }
+
+    -- Splits on `\n`, `\r\n` and `\r`, dropping the endings. A trailing ending
+    -- does not add an empty line; an empty string has no lines.
+    pub fn lines(self) -> List { native_str_lines(self) }
+
+    -- Splits at the first match. The separator is not part of either piece.
+    -- An empty separator is the same runtime error as `split`.
+    pub fn split_once(self, separator: String) -> ?(String, String) {
+        optional_string_pair(native_split_once(self, separator))
+    }
+
+    -- Splits at the last match. The separator is not part of either piece.
+    -- An empty separator is the same runtime error as `split`.
+    pub fn rsplit_once(self, separator: String) -> ?(String, String) {
+        optional_string_pair(native_rsplit_once(self, separator))
+    }
+
+    pub fn find_char(self, value: char) -> ?i64 { native_find_char(self, value) }
+    pub fn rfind_char(self, value: char) -> ?i64 { native_rfind_char(self, value) }
+    pub fn count_char(self, value: char) -> i64 { native_count_char(self, value) }
+
+    pub fn encode_utf8(self) -> List { native_str_encode_utf8(self) }
+    pub fn encode_utf16(self) -> List { native_str_encode_utf16(self) }
+
+    -- `len` counts bytes. An index below 0 or past `len` is a runtime error.
+    -- `len` itself is a boundary.
+    pub fn is_char_boundary(self, index: i64) -> bool { native_is_char_boundary(self, index) }
+    pub fn floor_char_boundary(self, index: i64) -> i64 { native_floor_char_boundary(self, index) }
+    pub fn ceil_char_boundary(self, index: i64) -> i64 { native_ceil_char_boundary(self, index) }
+    -- A byte index that is not a character boundary, or `len` itself, is null.
+    pub fn char_at_byte(self, index: i64) -> ?char { native_char_at_byte(self, index) }
+    -- `index` is a byte offset and must be a character boundary.
+    pub fn split_at(self, index: i64) -> List { native_split_at(self, index) }
+    -- `index` is a byte offset inside the string. `len` itself is out of range.
+    pub fn byte_at(self, index: i64) -> i64 { native_byte_at(self, index) }
+    -- A byte range that is reversed, out of range, or off a character boundary is null.
+    pub fn get(self, start: i64, end: i64) -> ?String {
+        let value = native_str_get(self, start, end)
+        if value == null { null } else { value.as(String) }
+    }
+    -- A byte index that is out of range or off a character boundary is null.
+    pub fn split_at_checked(self, index: i64) -> ?List {
+        let value = native_split_at_checked(self, index)
+        if value == null { null } else { value.as(List) }
+    }
+}
+
+fn optional_isize(value: Any) -> ?isize { if value == null { null } else { value.as(isize) } }
+fn optional_usize(value: Any) -> ?usize { if value == null { null } else { value.as(usize) } }
+
+fn optional_string(value: Any) -> ?String {
+    if value == null { null } else { value.as(String) }
+}
+
+fn optional_string_pair(value: Any) -> ?(String, String) {
+    if value == null { null } else { value.as((String, String)) }
+}
+
+-- Invalid UTF-8 is null. A value outside 0..=255 is a runtime error.
+pub fn string_from_utf8(bytes: List) -> ?String { optional_string(native_from_utf8(bytes)) }
+-- Invalid UTF-8 bytes become U+FFFD.
+pub fn string_from_utf8_lossy(bytes: List) -> String { native_from_utf8_lossy(bytes) }
+-- Invalid UTF-16 is null. A value outside 0..=65535 is a runtime error.
+pub fn string_from_utf16(units: List) -> ?String { optional_string(native_from_utf16(units)) }
+-- Unpaired surrogates become U+FFFD.
+pub fn string_from_utf16_lossy(units: List) -> String { native_from_utf16_lossy(units) }
+
+-- Character classes follow Unicode for the general predicates and ASCII for
+-- the `ascii` predicates. Whitespace is Unicode White_Space, the same set
+-- `trim` removes. ASCII case mapping leaves every non-ASCII character unchanged.
+const native_is_whitespace: fn(char) -> bool = .char_is_whitespace'builtin
+const native_is_alphabetic: fn(char) -> bool = .char_is_alphabetic'builtin
+const native_is_numeric: fn(char) -> bool = .char_is_numeric'builtin
+const native_is_alphanumeric: fn(char) -> bool = .char_is_alphanumeric'builtin
+const native_is_uppercase: fn(char) -> bool = .char_is_uppercase'builtin
+const native_is_lowercase: fn(char) -> bool = .char_is_lowercase'builtin
+const native_is_ascii: fn(char) -> bool = .char_is_ascii'builtin
+const native_is_ascii_digit: fn(char) -> bool = .char_is_ascii_digit'builtin
+const native_is_ascii_alphabetic: fn(char) -> bool = .char_is_ascii_alphabetic'builtin
+const native_is_ascii_hexdigit: fn(char) -> bool = .char_is_ascii_hexdigit'builtin
+const native_is_ascii_octdigit: fn(char) -> bool = .char_is_ascii_octdigit'builtin
+const native_is_ascii_control: fn(char) -> bool = .char_is_ascii_control'builtin
+const native_is_ascii_graphic: fn(char) -> bool = .char_is_ascii_graphic'builtin
+const native_is_ascii_punctuation: fn(char) -> bool = .char_is_ascii_punctuation'builtin
+const native_is_ascii_whitespace: fn(char) -> bool = .char_is_ascii_whitespace'builtin
+const native_is_ascii_alphanumeric: fn(char) -> bool = .char_is_ascii_alphanumeric'builtin
+const native_is_ascii_uppercase: fn(char) -> bool = .char_is_ascii_uppercase'builtin
+const native_is_ascii_lowercase: fn(char) -> bool = .char_is_ascii_lowercase'builtin
+const native_is_control: fn(char) -> bool = .char_is_control'builtin
+const native_utf8_len: fn(char) -> i64 = .char_utf8_len'builtin
+const native_utf16_len: fn(char) -> i64 = .char_utf16_len'builtin
+const native_escape_debug: fn(char) -> String = .char_escape_debug'builtin
+const native_escape_unicode: fn(char) -> String = .char_escape_unicode'builtin
+const native_escape_default: fn(char) -> String = .char_escape_default'builtin
+const native_is_digit: fn(char, i64) -> bool = .char_is_digit'builtin
+const native_to_digit: fn(char, i64) -> ?i64 = .char_to_digit'builtin
+const native_to_ascii_uppercase: fn(char) -> char = .char_to_ascii_uppercase'builtin
+const native_to_ascii_lowercase: fn(char) -> char = .char_to_ascii_lowercase'builtin
+const native_char_eq_ignore_ascii_case: fn(char, char) -> bool = .char_eq_ignore_ascii_case'builtin
+const native_to_code: fn(char) -> i64 = .char_to_code'builtin
+const native_from_code: fn(i64) -> ?char = .char_from_code'builtin
+const native_from_digit: fn(i64, i64) -> ?char = .char_from_digit'builtin
+const native_encode_utf8: fn(char) -> List = .char_encode_utf8'builtin
+const native_encode_utf16: fn(char) -> List = .char_encode_utf16'builtin
+const native_into_string: fn(char) -> String = .char_into_string'builtin
+const native_to_uppercase: fn(char) -> String = .char_to_uppercase'builtin
+const native_to_lowercase: fn(char) -> String = .char_to_lowercase'builtin
+
+-- A Unicode scalar value. Surrogates and codes outside `0..=0x10FFFF` are null.
+pub fn char_from_code(value: i64) -> ?char { native_from_code(value) }
+-- `radix` is from 2 to 36. A digit outside that radix is null.
+pub fn char_from_digit(digit: i64, radix: i64) -> ?char { native_from_digit(digit, radix) }
+pub const char_replacement: fn() -> char = .char_replacement'builtin
+pub const char_max: fn() -> char = .char_max'builtin
+pub const char_min: fn() -> char = .char_min'builtin
+
+impl char {
+    pub fn is_whitespace(self) -> bool { native_is_whitespace(self) }
+    pub fn is_alphabetic(self) -> bool { native_is_alphabetic(self) }
+    pub fn is_numeric(self) -> bool { native_is_numeric(self) }
+    pub fn is_alphanumeric(self) -> bool { native_is_alphanumeric(self) }
+    pub fn is_uppercase(self) -> bool { native_is_uppercase(self) }
+    pub fn is_lowercase(self) -> bool { native_is_lowercase(self) }
+    pub fn is_ascii(self) -> bool { native_is_ascii(self) }
+    pub fn is_ascii_digit(self) -> bool { native_is_ascii_digit(self) }
+    pub fn is_ascii_alphabetic(self) -> bool { native_is_ascii_alphabetic(self) }
+    pub fn is_ascii_hexdigit(self) -> bool { native_is_ascii_hexdigit(self) }
+    pub fn is_ascii_octdigit(self) -> bool { native_is_ascii_octdigit(self) }
+    pub fn is_ascii_control(self) -> bool { native_is_ascii_control(self) }
+    pub fn is_ascii_graphic(self) -> bool { native_is_ascii_graphic(self) }
+    pub fn is_ascii_punctuation(self) -> bool { native_is_ascii_punctuation(self) }
+    pub fn is_ascii_whitespace(self) -> bool { native_is_ascii_whitespace(self) }
+    pub fn is_ascii_alphanumeric(self) -> bool { native_is_ascii_alphanumeric(self) }
+    pub fn is_ascii_uppercase(self) -> bool { native_is_ascii_uppercase(self) }
+    pub fn is_ascii_lowercase(self) -> bool { native_is_ascii_lowercase(self) }
+    pub fn is_control(self) -> bool { native_is_control(self) }
+    pub fn utf8_len(self) -> i64 { native_utf8_len(self) }
+    pub fn utf16_len(self) -> i64 { native_utf16_len(self) }
+    pub fn escape_debug(self) -> String { native_escape_debug(self) }
+    pub fn escape_unicode(self) -> String { native_escape_unicode(self) }
+    pub fn escape_default(self) -> String { native_escape_default(self) }
+    -- `radix` is from 2 to 36. Anything outside that range is a runtime error.
+    pub fn is_digit(self, radix: i64) -> bool { native_is_digit(self, radix) }
+    -- A character that is not a digit in `radix` is null.
+    pub fn to_digit(self, radix: i64) -> ?i64 { native_to_digit(self, radix) }
+    pub fn to_ascii_uppercase(self) -> char { native_to_ascii_uppercase(self) }
+    pub fn to_ascii_lowercase(self) -> char { native_to_ascii_lowercase(self) }
+    pub fn eq_ignore_ascii_case(self, other: char) -> bool { native_char_eq_ignore_ascii_case(self, other) }
+    -- Unicode scalar value. Every `char` has one, including U+0000.
+    pub fn to_code(self) -> i64 { native_to_code(self) }
+    -- The one-scalar string for this char. Named to avoid the Display method.
+    pub fn into_string(self) -> String { native_into_string(self) }
+    -- Full Unicode mapping. One char may become several scalars, so the result
+    -- is a String. `'ß'` uppercases to `"SS"`.
+    pub fn to_uppercase(self) -> String { native_to_uppercase(self) }
+    pub fn to_lowercase(self) -> String { native_to_lowercase(self) }
+    pub fn encode_utf8(self) -> List { native_encode_utf8(self) }
+    pub fn encode_utf16(self) -> List { native_encode_utf16(self) }
+    -- A negative count is a runtime error.
+    pub fn repeat(self, count: i64) -> String { native_repeat_char(count, self) }
 }

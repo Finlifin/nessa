@@ -104,9 +104,13 @@ _tmp match {
 -- 源码:
 let msg = "hello, {name}! you are {age} years old."
 
--- NIR 脱糖:
-let msg = String.concat("hello, ", name.to_string(), "! you are ", age.to_string(), " years old.")
+-- NIR 脱糖（String 部分直接使用，其余部分取 Display 文本，再逐个 str_concat）:
+let msg = str_concat(str_concat(str_concat(str_concat("hello, ", name), "! you are "), Display.to_string(age)), " years old.")
 ```
+
+静态类型的部分经静态或派生的 trait 分派调用 `Display.to_string`；Any 部分
+先建立 `TraitProof(value, Display)`（缺少证明时为 TypeError），再按 schema
+槽位进行 `TraitCall`。
 
 ### Effect 调用 → evidence passing
 

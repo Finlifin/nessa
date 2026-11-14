@@ -369,43 +369,61 @@ fn h() { 3 }";
 
 #[test]
 fn archive_roundtrip_empty() {
-    let output = codegen_source("");
-    let bytes = nsbc_io::write_archive(&output).expect("write_archive failed");
-    // Should start with the NSBC magic bytes.
+    let artifact = compile("").into_artifact().expect("into_artifact failed");
+    let bytes = nsbc_io::write_artifact(&artifact).expect("write_artifact failed");
     assert!(bytes.len() >= 4, "Archive too short");
     assert_eq!(&bytes[..4], b"NSBC", "Bad magic bytes");
 }
 
 #[test]
 fn archive_roundtrip_single_function() {
-    let output = codegen_source("fn foo() { 1 }");
-    let bytes = nsbc_io::write_archive(&output).expect("write_archive failed");
+    let artifact = compile("fn foo() { 1 }")
+        .into_artifact()
+        .expect("into_artifact failed");
+    let bytes = nsbc_io::write_artifact(&artifact).expect("write_artifact failed");
     assert_eq!(&bytes[..4], b"NSBC");
 
-    // Read it back.
     let archive = nsbc_io::Archive::read_from(&mut &bytes[..]).expect("read_from failed");
     assert_eq!(archive.header.magic, *b"NSBC");
     assert_eq!(archive.header.version, nsbc::VERSION);
+    let restored = nsbc_io::read_artifact(&bytes).expect("read_artifact failed");
+    assert_eq!(
+        restored.codegen_output.functions.len(),
+        artifact.codegen_output.functions.len()
+    );
 }
 
 #[test]
-fn archive_has_code_section() {
-    let output = codegen_source("fn foo() { 1 }");
-    let bytes = nsbc_io::write_archive(&output).expect("write_archive failed");
+fn archive_has_code_and_metadata_sections() {
+    let artifact = compile("fn foo() { 1 }")
+        .into_artifact()
+        .expect("into_artifact failed");
+    let bytes = nsbc_io::write_artifact(&artifact).expect("write_artifact failed");
     let archive = nsbc_io::Archive::read_from(&mut &bytes[..]).expect("read_from failed");
-    let code = archive.find_section(nsbc::SectionKind::Code);
-    assert!(code.is_some(), "Archive should have a Code section");
+    assert!(archive.find_section(nsbc::SectionKind::Code).is_some());
+    assert!(archive.find_section(nsbc::SectionKind::Metadata).is_some());
 }
 
 // ===========================================================================
-// BytecodeStore (nsbc)
+// BytecodeStore (runtime)
 // ===========================================================================
 
 #[test]
 fn bytecode_store_load_codegen_output() {
     let output = codegen_source("fn foo() { 1 }");
-    let mut store = nsbc::BytecodeStore::new();
-    store.load_codegen_output(output);
+    let mut store = runtime::BytecodeStore::new();
+    for func in output.functions {
+        store.add_function(runtime::FunctionCode {
+            display_owner: func.display_owner,
+            func_id: func.func_id,
+            instructions: func.instructions,
+            register_count: func.register_count,
+            param_count: func.param_count,
+            is_closure: func.is_closure,
+            function_type: func.function_type,
+            abi: func.abi,
+        });
+    }
     assert!(
         store.function_count() > 0,
         "Store should have functions after loading"
@@ -416,13 +434,24 @@ fn bytecode_store_load_codegen_output() {
 fn bytecode_store_fetch() {
     let output = codegen_source("fn foo() { 1 }");
     let func_count = output.functions.len();
-    let mut store = nsbc::BytecodeStore::new();
-    store.load_codegen_output(output);
+    let mut store = runtime::BytecodeStore::new();
+    for func in output.functions {
+        store.add_function(runtime::FunctionCode {
+            display_owner: func.display_owner,
+            func_id: func.func_id,
+            instructions: func.instructions,
+            register_count: func.register_count,
+            param_count: func.param_count,
+            is_closure: func.is_closure,
+            function_type: func.function_type,
+            abi: func.abi,
+        });
+    }
 
-    // Try fetching the first instruction of the first function.
     if func_count > 0 {
-        let header = store.header(nsbc::FuncId(0));
-        assert!(header.is_some(), "Expected header for FuncId(0)");
+        let code = store.try_get_function(nsbc::FuncId(0));
+        assert!(code.is_some(), "Expected FunctionCode for FuncId(0)");
+        assert!(!code.unwrap().instructions.is_empty());
     }
 }
 

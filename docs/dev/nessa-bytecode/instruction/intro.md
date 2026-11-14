@@ -8,8 +8,7 @@
 |-------|------|------|
 | 00 | Imm | 立即数（12-bit，Load 时符号扩展） |
 | 01 | Const | 常量池索引 |
-| 10 | RegOff | `r[base] + sext(offset)` |
-| 11 | Reserved | 非法 |
+| 10 / 11 | Reserved | 非法（解码直接拒绝） |
 
 ## 指令表概览
 
@@ -53,14 +52,14 @@
 
 | Opcode | 助记符 | 语义 | 操作 |
 |--------|--------|------|------|
-| 0x40 | LOAD | r[d] = operand(amode) | Imm / Const / RegOff |
+| 0x40 | LOAD | r[d] = operand(amode) | Imm / Const |
 | 0x41 | LOAD_CONST_WIDE | r[d] = const_pool[idx19] | 宽常量池索引 |
 | 0x42 | LOAD_UNIT | r[d] = Unit | 加载 Unit 值 |
 | 0x43 | LOAD_TRUE | r[d] = true | 加载 bool true |
 | 0x44 | LOAD_FALSE | r[d] = false | 加载 bool false |
 | 0x45 | LOAD_NULL | r[d] = null | 加载 ?T 的空值 |
 | 0x48 | TYPE_CHECK | r[d] = r[s] is TypeIndex(imm) | 类型检查，结果为 bool |
-| 0x49 | TYPE_CAST | r[d] = r[s] as TypeIndex(imm) | 类型转换（失败则 panic） |
+| 0x49 | TYPE_CAST | r[d] = r[s] as TypeIndex(imm) | 类型转换（失败则报错） |
 | 0x4A | TYPE_CAST_SAFE | r[d] = r[s] as? TypeIndex(imm) | 安全转换（失败返回 null） |
 | 0x4B | TYPE_ASSERT | r[d] = checked r[s] : TypeIndex(imm) | 隐式类型边界检查；允许数值拓宽，禁止显式转换才允许的窄化/截断 |
 
@@ -72,11 +71,10 @@
 | 0x51 | STORE_FIELD | r[s].field[imm] = r[d] | 写入对象字段 |
 | 0x52 | LOAD_INDEX | r[d] = r[s1][r[imm]] | 数组/Map 索引读取 |
 | 0x53 | STORE_INDEX | r[s1][r[imm]] = r[d] | 数组/Map 索引写入 |
-| 0x54 | LOAD_GLOBAL | r[d] = globals[imm] | 读取全局变量 |
-| 0x55 | STORE_GLOBAL | globals[imm] = r[s] | 写入全局变量 |
-| 0x56 | LOAD_CAPTURE | r[d] = captures[imm] | 读取闭包捕获变量 |
-| 0x57 | LOAD_GLOBAL_WIDE | r[d] = globals[idx19] | 宽全局索引 |
-| 0x58 | STORE_GLOBAL_WIDE | globals[idx19] = r[d] | 宽全局写入 |
+| 0x54 | LOAD_GLOBAL | r[d] = globals[imm] | 读取全局变量（base 必须为 0） |
+| 0x55 | STORE_GLOBAL | globals[imm] = r[d] | 写入全局变量（值寄存器统一放在 `dst`，base 必须为 0） |
+| 0x57 | LOAD_GLOBAL_WIDE | r[d] = globals[const[imm]] | 宽全局索引（常量池 UInt） |
+| 0x58 | STORE_GLOBAL_WIDE | globals[const[imm]] = r[d] | 宽全局写入（值寄存器放在 `dst`，常量池 UInt） |
 
 ### 对象操作 (A-type: 01)
 
@@ -85,7 +83,7 @@
 | 0x60 | NEW_OBJECT | r[d] = new TypeIndex(imm) | 分配堆对象 |
 | 0x61 | NEW_LIST | r[d] = List(size=imm) | 创建 List |
 | 0x62 | NEW_MAP | r[d] = Map(capacity=imm) | 创建 Map |
-| 0x63 | NEW_CLOSURE | r[d] = Closure(func_id, captures) | 创建闭包（func_id:12） |
+| 0x63 | NEW_CLOSURE | r[d] = Closure(func_id, captures) | 创建闭包（func_id:12，捕获通过入口前缀传入） |
 | 0x64 | NEW_CLOSURE_WIDE | 同上，func_id 来自常量池 | 大 func_id |
 | 0x65 | LOAD_SLOT | r[d] = local_slots[index] | dst:5 \| slot:17 |
 | 0x66 | STORE_SLOT | local_slots[index] = r[s] | source:5 \| slot:17 |
@@ -131,8 +129,6 @@ EnumIs比较名义Enum身份和tag，对其它正常Enum或非Enum值返回false
 | 0x88 | CALL | call func_id(args...) | 静态调用（func_id:14） |
 | 0x89 | CALL_INDIRECT | call r[s](args...) | 闭包间接调用 |
 | 0x8A | CALL_METHOD | call r[s].method(args...) | 方法调用（method_id:12） |
-| 0x8B | CALL_WASM | call wasm_func(args...) | WASM 函数调用 |
-| 0x8C | TAIL_CALL | goto func_id(args...) | 尾调用 |
 | 0x8D | CALL_BUILTIN | call builtin(args...) | 注册的 builtin 函数 |
 | 0x8E | RETURN_UNIT | return Unit | 返回 Unit |
 | 0x8F | RETURN | return r[s] | 函数返回 |
@@ -142,33 +138,25 @@ EnumIs比较名义Enum身份和tag，对其它正常Enum或非Enum值返回false
 | 0x93 | CALL_INDIRECT_PROOF | call r[s](physical args...) | physical_count:5 \| callee:5 \| 0:12，不含 captures |
 
 TraitCall 的 proof 寄存器在参数区之后；receiver 的 proof 不重复加入参数区。
-TraitProof、TraitCall、CallIndirectProof 属于 Calls scope coverage；TraitAssert
-属于 CallsAndTypes；TraitProject 不查询词法 scope。旧 EffectCallDyn 没有该
-证明取得上下文契约，带裸 trait 输入明确拒绝，零输入 effect 捕获 proof 可执行。
+词法作用域表覆盖范围统一由 `nsbc::instruction_requires_scope` 定义：包含 `CALL_METHOD`、
+`CALL_METHOD_FAR`、`TRAIT_PROOF`、`TRAIT_CALL`、`CALL_INDIRECT_PROOF` 与 `TRAIT_ASSERT`；
+`TRAIT_PROJECT` 不查询词法 scope。`EFFECT_CALL_DYN` 带裸 trait 输入明确拒绝，零输入 effect 捕获 proof 可执行。
 
 ### Effect 相关 (E-type: 11)
 
 | Opcode | 助记符 | 语义 | 操作 |
 |--------|--------|------|------|
-| 0xC0 | EFFECT_CALL | r[d] = evidence.invoke(args) | 静态 evidence 调用 |
-| 0xC1 | EFFECT_CALL_DYN | r[d] = dynamic_lookup(effect, args) | 动态 effect 查找+调用 |
-| 0xC2 | PUSH_HANDLER | push handler frame | effect_type:11 \| handler:11 |
+| 0xC1 | EFFECT_CALL_DYN | r[0] = dynamic_lookup(effect, args) | 动态 effect 查找+调用 |
 | 0xC3 | POP_HANDLER | pop handler frame | 卸载 handler |
-| 0xC4 | SHIFT | capture continuation to reset | 捕获 delimited continuation |
-| 0xC5 | RESET | establish reset prompt | 建立 reset 边界 |
-| 0xC6 | RESUME | resume continuation with value | 恢复 continuation |
-| 0xC7 | PUSH_HANDLER_WIDE | push via const pool | 宽 handler 元数据 |
-| 0xC8 | CLONE_CONTINUATION | branch suspended computation | 为多次恢复建立独立分支 |
-| 0xC9 | DROP_CONTINUATION | discard suspended computation | 归还捕获的整个栈段链 |
 | 0xCA | PUSH_HANDLER_CLOSURE | install in-place closure | closure 寄存器:5 \| effect:17 |
 | 0xCB | PUSH_CAPTURING_HANDLER | install capturing closure | closure 寄存器:5 \| metadata 常量:17 |
 | 0xCC | RESET_CLOSURE | enter closure on delimiter stack | body 寄存器:5 \| handler 数量:5 \| 0:12 |
 | 0xCD | RESUME_CONTINUATION | invoke multi-shot language value | continuation 寄存器:5 \| value 寄存器:5 \| 0:12 |
 | 0xCE | RESUME_CONTINUATION_ONCE | consume proven single use | 同上；直接转移原栈段链 |
 
-`RESET`、`SHIFT`、`RESUME` 与 continuation 生命周期指令的 v3 编码及执行协议见
+Continuation 生命周期指令的 v4 编码及执行协议见
 [continuation-stack-abi.md](../../continuation-stack-abi.md)。捕获和恢复均转移栈段链接，
-`CLONE_CONTINUATION` 与多次调用的语言指令建立独立分支时复制状态，
+多次调用的 `RESUME_CONTINUATION` 建立独立分支时复制状态，
 `RESUME_CONTINUATION_ONCE` 经编译器证明单次使用后直接恢复原链。
 
 ### 系统指令 (E-type: 11)
@@ -176,7 +164,7 @@ TraitProof、TraitCall、CallIndirectProof 属于 Calls scope coverage；TraitAs
 | Opcode | 助记符 | 语义 | 操作 |
 |--------|--------|------|------|
 | 0xD0 | SAFEPOINT | GC/调度检查点 | 检查 gc_flag 和 preempt_flag |
-| 0xD1 | DEBUG_BREAK | 调试断点 | 仅 debug 模式有效 |
+| 0xD1 | UNREACHABLE | 返回 UnreachableExecuted 错误 | payload必须0，无后继控制流 |
 | 0xD2 | NOP | 无操作 | 用于对齐或占位 |
 | 0xD3 | ALLOCATE_SLOTS | allocate function local value slots | count:22，当前最大 131072 |
 | 0xD4 | MATCH_FAIL | 返回NoMatchingCase错误 | payload必须0，无后继控制流 |

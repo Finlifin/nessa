@@ -100,12 +100,22 @@ fn cyclic_runtime_initialization_and_invalid_init_signatures_are_diagnosed() {
 }
 
 #[test]
-fn archives_reject_global_schema_until_metadata_can_preserve_it() {
-    let result =
-        driver::Driver::new().compile("global value: i64 = 42\nfn main() -> i64 { value }");
+fn archives_preserve_and_execute_global_schema_metadata() {
+    let driver = driver::Driver::new();
+    let result = driver.compile("global value: i64 = 42\nfn main() -> i64 { value }");
     assert!(!result.has_errors, "{:?}", result.diagnostics);
-    let error = nsbc_io::write_archive(&result.codegen_output).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let bytes = nsbc_io::write_artifact(&result.into_artifact().unwrap()).unwrap();
+    let restored = nsbc_io::read_artifact(&bytes).unwrap();
+    let mut engine = initialization::Engine::with_defaults();
+    let entry = driver::install_artifact(engine.vm_mut(), restored)
+        .unwrap()
+        .unwrap();
+    let task = engine.vm_mut().spawn_root(entry);
+    assert!(matches!(
+        engine.vm_mut().run(),
+        interpreter::VmResult::Finished
+    ));
+    assert_eq!(engine.vm_mut().task_result_i64(task).unwrap(), 42);
 }
 
 #[test]

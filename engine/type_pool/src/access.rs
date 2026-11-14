@@ -5,11 +5,9 @@ use std::fmt;
 
 use crate::{MethodSlot, SnapshotError, TypeIndex, TypeKind, TypePool};
 
-/// Declaration visibility. Legacy metadata contains insufficient information
-/// to authorize a call; it must never be interpreted as public visibility.
+/// Declaration visibility for methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodAccess {
-    LegacyUnknown,
     Public,
     Package(u32),
     Private(u32),
@@ -27,7 +25,6 @@ pub struct ScopeContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MethodAccessError {
-    UnknownAccess,
     InvalidCaller(u32),
     InvalidMetadata(String),
 }
@@ -35,7 +32,6 @@ pub enum MethodAccessError {
 impl fmt::Display for MethodAccessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownAccess => f.write_str("legacy method visibility cannot authorize a call"),
             Self::InvalidCaller(scope) => write!(f, "invalid caller scope {scope}"),
             Self::InvalidMetadata(message) => f.write_str(message),
         }
@@ -95,7 +91,6 @@ pub(crate) fn validate_method(
 ) -> Result<(), SnapshotError> {
     if scopes.is_empty() {
         return match method.access {
-            MethodAccess::LegacyUnknown => Ok(()), // Preserve untrusted TPOL1 extend IDs.
             MethodAccess::Public if method.visible_scope.is_none() => Ok(()),
             _ => Err(SnapshotError::new(
                 "method visibility requires a lexical scope graph",
@@ -179,16 +174,12 @@ impl TypePool {
         method: &MethodSlot,
         caller_scope: u32,
     ) -> Result<bool, MethodAccessError> {
-        if method.access == MethodAccess::LegacyUnknown {
-            return Err(MethodAccessError::UnknownAccess);
-        }
         let caller = self
             .scope_context(caller_scope)
             .ok_or(MethodAccessError::InvalidCaller(caller_scope))?;
         validate_method(&self.scopes, method, &self.scope_packages)
             .map_err(|error| MethodAccessError::InvalidMetadata(error.to_string()))?;
         let allowed = match method.access {
-            MethodAccess::LegacyUnknown => return Err(MethodAccessError::UnknownAccess),
             MethodAccess::Public => true,
             MethodAccess::Package(package) => caller.package == package,
             MethodAccess::Private(owner) => {
@@ -317,18 +308,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_and_legacy_metadata_never_become_permission_denials() {
+    fn invalid_metadata_never_becomes_permission_denial() {
         let mut pool = TypePool::with_intrinsics();
-        let legacy = method(MethodAccess::LegacyUnknown, Some(123));
-        pool.add_method(Intrinsic::I64.type_index(), legacy.clone());
-        let restored = TypePool::restore(pool.snapshot()).unwrap();
-        assert_eq!(
-            restored.methods_of(Intrinsic::I64.type_index())[0].visible_scope,
-            Some(123)
-        );
-        assert_eq!(
-            restored.method_accessible(&legacy, 0),
-            Err(MethodAccessError::UnknownAccess)
+        pool.add_method(
+            Intrinsic::I64.type_index(),
+            method(MethodAccess::Public, Some(123)),
         );
         assert!(pool.install_scopes(graph()).is_err());
         assert!(pool.scopes().is_empty());
@@ -367,7 +351,6 @@ mod tests {
             MethodAccess::Public,
             MethodAccess::Package(10),
             MethodAccess::Private(1),
-            MethodAccess::LegacyUnknown,
         ] {
             pool.add_method(Intrinsic::I64.type_index(), method(access, Some(1)));
         }

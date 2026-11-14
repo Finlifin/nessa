@@ -106,7 +106,7 @@ impl Vm {
             .checked_vtable_descriptors(index)
             .map_err(VmError::TraitProofMetadata)?;
         for descriptor in &descriptors {
-            if descriptor.signature.is_none() || descriptor.func_id == type_pool::DERIVE_FUNC_ID {
+            if descriptor.signature.is_none() {
                 return Err(VmError::UnsupportedFunctionAbi);
             }
             let method = MethodSlot {
@@ -243,15 +243,13 @@ impl Vm {
         values: &[TaggedValue],
     ) -> Result<(), VmError> {
         let code = self.checked_function(id)?;
-        if let Some(abi) = &code.abi {
-            for (index, capture) in abi.captures.iter().enumerate() {
-                if let CaptureAbi::TraitProof { view } = capture {
-                    let value = *values.get(index).ok_or(VmError::InvalidTraitProof)?;
-                    if index == 0 || abi.captures[index - 1] != CaptureAbi::Value {
-                        return Err(VmError::InvalidTraitProof);
-                    }
-                    self.assert_trait_pair(value, values[index - 1], *view)?;
+        for (index, capture) in code.abi.captures.iter().enumerate() {
+            if let CaptureAbi::TraitProof { view } = capture {
+                let value = *values.get(index).ok_or(VmError::InvalidTraitProof)?;
+                if index == 0 || code.abi.captures[index - 1] != CaptureAbi::Value {
+                    return Err(VmError::InvalidTraitProof);
                 }
+                self.assert_trait_pair(value, values[index - 1], *view)?;
             }
         }
         Ok(())
@@ -263,9 +261,7 @@ impl Vm {
         values: &[TaggedValue],
     ) -> Result<(), VmError> {
         let code = self.checked_function(id)?;
-        let Some(abi) = &code.abi else {
-            return Ok(());
-        };
+        let abi = &code.abi;
         let expected = abi.physical_parameter_count() - abi.capture_count();
         if values.len() != expected {
             return Err(VmError::ArityError {
@@ -273,9 +269,9 @@ impl Vm {
                 got: u8::try_from(values.len()).unwrap_or(u8::MAX),
             });
         }
-        // Synthesized handler entries and legacy archives can carry an ABI
-        // without a source function signature. Only a real descriptor supplies
-        // ordinary parameter contracts; trait proof checks remain mandatory.
+        // Synthesized handler entries can carry an ABI without a source
+        // function signature. Only a real descriptor supplies ordinary
+        // parameter contracts; trait proof checks remain mandatory.
         let params = if code.function_type == TypeIndex::INVALID {
             None
         } else {
@@ -335,7 +331,7 @@ impl Vm {
     ) -> Result<(), VmError> {
         self.check_physical_arguments(id, values)?;
         let code = self.checked_function(id)?;
-        let Some(abi) = &code.abi else { return Ok(()) };
+        let abi = &code.abi;
         if code.function_type == TypeIndex::INVALID {
             return Ok(());
         }
@@ -383,9 +379,6 @@ impl Vm {
     ) -> Result<Vec<TaggedValue>, VmError> {
         self.check_user_argument_abi(id, values.len())?;
         let abi = self.checked_function(id)?.abi.clone();
-        let Some(abi) = abi else {
-            return Ok(values.to_vec());
-        };
         let mut physical = Vec::new();
         for (parameter, &data) in abi.parameters.iter().zip(values) {
             if let ParameterAbi::Trait { view } | ParameterAbi::TraitSelf { view } = parameter {
@@ -452,7 +445,7 @@ impl Vm {
         };
         let function = FuncId(descriptor.func_id);
         let target = self.checked_function(function)?;
-        let abi = target.abi.clone().ok_or(VmError::UnsupportedFunctionAbi)?;
+        let abi = target.abi.clone();
         if abi.capture_count() != 0 || abi.parameters.len() != params.len() {
             return Err(VmError::UnsupportedFunctionAbi);
         }
@@ -560,10 +553,10 @@ mod tests {
             param_count: 2,
             is_closure: false,
             function_type: signature,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![],
                 parameters: vec![ParameterAbi::Value; 2],
-            }),
+            },
         });
         let base = vm.roots.temporary_values.borrow().len();
         let before = vm.completed_collections();
@@ -710,14 +703,14 @@ mod tests {
         for id in 0..2 {
             vm.add_function(FunctionCode {
                 display_owner: None,
-                abi: Some(FunctionAbi {
+                abi: FunctionAbi {
                     captures: vec![],
                     parameters: if id == 0 {
                         vec![]
                     } else {
                         vec![ParameterAbi::Value]
                     },
-                }),
+                },
                 func_id: FuncId(id),
                 instructions: vec![Instruction::ret(Reg(0)).encode()],
                 register_count: 32,
@@ -784,10 +777,10 @@ mod tests {
         });
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![],
                 parameters: vec![ParameterAbi::Trait { view }],
-            }),
+            },
             func_id: FuncId(2),
             instructions: vec![Instruction::ret(Reg(1)).encode()],
             register_count: 32,
@@ -864,10 +857,10 @@ mod tests {
         vm.install_type_pool(type_pool::TypePool::restore(snapshot).unwrap());
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![],
                 parameters: vec![ParameterAbi::TraitSelf { view }, ParameterAbi::Value],
-            }),
+            },
             func_id: FuncId(2),
             instructions: vec![Instruction::ret(Reg(2)).encode()],
             register_count: 32,
@@ -890,10 +883,10 @@ mod tests {
 
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![CaptureAbi::Value, CaptureAbi::TraitProof { view }],
                 parameters: vec![],
-            }),
+            },
             func_id: FuncId(3),
             instructions: vec![Instruction::ret(Reg(0)).encode()],
             register_count: 32,
@@ -985,10 +978,10 @@ mod tests {
         let signature = vm.state.bytecode.get_function(FuncId(1)).function_type;
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![],
                 parameters: vec![ParameterAbi::TraitSelf { view }],
-            }),
+            },
             func_id: FuncId(2),
             instructions: vec![Instruction::ret(Reg(1)).encode()],
             register_count: 32,
@@ -1032,10 +1025,10 @@ mod tests {
         });
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![],
                 parameters: vec![ParameterAbi::TraitSelf { view }],
-            }),
+            },
             func_id: FuncId(3),
             instructions: vec![Instruction::return_unit().encode()],
             register_count: 32,
@@ -1059,10 +1052,10 @@ mod tests {
         let (mut vm, view, _) = fixture();
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![],
                 parameters: vec![ParameterAbi::Trait { view }],
-            }),
+            },
             func_id: FuncId(2),
             instructions: vec![Instruction::return_unit().encode()],
             register_count: 32,
@@ -1184,10 +1177,10 @@ mod tests {
         let (mut vm, view, _) = fixture();
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: Some(FunctionAbi {
+            abi: FunctionAbi {
                 captures: vec![CaptureAbi::Value, CaptureAbi::TraitProof { view }],
                 parameters: vec![],
-            }),
+            },
             func_id: FuncId(2),
             instructions: vec![Instruction::return_unit().encode()],
             register_count: 32,

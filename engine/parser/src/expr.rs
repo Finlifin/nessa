@@ -2,8 +2,8 @@ use ast::{NodeIndex, NodeKind};
 use lexer::token::TokenKind;
 
 use crate::basic::{
-    self, Rule, try_block_or_statement, try_catch_arm, try_multi_in_block, try_multi_with_bracket,
-    try_pattern_arm, try_property, try_property_assign,
+    self, Rule, try_block_or_statement, try_catch_arm, try_multi_with_bracket, try_pattern_arm,
+    try_property, try_property_assign,
 };
 use crate::definition;
 use crate::error::{ParseErrorKind, ParseResult};
@@ -203,6 +203,15 @@ pub fn try_expr_without_extended_call(p: &mut Parser) -> ParseResult {
     try_expr_with_option(p, ExprOption::without_extended_call())
 }
 
+/// Types in typed patterns may use function arrows but no boolean operators,
+/// comparisons or brace calls, which belong to the surrounding pattern.
+const PATTERN_TYPE_PREC: i32 = 50;
+
+pub(crate) fn try_pattern_type(p: &mut Parser) -> ParseResult {
+    let _g = p.enter();
+    try_expr_pratt(p, PATTERN_TYPE_PREC, ExprOption::without_extended_call())
+}
+
 pub fn try_expr_with_option(p: &mut Parser, option: ExprOption) -> ParseResult {
     let _g = p.enter();
     try_expr_pratt(p, 0, option)
@@ -226,6 +235,13 @@ fn try_expr_pratt(p: &mut Parser, min_prec: i32, option: ExprOption) -> ParseRes
     }
 
     loop {
+        if p.peek(&[TokenKind::Dot, TokenKind::Dot]) {
+            if RANGE_PREC < min_prec {
+                break;
+            }
+            left = parse_range_expr(p, left, option)?;
+            continue;
+        }
         let token = p.peek_token();
         let op = get_expr_op_info(token.kind);
 
@@ -308,7 +324,7 @@ fn try_prefix_expr(p: &mut Parser, option: ExprOption) -> ParseResult {
         TokenKind::KwNot => try_prefix_unary(p, TokenKind::KwNot, NodeKind::BoolNot),
         TokenKind::KwError => try_prefix_unary(p, TokenKind::KwError, NodeKind::ErrorConstruction),
         TokenKind::Question => try_prefix_unary(p, TokenKind::Question, NodeKind::OptionalType),
-        TokenKind::Minus => try_prefix_unary(p, TokenKind::Minus, NodeKind::Negative),
+        TokenKind::Minus => try_negative(p),
 
         TokenKind::KwFn => try_fn_type_expr(p),
         TokenKind::KwEffect | TokenKind::KwAsync => try_effect_type_expr(p),
@@ -414,7 +430,6 @@ fn parse_dot_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     match next.kind {
         TokenKind::KwUse => parse_handler_apply_expr(p, left),
         TokenKind::KwAs => parse_type_cast_expr(p, left),
-        TokenKind::Dot => parse_range_expr(p, left),
         _ => parse_projection_expr(p, left),
     }
 }
@@ -512,44 +527,49 @@ fn parse_type_cast_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
         .build())
 }
 
-fn parse_range_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
-    // We're positioned after the first dot (consumed by parse_dot_expr).
-    // The second dot is the next token.
-    if p.peek(&[TokenKind::Eq]) {
-        // ..=expr  (but first dot already consumed, so this is .=)
-        p.next_token(); // consume =
-        let end = try_expr_without_extended_call(p)?;
-        if end.is_null() {
+/// `..` binds more loosely than every binary operator, so `a + 1..b` is
+/// `(a + 1)..b`. Ranges do not chain: endpoints are parsed above this level.
+const RANGE_PREC: i32 = 10;
+
+/// Parses the optional upper bound after `..` or `..=`. In statement heads
+/// (`for x in 0.. { ... }`) a `{` opens the body, not an object bound.
+fn try_range_end(p: &mut Parser, option: ExprOption) -> ParseResult {
+    if option.no_extended_call && p.peek(&[TokenKind::LBrace]) {
+        return Ok(NULL);
+    }
+    try_expr_pratt(p, RANGE_PREC + 1, option)
+}
+
+/// `left..`, `left..end` or `left..=end`, positioned at the first dot.
+fn parse_range_expr(p: &mut Parser, left: NodeIndex, option: ExprOption) -> ParseResult {
+    p.eat_tokens(2);
+    let inclusive = p.eat_token(TokenKind::Eq);
+    let end = try_range_end(p, option)?;
+    let span = p.current_span();
+    let kind = match (inclusive, end.is_null()) {
+        (true, true) => {
             let _ = p.err(
                 ParseErrorKind::InvalidSyntax,
                 p.next_token_span(),
                 "Expected expression after `..=`",
             );
+            NodeKind::RangeFromToInclusive
         }
-        let span = p.current_span();
-        Ok(p.ast()
-            .builder(NodeKind::RangeFromToInclusive, span)
-            .add_child(left)
-            .add_child(end)
-            .build())
-    } else {
-        p.next_token(); // consume second dot
-        let end = try_expr_without_extended_call(p)?;
-        if !end.is_null() {
-            let span = p.current_span();
-            Ok(p.ast()
-                .builder(NodeKind::RangeFromTo, span)
-                .add_child(left)
-                .add_child(end)
-                .build())
-        } else {
-            let span = p.current_span();
-            Ok(p.ast()
+        (true, false) => NodeKind::RangeFromToInclusive,
+        (false, false) => NodeKind::RangeFromTo,
+        (false, true) => {
+            return Ok(p
+                .ast()
                 .builder(NodeKind::RangeFrom, span)
                 .add_child(left)
-                .build())
+                .build());
         }
-    }
+    };
+    Ok(p.ast()
+        .builder(kind, span)
+        .add_child(left)
+        .add_child(end)
+        .build())
 }
 
 fn parse_effect_handling_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
@@ -643,7 +663,11 @@ fn parse_option_propagation_expr(
 fn parse_post_match_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     let _g = p.enter();
     p.expect_token(TokenKind::KwMatch)?;
-    let arms = try_multi_in_block(p, &[Rule::comma_or_semicolon("match arm", try_pattern_arm)])?;
+    let arms = basic::try_required_block(
+        p,
+        "`match`",
+        &[Rule::comma_or_semicolon("match arm", try_pattern_arm)],
+    )?;
     let span = p.current_span();
     let idx = p
         .ast()
@@ -659,9 +683,9 @@ fn parse_matches_expr(p: &mut Parser, left: NodeIndex, option: ExprOption) -> Pa
     p.expect_token(TokenKind::KwMatches)?;
 
     let pat = if option.no_extended_call {
-        pattern::try_pattern_without_extended_call(p)?
+        pattern::try_refutable_pattern_without_extended_call(p)?
     } else {
-        pattern::try_pattern(p)?
+        pattern::try_refutable_pattern(p)?
     };
 
     if pat.is_null() {
@@ -827,13 +851,11 @@ fn try_prefix_range_or_symbol(p: &mut Parser, option: ExprOption) -> ParseResult
     let _g = p.enter();
 
     if p.peek(&[TokenKind::Dot, TokenKind::Dot]) {
-        p.eat_tokens(1); // consume first dot (one is consumed here since peek matched)
-        // Actually we need to eat both dots
-        p.eat_tokens(1); // consume second dot
+        p.eat_tokens(2);
 
         if p.eat_token(TokenKind::Eq) {
             // ..=expr
-            let to = try_expr_with_option(p, option)?;
+            let to = try_range_end(p, option)?;
             if to.is_null() {
                 let _ = p.err(
                     ParseErrorKind::InvalidSyntax,
@@ -850,7 +872,7 @@ fn try_prefix_range_or_symbol(p: &mut Parser, option: ExprOption) -> ParseResult
             return Ok(idx);
         }
 
-        let to = try_expr_with_option(p, option)?;
+        let to = try_range_end(p, option)?;
         if to.is_null() {
             // ..  (full range)
             let span = p.current_span();
@@ -873,13 +895,30 @@ fn try_prefix_range_or_symbol(p: &mut Parser, option: ExprOption) -> ParseResult
 }
 
 fn try_prefix_unary(p: &mut Parser, token_kind: TokenKind, node_kind: NodeKind) -> ParseResult {
+    try_prefix_operator(p, token_kind, node_kind, 0)
+}
+
+/// Arithmetic negation binds above every binary operator: `-a + b` is
+/// `(-a) + b`, while postfix operators still apply first: `-f(x)`.
+fn try_negative(p: &mut Parser) -> ParseResult {
+    try_prefix_operator(p, TokenKind::Minus, NodeKind::Negative, PREFIX_PREC)
+}
+
+const PREFIX_PREC: i32 = 90;
+
+fn try_prefix_operator(
+    p: &mut Parser,
+    token_kind: TokenKind,
+    node_kind: NodeKind,
+    min_prec: i32,
+) -> ParseResult {
     let _g = p.enter();
 
     if !p.eat_token(token_kind) {
         return Ok(NULL);
     }
 
-    let operand = try_expr_without_extended_call(p)?;
+    let operand = try_expr_pratt(p, min_prec, ExprOption::without_extended_call())?;
     if operand.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -1211,7 +1250,7 @@ fn try_single_case_map(p: &mut Parser, _option: ExprOption) -> ParseResult {
         return Ok(NULL);
     }
 
-    let pat = pattern::try_pattern(p)?;
+    let pat = pattern::try_refutable_pattern(p)?;
     if pat.is_null() {
         let _ = p.err_with_label(
             ParseErrorKind::InvalidSyntax,
@@ -1355,11 +1394,12 @@ fn try_fstring(p: &mut Parser) -> ParseResult {
                 break;
             }
             TokenKind::FStringLiteral => {
-                // Intern the raw text of this segment (no surrounding quotes).
+                // Segments keep the quoted source form of String literals, so
+                // escapes and doubled braces are decoded in one place.
                 let seg_span = p.current_span();
-                let raw = p.next_token_text().to_owned();
+                let quoted = format!("\"{}\"", p.next_token_text());
                 p.next_token(); // consume FStringLiteral
-                let str_id = str_interner::intern(&raw);
+                let str_id = str_interner::intern(&quoted);
                 let seg = p
                     .ast()
                     .builder(NodeKind::Str, seg_span)
@@ -1369,6 +1409,14 @@ fn try_fstring(p: &mut Parser) -> ParseResult {
             }
             TokenKind::FStringExprStart => {
                 p.next_token(); // consume `{`
+                if p.peek_token().kind == TokenKind::FStringExprEnd {
+                    let span = p.next_token_span();
+                    p.err(
+                        ParseErrorKind::UnexpectedToken,
+                        span,
+                        "string interpolation `{}` requires an expression",
+                    )?;
+                }
                 // Parse the inner expression.
                 let expr = try_expr(p)?;
                 parts.push(expr);

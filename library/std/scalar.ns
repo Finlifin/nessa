@@ -1,0 +1,864 @@
+-- std.scalar — methods on integer and bool values.
+-- Bit operations use the runtime width: 64 bits for i64, u64, isize and usize,
+-- and 128 bits for i128 and u128. A negative rotate distance is a runtime error.
+-- Distances at or above the width wrap. ilog2 and ilog10 of zero or a negative
+-- value are null. abs_diff returns the unsigned width of its inputs.
+-- wrapping_* keeps the low bits. saturating_* stops at the numeric bounds.
+-- checked_* returns null on overflow. checked_div and checked_rem also return
+-- null when the divisor is zero. Both operands must share a runtime width.
+-- div_euclid and rem_euclid reject a zero divisor. The signed minimum divided
+-- or remaindered by -1 is NumericOverflow. A negative shift or exponent is a
+-- runtime error. checked_shl and checked_shr return null when the distance is
+-- at least the width. checked_pow returns null on overflow. unsigned_abs is
+-- only defined for signed values. wrapping_div and wrapping_rem also reject a
+-- zero divisor, but the signed minimum divided by -1 wraps. saturating_abs,
+-- checked_abs, wrapping_abs, and signum are signed only. checked_ilog returns
+-- null for a non-positive value; a base below 2 is a runtime error.
+-- cast_unsigned and cast_signed keep the bits and change only the sign.
+-- checked_div_euclid and checked_rem_euclid return null for a zero divisor and
+-- for the signed minimum divided by -1. widening_mul is the full 64-bit product
+-- at 128 bits. next_power_of_two is unsigned; overflow is an error, and the
+-- checked form returns null. Zero's next power is 1. A divisor of zero makes
+-- is_multiple_of false.
+-- is_power_of_two is false for zero and for every negative value.
+-- strict_* reports NumericOverflow instead of wrapping or returning null.
+-- A zero divisor is still an error. A negative shift or exponent is an error.
+-- saturating_div and saturating_div_euclid stop at the signed maximum when
+-- the minimum is divided by -1.
+-- div_ceil rounds toward positive infinity. A zero divisor is an error, and
+-- overflow is NumericOverflow. checked_div_ceil returns null for both.
+-- next_multiple_of moves toward the sign of the factor. A zero factor is an
+-- error. to_be_bytes and to_le_bytes list the raw bytes.
+-- saturating_add_signed, wrapping_add_signed, and strict_add_signed take an
+-- unsigned receiver and a same-width signed operand. Saturating stops at 0
+-- and the unsigned maximum. Wrapping keeps the low bits. Strict reports
+-- NumericOverflow. The sub forms use the same rules.
+-- unbounded_shl and unbounded_shr do not wrap the distance. A distance at
+-- least the width yields 0, except a negative value shifted right yields -1.
+-- A negative distance is an error.
+-- i64_min, i64_max, u64_max, i128_min, i128_max, and u128_max are the bounds.
+-- isize_min, isize_max, and usize_max reuse the 64-bit bounds.
+-- highest_one and lowest_one are bit indexes. Zero is null. isolate_* keeps
+-- only that bit, and zero stays zero. bit_width counts the two's-complement
+-- bits, so every negative value uses the full width and zero uses none.
+-- i64_bits is 64, i128_bits and u128_bits are 128, and isize_bits and
+-- usize_bits are 64.
+-- isqrt rounds down. A negative value is an error, and checked_isqrt returns
+-- null. strict_abs is signed only; the minimum is NumericOverflow.
+-- wrapping_div_euclid rounds toward negative infinity and wraps the signed
+-- minimum divided by -1. wrapping_rem_euclid of that pair is 0.
+-- checked_signed_diff subtracts unsigned values into the signed width.
+-- checked_div_exact returns null for a zero divisor, overflow, or a remainder.
+-- strict_div_exact reports a remainder as InvalidArgument("division is not exact").
+-- Exact shifts are reversible. A distance at least the width is null, or
+-- NumericOverflow for the strict form. Lost bits are null, or
+-- InvalidArgument("shift is not exact").
+
+use .builtin.*
+
+const native_count_ones: fn(Any) -> i64 = .count_ones'builtin
+const native_count_zeros: fn(Any) -> i64 = .count_zeros'builtin
+const native_leading_zeros: fn(Any) -> i64 = .leading_zeros'builtin
+const native_trailing_zeros: fn(Any) -> i64 = .trailing_zeros'builtin
+const native_leading_ones: fn(Any) -> i64 = .leading_ones'builtin
+const native_trailing_ones: fn(Any) -> i64 = .trailing_ones'builtin
+const native_reverse_bits: fn(Any) -> Any = .reverse_bits'builtin
+const native_swap_bytes: fn(Any) -> Any = .swap_bytes'builtin
+const native_rotate_left: fn(Any, i64) -> Any = .rotate_left'builtin
+const native_rotate_right: fn(Any, i64) -> Any = .rotate_right'builtin
+const native_is_power_of_two: fn(Any) -> bool = .is_power_of_two'builtin
+const native_ilog2: fn(Any) -> ?i64 = .ilog2'builtin
+const native_ilog10: fn(Any) -> ?i64 = .ilog10'builtin
+const native_abs_diff: fn(Any, Any) -> Any = .abs_diff'builtin
+const native_wrapping_add: fn(Any, Any) -> Any = .wrapping_add'builtin
+const native_wrapping_sub: fn(Any, Any) -> Any = .wrapping_sub'builtin
+const native_wrapping_mul: fn(Any, Any) -> Any = .wrapping_mul'builtin
+const native_wrapping_neg: fn(Any) -> Any = .wrapping_neg'builtin
+const native_saturating_add: fn(Any, Any) -> Any = .saturating_add'builtin
+const native_saturating_sub: fn(Any, Any) -> Any = .saturating_sub'builtin
+const native_saturating_mul: fn(Any, Any) -> Any = .saturating_mul'builtin
+const native_saturating_neg: fn(Any) -> Any = .saturating_neg'builtin
+const native_checked_add: fn(Any, Any) -> Any = .checked_add'builtin
+const native_checked_sub: fn(Any, Any) -> Any = .checked_sub'builtin
+const native_checked_mul: fn(Any, Any) -> Any = .checked_mul'builtin
+const native_checked_div: fn(Any, Any) -> Any = .checked_div'builtin
+const native_checked_rem: fn(Any, Any) -> Any = .checked_rem'builtin
+const native_checked_neg: fn(Any) -> Any = .checked_neg'builtin
+const native_int_div_euclid: fn(Any, Any) -> Any = .int_div_euclid'builtin
+const native_int_rem_euclid: fn(Any, Any) -> Any = .int_rem_euclid'builtin
+const native_unsigned_abs: fn(Any) -> Any = .unsigned_abs'builtin
+const native_int_midpoint: fn(Any, Any) -> Any = .int_midpoint'builtin
+const native_checked_shl: fn(Any, i64) -> Any = .checked_shl'builtin
+const native_checked_shr: fn(Any, i64) -> Any = .checked_shr'builtin
+const native_wrapping_shl: fn(Any, i64) -> Any = .wrapping_shl'builtin
+const native_wrapping_shr: fn(Any, i64) -> Any = .wrapping_shr'builtin
+const native_checked_pow: fn(Any, i64) -> Any = .checked_pow'builtin
+const native_wrapping_pow: fn(Any, i64) -> Any = .wrapping_pow'builtin
+const native_saturating_pow: fn(Any, i64) -> Any = .saturating_pow'builtin
+const native_wrapping_div: fn(Any, Any) -> Any = .wrapping_div'builtin
+const native_wrapping_rem: fn(Any, Any) -> Any = .wrapping_rem'builtin
+const native_saturating_abs: fn(Any) -> Any = .saturating_abs'builtin
+const native_checked_abs: fn(Any) -> Any = .checked_abs'builtin
+const native_wrapping_abs: fn(Any) -> Any = .wrapping_abs'builtin
+const native_int_signum: fn(Any) -> i64 = .int_signum'builtin
+const native_checked_ilog: fn(Any, i64) -> Any = .checked_ilog'builtin
+const native_cast_unsigned: fn(Any) -> Any = .cast_unsigned'builtin
+const native_cast_signed: fn(Any) -> Any = .cast_signed'builtin
+const native_from_bits: fn(u64) -> f64 = .from_bits'builtin
+const native_checked_div_euclid: fn(Any, Any) -> Any = .checked_div_euclid'builtin
+const native_checked_rem_euclid: fn(Any, Any) -> Any = .checked_rem_euclid'builtin
+const native_widening_mul: fn(Any, Any) -> Any = .widening_mul'builtin
+const native_next_power_of_two: fn(Any) -> Any = .next_power_of_two'builtin
+const native_checked_next_power_of_two: fn(Any) -> Any = .checked_next_power_of_two'builtin
+const native_checked_add_signed: fn(Any, Any) -> Any = .checked_add_signed'builtin
+const native_checked_sub_signed: fn(Any, Any) -> Any = .checked_sub_signed'builtin
+const native_saturating_add_signed: fn(Any, Any) -> Any = .saturating_add_signed'builtin
+const native_saturating_sub_signed: fn(Any, Any) -> Any = .saturating_sub_signed'builtin
+const native_wrapping_add_signed: fn(Any, Any) -> Any = .wrapping_add_signed'builtin
+const native_wrapping_sub_signed: fn(Any, Any) -> Any = .wrapping_sub_signed'builtin
+const native_strict_add_signed: fn(Any, Any) -> Any = .strict_add_signed'builtin
+const native_strict_sub_signed: fn(Any, Any) -> Any = .strict_sub_signed'builtin
+const native_unbounded_shl: fn(Any, i64) -> Any = .unbounded_shl'builtin
+const native_unbounded_shr: fn(Any, i64) -> Any = .unbounded_shr'builtin
+const native_highest_one: fn(Any) -> Any = .highest_one'builtin
+const native_lowest_one: fn(Any) -> Any = .lowest_one'builtin
+const native_isolate_highest_one: fn(Any) -> Any = .isolate_highest_one'builtin
+const native_isolate_lowest_one: fn(Any) -> Any = .isolate_lowest_one'builtin
+const native_int_bit_width: fn(Any) -> i64 = .int_bit_width'builtin
+const native_int_isqrt: fn(Any) -> Any = .isqrt'builtin
+const native_checked_int_isqrt: fn(Any) -> Any = .checked_isqrt'builtin
+const native_strict_abs: fn(Any) -> Any = .strict_abs'builtin
+const native_wrapping_div_euclid: fn(Any, Any) -> Any = .wrapping_div_euclid'builtin
+const native_wrapping_rem_euclid: fn(Any, Any) -> Any = .wrapping_rem_euclid'builtin
+const native_checked_signed_diff: fn(Any, Any) -> Any = .checked_signed_diff'builtin
+const native_checked_div_exact: fn(Any, Any) -> Any = .checked_div_exact'builtin
+const native_strict_div_exact: fn(Any, Any) -> Any = .strict_div_exact'builtin
+const native_checked_shl_exact: fn(Any, i64) -> Any = .checked_shl_exact'builtin
+const native_strict_shl_exact: fn(Any, i64) -> Any = .strict_shl_exact'builtin
+const native_checked_shr_exact: fn(Any, i64) -> Any = .checked_shr_exact'builtin
+const native_strict_shr_exact: fn(Any, i64) -> Any = .strict_shr_exact'builtin
+const native_is_multiple_of: fn(Any, Any) -> bool = .is_multiple_of'builtin
+const native_strict_add: fn(Any, Any) -> Any = .strict_add'builtin
+const native_strict_sub: fn(Any, Any) -> Any = .strict_sub'builtin
+const native_strict_mul: fn(Any, Any) -> Any = .strict_mul'builtin
+const native_strict_div: fn(Any, Any) -> Any = .strict_div'builtin
+const native_strict_rem: fn(Any, Any) -> Any = .strict_rem'builtin
+const native_strict_neg: fn(Any) -> Any = .strict_neg'builtin
+const native_strict_shl: fn(Any, i64) -> Any = .strict_shl'builtin
+const native_strict_shr: fn(Any, i64) -> Any = .strict_shr'builtin
+const native_strict_pow: fn(Any, i64) -> Any = .strict_pow'builtin
+const native_saturating_div: fn(Any, Any) -> Any = .saturating_div'builtin
+const native_saturating_div_euclid: fn(Any, Any) -> Any = .saturating_div_euclid'builtin
+const native_checked_add_unsigned: fn(Any, Any) -> Any = .checked_add_unsigned'builtin
+const native_checked_sub_unsigned: fn(Any, Any) -> Any = .checked_sub_unsigned'builtin
+const native_saturating_add_unsigned: fn(Any, Any) -> Any = .saturating_add_unsigned'builtin
+const native_saturating_sub_unsigned: fn(Any, Any) -> Any = .saturating_sub_unsigned'builtin
+const native_wrapping_add_unsigned: fn(Any, Any) -> Any = .wrapping_add_unsigned'builtin
+const native_wrapping_sub_unsigned: fn(Any, Any) -> Any = .wrapping_sub_unsigned'builtin
+const native_strict_add_unsigned: fn(Any, Any) -> Any = .strict_add_unsigned'builtin
+const native_strict_sub_unsigned: fn(Any, Any) -> Any = .strict_sub_unsigned'builtin
+const native_int_to_str_radix: fn(Any, i64) -> String = .int_to_str_radix'builtin
+const native_i64_from_str_radix: fn(String, i64) -> Any = .i64_from_str_radix'builtin
+const native_u64_from_str_radix: fn(String, i64) -> Any = .u64_from_str_radix'builtin
+const native_i128_from_str_radix: fn(String, i64) -> Any = .i128_from_str_radix'builtin
+const native_u128_from_str_radix: fn(String, i64) -> Any = .u128_from_str_radix'builtin
+const native_div_ceil: fn(Any, Any) -> Any = .div_ceil'builtin
+const native_checked_div_ceil: fn(Any, Any) -> Any = .checked_div_ceil'builtin
+const native_div_floor: fn(Any, Any) -> Any = .div_floor'builtin
+const native_checked_div_floor: fn(Any, Any) -> Any = .checked_div_floor'builtin
+const native_int_gcd: fn(Any, Any) -> Any = .int_gcd'builtin
+const native_int_lcm: fn(Any, Any) -> Any = .int_lcm'builtin
+const native_checked_int_lcm: fn(Any, Any) -> Any = .checked_int_lcm'builtin
+const native_next_multiple_of: fn(Any, Any) -> Any = .next_multiple_of'builtin
+const native_checked_next_multiple_of: fn(Any, Any) -> Any = .checked_next_multiple_of'builtin
+const native_to_be_bytes: fn(Any) -> List = .int_to_be_bytes'builtin
+const native_to_le_bytes: fn(Any) -> List = .int_to_le_bytes'builtin
+const native_i64_from_be_bytes: fn(List) -> Any = .i64_from_be_bytes'builtin
+const native_i64_from_le_bytes: fn(List) -> Any = .i64_from_le_bytes'builtin
+const native_u64_from_be_bytes: fn(List) -> Any = .u64_from_be_bytes'builtin
+const native_u64_from_le_bytes: fn(List) -> Any = .u64_from_le_bytes'builtin
+const native_i128_from_be_bytes: fn(List) -> Any = .i128_from_be_bytes'builtin
+const native_i128_from_le_bytes: fn(List) -> Any = .i128_from_le_bytes'builtin
+const native_u128_from_be_bytes: fn(List) -> Any = .u128_from_be_bytes'builtin
+const native_u128_from_le_bytes: fn(List) -> Any = .u128_from_le_bytes'builtin
+
+fn optional_i64(value: Any) -> ?i64 { if value == null { null } else { value.as(i64) } }
+fn optional_u64(value: Any) -> ?u64 { if value == null { null } else { value.as(u64) } }
+fn optional_i128(value: Any) -> ?i128 { if value == null { null } else { value.as(i128) } }
+fn optional_u128(value: Any) -> ?u128 { if value == null { null } else { value.as(u128) } }
+fn optional_isize(value: Any) -> ?isize { if value == null { null } else { value.as(isize) } }
+fn optional_usize(value: Any) -> ?usize { if value == null { null } else { value.as(usize) } }
+
+-- A radix outside 2..=36 is a runtime error. Malformed text, a bad sign, or overflow is null.
+pub fn i64_from_str_radix(text: String, radix: i64) -> ?i64 { optional_i64(native_i64_from_str_radix(text, radix)) }
+pub fn u64_from_str_radix(text: String, radix: i64) -> ?u64 { optional_u64(native_u64_from_str_radix(text, radix)) }
+pub fn i128_from_str_radix(text: String, radix: i64) -> ?i128 { optional_i128(native_i128_from_str_radix(text, radix)) }
+pub fn u128_from_str_radix(text: String, radix: i64) -> ?u128 { optional_u128(native_u128_from_str_radix(text, radix)) }
+pub fn isize_from_str_radix(text: String, radix: i64) -> ?isize { optional_isize(native_i64_from_str_radix(text, radix)) }
+pub fn usize_from_str_radix(text: String, radix: i64) -> ?usize { optional_usize(native_u64_from_str_radix(text, radix)) }
+
+-- The list must contain 8 bytes for a 64-bit value, or 16 bytes for a 128-bit value.
+pub fn i64_from_be_bytes(bytes: List) -> i64 { native_i64_from_be_bytes(bytes).as(i64) }
+pub fn i64_from_le_bytes(bytes: List) -> i64 { native_i64_from_le_bytes(bytes).as(i64) }
+pub fn u64_from_be_bytes(bytes: List) -> u64 { native_u64_from_be_bytes(bytes).as(u64) }
+pub fn u64_from_le_bytes(bytes: List) -> u64 { native_u64_from_le_bytes(bytes).as(u64) }
+pub fn i128_from_be_bytes(bytes: List) -> i128 { native_i128_from_be_bytes(bytes).as(i128) }
+pub fn i128_from_le_bytes(bytes: List) -> i128 { native_i128_from_le_bytes(bytes).as(i128) }
+pub fn u128_from_be_bytes(bytes: List) -> u128 { native_u128_from_be_bytes(bytes).as(u128) }
+pub fn u128_from_le_bytes(bytes: List) -> u128 { native_u128_from_le_bytes(bytes).as(u128) }
+pub fn isize_from_be_bytes(bytes: List) -> isize { native_i64_from_be_bytes(bytes).as(isize) }
+pub fn isize_from_le_bytes(bytes: List) -> isize { native_i64_from_le_bytes(bytes).as(isize) }
+pub fn usize_from_be_bytes(bytes: List) -> usize { native_u64_from_be_bytes(bytes).as(usize) }
+pub fn usize_from_le_bytes(bytes: List) -> usize { native_u64_from_le_bytes(bytes).as(usize) }
+
+pub const i64_min: fn() -> i64 = .i64_min'builtin
+pub const i64_max: fn() -> i64 = .i64_max'builtin
+pub const u64_max: fn() -> u64 = .u64_max'builtin
+pub const i128_min: fn() -> i128 = .i128_min'builtin
+pub const i128_max: fn() -> i128 = .i128_max'builtin
+pub const u128_max: fn() -> u128 = .u128_max'builtin
+pub fn isize_min() -> isize { i64_min().as(isize) }
+pub fn isize_max() -> isize { i64_max().as(isize) }
+pub fn usize_max() -> usize { u64_max().as(usize) }
+pub const i64_bits: fn() -> i64 = .i64_bits'builtin
+pub const i128_bits: fn() -> i64 = .i128_bits'builtin
+pub const isize_bits: fn() -> i64 = .isize_bits'builtin
+pub const u128_bits: fn() -> i64 = .u128_bits'builtin
+pub const usize_bits: fn() -> i64 = .usize_bits'builtin
+
+const native_bool_not: fn(bool) -> bool = .bool_not'builtin
+const native_bool_and: fn(bool, bool) -> bool = .bool_and'builtin
+const native_bool_or: fn(bool, bool) -> bool = .bool_or'builtin
+const native_bool_xor: fn(bool, bool) -> bool = .bool_xor'builtin
+const native_bool_then: fn(bool, Any) -> Any = .bool_then'builtin
+
+impl bool {
+    pub fn to_i64(self) -> i64 { if self { 1 } else { 0 } }
+    pub fn negate(self) -> bool { native_bool_not(self) }
+    -- Both arguments are evaluated. Named to avoid the `and`/`or` keywords.
+    pub fn bitand(self, other: bool) -> bool { native_bool_and(self, other) }
+    pub fn bitor(self, other: bool) -> bool { native_bool_or(self, other) }
+    pub fn xor(self, other: bool) -> bool { native_bool_xor(self, other) }
+    -- True yields `value`. False yields null.
+    pub fn then(self, value: Any) -> Any { native_bool_then(self, value) }
+}
+
+impl i64 {
+    pub fn is_zero(self) -> bool { self == 0 }
+    pub fn is_negative(self) -> bool { self < 0 }
+    pub fn is_positive(self) -> bool { self > 0 }
+    pub fn count_ones(self) -> i64 { native_count_ones(self) }
+    pub fn count_zeros(self) -> i64 { native_count_zeros(self) }
+    pub fn leading_zeros(self) -> i64 { native_leading_zeros(self) }
+    pub fn trailing_zeros(self) -> i64 { native_trailing_zeros(self) }
+    pub fn leading_ones(self) -> i64 { native_leading_ones(self) }
+    pub fn trailing_ones(self) -> i64 { native_trailing_ones(self) }
+    pub fn reverse_bits(self) -> i64 { native_reverse_bits(self).as(i64) }
+    pub fn swap_bytes(self) -> i64 { native_swap_bytes(self).as(i64) }
+    pub fn rotate_left(self, distance: i64) -> i64 { native_rotate_left(self, distance).as(i64) }
+    pub fn rotate_right(self, distance: i64) -> i64 { native_rotate_right(self, distance).as(i64) }
+    pub fn is_power_of_two(self) -> bool { native_is_power_of_two(self) }
+    pub fn ilog2(self) -> ?i64 { native_ilog2(self) }
+    pub fn ilog10(self) -> ?i64 { native_ilog10(self) }
+    pub fn abs_diff(self, other: i64) -> u64 { native_abs_diff(self, other).as(u64) }
+    pub fn wrapping_add(self, other: i64) -> i64 { native_wrapping_add(self, other).as(i64) }
+    pub fn wrapping_sub(self, other: i64) -> i64 { native_wrapping_sub(self, other).as(i64) }
+    pub fn wrapping_mul(self, other: i64) -> i64 { native_wrapping_mul(self, other).as(i64) }
+    pub fn wrapping_neg(self) -> i64 { native_wrapping_neg(self).as(i64) }
+    pub fn saturating_add(self, other: i64) -> i64 { native_saturating_add(self, other).as(i64) }
+    pub fn saturating_sub(self, other: i64) -> i64 { native_saturating_sub(self, other).as(i64) }
+    pub fn saturating_mul(self, other: i64) -> i64 { native_saturating_mul(self, other).as(i64) }
+    pub fn saturating_neg(self) -> i64 { native_saturating_neg(self).as(i64) }
+    pub fn checked_add(self, other: i64) -> ?i64 { optional_i64(native_checked_add(self, other)) }
+    pub fn checked_sub(self, other: i64) -> ?i64 { optional_i64(native_checked_sub(self, other)) }
+    pub fn checked_mul(self, other: i64) -> ?i64 { optional_i64(native_checked_mul(self, other)) }
+    pub fn checked_div(self, other: i64) -> ?i64 { optional_i64(native_checked_div(self, other)) }
+    pub fn checked_rem(self, other: i64) -> ?i64 { optional_i64(native_checked_rem(self, other)) }
+    pub fn checked_neg(self) -> ?i64 { optional_i64(native_checked_neg(self)) }
+    pub fn div_euclid(self, other: i64) -> i64 { native_int_div_euclid(self, other).as(i64) }
+    pub fn rem_euclid(self, other: i64) -> i64 { native_int_rem_euclid(self, other).as(i64) }
+    pub fn unsigned_abs(self) -> u64 { native_unsigned_abs(self).as(u64) }
+    pub fn midpoint(self, other: i64) -> i64 { native_int_midpoint(self, other).as(i64) }
+    pub fn checked_shl(self, distance: i64) -> ?i64 { optional_i64(native_checked_shl(self, distance)) }
+    pub fn checked_shr(self, distance: i64) -> ?i64 { optional_i64(native_checked_shr(self, distance)) }
+    pub fn wrapping_shl(self, distance: i64) -> i64 { native_wrapping_shl(self, distance).as(i64) }
+    pub fn wrapping_shr(self, distance: i64) -> i64 { native_wrapping_shr(self, distance).as(i64) }
+    pub fn checked_pow(self, exponent: i64) -> ?i64 { optional_i64(native_checked_pow(self, exponent)) }
+    pub fn wrapping_pow(self, exponent: i64) -> i64 { native_wrapping_pow(self, exponent).as(i64) }
+    pub fn saturating_pow(self, exponent: i64) -> i64 { native_saturating_pow(self, exponent).as(i64) }
+    pub fn wrapping_div(self, other: i64) -> i64 { native_wrapping_div(self, other).as(i64) }
+    pub fn wrapping_rem(self, other: i64) -> i64 { native_wrapping_rem(self, other).as(i64) }
+    pub fn saturating_abs(self) -> i64 { native_saturating_abs(self).as(i64) }
+    pub fn checked_abs(self) -> ?i64 { optional_i64(native_checked_abs(self)) }
+    pub fn wrapping_abs(self) -> i64 { native_wrapping_abs(self).as(i64) }
+    pub fn signum(self) -> i64 { native_int_signum(self) }
+    pub fn checked_ilog(self, base: i64) -> ?i64 { optional_i64(native_checked_ilog(self, base)) }
+    pub fn cast_unsigned(self) -> u64 { native_cast_unsigned(self).as(u64) }
+    pub fn checked_div_euclid(self, other: i64) -> ?i64 { optional_i64(native_checked_div_euclid(self, other)) }
+    pub fn checked_rem_euclid(self, other: i64) -> ?i64 { optional_i64(native_checked_rem_euclid(self, other)) }
+    pub fn widening_mul(self, other: i64) -> i128 { native_widening_mul(self, other).as(i128) }
+    pub fn is_multiple_of(self, other: i64) -> bool { native_is_multiple_of(self, other) }
+    pub fn strict_add(self, other: i64) -> i64 { native_strict_add(self, other).as(i64) }
+    pub fn strict_sub(self, other: i64) -> i64 { native_strict_sub(self, other).as(i64) }
+    pub fn strict_mul(self, other: i64) -> i64 { native_strict_mul(self, other).as(i64) }
+    pub fn strict_div(self, other: i64) -> i64 { native_strict_div(self, other).as(i64) }
+    pub fn strict_rem(self, other: i64) -> i64 { native_strict_rem(self, other).as(i64) }
+    pub fn strict_neg(self) -> i64 { native_strict_neg(self).as(i64) }
+    pub fn strict_shl(self, distance: i64) -> i64 { native_strict_shl(self, distance).as(i64) }
+    pub fn strict_shr(self, distance: i64) -> i64 { native_strict_shr(self, distance).as(i64) }
+    pub fn unbounded_shl(self, distance: i64) -> i64 { native_unbounded_shl(self, distance).as(i64) }
+    pub fn unbounded_shr(self, distance: i64) -> i64 { native_unbounded_shr(self, distance).as(i64) }
+    pub fn highest_one(self) -> ?i64 { optional_i64(native_highest_one(self)) }
+    pub fn lowest_one(self) -> ?i64 { optional_i64(native_lowest_one(self)) }
+    pub fn isolate_highest_one(self) -> i64 { native_isolate_highest_one(self).as(i64) }
+    pub fn isolate_lowest_one(self) -> i64 { native_isolate_lowest_one(self).as(i64) }
+    pub fn bit_width(self) -> i64 { native_int_bit_width(self) }
+    pub fn isqrt(self) -> i64 { native_int_isqrt(self).as(i64) }
+    pub fn checked_isqrt(self) -> ?i64 { optional_i64(native_checked_int_isqrt(self)) }
+    pub fn strict_abs(self) -> i64 { native_strict_abs(self).as(i64) }
+    pub fn wrapping_div_euclid(self, other: i64) -> i64 { native_wrapping_div_euclid(self, other).as(i64) }
+    pub fn wrapping_rem_euclid(self, other: i64) -> i64 { native_wrapping_rem_euclid(self, other).as(i64) }
+    pub fn checked_div_exact(self, other: i64) -> ?i64 { optional_i64(native_checked_div_exact(self, other)) }
+    pub fn strict_div_exact(self, other: i64) -> i64 { native_strict_div_exact(self, other).as(i64) }
+    pub fn checked_shl_exact(self, distance: i64) -> ?i64 { optional_i64(native_checked_shl_exact(self, distance)) }
+    pub fn strict_shl_exact(self, distance: i64) -> i64 { native_strict_shl_exact(self, distance).as(i64) }
+    pub fn checked_shr_exact(self, distance: i64) -> ?i64 { optional_i64(native_checked_shr_exact(self, distance)) }
+    pub fn strict_shr_exact(self, distance: i64) -> i64 { native_strict_shr_exact(self, distance).as(i64) }
+    pub fn strict_pow(self, exponent: i64) -> i64 { native_strict_pow(self, exponent).as(i64) }
+    pub fn saturating_div(self, other: i64) -> i64 { native_saturating_div(self, other).as(i64) }
+    pub fn saturating_div_euclid(self, other: i64) -> i64 { native_saturating_div_euclid(self, other).as(i64) }
+    pub fn checked_add_unsigned(self, other: u64) -> ?i64 { optional_i64(native_checked_add_unsigned(self, other)) }
+    pub fn checked_sub_unsigned(self, other: u64) -> ?i64 { optional_i64(native_checked_sub_unsigned(self, other)) }
+    pub fn saturating_add_unsigned(self, other: u64) -> i64 { native_saturating_add_unsigned(self, other).as(i64) }
+    pub fn saturating_sub_unsigned(self, other: u64) -> i64 { native_saturating_sub_unsigned(self, other).as(i64) }
+    pub fn wrapping_add_unsigned(self, other: u64) -> i64 { native_wrapping_add_unsigned(self, other).as(i64) }
+    pub fn wrapping_sub_unsigned(self, other: u64) -> i64 { native_wrapping_sub_unsigned(self, other).as(i64) }
+    pub fn strict_add_unsigned(self, other: u64) -> i64 { native_strict_add_unsigned(self, other).as(i64) }
+    pub fn strict_sub_unsigned(self, other: u64) -> i64 { native_strict_sub_unsigned(self, other).as(i64) }
+    pub fn to_str_radix(self, radix: i64) -> String { native_int_to_str_radix(self, radix) }
+    pub fn div_ceil(self, other: i64) -> i64 { native_div_ceil(self, other).as(i64) }
+    pub fn checked_div_ceil(self, other: i64) -> ?i64 { optional_i64(native_checked_div_ceil(self, other)) }
+    pub fn div_floor(self, other: i64) -> i64 { native_div_floor(self, other).as(i64) }
+    pub fn checked_div_floor(self, other: i64) -> ?i64 { optional_i64(native_checked_div_floor(self, other)) }
+    pub fn gcd(self, other: i64) -> u64 { native_int_gcd(self, other).as(u64) }
+    pub fn lcm(self, other: i64) -> u64 { native_int_lcm(self, other).as(u64) }
+    pub fn checked_lcm(self, other: i64) -> ?u64 { optional_u64(native_checked_int_lcm(self, other)) }
+    pub fn next_multiple_of(self, other: i64) -> i64 { native_next_multiple_of(self, other).as(i64) }
+    pub fn checked_next_multiple_of(self, other: i64) -> ?i64 { optional_i64(native_checked_next_multiple_of(self, other)) }
+    pub fn to_be_bytes(self) -> List { native_to_be_bytes(self) }
+    pub fn to_le_bytes(self) -> List { native_to_le_bytes(self) }
+}
+
+impl u64 {
+    pub fn is_zero(self) -> bool { self == 0 }
+    pub fn count_ones(self) -> i64 { native_count_ones(self) }
+    pub fn count_zeros(self) -> i64 { native_count_zeros(self) }
+    pub fn leading_zeros(self) -> i64 { native_leading_zeros(self) }
+    pub fn trailing_zeros(self) -> i64 { native_trailing_zeros(self) }
+    pub fn leading_ones(self) -> i64 { native_leading_ones(self) }
+    pub fn trailing_ones(self) -> i64 { native_trailing_ones(self) }
+    pub fn reverse_bits(self) -> u64 { native_reverse_bits(self).as(u64) }
+    pub fn swap_bytes(self) -> u64 { native_swap_bytes(self).as(u64) }
+    pub fn rotate_left(self, distance: i64) -> u64 { native_rotate_left(self, distance).as(u64) }
+    pub fn rotate_right(self, distance: i64) -> u64 { native_rotate_right(self, distance).as(u64) }
+    pub fn is_power_of_two(self) -> bool { native_is_power_of_two(self) }
+    pub fn ilog2(self) -> ?i64 { native_ilog2(self) }
+    pub fn ilog10(self) -> ?i64 { native_ilog10(self) }
+    pub fn abs_diff(self, other: u64) -> u64 { native_abs_diff(self, other).as(u64) }
+    pub fn wrapping_add(self, other: u64) -> u64 { native_wrapping_add(self, other).as(u64) }
+    pub fn wrapping_sub(self, other: u64) -> u64 { native_wrapping_sub(self, other).as(u64) }
+    pub fn wrapping_mul(self, other: u64) -> u64 { native_wrapping_mul(self, other).as(u64) }
+    pub fn wrapping_neg(self) -> u64 { native_wrapping_neg(self).as(u64) }
+    pub fn saturating_add(self, other: u64) -> u64 { native_saturating_add(self, other).as(u64) }
+    pub fn saturating_sub(self, other: u64) -> u64 { native_saturating_sub(self, other).as(u64) }
+    pub fn saturating_mul(self, other: u64) -> u64 { native_saturating_mul(self, other).as(u64) }
+    pub fn saturating_neg(self) -> u64 { native_saturating_neg(self).as(u64) }
+    pub fn checked_add(self, other: u64) -> ?u64 { optional_u64(native_checked_add(self, other)) }
+    pub fn checked_sub(self, other: u64) -> ?u64 { optional_u64(native_checked_sub(self, other)) }
+    pub fn checked_mul(self, other: u64) -> ?u64 { optional_u64(native_checked_mul(self, other)) }
+    pub fn checked_div(self, other: u64) -> ?u64 { optional_u64(native_checked_div(self, other)) }
+    pub fn checked_rem(self, other: u64) -> ?u64 { optional_u64(native_checked_rem(self, other)) }
+    pub fn checked_neg(self) -> ?u64 { optional_u64(native_checked_neg(self)) }
+    pub fn div_euclid(self, other: u64) -> u64 { native_int_div_euclid(self, other).as(u64) }
+    pub fn rem_euclid(self, other: u64) -> u64 { native_int_rem_euclid(self, other).as(u64) }
+    pub fn midpoint(self, other: u64) -> u64 { native_int_midpoint(self, other).as(u64) }
+    pub fn checked_shl(self, distance: i64) -> ?u64 { optional_u64(native_checked_shl(self, distance)) }
+    pub fn checked_shr(self, distance: i64) -> ?u64 { optional_u64(native_checked_shr(self, distance)) }
+    pub fn wrapping_shl(self, distance: i64) -> u64 { native_wrapping_shl(self, distance).as(u64) }
+    pub fn wrapping_shr(self, distance: i64) -> u64 { native_wrapping_shr(self, distance).as(u64) }
+    pub fn checked_pow(self, exponent: i64) -> ?u64 { optional_u64(native_checked_pow(self, exponent)) }
+    pub fn wrapping_pow(self, exponent: i64) -> u64 { native_wrapping_pow(self, exponent).as(u64) }
+    pub fn saturating_pow(self, exponent: i64) -> u64 { native_saturating_pow(self, exponent).as(u64) }
+    pub fn wrapping_div(self, other: u64) -> u64 { native_wrapping_div(self, other).as(u64) }
+    pub fn wrapping_rem(self, other: u64) -> u64 { native_wrapping_rem(self, other).as(u64) }
+    pub fn checked_ilog(self, base: i64) -> ?i64 { optional_i64(native_checked_ilog(self, base)) }
+    pub fn cast_signed(self) -> i64 { native_cast_signed(self).as(i64) }
+    pub fn f64_from_bits(self) -> f64 { native_from_bits(self) }
+    pub fn checked_div_euclid(self, other: u64) -> ?u64 { optional_u64(native_checked_div_euclid(self, other)) }
+    pub fn checked_rem_euclid(self, other: u64) -> ?u64 { optional_u64(native_checked_rem_euclid(self, other)) }
+    pub fn widening_mul(self, other: u64) -> u128 { native_widening_mul(self, other).as(u128) }
+    pub fn next_power_of_two(self) -> u64 { native_next_power_of_two(self).as(u64) }
+    pub fn checked_next_power_of_two(self) -> ?u64 { optional_u64(native_checked_next_power_of_two(self)) }
+    pub fn checked_add_signed(self, other: i64) -> ?u64 { optional_u64(native_checked_add_signed(self, other)) }
+    pub fn checked_sub_signed(self, other: i64) -> ?u64 { optional_u64(native_checked_sub_signed(self, other)) }
+    pub fn saturating_add_signed(self, other: i64) -> u64 { native_saturating_add_signed(self, other).as(u64) }
+    pub fn saturating_sub_signed(self, other: i64) -> u64 { native_saturating_sub_signed(self, other).as(u64) }
+    pub fn wrapping_add_signed(self, other: i64) -> u64 { native_wrapping_add_signed(self, other).as(u64) }
+    pub fn wrapping_sub_signed(self, other: i64) -> u64 { native_wrapping_sub_signed(self, other).as(u64) }
+    pub fn strict_add_signed(self, other: i64) -> u64 { native_strict_add_signed(self, other).as(u64) }
+    pub fn strict_sub_signed(self, other: i64) -> u64 { native_strict_sub_signed(self, other).as(u64) }
+    pub fn unbounded_shl(self, distance: i64) -> u64 { native_unbounded_shl(self, distance).as(u64) }
+    pub fn unbounded_shr(self, distance: i64) -> u64 { native_unbounded_shr(self, distance).as(u64) }
+    pub fn highest_one(self) -> ?i64 { optional_i64(native_highest_one(self)) }
+    pub fn lowest_one(self) -> ?i64 { optional_i64(native_lowest_one(self)) }
+    pub fn isolate_highest_one(self) -> u64 { native_isolate_highest_one(self).as(u64) }
+    pub fn isolate_lowest_one(self) -> u64 { native_isolate_lowest_one(self).as(u64) }
+    pub fn bit_width(self) -> i64 { native_int_bit_width(self) }
+    pub fn isqrt(self) -> u64 { native_int_isqrt(self).as(u64) }
+    pub fn checked_isqrt(self) -> ?u64 { optional_u64(native_checked_int_isqrt(self)) }
+    pub fn wrapping_div_euclid(self, other: u64) -> u64 { native_wrapping_div_euclid(self, other).as(u64) }
+    pub fn wrapping_rem_euclid(self, other: u64) -> u64 { native_wrapping_rem_euclid(self, other).as(u64) }
+    pub fn checked_signed_diff(self, other: u64) -> ?i64 { optional_i64(native_checked_signed_diff(self, other)) }
+    pub fn checked_div_exact(self, other: u64) -> ?u64 { optional_u64(native_checked_div_exact(self, other)) }
+    pub fn strict_div_exact(self, other: u64) -> u64 { native_strict_div_exact(self, other).as(u64) }
+    pub fn checked_shl_exact(self, distance: i64) -> ?u64 { optional_u64(native_checked_shl_exact(self, distance)) }
+    pub fn strict_shl_exact(self, distance: i64) -> u64 { native_strict_shl_exact(self, distance).as(u64) }
+    pub fn checked_shr_exact(self, distance: i64) -> ?u64 { optional_u64(native_checked_shr_exact(self, distance)) }
+    pub fn strict_shr_exact(self, distance: i64) -> u64 { native_strict_shr_exact(self, distance).as(u64) }
+    pub fn is_multiple_of(self, other: u64) -> bool { native_is_multiple_of(self, other) }
+    pub fn strict_add(self, other: u64) -> u64 { native_strict_add(self, other).as(u64) }
+    pub fn strict_sub(self, other: u64) -> u64 { native_strict_sub(self, other).as(u64) }
+    pub fn strict_mul(self, other: u64) -> u64 { native_strict_mul(self, other).as(u64) }
+    pub fn strict_div(self, other: u64) -> u64 { native_strict_div(self, other).as(u64) }
+    pub fn strict_rem(self, other: u64) -> u64 { native_strict_rem(self, other).as(u64) }
+    pub fn strict_neg(self) -> u64 { native_strict_neg(self).as(u64) }
+    pub fn strict_shl(self, distance: i64) -> u64 { native_strict_shl(self, distance).as(u64) }
+    pub fn strict_shr(self, distance: i64) -> u64 { native_strict_shr(self, distance).as(u64) }
+    pub fn strict_pow(self, exponent: i64) -> u64 { native_strict_pow(self, exponent).as(u64) }
+    pub fn saturating_div(self, other: u64) -> u64 { native_saturating_div(self, other).as(u64) }
+    pub fn saturating_div_euclid(self, other: u64) -> u64 { native_saturating_div_euclid(self, other).as(u64) }
+    pub fn to_str_radix(self, radix: i64) -> String { native_int_to_str_radix(self, radix) }
+    pub fn div_ceil(self, other: u64) -> u64 { native_div_ceil(self, other).as(u64) }
+    pub fn checked_div_ceil(self, other: u64) -> ?u64 { optional_u64(native_checked_div_ceil(self, other)) }
+    pub fn div_floor(self, other: u64) -> u64 { native_div_floor(self, other).as(u64) }
+    pub fn checked_div_floor(self, other: u64) -> ?u64 { optional_u64(native_checked_div_floor(self, other)) }
+    pub fn gcd(self, other: u64) -> u64 { native_int_gcd(self, other).as(u64) }
+    pub fn lcm(self, other: u64) -> u64 { native_int_lcm(self, other).as(u64) }
+    pub fn checked_lcm(self, other: u64) -> ?u64 { optional_u64(native_checked_int_lcm(self, other)) }
+    pub fn next_multiple_of(self, other: u64) -> u64 { native_next_multiple_of(self, other).as(u64) }
+    pub fn checked_next_multiple_of(self, other: u64) -> ?u64 { optional_u64(native_checked_next_multiple_of(self, other)) }
+    pub fn to_be_bytes(self) -> List { native_to_be_bytes(self) }
+    pub fn to_le_bytes(self) -> List { native_to_le_bytes(self) }
+}
+
+impl i128 {
+    pub fn is_zero(self) -> bool { self == 0 }
+    pub fn is_negative(self) -> bool { self < 0 }
+    pub fn is_positive(self) -> bool { self > 0 }
+    pub fn count_ones(self) -> i64 { native_count_ones(self) }
+    pub fn count_zeros(self) -> i64 { native_count_zeros(self) }
+    pub fn leading_zeros(self) -> i64 { native_leading_zeros(self) }
+    pub fn trailing_zeros(self) -> i64 { native_trailing_zeros(self) }
+    pub fn leading_ones(self) -> i64 { native_leading_ones(self) }
+    pub fn trailing_ones(self) -> i64 { native_trailing_ones(self) }
+    pub fn reverse_bits(self) -> i128 { native_reverse_bits(self).as(i128) }
+    pub fn swap_bytes(self) -> i128 { native_swap_bytes(self).as(i128) }
+    pub fn rotate_left(self, distance: i64) -> i128 { native_rotate_left(self, distance).as(i128) }
+    pub fn rotate_right(self, distance: i64) -> i128 { native_rotate_right(self, distance).as(i128) }
+    pub fn is_power_of_two(self) -> bool { native_is_power_of_two(self) }
+    pub fn ilog2(self) -> ?i64 { native_ilog2(self) }
+    pub fn ilog10(self) -> ?i64 { native_ilog10(self) }
+    pub fn abs_diff(self, other: i128) -> u128 { native_abs_diff(self, other).as(u128) }
+    pub fn wrapping_add(self, other: i128) -> i128 { native_wrapping_add(self, other).as(i128) }
+    pub fn wrapping_sub(self, other: i128) -> i128 { native_wrapping_sub(self, other).as(i128) }
+    pub fn wrapping_mul(self, other: i128) -> i128 { native_wrapping_mul(self, other).as(i128) }
+    pub fn wrapping_neg(self) -> i128 { native_wrapping_neg(self).as(i128) }
+    pub fn saturating_add(self, other: i128) -> i128 { native_saturating_add(self, other).as(i128) }
+    pub fn saturating_sub(self, other: i128) -> i128 { native_saturating_sub(self, other).as(i128) }
+    pub fn saturating_mul(self, other: i128) -> i128 { native_saturating_mul(self, other).as(i128) }
+    pub fn saturating_neg(self) -> i128 { native_saturating_neg(self).as(i128) }
+    pub fn checked_add(self, other: i128) -> ?i128 { optional_i128(native_checked_add(self, other)) }
+    pub fn checked_sub(self, other: i128) -> ?i128 { optional_i128(native_checked_sub(self, other)) }
+    pub fn checked_mul(self, other: i128) -> ?i128 { optional_i128(native_checked_mul(self, other)) }
+    pub fn checked_div(self, other: i128) -> ?i128 { optional_i128(native_checked_div(self, other)) }
+    pub fn checked_rem(self, other: i128) -> ?i128 { optional_i128(native_checked_rem(self, other)) }
+    pub fn checked_neg(self) -> ?i128 { optional_i128(native_checked_neg(self)) }
+    pub fn div_euclid(self, other: i128) -> i128 { native_int_div_euclid(self, other).as(i128) }
+    pub fn rem_euclid(self, other: i128) -> i128 { native_int_rem_euclid(self, other).as(i128) }
+    pub fn unsigned_abs(self) -> u128 { native_unsigned_abs(self).as(u128) }
+    pub fn midpoint(self, other: i128) -> i128 { native_int_midpoint(self, other).as(i128) }
+    pub fn checked_shl(self, distance: i64) -> ?i128 { optional_i128(native_checked_shl(self, distance)) }
+    pub fn checked_shr(self, distance: i64) -> ?i128 { optional_i128(native_checked_shr(self, distance)) }
+    pub fn wrapping_shl(self, distance: i64) -> i128 { native_wrapping_shl(self, distance).as(i128) }
+    pub fn wrapping_shr(self, distance: i64) -> i128 { native_wrapping_shr(self, distance).as(i128) }
+    pub fn checked_pow(self, exponent: i64) -> ?i128 { optional_i128(native_checked_pow(self, exponent)) }
+    pub fn wrapping_pow(self, exponent: i64) -> i128 { native_wrapping_pow(self, exponent).as(i128) }
+    pub fn saturating_pow(self, exponent: i64) -> i128 { native_saturating_pow(self, exponent).as(i128) }
+    pub fn wrapping_div(self, other: i128) -> i128 { native_wrapping_div(self, other).as(i128) }
+    pub fn wrapping_rem(self, other: i128) -> i128 { native_wrapping_rem(self, other).as(i128) }
+    pub fn saturating_abs(self) -> i128 { native_saturating_abs(self).as(i128) }
+    pub fn checked_abs(self) -> ?i128 { optional_i128(native_checked_abs(self)) }
+    pub fn wrapping_abs(self) -> i128 { native_wrapping_abs(self).as(i128) }
+    pub fn signum(self) -> i64 { native_int_signum(self) }
+    pub fn checked_ilog(self, base: i64) -> ?i64 { optional_i64(native_checked_ilog(self, base)) }
+    pub fn cast_unsigned(self) -> u128 { native_cast_unsigned(self).as(u128) }
+    pub fn checked_div_euclid(self, other: i128) -> ?i128 { optional_i128(native_checked_div_euclid(self, other)) }
+    pub fn checked_rem_euclid(self, other: i128) -> ?i128 { optional_i128(native_checked_rem_euclid(self, other)) }
+    pub fn is_multiple_of(self, other: i128) -> bool { native_is_multiple_of(self, other) }
+    pub fn strict_add(self, other: i128) -> i128 { native_strict_add(self, other).as(i128) }
+    pub fn strict_sub(self, other: i128) -> i128 { native_strict_sub(self, other).as(i128) }
+    pub fn strict_mul(self, other: i128) -> i128 { native_strict_mul(self, other).as(i128) }
+    pub fn strict_div(self, other: i128) -> i128 { native_strict_div(self, other).as(i128) }
+    pub fn strict_rem(self, other: i128) -> i128 { native_strict_rem(self, other).as(i128) }
+    pub fn strict_neg(self) -> i128 { native_strict_neg(self).as(i128) }
+    pub fn strict_shl(self, distance: i64) -> i128 { native_strict_shl(self, distance).as(i128) }
+    pub fn strict_shr(self, distance: i64) -> i128 { native_strict_shr(self, distance).as(i128) }
+    pub fn unbounded_shl(self, distance: i64) -> i128 { native_unbounded_shl(self, distance).as(i128) }
+    pub fn unbounded_shr(self, distance: i64) -> i128 { native_unbounded_shr(self, distance).as(i128) }
+    pub fn highest_one(self) -> ?i64 { optional_i64(native_highest_one(self)) }
+    pub fn lowest_one(self) -> ?i64 { optional_i64(native_lowest_one(self)) }
+    pub fn isolate_highest_one(self) -> i128 { native_isolate_highest_one(self).as(i128) }
+    pub fn isolate_lowest_one(self) -> i128 { native_isolate_lowest_one(self).as(i128) }
+    pub fn bit_width(self) -> i64 { native_int_bit_width(self) }
+    pub fn isqrt(self) -> i128 { native_int_isqrt(self).as(i128) }
+    pub fn checked_isqrt(self) -> ?i128 { optional_i128(native_checked_int_isqrt(self)) }
+    pub fn strict_abs(self) -> i128 { native_strict_abs(self).as(i128) }
+    pub fn wrapping_div_euclid(self, other: i128) -> i128 { native_wrapping_div_euclid(self, other).as(i128) }
+    pub fn wrapping_rem_euclid(self, other: i128) -> i128 { native_wrapping_rem_euclid(self, other).as(i128) }
+    pub fn checked_div_exact(self, other: i128) -> ?i128 { optional_i128(native_checked_div_exact(self, other)) }
+    pub fn strict_div_exact(self, other: i128) -> i128 { native_strict_div_exact(self, other).as(i128) }
+    pub fn checked_shl_exact(self, distance: i64) -> ?i128 { optional_i128(native_checked_shl_exact(self, distance)) }
+    pub fn strict_shl_exact(self, distance: i64) -> i128 { native_strict_shl_exact(self, distance).as(i128) }
+    pub fn checked_shr_exact(self, distance: i64) -> ?i128 { optional_i128(native_checked_shr_exact(self, distance)) }
+    pub fn strict_shr_exact(self, distance: i64) -> i128 { native_strict_shr_exact(self, distance).as(i128) }
+    pub fn strict_pow(self, exponent: i64) -> i128 { native_strict_pow(self, exponent).as(i128) }
+    pub fn saturating_div(self, other: i128) -> i128 { native_saturating_div(self, other).as(i128) }
+    pub fn saturating_div_euclid(self, other: i128) -> i128 { native_saturating_div_euclid(self, other).as(i128) }
+    pub fn checked_add_unsigned(self, other: u128) -> ?i128 { optional_i128(native_checked_add_unsigned(self, other)) }
+    pub fn checked_sub_unsigned(self, other: u128) -> ?i128 { optional_i128(native_checked_sub_unsigned(self, other)) }
+    pub fn saturating_add_unsigned(self, other: u128) -> i128 { native_saturating_add_unsigned(self, other).as(i128) }
+    pub fn saturating_sub_unsigned(self, other: u128) -> i128 { native_saturating_sub_unsigned(self, other).as(i128) }
+    pub fn wrapping_add_unsigned(self, other: u128) -> i128 { native_wrapping_add_unsigned(self, other).as(i128) }
+    pub fn wrapping_sub_unsigned(self, other: u128) -> i128 { native_wrapping_sub_unsigned(self, other).as(i128) }
+    pub fn strict_add_unsigned(self, other: u128) -> i128 { native_strict_add_unsigned(self, other).as(i128) }
+    pub fn strict_sub_unsigned(self, other: u128) -> i128 { native_strict_sub_unsigned(self, other).as(i128) }
+    pub fn to_str_radix(self, radix: i64) -> String { native_int_to_str_radix(self, radix) }
+    pub fn div_ceil(self, other: i128) -> i128 { native_div_ceil(self, other).as(i128) }
+    pub fn checked_div_ceil(self, other: i128) -> ?i128 { optional_i128(native_checked_div_ceil(self, other)) }
+    pub fn div_floor(self, other: i128) -> i128 { native_div_floor(self, other).as(i128) }
+    pub fn checked_div_floor(self, other: i128) -> ?i128 { optional_i128(native_checked_div_floor(self, other)) }
+    pub fn gcd(self, other: i128) -> u128 { native_int_gcd(self, other).as(u128) }
+    pub fn lcm(self, other: i128) -> u128 { native_int_lcm(self, other).as(u128) }
+    pub fn checked_lcm(self, other: i128) -> ?u128 { optional_u128(native_checked_int_lcm(self, other)) }
+    pub fn next_multiple_of(self, other: i128) -> i128 { native_next_multiple_of(self, other).as(i128) }
+    pub fn checked_next_multiple_of(self, other: i128) -> ?i128 { optional_i128(native_checked_next_multiple_of(self, other)) }
+    pub fn to_be_bytes(self) -> List { native_to_be_bytes(self) }
+    pub fn to_le_bytes(self) -> List { native_to_le_bytes(self) }
+}
+
+impl u128 {
+    pub fn is_zero(self) -> bool { self == 0 }
+    pub fn count_ones(self) -> i64 { native_count_ones(self) }
+    pub fn count_zeros(self) -> i64 { native_count_zeros(self) }
+    pub fn leading_zeros(self) -> i64 { native_leading_zeros(self) }
+    pub fn trailing_zeros(self) -> i64 { native_trailing_zeros(self) }
+    pub fn leading_ones(self) -> i64 { native_leading_ones(self) }
+    pub fn trailing_ones(self) -> i64 { native_trailing_ones(self) }
+    pub fn reverse_bits(self) -> u128 { native_reverse_bits(self).as(u128) }
+    pub fn swap_bytes(self) -> u128 { native_swap_bytes(self).as(u128) }
+    pub fn rotate_left(self, distance: i64) -> u128 { native_rotate_left(self, distance).as(u128) }
+    pub fn rotate_right(self, distance: i64) -> u128 { native_rotate_right(self, distance).as(u128) }
+    pub fn is_power_of_two(self) -> bool { native_is_power_of_two(self) }
+    pub fn ilog2(self) -> ?i64 { native_ilog2(self) }
+    pub fn ilog10(self) -> ?i64 { native_ilog10(self) }
+    pub fn abs_diff(self, other: u128) -> u128 { native_abs_diff(self, other).as(u128) }
+    pub fn wrapping_add(self, other: u128) -> u128 { native_wrapping_add(self, other).as(u128) }
+    pub fn wrapping_sub(self, other: u128) -> u128 { native_wrapping_sub(self, other).as(u128) }
+    pub fn wrapping_mul(self, other: u128) -> u128 { native_wrapping_mul(self, other).as(u128) }
+    pub fn wrapping_neg(self) -> u128 { native_wrapping_neg(self).as(u128) }
+    pub fn saturating_add(self, other: u128) -> u128 { native_saturating_add(self, other).as(u128) }
+    pub fn saturating_sub(self, other: u128) -> u128 { native_saturating_sub(self, other).as(u128) }
+    pub fn saturating_mul(self, other: u128) -> u128 { native_saturating_mul(self, other).as(u128) }
+    pub fn saturating_neg(self) -> u128 { native_saturating_neg(self).as(u128) }
+    pub fn checked_add(self, other: u128) -> ?u128 { optional_u128(native_checked_add(self, other)) }
+    pub fn checked_sub(self, other: u128) -> ?u128 { optional_u128(native_checked_sub(self, other)) }
+    pub fn checked_mul(self, other: u128) -> ?u128 { optional_u128(native_checked_mul(self, other)) }
+    pub fn checked_div(self, other: u128) -> ?u128 { optional_u128(native_checked_div(self, other)) }
+    pub fn checked_rem(self, other: u128) -> ?u128 { optional_u128(native_checked_rem(self, other)) }
+    pub fn checked_neg(self) -> ?u128 { optional_u128(native_checked_neg(self)) }
+    pub fn div_euclid(self, other: u128) -> u128 { native_int_div_euclid(self, other).as(u128) }
+    pub fn rem_euclid(self, other: u128) -> u128 { native_int_rem_euclid(self, other).as(u128) }
+    pub fn midpoint(self, other: u128) -> u128 { native_int_midpoint(self, other).as(u128) }
+    pub fn checked_shl(self, distance: i64) -> ?u128 { optional_u128(native_checked_shl(self, distance)) }
+    pub fn checked_shr(self, distance: i64) -> ?u128 { optional_u128(native_checked_shr(self, distance)) }
+    pub fn wrapping_shl(self, distance: i64) -> u128 { native_wrapping_shl(self, distance).as(u128) }
+    pub fn wrapping_shr(self, distance: i64) -> u128 { native_wrapping_shr(self, distance).as(u128) }
+    pub fn checked_pow(self, exponent: i64) -> ?u128 { optional_u128(native_checked_pow(self, exponent)) }
+    pub fn wrapping_pow(self, exponent: i64) -> u128 { native_wrapping_pow(self, exponent).as(u128) }
+    pub fn saturating_pow(self, exponent: i64) -> u128 { native_saturating_pow(self, exponent).as(u128) }
+    pub fn wrapping_div(self, other: u128) -> u128 { native_wrapping_div(self, other).as(u128) }
+    pub fn wrapping_rem(self, other: u128) -> u128 { native_wrapping_rem(self, other).as(u128) }
+    pub fn checked_ilog(self, base: i64) -> ?i64 { optional_i64(native_checked_ilog(self, base)) }
+    pub fn cast_signed(self) -> i128 { native_cast_signed(self).as(i128) }
+    pub fn checked_div_euclid(self, other: u128) -> ?u128 { optional_u128(native_checked_div_euclid(self, other)) }
+    pub fn checked_rem_euclid(self, other: u128) -> ?u128 { optional_u128(native_checked_rem_euclid(self, other)) }
+    pub fn next_power_of_two(self) -> u128 { native_next_power_of_two(self).as(u128) }
+    pub fn checked_next_power_of_two(self) -> ?u128 { optional_u128(native_checked_next_power_of_two(self)) }
+    pub fn checked_add_signed(self, other: i128) -> ?u128 { optional_u128(native_checked_add_signed(self, other)) }
+    pub fn checked_sub_signed(self, other: i128) -> ?u128 { optional_u128(native_checked_sub_signed(self, other)) }
+    pub fn saturating_add_signed(self, other: i128) -> u128 { native_saturating_add_signed(self, other).as(u128) }
+    pub fn saturating_sub_signed(self, other: i128) -> u128 { native_saturating_sub_signed(self, other).as(u128) }
+    pub fn wrapping_add_signed(self, other: i128) -> u128 { native_wrapping_add_signed(self, other).as(u128) }
+    pub fn wrapping_sub_signed(self, other: i128) -> u128 { native_wrapping_sub_signed(self, other).as(u128) }
+    pub fn strict_add_signed(self, other: i128) -> u128 { native_strict_add_signed(self, other).as(u128) }
+    pub fn strict_sub_signed(self, other: i128) -> u128 { native_strict_sub_signed(self, other).as(u128) }
+    pub fn unbounded_shl(self, distance: i64) -> u128 { native_unbounded_shl(self, distance).as(u128) }
+    pub fn unbounded_shr(self, distance: i64) -> u128 { native_unbounded_shr(self, distance).as(u128) }
+    pub fn highest_one(self) -> ?i64 { optional_i64(native_highest_one(self)) }
+    pub fn lowest_one(self) -> ?i64 { optional_i64(native_lowest_one(self)) }
+    pub fn isolate_highest_one(self) -> u128 { native_isolate_highest_one(self).as(u128) }
+    pub fn isolate_lowest_one(self) -> u128 { native_isolate_lowest_one(self).as(u128) }
+    pub fn bit_width(self) -> i64 { native_int_bit_width(self) }
+    pub fn isqrt(self) -> u128 { native_int_isqrt(self).as(u128) }
+    pub fn checked_isqrt(self) -> ?u128 { optional_u128(native_checked_int_isqrt(self)) }
+    pub fn wrapping_div_euclid(self, other: u128) -> u128 { native_wrapping_div_euclid(self, other).as(u128) }
+    pub fn wrapping_rem_euclid(self, other: u128) -> u128 { native_wrapping_rem_euclid(self, other).as(u128) }
+    pub fn checked_signed_diff(self, other: u128) -> ?i128 { optional_i128(native_checked_signed_diff(self, other)) }
+    pub fn checked_div_exact(self, other: u128) -> ?u128 { optional_u128(native_checked_div_exact(self, other)) }
+    pub fn strict_div_exact(self, other: u128) -> u128 { native_strict_div_exact(self, other).as(u128) }
+    pub fn checked_shl_exact(self, distance: i64) -> ?u128 { optional_u128(native_checked_shl_exact(self, distance)) }
+    pub fn strict_shl_exact(self, distance: i64) -> u128 { native_strict_shl_exact(self, distance).as(u128) }
+    pub fn checked_shr_exact(self, distance: i64) -> ?u128 { optional_u128(native_checked_shr_exact(self, distance)) }
+    pub fn strict_shr_exact(self, distance: i64) -> u128 { native_strict_shr_exact(self, distance).as(u128) }
+    pub fn is_multiple_of(self, other: u128) -> bool { native_is_multiple_of(self, other) }
+    pub fn strict_add(self, other: u128) -> u128 { native_strict_add(self, other).as(u128) }
+    pub fn strict_sub(self, other: u128) -> u128 { native_strict_sub(self, other).as(u128) }
+    pub fn strict_mul(self, other: u128) -> u128 { native_strict_mul(self, other).as(u128) }
+    pub fn strict_div(self, other: u128) -> u128 { native_strict_div(self, other).as(u128) }
+    pub fn strict_rem(self, other: u128) -> u128 { native_strict_rem(self, other).as(u128) }
+    pub fn strict_neg(self) -> u128 { native_strict_neg(self).as(u128) }
+    pub fn strict_shl(self, distance: i64) -> u128 { native_strict_shl(self, distance).as(u128) }
+    pub fn strict_shr(self, distance: i64) -> u128 { native_strict_shr(self, distance).as(u128) }
+    pub fn strict_pow(self, exponent: i64) -> u128 { native_strict_pow(self, exponent).as(u128) }
+    pub fn saturating_div(self, other: u128) -> u128 { native_saturating_div(self, other).as(u128) }
+    pub fn saturating_div_euclid(self, other: u128) -> u128 { native_saturating_div_euclid(self, other).as(u128) }
+    pub fn to_str_radix(self, radix: i64) -> String { native_int_to_str_radix(self, radix) }
+    pub fn div_ceil(self, other: u128) -> u128 { native_div_ceil(self, other).as(u128) }
+    pub fn checked_div_ceil(self, other: u128) -> ?u128 { optional_u128(native_checked_div_ceil(self, other)) }
+    pub fn div_floor(self, other: u128) -> u128 { native_div_floor(self, other).as(u128) }
+    pub fn checked_div_floor(self, other: u128) -> ?u128 { optional_u128(native_checked_div_floor(self, other)) }
+    pub fn gcd(self, other: u128) -> u128 { native_int_gcd(self, other).as(u128) }
+    pub fn lcm(self, other: u128) -> u128 { native_int_lcm(self, other).as(u128) }
+    pub fn checked_lcm(self, other: u128) -> ?u128 { optional_u128(native_checked_int_lcm(self, other)) }
+    pub fn next_multiple_of(self, other: u128) -> u128 { native_next_multiple_of(self, other).as(u128) }
+    pub fn checked_next_multiple_of(self, other: u128) -> ?u128 { optional_u128(native_checked_next_multiple_of(self, other)) }
+    pub fn to_be_bytes(self) -> List { native_to_be_bytes(self) }
+    pub fn to_le_bytes(self) -> List { native_to_le_bytes(self) }
+}
+
+impl isize {
+    pub fn is_zero(self) -> bool { self == 0 }
+    pub fn is_negative(self) -> bool { self < 0 }
+    pub fn is_positive(self) -> bool { self > 0 }
+    pub fn count_ones(self) -> i64 { native_count_ones(self) }
+    pub fn count_zeros(self) -> i64 { native_count_zeros(self) }
+    pub fn leading_zeros(self) -> i64 { native_leading_zeros(self) }
+    pub fn trailing_zeros(self) -> i64 { native_trailing_zeros(self) }
+    pub fn leading_ones(self) -> i64 { native_leading_ones(self) }
+    pub fn trailing_ones(self) -> i64 { native_trailing_ones(self) }
+    pub fn reverse_bits(self) -> isize { native_reverse_bits(self).as(isize) }
+    pub fn swap_bytes(self) -> isize { native_swap_bytes(self).as(isize) }
+    pub fn rotate_left(self, distance: i64) -> isize { native_rotate_left(self, distance).as(isize) }
+    pub fn rotate_right(self, distance: i64) -> isize { native_rotate_right(self, distance).as(isize) }
+    pub fn is_power_of_two(self) -> bool { native_is_power_of_two(self) }
+    pub fn ilog2(self) -> ?i64 { native_ilog2(self) }
+    pub fn ilog10(self) -> ?i64 { native_ilog10(self) }
+    pub fn abs_diff(self, other: isize) -> usize { native_abs_diff(self, other).as(usize) }
+    pub fn wrapping_add(self, other: isize) -> isize { native_wrapping_add(self, other).as(isize) }
+    pub fn wrapping_sub(self, other: isize) -> isize { native_wrapping_sub(self, other).as(isize) }
+    pub fn wrapping_mul(self, other: isize) -> isize { native_wrapping_mul(self, other).as(isize) }
+    pub fn wrapping_neg(self) -> isize { native_wrapping_neg(self).as(isize) }
+    pub fn saturating_add(self, other: isize) -> isize { native_saturating_add(self, other).as(isize) }
+    pub fn saturating_sub(self, other: isize) -> isize { native_saturating_sub(self, other).as(isize) }
+    pub fn saturating_mul(self, other: isize) -> isize { native_saturating_mul(self, other).as(isize) }
+    pub fn saturating_neg(self) -> isize { native_saturating_neg(self).as(isize) }
+    pub fn checked_add(self, other: isize) -> ?isize { optional_isize(native_checked_add(self, other)) }
+    pub fn checked_sub(self, other: isize) -> ?isize { optional_isize(native_checked_sub(self, other)) }
+    pub fn checked_mul(self, other: isize) -> ?isize { optional_isize(native_checked_mul(self, other)) }
+    pub fn checked_div(self, other: isize) -> ?isize { optional_isize(native_checked_div(self, other)) }
+    pub fn checked_rem(self, other: isize) -> ?isize { optional_isize(native_checked_rem(self, other)) }
+    pub fn checked_neg(self) -> ?isize { optional_isize(native_checked_neg(self)) }
+    pub fn div_euclid(self, other: isize) -> isize { native_int_div_euclid(self, other).as(isize) }
+    pub fn rem_euclid(self, other: isize) -> isize { native_int_rem_euclid(self, other).as(isize) }
+    pub fn unsigned_abs(self) -> usize { native_unsigned_abs(self).as(usize) }
+    pub fn midpoint(self, other: isize) -> isize { native_int_midpoint(self, other).as(isize) }
+    pub fn checked_shl(self, distance: i64) -> ?isize { optional_isize(native_checked_shl(self, distance)) }
+    pub fn checked_shr(self, distance: i64) -> ?isize { optional_isize(native_checked_shr(self, distance)) }
+    pub fn wrapping_shl(self, distance: i64) -> isize { native_wrapping_shl(self, distance).as(isize) }
+    pub fn wrapping_shr(self, distance: i64) -> isize { native_wrapping_shr(self, distance).as(isize) }
+    pub fn checked_pow(self, exponent: i64) -> ?isize { optional_isize(native_checked_pow(self, exponent)) }
+    pub fn wrapping_pow(self, exponent: i64) -> isize { native_wrapping_pow(self, exponent).as(isize) }
+    pub fn saturating_pow(self, exponent: i64) -> isize { native_saturating_pow(self, exponent).as(isize) }
+    pub fn wrapping_div(self, other: isize) -> isize { native_wrapping_div(self, other).as(isize) }
+    pub fn wrapping_rem(self, other: isize) -> isize { native_wrapping_rem(self, other).as(isize) }
+    pub fn saturating_abs(self) -> isize { native_saturating_abs(self).as(isize) }
+    pub fn checked_abs(self) -> ?isize { optional_isize(native_checked_abs(self)) }
+    pub fn wrapping_abs(self) -> isize { native_wrapping_abs(self).as(isize) }
+    pub fn signum(self) -> i64 { native_int_signum(self) }
+    pub fn checked_ilog(self, base: i64) -> ?i64 { optional_i64(native_checked_ilog(self, base)) }
+    pub fn cast_unsigned(self) -> usize { native_cast_unsigned(self).as(usize) }
+    pub fn checked_div_euclid(self, other: isize) -> ?isize { optional_isize(native_checked_div_euclid(self, other)) }
+    pub fn checked_rem_euclid(self, other: isize) -> ?isize { optional_isize(native_checked_rem_euclid(self, other)) }
+    pub fn widening_mul(self, other: isize) -> i128 { native_widening_mul(self, other).as(i128) }
+    pub fn is_multiple_of(self, other: isize) -> bool { native_is_multiple_of(self, other) }
+    pub fn strict_add(self, other: isize) -> isize { native_strict_add(self, other).as(isize) }
+    pub fn strict_sub(self, other: isize) -> isize { native_strict_sub(self, other).as(isize) }
+    pub fn strict_mul(self, other: isize) -> isize { native_strict_mul(self, other).as(isize) }
+    pub fn strict_div(self, other: isize) -> isize { native_strict_div(self, other).as(isize) }
+    pub fn strict_rem(self, other: isize) -> isize { native_strict_rem(self, other).as(isize) }
+    pub fn strict_neg(self) -> isize { native_strict_neg(self).as(isize) }
+    pub fn strict_shl(self, distance: i64) -> isize { native_strict_shl(self, distance).as(isize) }
+    pub fn strict_shr(self, distance: i64) -> isize { native_strict_shr(self, distance).as(isize) }
+    pub fn unbounded_shl(self, distance: i64) -> isize { native_unbounded_shl(self, distance).as(isize) }
+    pub fn unbounded_shr(self, distance: i64) -> isize { native_unbounded_shr(self, distance).as(isize) }
+    pub fn highest_one(self) -> ?i64 { optional_i64(native_highest_one(self)) }
+    pub fn lowest_one(self) -> ?i64 { optional_i64(native_lowest_one(self)) }
+    pub fn isolate_highest_one(self) -> isize { native_isolate_highest_one(self).as(isize) }
+    pub fn isolate_lowest_one(self) -> isize { native_isolate_lowest_one(self).as(isize) }
+    pub fn bit_width(self) -> i64 { native_int_bit_width(self) }
+    pub fn isqrt(self) -> isize { native_int_isqrt(self).as(isize) }
+    pub fn checked_isqrt(self) -> ?isize { optional_isize(native_checked_int_isqrt(self)) }
+    pub fn strict_abs(self) -> isize { native_strict_abs(self).as(isize) }
+    pub fn wrapping_div_euclid(self, other: isize) -> isize { native_wrapping_div_euclid(self, other).as(isize) }
+    pub fn wrapping_rem_euclid(self, other: isize) -> isize { native_wrapping_rem_euclid(self, other).as(isize) }
+    pub fn checked_div_exact(self, other: isize) -> ?isize { optional_isize(native_checked_div_exact(self, other)) }
+    pub fn strict_div_exact(self, other: isize) -> isize { native_strict_div_exact(self, other).as(isize) }
+    pub fn checked_shl_exact(self, distance: i64) -> ?isize { optional_isize(native_checked_shl_exact(self, distance)) }
+    pub fn strict_shl_exact(self, distance: i64) -> isize { native_strict_shl_exact(self, distance).as(isize) }
+    pub fn checked_shr_exact(self, distance: i64) -> ?isize { optional_isize(native_checked_shr_exact(self, distance)) }
+    pub fn strict_shr_exact(self, distance: i64) -> isize { native_strict_shr_exact(self, distance).as(isize) }
+    pub fn strict_pow(self, exponent: i64) -> isize { native_strict_pow(self, exponent).as(isize) }
+    pub fn saturating_div(self, other: isize) -> isize { native_saturating_div(self, other).as(isize) }
+    pub fn saturating_div_euclid(self, other: isize) -> isize { native_saturating_div_euclid(self, other).as(isize) }
+    pub fn checked_add_unsigned(self, other: usize) -> ?isize { optional_isize(native_checked_add_unsigned(self, other)) }
+    pub fn checked_sub_unsigned(self, other: usize) -> ?isize { optional_isize(native_checked_sub_unsigned(self, other)) }
+    pub fn saturating_add_unsigned(self, other: usize) -> isize { native_saturating_add_unsigned(self, other).as(isize) }
+    pub fn saturating_sub_unsigned(self, other: usize) -> isize { native_saturating_sub_unsigned(self, other).as(isize) }
+    pub fn wrapping_add_unsigned(self, other: usize) -> isize { native_wrapping_add_unsigned(self, other).as(isize) }
+    pub fn wrapping_sub_unsigned(self, other: usize) -> isize { native_wrapping_sub_unsigned(self, other).as(isize) }
+    pub fn strict_add_unsigned(self, other: usize) -> isize { native_strict_add_unsigned(self, other).as(isize) }
+    pub fn strict_sub_unsigned(self, other: usize) -> isize { native_strict_sub_unsigned(self, other).as(isize) }
+    pub fn to_str_radix(self, radix: i64) -> String { native_int_to_str_radix(self, radix) }
+    pub fn div_ceil(self, other: isize) -> isize { native_div_ceil(self, other).as(isize) }
+    pub fn checked_div_ceil(self, other: isize) -> ?isize { optional_isize(native_checked_div_ceil(self, other)) }
+    pub fn div_floor(self, other: isize) -> isize { native_div_floor(self, other).as(isize) }
+    pub fn checked_div_floor(self, other: isize) -> ?isize { optional_isize(native_checked_div_floor(self, other)) }
+    pub fn gcd(self, other: isize) -> usize { native_int_gcd(self, other).as(usize) }
+    pub fn lcm(self, other: isize) -> usize { native_int_lcm(self, other).as(usize) }
+    pub fn checked_lcm(self, other: isize) -> ?usize { optional_usize(native_checked_int_lcm(self, other)) }
+    pub fn next_multiple_of(self, other: isize) -> isize { native_next_multiple_of(self, other).as(isize) }
+    pub fn checked_next_multiple_of(self, other: isize) -> ?isize { optional_isize(native_checked_next_multiple_of(self, other)) }
+    pub fn to_be_bytes(self) -> List { native_to_be_bytes(self) }
+    pub fn to_le_bytes(self) -> List { native_to_le_bytes(self) }
+}
+
+impl usize {
+    pub fn is_zero(self) -> bool { self == 0 }
+    pub fn count_ones(self) -> i64 { native_count_ones(self) }
+    pub fn count_zeros(self) -> i64 { native_count_zeros(self) }
+    pub fn leading_zeros(self) -> i64 { native_leading_zeros(self) }
+    pub fn trailing_zeros(self) -> i64 { native_trailing_zeros(self) }
+    pub fn leading_ones(self) -> i64 { native_leading_ones(self) }
+    pub fn trailing_ones(self) -> i64 { native_trailing_ones(self) }
+    pub fn reverse_bits(self) -> usize { native_reverse_bits(self).as(usize) }
+    pub fn swap_bytes(self) -> usize { native_swap_bytes(self).as(usize) }
+    pub fn rotate_left(self, distance: i64) -> usize { native_rotate_left(self, distance).as(usize) }
+    pub fn rotate_right(self, distance: i64) -> usize { native_rotate_right(self, distance).as(usize) }
+    pub fn is_power_of_two(self) -> bool { native_is_power_of_two(self) }
+    pub fn ilog2(self) -> ?i64 { native_ilog2(self) }
+    pub fn ilog10(self) -> ?i64 { native_ilog10(self) }
+    pub fn abs_diff(self, other: usize) -> usize { native_abs_diff(self, other).as(usize) }
+    pub fn wrapping_add(self, other: usize) -> usize { native_wrapping_add(self, other).as(usize) }
+    pub fn wrapping_sub(self, other: usize) -> usize { native_wrapping_sub(self, other).as(usize) }
+    pub fn wrapping_mul(self, other: usize) -> usize { native_wrapping_mul(self, other).as(usize) }
+    pub fn wrapping_neg(self) -> usize { native_wrapping_neg(self).as(usize) }
+    pub fn saturating_add(self, other: usize) -> usize { native_saturating_add(self, other).as(usize) }
+    pub fn saturating_sub(self, other: usize) -> usize { native_saturating_sub(self, other).as(usize) }
+    pub fn saturating_mul(self, other: usize) -> usize { native_saturating_mul(self, other).as(usize) }
+    pub fn saturating_neg(self) -> usize { native_saturating_neg(self).as(usize) }
+    pub fn checked_add(self, other: usize) -> ?usize { optional_usize(native_checked_add(self, other)) }
+    pub fn checked_sub(self, other: usize) -> ?usize { optional_usize(native_checked_sub(self, other)) }
+    pub fn checked_mul(self, other: usize) -> ?usize { optional_usize(native_checked_mul(self, other)) }
+    pub fn checked_div(self, other: usize) -> ?usize { optional_usize(native_checked_div(self, other)) }
+    pub fn checked_rem(self, other: usize) -> ?usize { optional_usize(native_checked_rem(self, other)) }
+    pub fn checked_neg(self) -> ?usize { optional_usize(native_checked_neg(self)) }
+    pub fn div_euclid(self, other: usize) -> usize { native_int_div_euclid(self, other).as(usize) }
+    pub fn rem_euclid(self, other: usize) -> usize { native_int_rem_euclid(self, other).as(usize) }
+    pub fn midpoint(self, other: usize) -> usize { native_int_midpoint(self, other).as(usize) }
+    pub fn checked_shl(self, distance: i64) -> ?usize { optional_usize(native_checked_shl(self, distance)) }
+    pub fn checked_shr(self, distance: i64) -> ?usize { optional_usize(native_checked_shr(self, distance)) }
+    pub fn wrapping_shl(self, distance: i64) -> usize { native_wrapping_shl(self, distance).as(usize) }
+    pub fn wrapping_shr(self, distance: i64) -> usize { native_wrapping_shr(self, distance).as(usize) }
+    pub fn checked_pow(self, exponent: i64) -> ?usize { optional_usize(native_checked_pow(self, exponent)) }
+    pub fn wrapping_pow(self, exponent: i64) -> usize { native_wrapping_pow(self, exponent).as(usize) }
+    pub fn saturating_pow(self, exponent: i64) -> usize { native_saturating_pow(self, exponent).as(usize) }
+    pub fn wrapping_div(self, other: usize) -> usize { native_wrapping_div(self, other).as(usize) }
+    pub fn wrapping_rem(self, other: usize) -> usize { native_wrapping_rem(self, other).as(usize) }
+    pub fn checked_ilog(self, base: i64) -> ?i64 { optional_i64(native_checked_ilog(self, base)) }
+    pub fn cast_signed(self) -> isize { native_cast_signed(self).as(isize) }
+    pub fn checked_div_euclid(self, other: usize) -> ?usize { optional_usize(native_checked_div_euclid(self, other)) }
+    pub fn checked_rem_euclid(self, other: usize) -> ?usize { optional_usize(native_checked_rem_euclid(self, other)) }
+    pub fn widening_mul(self, other: usize) -> u128 { native_widening_mul(self, other).as(u128) }
+    pub fn next_power_of_two(self) -> usize { native_next_power_of_two(self).as(usize) }
+    pub fn checked_next_power_of_two(self) -> ?usize { optional_usize(native_checked_next_power_of_two(self)) }
+    pub fn checked_add_signed(self, other: isize) -> ?usize { optional_usize(native_checked_add_signed(self, other)) }
+    pub fn checked_sub_signed(self, other: isize) -> ?usize { optional_usize(native_checked_sub_signed(self, other)) }
+    pub fn saturating_add_signed(self, other: isize) -> usize { native_saturating_add_signed(self, other).as(usize) }
+    pub fn saturating_sub_signed(self, other: isize) -> usize { native_saturating_sub_signed(self, other).as(usize) }
+    pub fn wrapping_add_signed(self, other: isize) -> usize { native_wrapping_add_signed(self, other).as(usize) }
+    pub fn wrapping_sub_signed(self, other: isize) -> usize { native_wrapping_sub_signed(self, other).as(usize) }
+    pub fn strict_add_signed(self, other: isize) -> usize { native_strict_add_signed(self, other).as(usize) }
+    pub fn strict_sub_signed(self, other: isize) -> usize { native_strict_sub_signed(self, other).as(usize) }
+    pub fn unbounded_shl(self, distance: i64) -> usize { native_unbounded_shl(self, distance).as(usize) }
+    pub fn unbounded_shr(self, distance: i64) -> usize { native_unbounded_shr(self, distance).as(usize) }
+    pub fn highest_one(self) -> ?i64 { optional_i64(native_highest_one(self)) }
+    pub fn lowest_one(self) -> ?i64 { optional_i64(native_lowest_one(self)) }
+    pub fn isolate_highest_one(self) -> usize { native_isolate_highest_one(self).as(usize) }
+    pub fn isolate_lowest_one(self) -> usize { native_isolate_lowest_one(self).as(usize) }
+    pub fn bit_width(self) -> i64 { native_int_bit_width(self) }
+    pub fn isqrt(self) -> usize { native_int_isqrt(self).as(usize) }
+    pub fn checked_isqrt(self) -> ?usize { optional_usize(native_checked_int_isqrt(self)) }
+    pub fn wrapping_div_euclid(self, other: usize) -> usize { native_wrapping_div_euclid(self, other).as(usize) }
+    pub fn wrapping_rem_euclid(self, other: usize) -> usize { native_wrapping_rem_euclid(self, other).as(usize) }
+    pub fn checked_signed_diff(self, other: usize) -> ?isize { optional_isize(native_checked_signed_diff(self, other)) }
+    pub fn checked_div_exact(self, other: usize) -> ?usize { optional_usize(native_checked_div_exact(self, other)) }
+    pub fn strict_div_exact(self, other: usize) -> usize { native_strict_div_exact(self, other).as(usize) }
+    pub fn checked_shl_exact(self, distance: i64) -> ?usize { optional_usize(native_checked_shl_exact(self, distance)) }
+    pub fn strict_shl_exact(self, distance: i64) -> usize { native_strict_shl_exact(self, distance).as(usize) }
+    pub fn checked_shr_exact(self, distance: i64) -> ?usize { optional_usize(native_checked_shr_exact(self, distance)) }
+    pub fn strict_shr_exact(self, distance: i64) -> usize { native_strict_shr_exact(self, distance).as(usize) }
+    pub fn is_multiple_of(self, other: usize) -> bool { native_is_multiple_of(self, other) }
+    pub fn strict_add(self, other: usize) -> usize { native_strict_add(self, other).as(usize) }
+    pub fn strict_sub(self, other: usize) -> usize { native_strict_sub(self, other).as(usize) }
+    pub fn strict_mul(self, other: usize) -> usize { native_strict_mul(self, other).as(usize) }
+    pub fn strict_div(self, other: usize) -> usize { native_strict_div(self, other).as(usize) }
+    pub fn strict_rem(self, other: usize) -> usize { native_strict_rem(self, other).as(usize) }
+    pub fn strict_neg(self) -> usize { native_strict_neg(self).as(usize) }
+    pub fn strict_shl(self, distance: i64) -> usize { native_strict_shl(self, distance).as(usize) }
+    pub fn strict_shr(self, distance: i64) -> usize { native_strict_shr(self, distance).as(usize) }
+    pub fn strict_pow(self, exponent: i64) -> usize { native_strict_pow(self, exponent).as(usize) }
+    pub fn saturating_div(self, other: usize) -> usize { native_saturating_div(self, other).as(usize) }
+    pub fn saturating_div_euclid(self, other: usize) -> usize { native_saturating_div_euclid(self, other).as(usize) }
+    pub fn to_str_radix(self, radix: i64) -> String { native_int_to_str_radix(self, radix) }
+    pub fn div_ceil(self, other: usize) -> usize { native_div_ceil(self, other).as(usize) }
+    pub fn checked_div_ceil(self, other: usize) -> ?usize { optional_usize(native_checked_div_ceil(self, other)) }
+    pub fn div_floor(self, other: usize) -> usize { native_div_floor(self, other).as(usize) }
+    pub fn checked_div_floor(self, other: usize) -> ?usize { optional_usize(native_checked_div_floor(self, other)) }
+    pub fn gcd(self, other: usize) -> usize { native_int_gcd(self, other).as(usize) }
+    pub fn lcm(self, other: usize) -> usize { native_int_lcm(self, other).as(usize) }
+    pub fn checked_lcm(self, other: usize) -> ?usize { optional_usize(native_checked_int_lcm(self, other)) }
+    pub fn next_multiple_of(self, other: usize) -> usize { native_next_multiple_of(self, other).as(usize) }
+    pub fn checked_next_multiple_of(self, other: usize) -> ?usize { optional_usize(native_checked_next_multiple_of(self, other)) }
+    pub fn to_be_bytes(self) -> List { native_to_be_bytes(self) }
+    pub fn to_le_bytes(self) -> List { native_to_le_bytes(self) }
+}

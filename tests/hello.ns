@@ -1,3 +1,13 @@
-fn main() {
-  print(42);
-}
+effect yield(data: Any)
+
+fn hello() -> #yield Any:
+    yield("Hello, World!")
+    yield(234324)
+
+
+fn main():
+    hello()# {
+        yield(data) =>
+            println(data)
+    }
+

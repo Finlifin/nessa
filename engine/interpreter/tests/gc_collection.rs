@@ -24,8 +24,68 @@ fn vm() -> Vm {
     )
 }
 
+fn register_pause_effect(pool: &mut TypePool) -> type_pool::TypeIndex {
+    pool.intern_structural(type_pool::TypeKind::Effect {
+        params: vec![],
+        ret: Intrinsic::Any.type_index(),
+        is_async: false,
+    })
+}
+
+fn install_pause_effect(engine: &mut Vm) -> (type_pool::TypeIndex, u32) {
+    let mut pool = TypePool::with_intrinsics();
+    let effect = register_pause_effect(&mut pool);
+    engine.install_type_pool(pool);
+    let meta = engine
+        .push_constant(&Constant::UInt(effect.as_u32() as u64))
+        .unwrap();
+    (effect, meta)
+}
+
+fn add_pause_handler(engine: &mut Vm, id: u32) {
+    add_function_with_abi(
+        engine,
+        id,
+        &[Instruction::ret(Reg(0))],
+        1,
+        true,
+        nsbc::FunctionAbi::closure_values(0, 1),
+    );
+}
+
+fn pause_collect_and_resume(
+    handler_func: u32,
+    meta_const: u32,
+    body_func: u32,
+    collect_builtin: u32,
+    resume_imm: Option<u16>,
+) -> Vec<Instruction> {
+    let load_resume = match resume_imm {
+        Some(imm) => Instruction::load_imm(Reg(1), imm),
+        None => Instruction::load_unit(Reg(1)),
+    };
+    vec![
+        Instruction::new_closure(Reg(19), handler_func, 0),
+        Instruction::push_capturing_handler(Reg(19), meta_const),
+        Instruction::new_closure(Reg(20), body_func, 0),
+        Instruction::reset_closure(Reg(20), 1),
+        Instruction::e_type(Opcode::PopHandler, 0),
+        Instruction::mov(Reg(21), Reg(0)),
+        Instruction::call_builtin(collect_builtin, 0),
+        load_resume,
+        Instruction::resume_continuation_once(Reg(21), Reg(1)),
+    ]
+}
+
 fn add_function(vm: &mut Vm, id: u32, instructions: &[Instruction], params: u8) {
-    add_function_with_abi(vm, id, instructions, params, None);
+    add_function_with_abi(
+        vm,
+        id,
+        instructions,
+        params,
+        false,
+        nsbc::FunctionAbi::value_only(params as usize),
+    );
 }
 
 fn add_function_with_abi(
@@ -33,7 +93,8 @@ fn add_function_with_abi(
     id: u32,
     instructions: &[Instruction],
     params: u8,
-    abi: Option<nsbc::FunctionAbi>,
+    is_closure: bool,
+    abi: nsbc::FunctionAbi,
 ) {
     vm.add_function(FunctionCode {
         display_owner: None,
@@ -45,7 +106,7 @@ fn add_function_with_abi(
             .collect(),
         register_count: 32,
         param_count: params,
-        is_closure: params == 8,
+        is_closure,
         function_type: type_pool::TypeIndex::INVALID,
     });
 }
@@ -153,24 +214,14 @@ fn removed_map_value_survives_context_roots_and_return_register_publication() {
 #[test]
 fn collection_preserves_maps_in_detached_continuation_segments() {
     let mut engine = vm();
-    engine.push_constant(&Constant::Str("key".into())).unwrap();
+    let (pause_effect, pause_meta) = install_pause_effect(&mut engine);
+    let key_const = engine.push_constant(&Constant::Str("key".into())).unwrap() as u16;
     engine.register_builtin(0, make_string);
     engine.register_builtin(1, collect);
     engine.register_builtin(2, length);
-    add_function(
-        &mut engine,
-        0,
-        &[
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::reset(Reg(20), 1, 0),
-            Instruction::mov(Reg(21), Reg(0)),
-            Instruction::call_builtin(1, 0),
-            Instruction::load_imm(Reg(1), 40),
-            Instruction::resume(Reg(21), Reg(1)),
-            Instruction::ret(Reg(0)),
-        ],
-        0,
-    );
+    let mut main = pause_collect_and_resume(2, pause_meta, 1, 1, Some(40));
+    main.push(Instruction::ret(Reg(0)));
+    add_function(&mut engine, 0, &main, 0);
     add_function(
         &mut engine,
         1,
@@ -178,21 +229,21 @@ fn collection_preserves_maps_in_detached_continuation_segments() {
             Instruction::allocate_slots(1),
             Instruction::a_type(Opcode::NewMap, AddrMode::Imm, Reg(10), Reg(0), 0),
             Instruction::call_builtin(0, 0),
-            Instruction::load_const(Reg(1), 0),
+            Instruction::load_const(Reg(1), key_const),
             Instruction::a_type(Opcode::StoreIndex, AddrMode::Imm, Reg(0), Reg(10), 1),
             Instruction::store_slot(0, Reg(10)),
             Instruction::load_unit(Reg(10)),
             Instruction::load_unit(Reg(0)),
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::shift(Reg(20), Reg(0)),
+            Instruction::effect_call(pause_effect, 0),
             Instruction::load_slot(Reg(10), 0),
-            Instruction::load_const(Reg(1), 0),
+            Instruction::load_const(Reg(1), key_const),
             Instruction::a_type(Opcode::LoadIndex, AddrMode::Imm, Reg(0), Reg(10), 1),
             Instruction::call_builtin(2, 1),
             Instruction::ret(Reg(0)),
         ],
         0,
     );
+    add_pause_handler(&mut engine, 2);
     let task = engine.spawn_root(FuncId(0));
     assert!(matches!(engine.run(), VmResult::Finished));
     assert_eq!(engine.task_result_i64(task).unwrap(), 8);
@@ -258,11 +309,11 @@ fn collection_preserves_a_heap_value_rooted_only_in_globals() {
         0,
         &[
             Instruction::call_builtin(0, 0),
-            Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(0), 0),
+            Instruction::store_global(0, Reg(0)),
             // Neither registers nor constants retain the allocated string.
             Instruction::load_unit(Reg(0)),
             Instruction::call_builtin(1, 0),
-            Instruction::a_type(Opcode::LoadGlobal, AddrMode::Imm, Reg(0), Reg(0), 0),
+            Instruction::load_global(Reg(0), 0),
             Instruction::call_builtin(2, 1),
             Instruction::ret(Reg(0)),
         ],
@@ -278,7 +329,14 @@ fn collection_preserves_a_heap_value_rooted_only_in_globals() {
 
 #[test]
 fn collection_preserves_a_delimited_entry_closures_captured_heap_value() {
+    let mut pool = TypePool::with_intrinsics();
+    let effect = pool.intern_structural(type_pool::TypeKind::Effect {
+        params: vec![],
+        ret: Intrinsic::I64.type_index(),
+        is_async: false,
+    });
     let mut engine = vm();
+    engine.install_type_pool(pool);
     engine.register_builtin(0, make_string);
     engine.register_builtin(1, collect);
     engine.register_builtin(2, length);
@@ -287,40 +345,52 @@ fn collection_preserves_a_delimited_entry_closures_captured_heap_value() {
         0,
         &[
             Instruction::call_builtin(0, 0),
+            Instruction::new_closure(Reg(2), 2, 1),
+            Instruction::push_handler_closure(effect, Reg(2)),
+            Instruction::load_unit(Reg(2)),
+            Instruction::call_builtin(0, 0),
             Instruction::new_closure(Reg(1), 1, 1),
-            Instruction::reset_closure(Reg(1), 0),
+            Instruction::load_unit(Reg(0)),
+            Instruction::reset_closure(Reg(1), 1),
+            Instruction::e_type(Opcode::PopHandler, 0),
             Instruction::ret(Reg(0)),
         ],
         0,
     );
-    engine.add_function(FunctionCode {
-        display_owner: None,
-        abi: Some(nsbc::FunctionAbi {
-            captures: vec![nsbc::CaptureAbi::Value],
-            parameters: vec![],
-        }),
-        func_id: FuncId(1),
-        instructions: [
+    add_function_with_abi(
+        &mut engine,
+        1,
+        &[
+            Instruction::allocate_slots(1),
+            Instruction::store_slot(0, Reg(0)),
             Instruction::load_unit(Reg(0)),
+            Instruction::load_unit(Reg(1)),
             Instruction::call_builtin(1, 0),
-            Instruction::load_capture(Reg(0), 0),
+            Instruction::effect_call(effect, 0),
+            Instruction::mov(Reg(20), Reg(0)),
+            Instruction::load_slot(Reg(0), 0),
             Instruction::call_builtin(2, 1),
+            Instruction::add(Reg(0), Reg(0), Reg(20)),
             Instruction::ret(Reg(0)),
-        ]
-        .iter()
-        .map(|instruction| instruction.encode())
-        .collect(),
-        register_count: 32,
-        param_count: 1,
-        is_closure: true,
-        function_type: type_pool::TypeIndex::INVALID,
-    });
+        ],
+        1,
+        true,
+        nsbc::FunctionAbi::closure_values(1, 0),
+    );
+    add_function_with_abi(
+        &mut engine,
+        2,
+        &[Instruction::call_builtin(2, 1), Instruction::ret(Reg(0))],
+        1,
+        true,
+        nsbc::FunctionAbi::closure_values(1, 0),
+    );
     let before = engine.completed_collections();
     let task = engine.spawn_root(FuncId(0));
     let result = engine.run();
     assert!(matches!(result, VmResult::Finished), "{result:?}");
     assert!(engine.completed_collections() > before);
-    assert_eq!(engine.task_result_i64(task).unwrap(), 8);
+    assert_eq!(engine.task_result_i64(task).unwrap(), 16);
 }
 
 #[test]
@@ -464,23 +534,13 @@ fn collection_preserves_idle_engine_and_captured_frame_roots() {
     // Moving the engine must not change its registered root address.
     let mut idle = Box::new(idle);
     let mut active = vm();
+    let (pause_effect, pause_meta) = install_pause_effect(&mut active);
     active.register_builtin(0, make_string);
     active.register_builtin(1, collect);
     active.register_builtin(2, length);
-    add_function(
-        &mut active,
-        0,
-        &[
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::reset(Reg(20), 1, 0),
-            Instruction::mov(Reg(21), Reg(0)),
-            Instruction::call_builtin(1, 0), // collect while the delimiter is detached
-            Instruction::load_imm(Reg(1), 40),
-            Instruction::resume(Reg(21), Reg(1)),
-            Instruction::ret(Reg(0)),
-        ],
-        0,
-    );
+    let mut main = pause_collect_and_resume(9, pause_meta, 1, 1, Some(40));
+    main.push(Instruction::ret(Reg(0)));
+    add_function(&mut active, 0, &main, 0);
     add_function(
         &mut active,
         1,
@@ -509,8 +569,7 @@ fn collection_preserves_idle_engine_and_captured_frame_roots() {
             Instruction::allocate_slots(1),
             Instruction::call_builtin(0, 0),
             Instruction::store_slot(0, Reg(0)),
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::shift(Reg(20), Reg(0)),
+            Instruction::effect_call(pause_effect, 0),
             Instruction::mov(Reg(22), Reg(0)),
             Instruction::load_slot(Reg(0), 0),
             Instruction::call_builtin(2, 1),
@@ -527,11 +586,10 @@ fn collection_preserves_idle_engine_and_captured_frame_roots() {
         8,
         &[Instruction::call_builtin(2, 1), Instruction::ret(Reg(0))],
         8,
-        Some(nsbc::FunctionAbi {
-            captures: vec![nsbc::CaptureAbi::Value; 8],
-            parameters: vec![],
-        }),
+        true,
+        nsbc::FunctionAbi::closure_values(8, 0),
     );
+    add_pause_handler(&mut active, 9);
     let before = active.completed_collections();
     let task = active.spawn_root(FuncId(0));
     assert!(matches!(active.run(), VmResult::Finished));
@@ -547,7 +605,7 @@ fn collection_preserves_idle_engine_and_captured_frame_roots() {
     active.register_builtin(3, retain_argument);
     add_function(
         &mut active,
-        9,
+        10,
         &[
             Instruction::call_builtin(0, 0),
             Instruction::call_builtin(3, 1),
@@ -555,7 +613,7 @@ fn collection_preserves_idle_engine_and_captured_frame_roots() {
         ],
         0,
     );
-    let argument_task = active.spawn_root(FuncId(9));
+    let argument_task = active.spawn_root(FuncId(10));
     assert!(matches!(active.run(), VmResult::Finished));
     assert_eq!(active.task_result_i64(argument_task).unwrap(), 8);
     drop(active);
@@ -564,10 +622,6 @@ fn collection_preserves_idle_engine_and_captured_frame_roots() {
     assert!(matches!(
         idle.push_constant(&Constant::Str("a".repeat(524_281))),
         Err(VmError::ObjectTooLarge)
-    ));
-    assert!(matches!(
-        idle.push_constant(&Constant::BigInt("1".into())),
-        Err(VmError::UnsupportedConstant)
     ));
 }
 
@@ -705,11 +759,11 @@ fn collection_preserves_a_string_rooted_only_in_a_struct_field() {
             Instruction::new_object(Reg(20), ty),
             Instruction::call_builtin(0, 0),
             Instruction::store_field(Reg(20), 0, Reg(0)),
-            Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(20), 0),
+            Instruction::store_global(0, Reg(20)),
             Instruction::load_unit(Reg(20)),
             Instruction::load_unit(Reg(0)),
             Instruction::call_builtin(1, 0),
-            Instruction::a_type(Opcode::LoadGlobal, AddrMode::Imm, Reg(20), Reg(0), 0),
+            Instruction::load_global(Reg(20), 0),
             Instruction::load_field(Reg(0), Reg(20), 0),
             Instruction::call_builtin(2, 1),
             Instruction::ret(Reg(0)),
@@ -784,23 +838,13 @@ fn collection_preserves_strings_owned_only_by_a_growing_list() {
 #[test]
 fn collection_preserves_lists_in_detached_continuation_segments() {
     let mut engine = vm();
+    let (pause_effect, pause_meta) = install_pause_effect(&mut engine);
     engine.register_builtin(0, make_string);
     engine.register_builtin(1, collect);
     engine.register_builtin(2, length);
-    add_function(
-        &mut engine,
-        0,
-        &[
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::reset(Reg(20), 1, 0),
-            Instruction::mov(Reg(21), Reg(0)),
-            Instruction::call_builtin(1, 0),
-            Instruction::load_imm(Reg(1), 40),
-            Instruction::resume(Reg(21), Reg(1)),
-            Instruction::ret(Reg(0)),
-        ],
-        0,
-    );
+    let mut main = pause_collect_and_resume(2, pause_meta, 1, 1, Some(40));
+    main.push(Instruction::ret(Reg(0)));
+    add_function(&mut engine, 0, &main, 0);
     add_function(
         &mut engine,
         1,
@@ -813,8 +857,7 @@ fn collection_preserves_lists_in_detached_continuation_segments() {
             Instruction::store_slot(0, Reg(10)),
             Instruction::load_unit(Reg(10)),
             Instruction::load_unit(Reg(0)),
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::shift(Reg(20), Reg(0)),
+            Instruction::effect_call(pause_effect, 0),
             Instruction::load_slot(Reg(10), 0),
             Instruction::load_imm(Reg(1), 0),
             Instruction::a_type(Opcode::LoadIndex, AddrMode::Imm, Reg(0), Reg(10), 1),
@@ -823,6 +866,7 @@ fn collection_preserves_lists_in_detached_continuation_segments() {
         ],
         0,
     );
+    add_pause_handler(&mut engine, 2);
     let task = engine.spawn_root(FuncId(0));
     assert!(matches!(engine.run(), VmResult::Finished));
     assert_eq!(engine.task_result_i64(task).unwrap(), 8);
@@ -907,28 +951,21 @@ fn collection_preserves_strings_rooted_only_in_tuple_fields() {
 #[test]
 fn collection_preserves_tuple_fields_in_paused_continuation_segments() {
     let mut pool = TypePool::with_intrinsics();
+    let pause_effect = register_pause_effect(&mut pool);
     let ty = pool.intern_structural(type_pool::TypeKind::Tuple {
         elements: vec![Intrinsic::Str.type_index()],
     });
     let mut engine = vm();
     engine.install_type_pool(pool);
+    let pause_meta = engine
+        .push_constant(&Constant::UInt(pause_effect.as_u32() as u64))
+        .unwrap();
     engine.register_builtin(0, make_string);
     engine.register_builtin(1, collect);
     engine.register_builtin(2, length);
-    add_function(
-        &mut engine,
-        0,
-        &[
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::reset(Reg(20), 1, 0),
-            Instruction::mov(Reg(21), Reg(0)),
-            Instruction::call_builtin(1, 0),
-            Instruction::load_imm(Reg(1), 40),
-            Instruction::resume(Reg(21), Reg(1)),
-            Instruction::ret(Reg(0)),
-        ],
-        0,
-    );
+    let mut main = pause_collect_and_resume(2, pause_meta, 1, 1, Some(40));
+    main.push(Instruction::ret(Reg(0)));
+    add_function(&mut engine, 0, &main, 0);
     add_function(
         &mut engine,
         1,
@@ -940,8 +977,7 @@ fn collection_preserves_tuple_fields_in_paused_continuation_segments() {
             Instruction::store_slot(0, Reg(10)),
             Instruction::load_unit(Reg(10)),
             Instruction::load_unit(Reg(0)),
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::shift(Reg(20), Reg(0)),
+            Instruction::effect_call(pause_effect, 0),
             Instruction::load_slot(Reg(10), 0),
             Instruction::load_field(Reg(0), Reg(10), 0),
             Instruction::call_builtin(2, 1),
@@ -949,6 +985,7 @@ fn collection_preserves_tuple_fields_in_paused_continuation_segments() {
         ],
         0,
     );
+    add_pause_handler(&mut engine, 2);
     let task = engine.spawn_root(FuncId(0));
     assert!(matches!(engine.run(), VmResult::Finished));
     assert_eq!(engine.task_result_i64(task).unwrap(), 8);
@@ -1025,9 +1062,13 @@ fn collection_preserves_string_owned_only_by_an_enum_payload() {
 
 #[test]
 fn collection_preserves_enum_payloads_in_paused_continuation_segments() {
-    let (pool, ty, arguments) = enum_string_types();
+    let (mut pool, ty, arguments) = enum_string_types();
+    let pause_effect = register_pause_effect(&mut pool);
     let mut engine = vm();
     engine.install_type_pool(pool);
+    let pause_meta = engine
+        .push_constant(&Constant::UInt(pause_effect.as_u32() as u64))
+        .unwrap();
     let descriptor = engine
         .push_constant(&Constant::Enum {
             type_index: ty,
@@ -1037,20 +1078,9 @@ fn collection_preserves_enum_payloads_in_paused_continuation_segments() {
     engine.register_builtin(0, make_string);
     engine.register_builtin(1, collect);
     engine.register_builtin(2, length);
-    add_function(
-        &mut engine,
-        0,
-        &[
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::reset(Reg(20), 1, 0),
-            Instruction::mov(Reg(21), Reg(0)),
-            Instruction::call_builtin(1, 0),
-            Instruction::load_imm(Reg(1), 40),
-            Instruction::resume(Reg(21), Reg(1)),
-            Instruction::ret(Reg(0)),
-        ],
-        0,
-    );
+    let mut main = pause_collect_and_resume(2, pause_meta, 1, 1, Some(40));
+    main.push(Instruction::ret(Reg(0)));
+    add_function(&mut engine, 0, &main, 0);
     add_function(
         &mut engine,
         1,
@@ -1064,8 +1094,7 @@ fn collection_preserves_enum_payloads_in_paused_continuation_segments() {
             Instruction::load_unit(Reg(0)),
             Instruction::load_unit(Reg(10)),
             Instruction::load_unit(Reg(11)),
-            Instruction::load_imm(Reg(20), 7),
-            Instruction::shift(Reg(20), Reg(0)),
+            Instruction::effect_call(pause_effect, 0),
             Instruction::load_slot(Reg(11), 0),
             Instruction::enum_field(Reg(0), Reg(11), 0),
             Instruction::call_builtin(2, 1),
@@ -1073,6 +1102,7 @@ fn collection_preserves_enum_payloads_in_paused_continuation_segments() {
         ],
         0,
     );
+    add_pause_handler(&mut engine, 2);
     let task = engine.spawn_root(FuncId(0));
     assert!(matches!(engine.run(), VmResult::Finished));
     assert_eq!(engine.task_result_i64(task).unwrap(), 8);
@@ -1101,6 +1131,7 @@ fn equality_result(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 fn ordinary_eq_method_frames_retain_both_nested_payloads_through_gc_and_effect_pause() {
     for paused in [false, true] {
         let mut pool = TypePool::with_intrinsics();
+        let pause_effect = register_pause_effect(&mut pool);
         let inner = pool.register(type_pool::TypeInfo {
             kind: type_pool::TypeKind::Struct {
                 name: str_interner::intern("InnerEqPayload"),
@@ -1142,19 +1173,15 @@ fn ordinary_eq_method_frames_retain_both_nested_payloads_through_gc_and_effect_p
         );
         let mut engine = vm();
         engine.install_type_pool(pool);
+        let pause_meta = engine
+            .push_constant(&Constant::UInt(pause_effect.as_u32() as u64))
+            .unwrap();
         engine.register_builtin(0, make_string);
         engine.register_builtin(1, collect);
         engine.register_builtin(2, compare_strings_after_collection);
         engine.register_builtin(3, equality_result);
         let mut main = if paused {
-            vec![
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::reset(Reg(20), 1, 0),
-                Instruction::mov(Reg(21), Reg(0)),
-                Instruction::call_builtin(1, 0),
-                Instruction::load_imm(Reg(1), 40),
-                Instruction::resume(Reg(21), Reg(1)),
-            ]
+            pause_collect_and_resume(3, pause_meta, 1, 1, Some(40))
         } else {
             vec![Instruction::call(1, 0)]
         };
@@ -1188,10 +1215,7 @@ fn ordinary_eq_method_frames_retain_both_nested_payloads_through_gc_and_effect_p
             Instruction::load_unit(Reg(20)),
         ];
         if paused {
-            eq.extend([
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::shift(Reg(20), Reg(0)),
-            ]);
+            eq.push(Instruction::effect_call(pause_effect, 0));
         }
         eq.extend([
             Instruction::call_builtin(1, 0),
@@ -1205,6 +1229,7 @@ fn ordinary_eq_method_frames_retain_both_nested_payloads_through_gc_and_effect_p
             Instruction::ret(Reg(0)),
         ]);
         add_function(&mut engine, 2, &eq, 2);
+        add_pause_handler(&mut engine, 3);
         let task = engine.spawn_root(FuncId(0));
         assert!(
             matches!(engine.run(), VmResult::Finished),
@@ -1247,6 +1272,7 @@ fn concat_result_after_collection(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmErro
 fn concat_method_frames_keep_operands_and_native_results_through_gc_and_effect_pause() {
     for pause in ["none", "operands", "result"] {
         let mut pool = TypePool::with_intrinsics();
+        let pause_effect = register_pause_effect(&mut pool);
         let wrapper = pool.register(type_pool::TypeInfo {
             kind: type_pool::TypeKind::Struct {
                 name: str_interner::intern("ConcatOperand"),
@@ -1276,6 +1302,9 @@ fn concat_method_frames_keep_operands_and_native_results_through_gc_and_effect_p
         }
         let mut engine = vm();
         engine.install_type_pool(pool);
+        let pause_meta = engine
+            .push_constant(&Constant::UInt(pause_effect.as_u32() as u64))
+            .unwrap();
         engine.register_builtin(0, make_string);
         engine.register_builtin(1, collect);
         engine.register_builtin(2, concatenate_with_collections);
@@ -1283,14 +1312,7 @@ fn concat_method_frames_keep_operands_and_native_results_through_gc_and_effect_p
         let mut main = if pause == "none" {
             vec![Instruction::call(1, 0)]
         } else {
-            vec![
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::reset(Reg(20), 1, 0),
-                Instruction::mov(Reg(21), Reg(0)),
-                Instruction::call_builtin(1, 0),
-                Instruction::load_imm(Reg(1), 40),
-                Instruction::resume(Reg(21), Reg(1)),
-            ]
+            pause_collect_and_resume(4, pause_meta, 1, 1, Some(40))
         };
         main.extend([Instruction::call_builtin(3, 1), Instruction::ret(Reg(0))]);
         add_function(&mut engine, 0, &main, 0);
@@ -1319,10 +1341,7 @@ fn concat_method_frames_keep_operands_and_native_results_through_gc_and_effect_p
             Instruction::load_unit(Reg(20)),
         ];
         if pause == "operands" {
-            method.extend([
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::shift(Reg(20), Reg(0)),
-            ]);
+            method.push(Instruction::effect_call(pause_effect, 0));
         }
         method.extend([
             Instruction::load_slot(Reg(10), 0),
@@ -1340,10 +1359,7 @@ fn concat_method_frames_keep_operands_and_native_results_through_gc_and_effect_p
             Instruction::store_slot(1, Reg(0)),
         ]);
         if pause == "result" {
-            method.extend([
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::shift(Reg(20), Reg(0)),
-            ]);
+            method.push(Instruction::effect_call(pause_effect, 0));
         }
         method.extend([Instruction::load_slot(Reg(0), 2), Instruction::ret(Reg(0))]);
         add_function(&mut engine, 2, &method, 2);
@@ -1370,6 +1386,7 @@ fn concat_method_frames_keep_operands_and_native_results_through_gc_and_effect_p
             ],
             2,
         );
+        add_pause_handler(&mut engine, 4);
         let task = engine.spawn_root(FuncId(0));
         assert!(matches!(engine.run(), VmResult::Finished), "pause={pause}");
         assert_eq!(engine.task_result_i64(task).unwrap(), 16, "pause={pause}");
@@ -1415,6 +1432,7 @@ fn return_getter_payload_after_collection(ctx: &mut BuiltinCtx<'_>) -> Result<()
 fn custom_apply_update_frames_retain_receiver_key_rhs_and_results_across_collection_and_pause() {
     for pause in ["none", "update", "getter"] {
         let mut pool = TypePool::with_intrinsics();
+        let pause_effect = register_pause_effect(&mut pool);
         let wrapper = pool.register(type_pool::TypeInfo {
             kind: type_pool::TypeKind::Struct {
                 name: str_interner::intern("MutableCallable"),
@@ -1444,6 +1462,9 @@ fn custom_apply_update_frames_retain_receiver_key_rhs_and_results_across_collect
         }
         let mut engine = vm();
         engine.install_type_pool(pool);
+        let pause_meta = engine
+            .push_constant(&Constant::UInt(pause_effect.as_u32() as u64))
+            .unwrap();
         engine.register_builtin(0, make_before_update);
         engine.register_builtin(1, make_lookup_key);
         engine.register_builtin(2, make_string);
@@ -1454,14 +1475,7 @@ fn custom_apply_update_frames_retain_receiver_key_rhs_and_results_across_collect
         let mut main = if pause == "none" {
             vec![Instruction::call(1, 0)]
         } else {
-            vec![
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::reset(Reg(20), 1, 0),
-                Instruction::mov(Reg(21), Reg(0)),
-                Instruction::call_builtin(3, 0),
-                Instruction::load_unit(Reg(1)),
-                Instruction::resume(Reg(21), Reg(1)),
-            ]
+            pause_collect_and_resume(4, pause_meta, 1, 3, None)
         };
         main.extend([Instruction::call_builtin(6, 1), Instruction::ret(Reg(0))]);
         add_function(&mut engine, 0, &main, 0);
@@ -1502,10 +1516,7 @@ fn custom_apply_update_frames_retain_receiver_key_rhs_and_results_across_collect
             Instruction::load_unit(Reg(20)),
         ];
         if pause == "update" {
-            setter.extend([
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::shift(Reg(20), Reg(0)),
-            ]);
+            setter.push(Instruction::effect_call(pause_effect, 0));
         }
         setter.extend([
             Instruction::load_slot(Reg(10), 0),
@@ -1536,13 +1547,11 @@ fn custom_apply_update_frames_retain_receiver_key_rhs_and_results_across_collect
             Instruction::load_unit(Reg(1)),
         ];
         if pause == "getter" {
-            getter.extend([
-                Instruction::load_imm(Reg(20), 7),
-                Instruction::shift(Reg(20), Reg(0)),
-            ]);
+            getter.push(Instruction::effect_call(pause_effect, 0));
         }
         getter.extend([Instruction::load_slot(Reg(0), 0), Instruction::ret(Reg(0))]);
         add_function(&mut engine, 3, &getter, 2);
+        add_pause_handler(&mut engine, 4);
         let task = engine.spawn_root(FuncId(0));
         assert!(matches!(engine.run(), VmResult::Finished), "pause={pause}");
         assert_eq!(engine.task_result_i64(task).unwrap(), 8, "pause={pause}");

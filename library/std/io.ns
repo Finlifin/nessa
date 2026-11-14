@@ -2,8 +2,24 @@
 
 use .builtin.*
 
-pub const print: fn(Any) -> Unit = .print'builtin
-pub const println: fn(Any) -> Unit = .println'builtin
+const print_native: fn(Any) -> Unit = .print'builtin
+const println_native: fn(Any) -> Unit = .println'builtin
+
+-- Values with a Display implementation visible here print their Display
+-- text; all other values keep the native representation.
+pub fn print(value: Any) -> Unit {
+    value match {
+        shown: Display => print_native(shown.to_string()),
+        _ => print_native(value),
+    }
+}
+
+pub fn println(value: Any) -> Unit {
+    value match {
+        shown: Display => println_native(shown.to_string()),
+        _ => println_native(value),
+    }
+}
 
 pub const type_of: fn(Any) -> Type = .type_of'builtin
 pub const to_i64: fn(Any) -> i64 = .to_i64'builtin

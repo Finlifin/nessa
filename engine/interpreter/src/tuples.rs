@@ -2,11 +2,56 @@
 
 use gc::ObjectHeader;
 use runtime::TaggedValue;
-use type_pool::{TypeIndex, TypeKind};
+use type_pool::{TypeId, TypeIndex, TypeKind};
 
 use crate::{Vm, VmError};
 
 impl Vm {
+    pub(super) fn alloc_tuple(
+        &mut self,
+        elements: &[TypeIndex],
+        values: &[TaggedValue],
+    ) -> Result<TaggedValue, VmError> {
+        if elements.len() != values.len() {
+            return Err(VmError::TypeError);
+        }
+        let ty = (0..self.state.type_pool.len())
+            .map(|index| TypeIndex::from_raw(index as u32))
+            .find(|&index| {
+                matches!(
+                    &self.state.type_pool.get(index).kind,
+                    TypeKind::Tuple { elements: found } if found.as_slice() == elements
+                )
+            })
+            .unwrap_or_else(|| {
+                self.state.type_pool.intern_structural(TypeKind::Tuple {
+                    elements: elements.to_vec(),
+                })
+            });
+        let words = u16::try_from(values.len()).map_err(|_| VmError::ObjectTooLarge)?;
+        let info = self.state.type_pool.get_mut(ty);
+        if info.type_id == TypeId::ZERO && info.size == 0 {
+            info.size = u32::from(words).saturating_mul(8);
+            info.align = 8;
+        }
+        let root = self.roots.temporary_values.borrow().len();
+        self.with_temporary_roots(values, |vm| {
+            // SAFETY: payload length fits u16; every element is rooted for the
+            // allocation and written before another safepoint.
+            let pointer =
+                unsafe { vm.state.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+            for index in 0..values.len() {
+                let value = vm.roots.temporary_values.borrow()[root + index];
+                // SAFETY: index is in bounds of the fresh aligned tuple payload.
+                unsafe {
+                    pointer.as_ptr().cast::<u64>().add(index).write(value.raw());
+                }
+            }
+            // SAFETY: the tuple payload is fully initialized.
+            Ok(unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) })
+        })
+    }
+
     pub(super) fn tuple_values(&self, value: TaggedValue) -> Result<Vec<TaggedValue>, VmError> {
         let pointer = value.as_heap_ptr().ok_or(VmError::TypeError)?;
         // SAFETY: source is a live value rooted for the enclosing VM operation.

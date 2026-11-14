@@ -20,6 +20,8 @@ const MODULES: &[(&str, &str)] = &[
         "collections",
         include_str!("../../../library/std/collections.ns"),
     ),
+    ("range", include_str!("../../../library/std/range.ns")),
+    ("scalar", include_str!("../../../library/std/scalar.ns")),
     ("prelude", include_str!("../../../library/std/prelude.ns")),
 ];
 

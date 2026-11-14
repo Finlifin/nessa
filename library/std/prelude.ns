@@ -6,3 +6,4 @@ pub use .io.*
 pub use .math.*
 pub use .string.*
 pub use .process.*
+pub use .scalar.*

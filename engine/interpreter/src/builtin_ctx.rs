@@ -162,6 +162,270 @@ impl<'vm> BuiltinCtx<'vm> {
         Ok(self.retain_collection_result(value))
     }
 
+    fn return_fresh_list(&mut self, value: TaggedValue) -> Result<(), VmError> {
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn list_windows(&mut self, list: TaggedValue, size: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(size)?;
+        let value = self.vm.list_windows(list, size)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_chunks(&mut self, list: TaggedValue, size: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(size)?;
+        let value = self.vm.list_chunks(list, size)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_chunks_exact(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(size)?;
+        let value = self.vm.list_chunks_exact(list, size)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_rchunks(&mut self, list: TaggedValue, size: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(size)?;
+        let value = self.vm.list_rchunks(list, size)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_rchunks_exact(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(size)?;
+        let value = self.vm.list_rchunks_exact(list, size)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_chunks_remainder(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(size)?;
+        let value = self.vm.list_chunks_remainder(list, size)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_rchunks_remainder(
+        &mut self,
+        list: TaggedValue,
+        size: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(size)?;
+        let value = self.vm.list_rchunks_remainder(list, size)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_split_at(&mut self, list: TaggedValue, index: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(index)?;
+        let value = self.vm.list_split_at(list, index)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_rotate_left(
+        &mut self,
+        list: TaggedValue,
+        distance: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(distance)?;
+        let value = self.vm.list_rotate_left(list, distance)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_rotate_right(
+        &mut self,
+        list: TaggedValue,
+        distance: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(distance)?;
+        let value = self.vm.list_rotate_right(list, distance)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_repeat(&mut self, list: TaggedValue, count: usize) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.list_repeat(list, count)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_truncate(&mut self, list: TaggedValue, len: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(len)?;
+        self.vm.list_truncate(list, len)
+    }
+
+    pub fn list_fill(&mut self, list: TaggedValue, value: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(value)?;
+        self.vm.list_fill(list, value)
+    }
+
+    pub fn list_swap_remove(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(index)?;
+        let value = self.vm.list_swap_remove(list, index)?;
+        Ok(self.retain_collection_result(value))
+    }
+
+    pub fn list_split_off(&mut self, list: TaggedValue, index: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(index)?;
+        let value = self.vm.list_split_off(list, index)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_resize(
+        &mut self,
+        list: TaggedValue,
+        len: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(len)?;
+        self.require_rooted_value(value)?;
+        self.vm.list_resize(list, len, value)
+    }
+
+    pub fn list_copy(&mut self, list: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.list_copy(list)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_reverse(&mut self, list: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.list_reverse(list)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_concat(&mut self, left: TaggedValue, right: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(left)?;
+        self.require_rooted_value(right)?;
+        let value = self.vm.list_concat(left, right)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_swap(
+        &mut self,
+        list: TaggedValue,
+        left: TaggedValue,
+        right: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(left)?;
+        self.require_rooted_value(right)?;
+        self.vm.list_swap(list, left, right)
+    }
+
+    pub fn list_clear(&mut self, list: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.vm.list_clear(list)
+    }
+
+    pub fn list_insert(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(index)?;
+        self.require_rooted_value(value)?;
+        self.vm.list_insert(list, index, value)
+    }
+
+    pub fn list_remove(
+        &mut self,
+        list: TaggedValue,
+        index: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(index)?;
+        let value = self.vm.list_remove(list, index)?;
+        Ok(self.retain_collection_result(value))
+    }
+
+    pub fn list_take(&mut self, list: TaggedValue, count: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(count)?;
+        let value = self.vm.list_take(list, count)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_drop(&mut self, list: TaggedValue, count: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(count)?;
+        let value = self.vm.list_drop(list, count)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_first(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.list_first(list)?;
+        Ok(self.retain_collection_result(value))
+    }
+
+    pub fn list_last(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.list_last(list)?;
+        Ok(self.retain_collection_result(value))
+    }
+
+    pub fn list_append(&mut self, list: TaggedValue, other: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(other)?;
+        self.vm.list_append(list, other)
+    }
+
+    pub fn list_enumerate(&mut self, list: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.list_enumerate(list)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_flatten(&mut self, list: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.list_flatten(list)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_zip(&mut self, left: TaggedValue, right: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(left)?;
+        self.require_rooted_value(right)?;
+        let value = self.vm.list_zip(left, right)?;
+        self.return_fresh_list(value)
+    }
+
+    pub fn list_join(&mut self, list: TaggedValue, separator: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        self.require_rooted_value(separator)?;
+        let joined = self.vm.list_join(list, separator)?;
+        self.return_string(&joined)
+    }
+
     pub fn return_empty_map(&mut self) -> Result<(), VmError> {
         let value = self.vm.new_map(0)?;
         self.write_return(value);
@@ -178,6 +442,85 @@ impl<'vm> BuiltinCtx<'vm> {
         self.require_rooted_value(map)?;
         let keys = self.vm.map_keys(map)?;
         self.write_return(keys);
+        Ok(())
+    }
+
+    /// Return values in the same order as `return_map_keys`.
+    pub fn return_map_values(&mut self, map: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(map)?;
+        let values = self.vm.map_values(map)?;
+        self.write_return(values);
+        Ok(())
+    }
+
+    pub fn return_map_entries(&mut self, map: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(map)?;
+        let entries = self.vm.map_entries(map)?;
+        self.write_return(entries);
+        Ok(())
+    }
+
+    pub fn map_copy(&mut self, map: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(map)?;
+        let value = self.vm.map_copy(map)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn map_clear(&mut self, map: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(map)?;
+        self.vm.map_clear(map)
+    }
+
+    pub fn map_merge(&mut self, map: TaggedValue, other: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(map)?;
+        self.require_rooted_value(other)?;
+        self.vm.map_merge(map, other)
+    }
+
+    pub fn map_get_or_insert(
+        &mut self,
+        map: TaggedValue,
+        key: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        self.require_rooted_value(map)?;
+        self.require_rooted_value(key)?;
+        self.require_rooted_value(value)?;
+        let stored = self.vm.map_get_or_insert(map, key, value)?;
+        Ok(self.retain_collection_result(stored))
+    }
+
+    pub fn map_insert_absent(
+        &mut self,
+        map: TaggedValue,
+        key: TaggedValue,
+        value: TaggedValue,
+    ) -> Result<bool, VmError> {
+        self.require_rooted_value(map)?;
+        self.require_rooted_value(key)?;
+        self.require_rooted_value(value)?;
+        self.vm.map_insert_absent(map, key, value)
+    }
+
+    /// Return a fresh List containing a new String for each piece.
+    pub fn return_string_list(&mut self, pieces: &[&str]) -> Result<(), VmError> {
+        let list = self.vm.new_string_list(pieces)?;
+        self.write_return(list);
+        Ok(())
+    }
+
+    /// Return a fresh List of the Unicode scalar values of `text`.
+    pub fn return_char_list(&mut self, text: &str) -> Result<(), VmError> {
+        let list = self.vm.new_char_list(text)?;
+        self.write_return(list);
+        Ok(())
+    }
+
+    /// Return a fresh List of immediate i64 values.
+    pub fn return_i64_list(&mut self, values: &[i64]) -> Result<(), VmError> {
+        let list = self.vm.new_i64_list(values)?;
+        self.write_return(list);
         Ok(())
     }
 
@@ -300,8 +643,13 @@ impl<'vm> BuiltinCtx<'vm> {
     /// Copy numeric data out of a live argument, retaining no managed pointer.
     pub fn arg_number(&self, i: u8) -> Result<Number, VmError> {
         let value = self.arg(i)?;
-        // SAFETY: arg roots the live VM value until this context exits; this
-        // read completes without allocation or a collection safepoint.
+        self.number_of(value)
+    }
+
+    /// Read an immediate number. Heap values that are not numbers are `TypeError`.
+    pub fn number_of(&self, value: TaggedValue) -> Result<Number, VmError> {
+        // SAFETY: `value` was copied from a rooted VM slot. Number payloads are
+        // immediates, so this read does not follow a movable heap pointer.
         unsafe { Number::from_tagged(value) }.ok_or(VmError::TypeError)
     }
 
@@ -320,6 +668,10 @@ impl<'vm> BuiltinCtx<'vm> {
         let value = self.vm.type_value(ty)?;
         self.write_return(value);
         Ok(())
+    }
+
+    pub fn arg_char(&self, i: u8) -> Result<char, VmError> {
+        self.arg(i)?.as_char().ok_or(VmError::TypeError)
     }
 
     pub fn arg_bool(&self, i: u8) -> Result<bool, VmError> {
@@ -351,6 +703,10 @@ impl<'vm> BuiltinCtx<'vm> {
         self.write_return(TaggedValue::UNIT);
     }
 
+    pub fn return_null(&mut self) {
+        self.write_return(TaggedValue::NULL);
+    }
+
     pub fn return_i64(&mut self, v: i64) -> Result<(), VmError> {
         self.return_number(Number::I64(v))
     }
@@ -364,6 +720,28 @@ impl<'vm> BuiltinCtx<'vm> {
         let value = self.vm.number_value(number)?;
         self.write_return(value);
         Ok(())
+    }
+
+    pub fn return_optional_string_pair(
+        &mut self,
+        pair: Option<(&str, &str)>,
+    ) -> Result<(), VmError> {
+        let Some((left, right)) = pair else {
+            self.return_null();
+            return Ok(());
+        };
+        self.check_string_size(left.len())?;
+        self.check_string_size(right.len())?;
+        let left = self.vm.alloc_string(left)?;
+        let right = self.vm.alloc_string(right)?;
+        let str_ty = Intrinsic::Str.type_index();
+        let value = self.vm.alloc_tuple(&[str_ty, str_ty], &[left, right])?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn return_char(&mut self, value: char) {
+        self.write_return(TaggedValue::from_char(value));
     }
 
     pub fn return_bool(&mut self, v: bool) {
@@ -385,6 +763,13 @@ impl<'vm> BuiltinCtx<'vm> {
     /// Check the logical Display result limit before host or managed composition.
     pub fn check_display_size(&self, bytes: usize) -> Result<(), VmError> {
         self.vm.check_display_bytes(self.task_id, bytes)
+    }
+
+    /// Check that a String of `bytes` UTF-8 bytes can be returned, before the
+    /// host builds it: the Display limit applies, then the managed object limit.
+    pub fn check_string_size(&self, bytes: usize) -> Result<(), VmError> {
+        self.check_display_size(bytes)?;
+        Vm::string_payload_words(bytes).map(|_| ())
     }
 
     /// Internal generated Tuple traversal hook; unauthorized frames are rejected.
@@ -440,51 +825,34 @@ impl<'vm> BuiltinCtx<'vm> {
         self.vm.scalar_partial_cmp(left, right)
     }
 
-    /// Format a compiler-derived Display receiver and publish its String result.
-    /// The signed bootstrap contract and tagged-field layout are checked before
-    /// reading the rooted object; only the final publication allocates in the GC.
-    pub fn return_derived_display(&mut self, value: TaggedValue) -> Result<(), VmError> {
+    /// Native equality of two rooted values when VM kernels can decide it;
+    /// `None` defers two non-scalar values to source-level `PartialEq`.
+    pub fn native_equal(
+        &self,
+        left: TaggedValue,
+        right: TaggedValue,
+    ) -> Result<Option<bool>, VmError> {
+        self.require_rooted_value(left)?;
+        self.require_rooted_value(right)?;
+        self.vm.native_equal(left, right)
+    }
+
+    /// Element count when `value` is a tuple object.
+    pub fn tuple_length(&self, value: TaggedValue) -> Result<Option<usize>, VmError> {
         self.require_rooted_value(value)?;
-        let ty = self.vm.reflected_type(value)?;
-        let pool = &self.vm.state.type_pool;
-        let key = pool
-            .trait_schema(pool.well_known.display)
-            .and_then(|schema| {
-                schema
-                    .slots
-                    .iter()
-                    .find(|key| str_interner::try_get(key.name).as_deref() == Some("to_string"))
-            })
-            .ok_or(VmError::UnsupportedDerivedMethod("display contract"))?;
-        pool.check_native_derived_method(key, ty)
-            .map_err(|_| VmError::UnsupportedDerivedMethod("display contract"))?;
-        // A raw Any call to this internal builtin is not a Display wrapper.
-        // Authenticate the executing ordinary function against the published
-        // global implementation; do not reselect caller-scope trait evidence.
-        let current = self
-            .vm
-            .roots
-            .scheduler
-            .get_task(self.task_id)
-            .ok_or(VmError::InvalidTask)?
-            .current_func;
-        let implementation = pool
-            .find_trait_impl(ty, pool.well_known.display)
-            .ok_or(VmError::UnsupportedDerivedMethod("display wrapper"))?;
-        if !implementation.methods.iter().any(|method| {
-            method.name == key.name && method.func_id == current.0 && method.visible_scope.is_none()
-        }) {
-            return Err(VmError::UnsupportedDerivedMethod("display wrapper"));
-        }
-        let function = self.vm.checked_function(current)?;
-        pool.check_trait_method_signature(key, ty, function.function_type)
-            .map_err(|_| VmError::UnsupportedDerivedMethod("display wrapper"))?;
-        if !matches!(&function.abi, Some(abi) if abi.captures.is_empty() && abi.parameters == [nsbc::ParameterAbi::Value])
-        {
-            return Err(VmError::UnsupportedDerivedMethod("display wrapper"));
-        }
-        let text = self.vm.derived_struct_to_string(value, ty)?;
-        self.return_string(&text)
+        self.vm.tuple_length(value)
+    }
+
+    /// Tuple element `index`, retained for the caller as a native result.
+    pub fn tuple_element(&self, value: TaggedValue, index: i64) -> Result<TaggedValue, VmError> {
+        self.require_rooted_value(value)?;
+        Ok(self.retain_collection_result(self.vm.tuple_element(value, index)?))
+    }
+
+    /// Whether `value` is the `done` result of any concrete `IterationStep(T)`.
+    /// Nominal enums, templates and non-enum values are type errors.
+    pub fn iteration_step_done(&self, value: TaggedValue) -> Result<bool, VmError> {
+        self.vm.iteration_step_done(value)
     }
 
     /// Synchronously collect with this task's arguments and slots rooted.
@@ -761,7 +1129,7 @@ mod tests {
             ] {
                 vm.add_function(FunctionCode {
                     display_owner: None,
-                    abi: None,
+                    abi: nsbc::FunctionAbi::value_only(params as usize),
                     func_id: FuncId(id),
                     instructions: instructions.into_iter().map(Instruction::encode).collect(),
                     register_count: 32,
@@ -900,163 +1268,6 @@ mod tests {
         assert!(matches!(
             ctx.scalar_partial_cmp(TaggedValue::TRUE, TaggedValue::from_i64(1)),
             Err(VmError::TypeError)
-        ));
-    }
-
-    #[test]
-    fn derived_display_native_checks_contract_payload_and_metadata_names() {
-        use type_pool::{
-            FieldInfo, TraitDispatchSchema, TraitMethodKey, TraitMethodSignature,
-            TraitParameterKind, TraitTypeStep, TypeId, TypeInfo, TypeKind,
-        };
-        let mut vm = crate::tests::make_vm();
-        let owner = vm.state.type_pool.well_known.display;
-        let declaration = vm.state.type_pool.intern_structural(TypeKind::Function {
-            params: vec![owner],
-            ret: Intrinsic::Str.type_index(),
-        });
-        vm.state
-            .type_pool
-            .register_trait_schema(TraitDispatchSchema {
-                trait_type: owner,
-                slots: vec![TraitMethodKey {
-                    trait_owner: owner,
-                    name: str_interner::intern("to_string"),
-                    signature: Some(TraitMethodSignature {
-                        associated_paths: Vec::new(),
-                        declaration,
-                        self_paths: vec![vec![TraitTypeStep::Parameter(0)]],
-                        parameter_kinds: vec![TraitParameterKind::Receiver],
-                    }),
-                }],
-            })
-            .unwrap();
-        let ty = vm.state.type_pool.register(TypeInfo {
-            kind: TypeKind::Struct {
-                name: str_interner::intern("Native"),
-                fields: vec![FieldInfo {
-                    name: str_interner::intern("x"),
-                    ty: Intrinsic::I64.type_index(),
-                    has_default: false,
-                    offset: 0,
-                }],
-            },
-            type_id: TypeId(942, 1),
-            size: 8,
-            align: 8,
-        });
-        let signature = vm.state.type_pool.intern_structural(TypeKind::Function {
-            params: vec![ty],
-            ret: Intrinsic::Str.type_index(),
-        });
-        vm.add_function(runtime::FunctionCode {
-            display_owner: None,
-            abi: Some(nsbc::FunctionAbi {
-                captures: vec![],
-                parameters: vec![nsbc::ParameterAbi::Value],
-            }),
-            func_id: nsbc::FuncId(0),
-            instructions: vec![nsbc::Instruction::return_unit().encode()],
-            register_count: 1,
-            param_count: 1,
-            is_closure: false,
-            function_type: signature,
-        });
-        vm.state
-            .type_pool
-            .add_trait_impl(type_pool::TraitImplRecord {
-                implementor: ty,
-                trait_type: owner,
-                visible_scope: None,
-                methods: vec![type_pool::MethodSlot {
-                    name: str_interner::intern("to_string"),
-                    func_id: 0,
-                    trait_impl: Some(owner),
-                    visible_scope: None,
-                    access: type_pool::MethodAccess::Public,
-                }],
-            });
-        let task = vm.spawn_root(nsbc::FuncId(0));
-        for words in [0, 1] {
-            // SAFETY: TestVm keeps an operation live. Initialize the complete
-            // allocation and publish it to the task before any other allocation.
-            let payload = unsafe { vm.state.heap.alloc_object(ty, words) }.unwrap();
-            if words == 1 {
-                // SAFETY: this allocation owns one aligned tagged payload slot.
-                unsafe {
-                    payload
-                        .as_ptr()
-                        .cast::<TaggedValue>()
-                        .write(TaggedValue::from_i64(42));
-                }
-            }
-            // SAFETY: the freshly initialized object remains live and rooted.
-            let value = unsafe { TaggedValue::from_heap_ptr(payload.as_ptr()) };
-            vm.roots
-                .scheduler
-                .get_task_mut(task)
-                .unwrap()
-                .registers
-                .set(Reg(0), value);
-            let mut ctx = BuiltinCtx::new(&mut vm, task, 1);
-            let argument = ctx.arg(0).unwrap();
-            if words == 0 {
-                assert!(matches!(
-                    ctx.return_derived_display(argument),
-                    Err(VmError::TypeError)
-                ));
-            } else {
-                ctx.return_derived_display(argument).unwrap();
-                assert_eq!(ctx.arg_string(0).unwrap(), "Native { x: 42 }");
-            }
-        }
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(0), TaggedValue::from_i64(42));
-        let mut ctx = BuiltinCtx::new(&mut vm, task, 1);
-        assert!(matches!(
-            ctx.return_derived_display(TaggedValue::from_i64(42)),
-            Err(VmError::UnsupportedDerivedMethod("display contract"))
-        ));
-        drop(ctx);
-        if let TypeKind::Struct { fields, .. } = &mut vm.state.type_pool.get_mut(ty).kind {
-            fields[0].name = str_interner::StrId::from_raw(u32::MAX);
-        }
-        // SAFETY: the operation owns this new initialized allocation, and it is
-        // placed in the task register before calling the formatting facade.
-        let payload = unsafe { vm.state.heap.alloc_object(ty, 1) }.unwrap();
-        unsafe {
-            payload
-                .as_ptr()
-                .cast::<TaggedValue>()
-                .write(TaggedValue::from_i64(42));
-        }
-        let value = unsafe { TaggedValue::from_heap_ptr(payload.as_ptr()) };
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(0), value);
-        let mut ctx = BuiltinCtx::new(&mut vm, task, 1);
-        let argument = ctx.arg(0).unwrap();
-        assert!(matches!(
-            ctx.return_derived_display(argument),
-            Err(VmError::TypeError)
-        ));
-        drop(ctx);
-        if let TypeKind::Struct { fields, .. } = &mut vm.state.type_pool.get_mut(ty).kind {
-            fields[0].name = str_interner::intern("x");
-        }
-        vm.roots.scheduler.get_task_mut(task).unwrap().current_func = nsbc::FuncId(1);
-        let mut ctx = BuiltinCtx::new(&mut vm, task, 1);
-        let argument = ctx.arg(0).unwrap();
-        assert!(matches!(
-            ctx.return_derived_display(argument),
-            Err(VmError::UnsupportedDerivedMethod("display wrapper"))
         ));
     }
 

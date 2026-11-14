@@ -378,7 +378,7 @@ fn try_for_statement(p: &mut Parser) -> ParseResult {
         NULL
     };
 
-    let pat = pattern::try_pattern_without_extended_call(p)?;
+    let pat = pattern::try_refutable_pattern_without_extended_call(p)?;
     if pat.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -535,8 +535,9 @@ pub fn try_when_statement(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    let arms = try_multi_in_block(
+    let arms = basic::try_required_block(
         p,
+        "`when`",
         &[
             Rule::semicolon("else condition arm", try_else_condition_arm),
             Rule::semicolon("condition arm", try_condition_arm),

@@ -2,7 +2,7 @@
 
 use gc::ObjectHeader;
 use nsbc::FuncId;
-use runtime::{ClosureEnv, TaggedValue, TaskId};
+use runtime::{ClosureEnv, TaggedValue};
 use type_pool::Intrinsic;
 
 use crate::{Vm, VmError};
@@ -37,35 +37,11 @@ impl Vm {
             capture_count,
         })
     }
-
-    pub(super) fn load_capture_value(
-        &self,
-        task: TaskId,
-        index: u32,
-    ) -> Result<TaggedValue, VmError> {
-        let context = self
-            .roots
-            .scheduler
-            .get_task(task)
-            .expect("dispatched task exists");
-        let environment = match context.call_stack.last() {
-            Some(frame) => frame.closure_env,
-            None => context.stacks.active().entry_closure_env,
-        }
-        .ok_or(VmError::TypeError)?;
-        let layout = Self::closure_layout(environment)?;
-        self.check_entry_environment(context.current_func, Some(environment))?;
-        if index >= layout.capture_count {
-            return Err(VmError::TypeError);
-        }
-        // SAFETY: the live closure's header and capture index are checked.
-        Ok(unsafe { ClosureEnv::get_capture(layout.pointer, index) })
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use nsbc::{Instruction, Reg};
+    use nsbc::{FunctionAbi, Instruction, Reg};
     use runtime::FunctionCode;
     use type_pool::TypeIndex;
 
@@ -73,10 +49,17 @@ mod tests {
     use crate::VmResult;
     use crate::tests::make_vm;
 
-    fn add(vm: &mut Vm, id: u32, code: &[Instruction], is_closure: bool, params: u8) {
+    fn add(
+        vm: &mut Vm,
+        id: u32,
+        code: &[Instruction],
+        abi: FunctionAbi,
+        is_closure: bool,
+        params: u8,
+    ) {
         vm.add_function(FunctionCode {
             display_owner: None,
-            abi: None,
+            abi,
             func_id: FuncId(id),
             instructions: code
                 .iter()
@@ -90,47 +73,43 @@ mod tests {
     }
 
     #[test]
-    fn capture_reads_use_the_current_closure_and_check_the_array_bound() {
-        for index in [0, 1] {
-            let mut vm = make_vm();
-            add(
-                &mut vm,
-                0,
-                &[
-                    Instruction::load_imm(Reg(0), 42),
-                    Instruction::new_closure(Reg(1), 1, 1),
-                    Instruction::call_indirect(Reg(1), 0),
-                    Instruction::ret(Reg(0)),
-                ],
-                false,
-                0,
-            );
-            add(
-                &mut vm,
-                1,
-                &[
-                    Instruction::load_capture(Reg(0), index),
-                    Instruction::ret(Reg(0)),
-                ],
-                true,
-                1,
-            );
-            let task = vm.spawn_root(FuncId(0));
-            let result = vm.run();
-            if index == 0 {
-                assert!(matches!(result, VmResult::Finished), "{result:?}");
-                assert_eq!(vm.task_result_i64(task).unwrap(), 42);
-            } else {
-                assert!(
-                    matches!(result, VmResult::Error(VmError::TypeError)),
-                    "{result:?}"
-                );
-            }
-        }
+    fn closure_entry_receives_captures_before_explicit_parameters() {
+        let mut vm = make_vm();
+        add(
+            &mut vm,
+            0,
+            &[
+                Instruction::load_imm(Reg(0), 10),
+                Instruction::load_imm(Reg(1), 20),
+                Instruction::new_closure(Reg(3), 1, 2),
+                Instruction::load_imm(Reg(0), 12),
+                Instruction::call_indirect(Reg(3), 1),
+                Instruction::ret(Reg(0)),
+            ],
+            FunctionAbi::value_only(0),
+            false,
+            0,
+        );
+        add(
+            &mut vm,
+            1,
+            &[
+                Instruction::add(Reg(0), Reg(0), Reg(1)),
+                Instruction::add(Reg(0), Reg(0), Reg(2)),
+                Instruction::ret(Reg(0)),
+            ],
+            FunctionAbi::closure_values(2, 1),
+            true,
+            3,
+        );
+        let task = vm.spawn_root(FuncId(0));
+        let result = vm.run();
+        assert!(matches!(result, VmResult::Finished), "{result:?}");
+        assert_eq!(vm.task_result_i64(task).unwrap(), 42);
     }
 
     #[test]
-    fn ordinary_callees_cannot_read_an_outer_closures_environment() {
+    fn ordinary_callees_do_not_inherit_caller_closure_captures() {
         let mut vm = make_vm();
         add(
             &mut vm,
@@ -141,6 +120,7 @@ mod tests {
                 Instruction::call_indirect(Reg(1), 0),
                 Instruction::ret(Reg(0)),
             ],
+            FunctionAbi::value_only(0),
             false,
             0,
         );
@@ -148,35 +128,36 @@ mod tests {
             &mut vm,
             1,
             &[Instruction::call(2, 0), Instruction::ret(Reg(0))],
+            FunctionAbi::closure_values(1, 0),
             true,
             1,
         );
         add(
             &mut vm,
             2,
-            &[
-                Instruction::load_capture(Reg(0), 0),
-                Instruction::ret(Reg(0)),
-            ],
-            false,
-            0,
+            &[Instruction::ret(Reg(0))],
+            FunctionAbi::closure_values(1, 0),
+            true,
+            1,
         );
         vm.spawn_root(FuncId(0));
         assert!(matches!(vm.run(), VmResult::Error(VmError::TypeError)));
     }
 
     #[test]
-    fn delimiter_entry_keeps_its_own_closure_environment() {
+    fn delimiter_entry_receives_its_own_closure_captures_as_entry_parameters() {
         let mut vm = make_vm();
         add(
             &mut vm,
             0,
             &[
-                Instruction::load_imm(Reg(0), 42),
-                Instruction::new_closure(Reg(1), 1, 1),
-                Instruction::reset_closure(Reg(1), 0),
+                Instruction::load_imm(Reg(0), 40),
+                Instruction::load_imm(Reg(1), 2),
+                Instruction::new_closure(Reg(2), 1, 2),
+                Instruction::reset_closure(Reg(2), 0),
                 Instruction::ret(Reg(0)),
             ],
+            FunctionAbi::value_only(0),
             false,
             0,
         );
@@ -184,11 +165,12 @@ mod tests {
             &mut vm,
             1,
             &[
-                Instruction::load_capture(Reg(0), 0),
+                Instruction::add(Reg(0), Reg(0), Reg(1)),
                 Instruction::ret(Reg(0)),
             ],
+            FunctionAbi::closure_values(2, 0),
             true,
-            1,
+            2,
         );
         let task = vm.spawn_root(FuncId(0));
         let result = vm.run();

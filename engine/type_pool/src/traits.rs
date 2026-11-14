@@ -102,17 +102,11 @@ pub(crate) fn validate_record_scope(
 ) -> Result<(), crate::SnapshotError> {
     if let Some(scope) = record.visible_scope {
         if scopes.is_empty() {
-            if record.methods.is_empty()
-                || record
-                    .methods
-                    .iter()
-                    .any(|method| method.access != crate::MethodAccess::LegacyUnknown)
-            {
-                return Err(crate::SnapshotError::new(
-                    "scoped trait implementation requires a lexical scope graph",
-                ));
-            }
-        } else if scope as usize >= scopes.len() {
+            return Err(crate::SnapshotError::new(
+                "scoped trait implementation requires a lexical scope graph",
+            ));
+        }
+        if scope as usize >= scopes.len() {
             return Err(crate::SnapshotError::new(
                 "trait implementation scope is out of range",
             ));
@@ -714,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unknown_scopes_roundtrip_but_cannot_supply_scoped_evidence() {
+    fn scoped_implementations_without_scope_graph_are_rejected_and_cannot_supply_evidence() {
         let mut pool = TypePool::with_intrinsics();
         let owner = Intrinsic::I64.type_index();
         let eq = pool.well_known.eq;
@@ -723,7 +717,7 @@ mod tests {
             func_id: 17,
             trait_impl: Some(eq),
             visible_scope: Some(999),
-            access: MethodAccess::LegacyUnknown,
+            access: MethodAccess::Public,
         };
         pool.add_trait_impl(TraitImplRecord {
             implementor: owner,
@@ -737,15 +731,13 @@ mod tests {
             visible_scope: Some(999),
             entries: vec![17],
         });
-        let restored = TypePool::restore(pool.snapshot()).unwrap();
-        assert!(!restored.has_trait_impl(owner, eq));
+        assert!(!pool.has_trait_impl(owner, eq));
         assert_eq!(
-            restored.find_trait_impl_scoped(owner, eq, 0).unwrap_err(),
+            pool.find_trait_impl_scoped(owner, eq, 0).unwrap_err(),
             TraitLookupError::MissingScopeGraph
         );
-        let mut snapshot = pool.snapshot();
-        snapshot.trait_impls[0].methods.clear();
-        assert!(TypePool::restore(snapshot).is_err());
+        assert!(pool.validate().is_err());
+        assert!(TypePool::restore(pool.snapshot()).is_err());
     }
 
     #[test]
@@ -753,8 +745,18 @@ mod tests {
         let mut pool = pool();
         let owner = Intrinsic::I64.type_index();
         let eq = pool.well_known.eq;
+        pool.register_trait_schema(crate::TraitDispatchSchema {
+            trait_type: eq,
+            slots: vec![crate::TraitMethodKey {
+                trait_owner: eq,
+                name: str_interner::intern("eq"),
+                signature: None,
+            }],
+        })
+        .unwrap();
         implementation(&mut pool, owner, eq, None, crate::DERIVE_FUNC_ID);
         implementation(&mut pool, owner, eq, Some(1), 17);
+        assert!(pool.resolve_derived_methods([]).is_err());
         pool.resolve_derived_methods([(owner, eq, str_interner::intern("eq"), 41)])
             .unwrap();
         assert_eq!(

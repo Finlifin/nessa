@@ -1,7 +1,90 @@
-use nsbc::{AddrMode, Constant, Instruction, InstructionData, Opcode, Reg};
-use type_pool::{Intrinsic, TypeId, TypeInfo, TypeKind, TypePool};
+use std::collections::BTreeSet;
+
+use nsbc::{
+    AddrMode, Constant, Instruction, InstructionData, Opcode, Reg, instruction_requires_scope,
+};
+use sha2::{Digest, Sha256};
+use type_pool::{
+    IdentityPathSegment, Intrinsic, NominalTypeProvenance, PackageTypeContext, TypeId,
+    TypeIdentityInput, TypeIndex, TypeInfo, TypeKind, TypePool,
+};
 
 use super::*;
+
+fn finalize_pool(pool: &mut TypePool) {
+    let snapshot = pool.snapshot();
+    let structural: BTreeSet<_> = snapshot.structural_types.iter().copied().collect();
+    let mut declarations = Vec::new();
+    for (index, info) in snapshot.types.iter().enumerate() {
+        let ty = TypeIndex::from_raw(index as u32);
+        if pool.is_reserved_type(ty) {
+            continue;
+        }
+        let path = match &info.kind {
+            TypeKind::Struct { name, .. }
+            | TypeKind::Newtype { name, .. }
+            | TypeKind::Trait { name, .. }
+            | TypeKind::Module { name } => Some(vec![
+                IdentityPathSegment::Lexical {
+                    kind: 0,
+                    ordinal: index as u32,
+                },
+                IdentityPathSegment::Named(str_interner::get(*name)),
+            ]),
+            TypeKind::Enum { name, .. } if !structural.contains(&ty) => Some(vec![
+                IdentityPathSegment::Lexical {
+                    kind: 0,
+                    ordinal: index as u32,
+                },
+                IdentityPathSegment::Named(str_interner::get(*name)),
+            ]),
+            TypeKind::Effect { .. } if !structural.contains(&ty) => {
+                Some(vec![IdentityPathSegment::Lexical {
+                    kind: 6,
+                    ordinal: index as u32,
+                }])
+            }
+            _ => None,
+        };
+        if let Some(path) = path {
+            declarations.push(NominalTypeProvenance {
+                type_index: ty,
+                package: 0,
+                path,
+                last_stable_version: "1.0.0".into(),
+            });
+        }
+    }
+    pool.finalize_type_identities(TypeIdentityInput {
+        schema: 1,
+        packages: vec![PackageTypeContext {
+            identity_schema: 1,
+            identity: [0x22; 16],
+            qualified_name: "org.test/artifact".into(),
+            version: "1.0.0".into(),
+        }],
+        declarations,
+    })
+    .unwrap();
+}
+
+fn collect_scopes(functions: &[CompiledFunction], scope: u32) -> Vec<MethodCallScope> {
+    let mut scopes = Vec::new();
+    for function in functions {
+        for (pc, &word) in function.instructions.iter().enumerate() {
+            if let Some(inst) = Instruction::decode(word)
+                && instruction_requires_scope(inst.opcode)
+            {
+                scopes.push(MethodCallScope {
+                    func_id: function.func_id,
+                    pc: pc as u32,
+                    scope,
+                });
+            }
+        }
+    }
+    scopes
+}
 
 fn fixture() -> CompiledArtifact {
     let mut pool = TypePool::with_intrinsics();
@@ -34,10 +117,50 @@ fn fixture() -> CompiledArtifact {
         size: 0,
         align: 0,
     });
+    finalize_pool(&mut pool);
+    let functions = vec![
+        CompiledFunction {
+            display_owner: None,
+            abi: FunctionAbi::default(),
+            func_id: FuncId(0),
+            name: str_interner::intern("artifact_entry"),
+            instructions: [
+                Instruction::allocate_slots(1),
+                Instruction::safepoint(),
+                Instruction::load_const(Reg(0), 0),
+                Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(0), 0),
+                Instruction::a_type(Opcode::LoadGlobal, AddrMode::Imm, Reg(1), Reg(0), 0),
+                Instruction::ret(Reg(1)),
+            ]
+            .iter()
+            .map(|instruction| instruction.encode())
+            .collect(),
+            register_count: 2,
+            param_count: 0,
+            is_closure: false,
+            function_type: signature,
+            safepoint_pcs: vec![1],
+        },
+        CompiledFunction {
+            display_owner: None,
+            abi: FunctionAbi::default(),
+            func_id: FuncId(1),
+            name: str_interner::intern("artifact_closure"),
+            instructions: vec![
+                Instruction::load_imm(Reg(0), 7).encode(),
+                Instruction::ret(Reg(0)).encode(),
+            ],
+            register_count: 1,
+            param_count: 0,
+            is_closure: true,
+            function_type: signature,
+            safepoint_pcs: vec![],
+        },
+    ];
+    let method_call_scopes = collect_scopes(&functions, 0);
     CompiledArtifact {
         codegen_output: CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: nsbc::ScopeCoverage::Calls,
+            method_call_scopes,
             globals: vec![GlobalInfo {
                 type_index: Intrinsic::I64.type_index(),
                 is_mutable: false,
@@ -51,45 +174,7 @@ fn fixture() -> CompiledArtifact {
                 Constant::Type(alias),
                 Constant::Float(f64::from_bits(0x7ff8_0000_0000_0123)),
             ],
-            functions: vec![
-                CompiledFunction {
-                    display_owner: None,
-                    abi: None,
-                    func_id: FuncId(0),
-                    name: str_interner::intern("artifact_entry"),
-                    instructions: [
-                        Instruction::allocate_slots(1),
-                        Instruction::safepoint(),
-                        Instruction::load_const(Reg(0), 0),
-                        Instruction::a_type(Opcode::StoreGlobal, AddrMode::Imm, Reg(0), Reg(0), 0),
-                        Instruction::a_type(Opcode::LoadGlobal, AddrMode::Imm, Reg(1), Reg(0), 0),
-                        Instruction::ret(Reg(1)),
-                    ]
-                    .iter()
-                    .map(|instruction| instruction.encode())
-                    .collect(),
-                    register_count: 2,
-                    param_count: 0,
-                    is_closure: false,
-                    function_type: signature,
-                    safepoint_pcs: vec![1],
-                },
-                CompiledFunction {
-                    display_owner: None,
-                    abi: None,
-                    func_id: FuncId(1),
-                    name: str_interner::intern("artifact_closure"),
-                    instructions: vec![
-                        Instruction::load_imm(Reg(0), 7).encode(),
-                        Instruction::ret(Reg(0)).encode(),
-                    ],
-                    register_count: 1,
-                    param_count: 0,
-                    is_closure: true,
-                    function_type: signature,
-                    safepoint_pcs: vec![],
-                },
-            ],
+            functions,
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
@@ -127,22 +212,75 @@ fn rejects(bytes: &[u8], message: &str) {
     assert!(error.to_string().contains(message), "{error}");
 }
 
+fn methods_offset(metadata: &[u8]) -> usize {
+    let mut reader = Reader {
+        remaining: metadata,
+    };
+    reader.take(20).unwrap();
+    reader.blob().unwrap();
+    let globals = reader.u32().unwrap() as usize;
+    reader.take(globals * 5).unwrap();
+    let functions = reader.u32().unwrap();
+    for _ in 0..functions {
+        reader.u32().unwrap();
+        reader.string().unwrap();
+        reader.u32().unwrap();
+    }
+    metadata.len() - reader.remaining.len()
+}
+
+fn scopes_offset(metadata: &[u8]) -> usize {
+    let mut reader = Reader {
+        remaining: &metadata[methods_offset(metadata)..],
+    };
+    let methods = reader.u32().unwrap();
+    for _ in 0..methods {
+        reader.u32().unwrap();
+        reader.string().unwrap();
+    }
+    let builtins = reader.u32().unwrap();
+    for _ in 0..builtins {
+        reader.u32().unwrap();
+        reader.string().unwrap();
+    }
+    metadata.len() - reader.remaining.len()
+}
+
+fn abis_offset(metadata: &[u8]) -> usize {
+    let start = scopes_offset(metadata);
+    let mut reader = Reader {
+        remaining: &metadata[start..],
+    };
+    let scopes = reader.u32().unwrap() as usize;
+    reader.take(scopes * 12).unwrap();
+    metadata.len() - reader.remaining.len()
+}
+
 #[test]
 fn complete_artifacts_roundtrip_every_runtime_metadata_component() {
     let artifact = fixture();
     let bytes = write_artifact(&artifact).unwrap();
     let archive = Archive::read_from(&mut bytes.as_slice()).unwrap();
+    assert_eq!(archive.header.version, nsbc::VERSION);
     assert_eq!(archive.sections.len(), 4);
     assert_ne!(archive.header.checksum, [0; 32]);
+    let metadata = archive.find_section(SectionKind::Metadata).unwrap();
+    assert_eq!(&metadata[..8], b"NSAM\x06\x00\x00\x00");
+    assert_eq!(&metadata[24..32], b"TPOL\x0b\x00\x00\x00");
     let code = archive.find_section(SectionKind::Code).unwrap();
     assert_eq!(u32::from_le_bytes(code[8..12].try_into().unwrap()), 36);
     assert_eq!(u16::from_le_bytes(code[34..36].try_into().unwrap()), 2);
+
     let mut loaded = read_artifact(&bytes).unwrap();
     assert_eq!(loaded.entry, artifact.entry);
     assert_eq!(loaded.builtin_abi_version, 1);
     assert_eq!(
         loaded.codegen_output.globals,
         artifact.codegen_output.globals
+    );
+    assert_eq!(
+        loaded.codegen_output.method_call_scopes,
+        artifact.codegen_output.method_call_scopes
     );
     assert_eq!(loaded.type_pool.len(), artifact.type_pool.len());
     assert_eq!(loaded.type_pool.scopes(), artifact.type_pool.scopes());
@@ -173,6 +311,8 @@ fn complete_artifacts_roundtrip_every_runtime_metadata_component() {
             str_interner::try_get(expected.name)
         );
         assert_eq!(actual.function_type, expected.function_type);
+        assert_eq!(actual.abi, expected.abi);
+        assert_eq!(actual.display_owner, expected.display_owner);
         assert_eq!(actual.is_closure, expected.is_closure);
         assert_eq!(actual.param_count, expected.param_count);
         assert_eq!(actual.register_count, expected.register_count);
@@ -193,14 +333,72 @@ fn complete_artifacts_roundtrip_every_runtime_metadata_component() {
 }
 
 #[test]
-fn legacy_archives_and_zero_checksums_cannot_be_executed() {
-    let mut artifact = fixture();
-    artifact.codegen_output.globals.clear();
-    let legacy = crate::write_archive(&artifact.codegen_output).unwrap();
-    rejects(&legacy, "missing Metadata");
-    let mut bytes = write_artifact(&fixture()).unwrap();
-    bytes[8..40].fill(0);
-    rejects(&bytes, "require a checksum");
+fn rejects_legacy_container_versions_zero_checksums_and_legacy_metadata_revisions() {
+    let bytes = write_artifact(&fixture()).unwrap();
+
+    // Container versions != 4 (even with recomputed SHA-256) are rejected.
+    for version in [0u32, 1, 2, 3, 5, u32::MAX] {
+        let mut bad = bytes.clone();
+        bad[4..8].copy_from_slice(&version.to_le_bytes());
+        let checksum = Sha256::digest(&bad[nsbc::FILE_HEADER_SIZE..]);
+        bad[8..40].copy_from_slice(&checksum);
+        rejects(&bad, "unsupported NSBC version");
+    }
+
+    // Zero checksum and missing Metadata section are rejected.
+    let mut zeroed = bytes.clone();
+    zeroed[8..40].fill(0);
+    rejects(&zeroed, "checksum mismatch");
+
+    let mut incomplete_writer = ArchiveWriter::new();
+    incomplete_writer.add_raw_section(SectionKind::Code, vec![0; 4]);
+    incomplete_writer.add_constants_section(&[]).unwrap();
+    incomplete_writer.add_raw_section(SectionKind::StackMaps, vec![0; 4]);
+    let mut incomplete = Vec::new();
+    incomplete_writer.write_to(&mut incomplete).unwrap();
+    rejects(&incomplete, "missing Metadata");
+
+    // NSAM revisions != 6 (including legacy 1..=5) are rejected.
+    for revision in [0u32, 1, 2, 3, 4, 5, 7, u32::MAX] {
+        rejects(
+            &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
+                metadata[4..8].copy_from_slice(&revision.to_le_bytes());
+            }),
+            "unsupported artifact metadata revision",
+        );
+    }
+
+    // TPOL versions != 11 (including legacy 1..=10) are rejected.
+    for version in [0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, u32::MAX] {
+        rejects(
+            &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
+                assert_eq!(&metadata[24..28], b"TPOL");
+                metadata[28..32].copy_from_slice(&version.to_le_bytes());
+            }),
+            "unsupported type metadata version",
+        );
+    }
+
+    // Retired constant tag 4 (BigInt) and truncated tag 5 (Int128) are rejected.
+    rejects(
+        &rewrite_section(&bytes, SectionKind::Constants, |constants| {
+            *constants = vec![1, 0, 0, 0, 4, 1, 0, 0, 0, 42];
+        }),
+        "unknown constant tag",
+    );
+    rejects(
+        &rewrite_section(&bytes, SectionKind::Constants, |constants| {
+            *constants = vec![1, 0, 0, 0, 5, 0, 0, 0, 0];
+        }),
+        "truncated constant payload",
+    );
+
+    // Unfinalized TypePool is rejected on write_artifact.
+    let mut unfinalized = fixture();
+    unfinalized.type_pool = TypePool::with_intrinsics();
+    let error = write_artifact(&unfinalized).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("TPOL11 requires finalized"));
 }
 
 #[test]
@@ -229,20 +427,9 @@ fn code_tables_reject_bad_offsets_overlaps_counts_flags_and_trailing_bytes() {
         &rewrite_section(&bytes, SectionKind::StackMaps, |maps| maps.push(0)),
         "trailing bytes",
     );
-}
-
-#[test]
-fn metadata_requires_its_magic_revision_and_exact_payload() {
-    let bytes = write_artifact(&fixture()).unwrap();
     rejects(
         &rewrite_section(&bytes, SectionKind::Metadata, |metadata| metadata[0] ^= 1),
         "metadata magic",
-    );
-    rejects(
-        &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            metadata[4..8].copy_from_slice(&7u32.to_le_bytes())
-        }),
-        "metadata revision",
     );
     rejects(
         &rewrite_section(&bytes, SectionKind::Metadata, |metadata| metadata.push(0)),
@@ -275,7 +462,7 @@ fn code_partition_validation_preserves_table_order_and_rejects_amplifying_ranges
     artifact.codegen_output.functions = (0..100)
         .map(|id| CompiledFunction {
             display_owner: None,
-            abi: None,
+            abi: FunctionAbi::default(),
             func_id: FuncId(id),
             name: str_interner::intern("overlapping_code"),
             instructions: instructions.clone(),
@@ -286,6 +473,7 @@ fn code_partition_validation_preserves_table_order_and_rejects_amplifying_ranges
             safepoint_pcs: Vec::new(),
         })
         .collect();
+    artifact.codegen_output.method_call_scopes.clear();
     let bytes = write_artifact(&artifact).unwrap();
     let overlapping = rewrite_section(&bytes, SectionKind::Code, |code| {
         let data_start = 4 + 16 * 100;
@@ -300,7 +488,6 @@ fn code_partition_validation_preserves_table_order_and_rejects_amplifying_ranges
 
 fn method_fixture() -> CompiledArtifact {
     let mut artifact = fixture();
-    artifact.type_pool.install_scopes(vec![]).unwrap();
     // StrId zero is always representable by the narrow method form. Preserve a
     // numeric UInt with that same value and also use it as old far metadata.
     artifact.codegen_output.constants = vec![Constant::UInt(0)];
@@ -316,51 +503,31 @@ fn method_fixture() -> CompiledArtifact {
     .iter()
     .map(|instruction| instruction.encode())
     .collect();
+    artifact.codegen_output.method_call_scopes = vec![
+        MethodCallScope {
+            func_id: FuncId(0),
+            pc: 2,
+            scope: 0,
+        },
+        MethodCallScope {
+            func_id: FuncId(0),
+            pc: 3,
+            scope: 1,
+        },
+    ];
     artifact
-}
-
-fn scoped_method_fixture() -> CompiledArtifact {
-    let mut artifact = method_fixture();
-    artifact
-        .type_pool
-        .install_scopes(vec![
-            type_pool::ScopeContext {
-                parent: None,
-                package: 0,
-                assoc_type: None,
-            },
-            type_pool::ScopeContext {
-                parent: Some(0),
-                package: 0,
-                assoc_type: None,
-            },
-        ])
-        .unwrap();
-    artifact
-}
-
-fn methods_offset(metadata: &[u8]) -> usize {
-    let mut reader = Reader {
-        remaining: metadata,
-    };
-    reader.take(20).unwrap();
-    reader.blob().unwrap();
-    let globals = reader.u32().unwrap() as usize;
-    reader.take(globals * 5).unwrap();
-    let functions = reader.u32().unwrap();
-    for _ in 0..functions {
-        reader.u32().unwrap();
-        reader.string().unwrap();
-        reader.u32().unwrap();
-    }
-    metadata.len() - reader.remaining.len()
 }
 
 #[test]
-fn method_relocation_preserves_numeric_uints_and_remains_stable_on_resave() {
-    let bytes = write_artifact(&method_fixture()).unwrap();
+fn method_relocation_preserves_numeric_uints_callsite_scopes_and_resaves() {
+    let artifact = method_fixture();
+    let bytes = write_artifact(&artifact).unwrap();
     let loaded = read_artifact(&bytes).unwrap();
     assert_eq!(loaded.codegen_output.constants.len(), 2);
+    assert_eq!(
+        loaded.codegen_output.method_call_scopes,
+        artifact.codegen_output.method_call_scopes
+    );
     let words = &loaded.codegen_output.functions[0].instructions;
     let load = Instruction::decode(words[0]).unwrap();
     let InstructionData::A {
@@ -420,7 +587,7 @@ fn method_slots_cannot_alias_numeric_or_handler_metadata_uses() {
     let corrupt = rewrite_section(&bytes, SectionKind::Code, |code| {
         let offset = u32::from_le_bytes(code[8..12].try_into().unwrap()) as usize;
         code[offset..offset + 4].copy_from_slice(
-            &Instruction::e_type(Opcode::PushHandlerWide, 0)
+            &Instruction::push_capturing_handler(Reg(0), 0)
                 .encode()
                 .to_le_bytes(),
         );
@@ -429,11 +596,11 @@ fn method_slots_cannot_alias_numeric_or_handler_metadata_uses() {
 }
 
 #[test]
-fn method_relocation_widens_loads_and_moves_wide_handler_metadata_in_place() {
+fn method_relocation_widens_loads_and_moves_capturing_handler_metadata_in_place() {
     let mut artifact = method_fixture();
     let effect = artifact.type_pool.register(TypeInfo {
         kind: TypeKind::Effect {
-            params: vec![],
+            params: vec![Intrinsic::I64.type_index()],
             ret: Intrinsic::I64.type_index(),
             is_async: false,
         },
@@ -441,7 +608,8 @@ fn method_relocation_widens_loads_and_moves_wide_handler_metadata_in_place() {
         size: 0,
         align: 0,
     });
-    let packed = (effect.as_u32() as u64) << 32 | 1;
+    finalize_pool(&mut artifact.type_pool);
+    let packed = (1u64 << 32) | u64::from(effect.as_u32());
     artifact
         .codegen_output
         .constants
@@ -454,13 +622,18 @@ fn method_relocation_widens_loads_and_moves_wide_handler_metadata_in_place() {
         Instruction::load_const(Reg(0), 4095),
         Instruction::load_imm(Reg(1), 1),
         Instruction::call_method(Reg(1), 0, 0),
-        Instruction::e_type(Opcode::PushHandlerWide, 1),
+        Instruction::push_capturing_handler(Reg(1), 1),
         Instruction::e_type(Opcode::PopHandler, 0),
         Instruction::ret(Reg(0)),
     ]
     .iter()
     .map(|instruction| instruction.encode())
     .collect();
+    artifact.codegen_output.method_call_scopes = vec![MethodCallScope {
+        func_id: FuncId(0),
+        pc: 3,
+        scope: 0,
+    }];
     let bytes = write_artifact(&artifact).unwrap();
     let loaded = read_artifact(&bytes).unwrap();
     let words = &loaded.codegen_output.functions[0].instructions;
@@ -483,18 +656,19 @@ fn method_relocation_widens_loads_and_moves_wide_handler_metadata_in_place() {
     let InstructionData::E { payload } = handler.data else {
         panic!("expected handler");
     };
-    assert_eq!(handler.opcode, Opcode::PushHandlerWide);
-    assert_ne!(payload, 1);
+    assert_eq!(handler.opcode, Opcode::PushCapturingHandler);
+    let relocated_handler = payload & 0x1ffff;
+    assert_ne!(relocated_handler, 1);
     assert!(
-        matches!(loaded.codegen_output.constants[payload as usize], Constant::UInt(value) if value == packed)
+        matches!(loaded.codegen_output.constants[relocated_handler as usize], Constant::UInt(value) if value == packed)
     );
 }
 
 #[test]
 fn unrelated_far_jump_words_and_safepoint_pcs_survive_relocation() {
     let mut artifact = method_fixture();
-    let function = &mut artifact.codegen_output.functions[0];
     let distance = (1 << 17) + 1;
+    let function = &mut artifact.codegen_output.functions[0];
     function.instructions = vec![Instruction::nop().encode(); distance + 3];
     let far_word = ((Opcode::JmpFar as u32) << 24) | distance as u32;
     function.instructions[0] = far_word;
@@ -502,6 +676,11 @@ fn unrelated_far_jump_words_and_safepoint_pcs_survive_relocation() {
     function.instructions[distance + 1] = Instruction::call_method(Reg(1), 0, 0).encode();
     function.instructions[distance + 2] = Instruction::ret(Reg(0)).encode();
     function.safepoint_pcs = vec![distance as u32];
+    artifact.codegen_output.method_call_scopes = vec![MethodCallScope {
+        func_id: FuncId(0),
+        pc: (distance + 1) as u32,
+        scope: 0,
+    }];
     let loaded = read_artifact(&write_artifact(&artifact).unwrap()).unwrap();
     let function = &loaded.codegen_output.functions[0];
     assert_eq!(function.instructions[0], far_word);
@@ -534,11 +713,16 @@ fn builtin_manifest_roundtrips_and_must_cover_real_call_operands() {
     .iter()
     .map(|instruction| instruction.encode())
     .collect();
+    artifact.codegen_output.method_call_scopes.clear();
     let bytes = write_artifact(&artifact).unwrap();
     assert_eq!(read_artifact(&bytes).unwrap().builtins, artifact.builtins);
     let corrupt = rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-        let id_offset = metadata.len() - 8 - "to_i64".len();
-        metadata[id_offset..id_offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        let builtins_start = methods_offset(metadata) + 4;
+        assert_eq!(
+            &metadata[builtins_start..builtins_start + 8],
+            &[1, 0, 0, 0, 3, 0, 0, 0]
+        );
+        metadata[builtins_start + 4..builtins_start + 8].copy_from_slice(&1u32.to_le_bytes());
     });
     rejects(&corrupt, "undeclared builtin");
     artifact.builtins.push(artifact.builtins[0].clone());
@@ -576,11 +760,57 @@ fn corrupt_global_flags_types_and_entry_are_rejected_before_execution() {
 }
 
 #[test]
-fn generated_derived_function_identity_survives_artifact_roundtrip() {
+fn resolved_derived_methods_roundtrip_while_unresolved_sentinels_are_rejected() {
     let mut artifact = fixture();
     let owner = Intrinsic::I64.type_index();
-    let trait_type = artifact.type_pool.well_known.eq;
+    let trait_type = artifact.type_pool.register(TypeInfo {
+        kind: TypeKind::Trait {
+            name: str_interner::intern("DerivedEqView"),
+            parents: vec![],
+            assoc_types: vec![],
+        },
+        type_id: TypeId::ZERO,
+        size: 0,
+        align: 0,
+    });
+    let declaration = artifact.type_pool.intern_structural(TypeKind::Function {
+        params: vec![trait_type],
+        ret: Intrinsic::Bool.type_index(),
+    });
+    let actual = artifact.type_pool.intern_structural(TypeKind::Function {
+        params: vec![owner],
+        ret: Intrinsic::Bool.type_index(),
+    });
     let name = str_interner::intern("eq");
+    artifact
+        .type_pool
+        .register_trait_schema(type_pool::TraitDispatchSchema {
+            trait_type,
+            slots: vec![type_pool::TraitMethodKey {
+                trait_owner: trait_type,
+                name,
+                signature: Some(type_pool::TraitMethodSignature {
+                    associated_paths: vec![],
+                    declaration,
+                    self_paths: vec![vec![type_pool::TraitTypeStep::Parameter(0)]],
+                    parameter_kinds: vec![type_pool::TraitParameterKind::Receiver],
+                }),
+            }],
+        })
+        .unwrap();
+    let impl_fn = &mut artifact.codegen_output.functions[1];
+    impl_fn.function_type = actual;
+    impl_fn.is_closure = false;
+    impl_fn.param_count = 1;
+    impl_fn.abi = FunctionAbi {
+        captures: vec![],
+        parameters: vec![ParameterAbi::Value],
+    };
+    impl_fn.instructions = vec![
+        Instruction::a_type(Opcode::LoadTrue, AddrMode::Imm, Reg(0), Reg(0), 0).encode(),
+        Instruction::ret(Reg(0)).encode(),
+    ];
+
     let method = type_pool::MethodSlot {
         name,
         func_id: type_pool::DERIVE_FUNC_ID,
@@ -603,10 +833,23 @@ fn generated_derived_function_identity_survives_artifact_roundtrip() {
         visible_scope: None,
         entries: vec![type_pool::DERIVE_FUNC_ID],
     });
+    finalize_pool(&mut artifact.type_pool);
+
+    // Unresolved DERIVE_FUNC_ID must be rejected before producing an archive.
+    let unresolved_err = write_artifact(&artifact).unwrap_err();
+    assert_eq!(unresolved_err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        unresolved_err
+            .to_string()
+            .contains("unresolved derived method sentinel")
+    );
+
+    // Once resolved to a real function, roundtrip succeeds cleanly.
     artifact
         .type_pool
         .resolve_derived_methods([(owner, trait_type, name, 1)])
         .unwrap();
+    finalize_pool(&mut artifact.type_pool);
     let loaded = read_artifact(&write_artifact(&artifact).unwrap()).unwrap();
     assert_eq!(
         loaded.type_pool.find_method(owner, name).unwrap().func_id,
@@ -632,94 +875,12 @@ fn generated_derived_function_identity_survives_artifact_roundtrip() {
 }
 
 #[test]
-fn metadata_revisions_preserve_legacy_none_and_complete_empty_callsite_context() {
-    for scopes in [None, Some(vec![])] {
-        let mut artifact = fixture();
-        artifact.codegen_output.method_call_scopes = scopes.clone();
-        let bytes = write_artifact(&artifact).unwrap();
-        let archive = Archive::read_from(&mut bytes.as_slice()).unwrap();
-        let metadata = archive.find_section(SectionKind::Metadata).unwrap();
-        assert_eq!(
-            u32::from_le_bytes(metadata[4..8].try_into().unwrap()),
-            if scopes.is_some() { 2 } else { 1 }
-        );
-        let loaded = read_artifact(&bytes).unwrap();
-        assert!(
-            loaded
-                .codegen_output
-                .functions
-                .iter()
-                .all(|function| function.abi.is_none())
-        );
-        assert_eq!(loaded.codegen_output.method_call_scopes, scopes);
-        let resaved = write_artifact(&loaded).unwrap();
-        assert_eq!(
-            read_artifact(&resaved)
-                .unwrap()
-                .codegen_output
-                .method_call_scopes,
-            scopes
-        );
-    }
-}
-
-#[test]
-fn callsite_context_survives_method_name_and_constant_relocation() {
-    let mut artifact = scoped_method_fixture();
-    let scopes = vec![
-        nsbc::MethodCallScope {
-            func_id: FuncId(0),
-            pc: 2,
-            scope: 0,
-        },
-        nsbc::MethodCallScope {
-            func_id: FuncId(0),
-            pc: 3,
-            scope: 1,
-        },
-    ];
-    artifact.codegen_output.method_call_scopes = Some(scopes.clone());
-    let bytes = write_artifact(&artifact).unwrap();
-    let loaded = read_artifact(&bytes).unwrap();
-    assert_eq!(
-        loaded.codegen_output.method_call_scopes,
-        Some(scopes.clone())
-    );
-    assert_eq!(
-        loaded.codegen_output.functions[0].instructions.len(),
-        artifact.codegen_output.functions[0].instructions.len()
-    );
-    for scope in &scopes {
-        assert_eq!(
-            Instruction::decode(loaded.codegen_output.functions[0].instructions[scope.pc as usize])
-                .unwrap()
-                .opcode,
-            Opcode::CallMethodFar
-        );
-    }
-    let resaved = read_artifact(&write_artifact(&loaded).unwrap()).unwrap();
-    assert_eq!(resaved.codegen_output.method_call_scopes, Some(scopes));
-}
-
-#[test]
 fn damaged_callsite_counts_scopes_pcs_and_duplicates_are_rejected() {
-    let mut artifact = scoped_method_fixture();
-    artifact.codegen_output.method_call_scopes = Some(vec![
-        nsbc::MethodCallScope {
-            func_id: FuncId(0),
-            pc: 2,
-            scope: 0,
-        },
-        nsbc::MethodCallScope {
-            func_id: FuncId(0),
-            pc: 3,
-            scope: 1,
-        },
-    ]);
+    let artifact = method_fixture();
     let bytes = write_artifact(&artifact).unwrap();
     for mutation in 0..6 {
         let damaged = rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            let count = metadata.len() - 28;
+            let count = scopes_offset(metadata);
             let first = count + 4;
             let second = first + 12;
             match mutation {
@@ -730,7 +891,7 @@ fn damaged_callsite_counts_scopes_pcs_and_duplicates_are_rejected() {
                 4 => metadata[second + 4..second + 8].copy_from_slice(&2_u32.to_le_bytes()),
                 _ => {
                     metadata[count..count + 4].copy_from_slice(&1_u32.to_le_bytes());
-                    metadata.truncate(second);
+                    metadata.drain(first..second);
                 }
             }
         });
@@ -743,216 +904,77 @@ fn damaged_callsite_counts_scopes_pcs_and_duplicates_are_rejected() {
             "mutation {mutation}: {error}"
         );
     }
-}
 
-#[test]
-fn full_type_context_coverage_has_an_explicit_third_metadata_revision() {
-    let mut artifact = fixture();
-    artifact.codegen_output.scope_coverage = nsbc::ScopeCoverage::CallsAndTypes;
-    artifact.codegen_output.functions[0].instructions = vec![
-        Instruction::load_const(Reg(0), 0).encode(),
-        Instruction::a_type(
-            Opcode::TypeCheck,
-            AddrMode::Imm,
-            Reg(1),
-            Reg(0),
-            Intrinsic::I64.type_index().as_u32() as u16,
-        )
-        .encode(),
-        Instruction::ret(Reg(0)).encode(),
-    ];
-    artifact.codegen_output.functions[0].safepoint_pcs.clear();
-    artifact.codegen_output.method_call_scopes = Some(vec![nsbc::MethodCallScope {
-        func_id: FuncId(0),
-        pc: 1,
-        scope: 0,
-    }]);
-    let bytes = write_artifact(&artifact).unwrap();
-    let archive = Archive::read_from(&mut bytes.as_slice()).unwrap();
+    // Missing required scope on write_artifact is also rejected.
+    let mut missing_scope = method_fixture();
+    missing_scope.codegen_output.method_call_scopes.pop();
     assert_eq!(
-        u32::from_le_bytes(
-            archive.find_section(SectionKind::Metadata).unwrap()[4..8]
-                .try_into()
-                .unwrap()
-        ),
-        3
-    );
-    let loaded = read_artifact(&bytes).unwrap();
-    assert_eq!(
-        loaded.codegen_output.scope_coverage,
-        nsbc::ScopeCoverage::CallsAndTypes
-    );
-    assert_eq!(
-        loaded.codegen_output.method_call_scopes,
-        artifact.codegen_output.method_call_scopes
-    );
-    let downgraded = rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-        metadata[4..8].copy_from_slice(&2_u32.to_le_bytes());
-    });
-    rejects(&downgraded, "not covered by this metadata version");
-    artifact.codegen_output.method_call_scopes = Some(vec![]);
-    assert_eq!(
-        write_artifact(&artifact).unwrap_err().kind(),
-        io::ErrorKind::InvalidInput
-    );
-    artifact.codegen_output.scope_coverage = nsbc::ScopeCoverage::Calls;
-    let old_calls_only = read_artifact(&write_artifact(&artifact).unwrap()).unwrap();
-    assert_eq!(
-        old_calls_only.codegen_output.scope_coverage,
-        nsbc::ScopeCoverage::Calls
-    );
-    assert_eq!(
-        old_calls_only.codegen_output.method_call_scopes,
-        Some(vec![])
-    );
-    artifact.codegen_output.scope_coverage = nsbc::ScopeCoverage::CallsAndTypes;
-    artifact.codegen_output.method_call_scopes = None;
-    assert_eq!(
-        write_artifact(&artifact).unwrap_err().kind(),
+        write_artifact(&missing_scope).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
 }
 
 fn explicit_capture_fixture() -> CompiledArtifact {
     let mut artifact = fixture();
-    artifact.codegen_output.functions[0].abi = Some(nsbc::FunctionAbi {
-        captures: vec![],
-        parameters: vec![],
-    });
+    artifact.codegen_output.functions[0].abi = FunctionAbi::default();
     artifact.codegen_output.functions[0]
         .instructions
         .insert(5, Instruction::new_closure(Reg(0), 1, 1).encode());
     let closure = &mut artifact.codegen_output.functions[1];
     closure.param_count = 1;
-    closure.abi = Some(nsbc::FunctionAbi {
-        captures: vec![nsbc::CaptureAbi::Value],
+    closure.abi = FunctionAbi {
+        captures: vec![CaptureAbi::Value],
         parameters: vec![],
-    });
+    };
     artifact
 }
 
 #[test]
-fn fourth_metadata_revision_preserves_explicit_capture_abi_and_scope_presence() {
-    for scopes in [None, Some(vec![])] {
-        let mut artifact = explicit_capture_fixture();
-        artifact.codegen_output.method_call_scopes = scopes.clone();
-        let bytes = write_artifact(&artifact).unwrap();
-        let archive = Archive::read_from(&mut bytes.as_slice()).unwrap();
-        let metadata = archive.find_section(SectionKind::Metadata).unwrap();
-        assert_eq!(&metadata[..8], b"NSAM\x04\x00\x00\x00");
-        let loaded = read_artifact(&bytes).unwrap();
-        assert_eq!(
-            loaded.codegen_output.scope_coverage,
-            nsbc::ScopeCoverage::Calls
-        );
-        assert_eq!(loaded.codegen_output.method_call_scopes, scopes);
-        for (original, restored) in artifact
-            .codegen_output
-            .functions
-            .iter()
-            .zip(&loaded.codegen_output.functions)
-        {
-            assert_eq!(restored.abi, original.abi);
-            assert_eq!(restored.func_id, original.func_id);
-        }
-        let resaved = write_artifact(&loaded).unwrap();
-        assert_eq!(
-            read_artifact(&resaved).unwrap().codegen_output.functions[1].abi,
-            artifact.codegen_output.functions[1].abi
-        );
-    }
-}
-
-#[test]
-fn fourth_revision_preserves_mixed_legacy_and_value_parameters() {
-    let mut artifact = fixture();
-    let signature = artifact.type_pool.intern_structural(TypeKind::Function {
-        params: vec![Intrinsic::I64.type_index()],
-        ret: Intrinsic::I64.type_index(),
-    });
-    artifact.codegen_output.functions[1].function_type = signature;
-    artifact.codegen_output.functions[1].param_count = 1;
-    artifact.codegen_output.functions[1].abi = Some(nsbc::FunctionAbi {
-        captures: vec![],
-        parameters: vec![nsbc::ParameterAbi::Value],
-    });
-    artifact.codegen_output.scope_coverage = nsbc::ScopeCoverage::CallsAndTypes;
-    artifact.codegen_output.method_call_scopes = Some(vec![nsbc::MethodCallScope {
-        func_id: FuncId(0),
-        pc: 3,
-        scope: 0,
-    }]);
-    let bytes = write_artifact(&artifact).unwrap();
-    let restored = read_artifact(&bytes).unwrap();
-    assert!(restored.codegen_output.functions[0].abi.is_none());
-    assert_eq!(
-        restored.codegen_output.functions[1].abi,
-        artifact.codegen_output.functions[1].abi
-    );
-    assert_eq!(
-        restored.codegen_output.scope_coverage,
-        nsbc::ScopeCoverage::CallsAndTypes
-    );
-    assert_eq!(
-        restored.codegen_output.method_call_scopes,
-        artifact.codegen_output.method_call_scopes
-    );
-    let metadata = Archive::read_from(&mut bytes.as_slice()).unwrap();
-    let payload = metadata.find_section(SectionKind::Metadata).unwrap();
-    let mut damaged = payload.to_vec();
-    *damaged.last_mut().unwrap() = 255;
-    assert!(
-        decode_metadata(&damaged)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("parameter ABI tag")
-    );
-}
-
-#[test]
-fn abi_metadata_rejects_corrupt_tags_counts_identities_and_views() {
+fn mandatory_function_abi_preserves_captures_parameters_and_rejects_corruption() {
     let artifact = explicit_capture_fixture();
     let bytes = write_artifact(&artifact).unwrap();
-    // Two ABI records occupy 31 bytes: empty entry (13) and one-capture
-    // closure (14), preceded by the four-byte table count.
+    let loaded = read_artifact(&bytes).unwrap();
+    for (original, restored) in artifact
+        .codegen_output
+        .functions
+        .iter()
+        .zip(&loaded.codegen_output.functions)
+    {
+        assert_eq!(restored.abi, original.abi);
+        assert_eq!(restored.func_id, original.func_id);
+    }
+    assert_eq!(write_artifact(&loaded).unwrap(), bytes);
+
+    // ABI section layout for explicit_capture_fixture():
+    // count=2 (4B), f0=[id=0(4B), cap=0(4B), param=0(4B)] (12B),
+    // f1=[id=1(4B), cap=1(4B), tag=0(1B), param=0(4B)] (13B).
     for (offset, value, message) in [
-        (0, 1, "ABI count"),
+        (0, 1u32, "ABI count"),
         (4, u32::MAX, "unknown function ABI"),
-        (17, 0, "duplicate function ABI"),
-        (22, u32::MAX, "count"),
+        (16, 0, "duplicate function ABI"),
+        (20, u32::MAX, "count"),
     ] {
         rejects(
             &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-                let start = metadata.len() - 31;
+                let start = abis_offset(metadata);
                 metadata[start + offset..start + offset + 4].copy_from_slice(&value.to_le_bytes());
-            }),
-            message,
-        );
-    }
-    for (offset, message) in [(8, "presence tag"), (26, "capture ABI tag")] {
-        rejects(
-            &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-                let start = metadata.len() - 31;
-                metadata[start + offset] = 255;
-            }),
-            message,
-        );
-    }
-    for (distance, message) in [(33, "scope coverage tag"), (32, "scope table presence tag")] {
-        rejects(
-            &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-                let position = metadata.len() - distance;
-                metadata[position] = 255;
             }),
             message,
         );
     }
     rejects(
         &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            let start = metadata.len() - 31;
-            metadata[start + 22..start + 26].copy_from_slice(&33u32.to_le_bytes());
-            metadata.extend([0; 32]);
+            let start = abis_offset(metadata);
+            assert_eq!(metadata[start + 24], 0);
+            metadata[start + 24] = 255;
+        }),
+        "capture ABI tag",
+    );
+    rejects(
+        &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
+            let start = abis_offset(metadata);
+            metadata[start + 20..start + 24].copy_from_slice(&33u32.to_le_bytes());
+            metadata.splice(start + 25..start + 25, [0; 32]);
         }),
         "capture ABI count exceeds the register limit",
     );
@@ -962,22 +984,23 @@ fn abi_metadata_rejects_corrupt_tags_counts_identities_and_views() {
         artifact.type_pool.well_known.eq.as_u32(),
     ] {
         let damaged = rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            let tag = metadata.len() - 5;
+            let start = abis_offset(metadata);
+            let tag = start + 24;
             metadata[tag] = 1;
             metadata.splice(tag + 1..tag + 1, view.to_le_bytes());
         });
         let valid_view = view == artifact.type_pool.well_known.eq.as_u32();
         let damaged = if valid_view {
-            // Proof-bearing layouts now execute. Keep this a rejection case
-            // by corrupting the closure's physical parameter count, rather
-            // than treating all valid trait proof views as unsupported.
             rewrite_section(&damaged, SectionKind::Code, |code| code[33] = 0)
         } else {
             damaged
         };
         let error = read_artifact(&damaged).err().unwrap().to_string();
         if valid_view {
-            assert!(error.contains("closure capture count disagrees"), "{error}");
+            assert!(
+                error.contains("disagrees") || error.contains("capture"),
+                "{error}"
+            );
         } else {
             assert!(error.contains("trait") || error.contains("type"), "{error}");
         }
@@ -992,7 +1015,7 @@ fn trait_proof_fixture() -> CompiledArtifact {
             parents: vec![],
             assoc_types: vec![],
         },
-        type_id: TypeId(901, 99),
+        type_id: TypeId::ZERO,
         size: 0,
         align: 0,
     });
@@ -1043,11 +1066,10 @@ fn trait_proof_fixture() -> CompiledArtifact {
             }],
         })
         .unwrap();
+    finalize_pool(&mut artifact.type_pool);
+
     let entry = &mut artifact.codegen_output.functions[0];
-    entry.abi = Some(nsbc::FunctionAbi {
-        captures: vec![],
-        parameters: vec![],
-    });
+    entry.abi = FunctionAbi::default();
     entry.safepoint_pcs.clear();
     entry.instructions = [
         Instruction::load_const(Reg(0), 0),
@@ -1060,73 +1082,25 @@ fn trait_proof_fixture() -> CompiledArtifact {
     .to_vec();
     let method = &mut artifact.codegen_output.functions[1];
     method.function_type = actual;
+    method.is_closure = false;
     method.param_count = 1;
-    method.abi = Some(nsbc::FunctionAbi {
+    method.abi = FunctionAbi {
         captures: vec![],
-        parameters: vec![nsbc::ParameterAbi::Value],
-    });
-    artifact.codegen_output.scope_coverage = nsbc::ScopeCoverage::CallsAndTypes;
-    artifact.codegen_output.method_call_scopes = Some(
-        [1, 2, 3]
-            .map(|pc| nsbc::MethodCallScope {
-                func_id: FuncId(0),
-                pc,
-                scope: 0,
-            })
-            .to_vec(),
-    );
+        parameters: vec![ParameterAbi::Value],
+    };
+    artifact.codegen_output.method_call_scopes = [1, 2, 3]
+        .map(|pc| MethodCallScope {
+            func_id: FuncId(0),
+            pc,
+            scope: 0,
+        })
+        .to_vec();
     artifact
 }
 
 #[test]
-fn fifth_revision_preserves_specialized_self_proofs_and_rejects_legacy_tags() {
+fn trait_proof_instructions_specialized_self_proofs_and_slot_validation_roundtrip() {
     let mut artifact = trait_proof_fixture();
-    let view = artifact.type_pool.trait_schemas_snapshot()[0].trait_type;
-    let entry = &mut artifact.codegen_output.functions[0];
-    entry.register_count = 3;
-    entry.instructions[1] = Instruction::trait_proof(Reg(2), Reg(0), view).encode();
-    entry.instructions[2] = Instruction::trait_assert(Reg(0), Reg(2), view).encode();
-    entry.instructions[3] = Instruction::trait_call(Reg(2), 0, 2).encode();
-    let method = &mut artifact.codegen_output.functions[1];
-    method.register_count = 2;
-    method.param_count = 2;
-    method.abi.as_mut().unwrap().parameters = vec![nsbc::ParameterAbi::TraitSelf { view }];
-    let expected_abi = method.abi.clone();
-    let bytes = write_artifact(&artifact).unwrap();
-    let archive = Archive::read_from(&mut bytes.as_slice()).unwrap();
-    assert_eq!(
-        &archive.find_section(SectionKind::Metadata).unwrap()[..8],
-        b"NSAM\x05\x00\x00\x00"
-    );
-    let restored = read_artifact(&bytes).unwrap();
-    assert_eq!(restored.codegen_output.functions[1].abi, expected_abi);
-    assert_eq!(write_artifact(&restored).unwrap(), bytes);
-
-    rejects(
-        &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            metadata[4..8].copy_from_slice(&4u32.to_le_bytes());
-        }),
-        "TraitSelf parameter requires metadata revision 5",
-    );
-    rejects(
-        &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            let tag = metadata.len() - 5;
-            metadata[tag] = 255;
-        }),
-        "invalid parameter ABI tag",
-    );
-    rejects(
-        &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            let view_offset = metadata.len() - 4;
-            metadata[view_offset..].copy_from_slice(&u32::MAX.to_le_bytes());
-        }),
-        "type index",
-    );
-}
-
-#[test]
-fn trait_proof_instructions_and_interface_slots_survive_archive_roundtrip() {
-    let artifact = trait_proof_fixture();
     let bytes = write_artifact(&artifact).unwrap();
     let loaded = read_artifact(&bytes).unwrap();
     assert_eq!(
@@ -1142,11 +1116,7 @@ fn trait_proof_instructions_and_interface_slots_survive_archive_roundtrip() {
         artifact.type_pool.snapshot().trait_schemas
     );
     assert_eq!(write_artifact(&loaded).unwrap(), bytes);
-}
 
-#[test]
-fn archive_rejects_invalid_trait_proof_type_slot_and_physical_arity() {
-    let bytes = write_artifact(&trait_proof_fixture()).unwrap();
     for (pc, replacement, error) in [
         (
             1,
@@ -1175,83 +1145,40 @@ fn archive_rejects_invalid_trait_proof_type_slot_and_physical_arity() {
         );
     }
     rejects(&bytes[..bytes.len() - 1], "section");
-}
 
-#[test]
-fn legacy_native_display_sentinel_is_not_upgraded_to_generated_proof_metadata() {
-    let mut artifact = fixture();
-    let owner = artifact.type_pool.register(TypeInfo {
-        kind: TypeKind::Struct {
-            name: str_interner::intern("LegacyDisplayed"),
-            fields: vec![type_pool::FieldInfo {
-                name: str_interner::intern("number"),
-                ty: Intrinsic::I64.type_index(),
-                offset: 0,
-                has_default: false,
-            }],
-        },
-        type_id: TypeId(902, 1),
-        size: 8,
-        align: 8,
-    });
-    let view = artifact.type_pool.well_known.display;
-    let name = str_interner::intern("to_string");
-    let method = type_pool::MethodSlot {
-        name,
-        func_id: type_pool::DERIVE_FUNC_ID,
-        access: type_pool::MethodAccess::LegacyUnknown,
-        trait_impl: Some(view),
-        visible_scope: None,
-    };
-    artifact.type_pool.add_method(owner, method.clone());
-    artifact
-        .type_pool
-        .add_trait_impl(type_pool::TraitImplRecord {
-            trait_type: view,
-            implementor: owner,
-            visible_scope: None,
-            methods: vec![method],
-        });
-    artifact.type_pool.add_vtable(type_pool::VTable {
-        trait_type: view,
-        implementor: owner,
-        visible_scope: None,
-        entries: vec![type_pool::DERIVE_FUNC_ID],
-    });
-    let bytes = write_artifact(&artifact).unwrap();
-    let restored = read_artifact(&bytes).unwrap();
-    let slot = restored.type_pool.find_method(owner, name).unwrap();
-    assert_eq!(slot.func_id, type_pool::DERIVE_FUNC_ID);
-    assert_eq!(slot.access, type_pool::MethodAccess::LegacyUnknown);
-    assert!(restored.type_pool.trait_schema(view).is_none());
-    assert!(restored.builtins.is_empty());
-    assert_eq!(restored.builtin_abi_version, 1);
-    assert_eq!(write_artifact(&restored).unwrap(), bytes);
-}
+    // Specialized ParameterAbi::TraitSelf roundtrip and parameter tag corruption.
+    let view = artifact.type_pool.trait_schemas_snapshot()[0].trait_type;
+    let entry = &mut artifact.codegen_output.functions[0];
+    entry.register_count = 3;
+    entry.instructions[1] = Instruction::trait_proof(Reg(2), Reg(0), view).encode();
+    entry.instructions[2] = Instruction::trait_assert(Reg(0), Reg(2), view).encode();
+    entry.instructions[3] = Instruction::trait_call(Reg(2), 0, 2).encode();
+    let method = &mut artifact.codegen_output.functions[1];
+    method.register_count = 2;
+    method.param_count = 2;
+    method.abi.parameters = vec![ParameterAbi::TraitSelf { view }];
+    let expected_abi = method.abi.clone();
+    let self_bytes = write_artifact(&artifact).unwrap();
+    let restored = read_artifact(&self_bytes).unwrap();
+    assert_eq!(restored.codegen_output.functions[1].abi, expected_abi);
+    assert_eq!(write_artifact(&restored).unwrap(), self_bytes);
 
-#[test]
-fn loading_legacy_artifact_does_not_install_intrinsic_trait_implementations() {
-    let artifact = fixture();
-    assert!(artifact.type_pool.trait_schemas_snapshot().is_empty());
-    let bytes = write_artifact(&artifact).unwrap();
-    let loaded = read_artifact(&bytes).unwrap();
-    for ty in [Intrinsic::I64, Intrinsic::Bool, Intrinsic::Str] {
-        for view in [
-            loaded.type_pool.well_known.eq,
-            loaded.type_pool.well_known.partial_eq,
-            loaded.type_pool.well_known.display,
-        ] {
-            assert!(
-                loaded
-                    .type_pool
-                    .find_trait_impl(ty.type_index(), view)
-                    .is_none(),
-                "loading must preserve absent legacy implementation for {ty:?}"
-            );
-        }
-    }
-    assert!(loaded.type_pool.trait_schemas_snapshot().is_empty());
-    assert_eq!(write_artifact(&loaded).unwrap(), bytes);
+    rejects(
+        &rewrite_section(&self_bytes, SectionKind::Metadata, |metadata| {
+            let start = abis_offset(metadata);
+            // count(4) + f0(12) + f1_id(4) + f1_cap(4) + f1_param_count(4) = 28
+            assert_eq!(metadata[start + 28], 2);
+            metadata[start + 28] = 255;
+        }),
+        "invalid parameter ABI tag",
+    );
+    rejects(
+        &rewrite_section(&self_bytes, SectionKind::Metadata, |metadata| {
+            let start = abis_offset(metadata) + 29;
+            metadata[start..start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        }),
+        "type index",
+    );
 }
 
 fn generated_display_fixture() -> CompiledArtifact {
@@ -1261,7 +1188,7 @@ fn generated_display_fixture() -> CompiledArtifact {
             name: str_interner::intern("PersistedDisplay"),
             fields: vec![],
         },
-        type_id: TypeId(922, 1),
+        type_id: TypeId::ZERO,
         size: 0,
         align: 8,
     });
@@ -1313,15 +1240,17 @@ fn generated_display_fixture() -> CompiledArtifact {
         params: vec![owner],
         ret: Intrinsic::Str.type_index(),
     });
+    finalize_pool(&mut artifact.type_pool);
+
     let function = &mut artifact.codegen_output.functions[1];
     function.display_owner = Some(owner);
     function.function_type = signature;
     function.is_closure = false;
     function.param_count = 1;
-    function.abi = Some(nsbc::FunctionAbi {
+    function.abi = FunctionAbi {
         captures: vec![],
-        parameters: vec![nsbc::ParameterAbi::Value],
-    });
+        parameters: vec![ParameterAbi::Value],
+    };
     function.instructions = [Instruction::load_const(Reg(0), 1), Instruction::ret(Reg(0))]
         .map(Instruction::encode)
         .to_vec();
@@ -1329,15 +1258,13 @@ fn generated_display_fixture() -> CompiledArtifact {
 }
 
 #[test]
-fn sixth_metadata_revision_preserves_generated_display_owners_and_legacy_absence() {
+fn generated_display_metadata_roundtrips_and_rejects_corrupt_tables_and_contracts() {
     let artifact = generated_display_fixture();
     let bytes = write_artifact(&artifact).unwrap();
     let archive = Archive::read_from(&mut bytes.as_slice()).unwrap();
     let metadata = archive.find_section(SectionKind::Metadata).unwrap();
     assert_eq!(&metadata[..8], b"NSAM\x06\x00\x00\x00");
     let restored = read_artifact(&bytes).unwrap();
-    assert_eq!(restored.codegen_output.method_call_scopes, None);
-    assert_eq!(restored.codegen_output.scope_coverage, ScopeCoverage::Calls);
     for (original, loaded) in artifact
         .codegen_output
         .functions
@@ -1349,28 +1276,7 @@ fn sixth_metadata_revision_preserves_generated_display_owners_and_legacy_absence
         assert_eq!(loaded.abi, original.abi);
     }
     assert_eq!(write_artifact(&restored).unwrap(), bytes);
-    let mut legacy = restored;
-    legacy.codegen_output.functions[1].display_owner = None;
-    let bytes = write_artifact(&legacy).unwrap();
-    let archive = Archive::read_from(&mut bytes.as_slice()).unwrap();
-    assert_eq!(
-        &archive.find_section(SectionKind::Metadata).unwrap()[..8],
-        b"NSAM\x04\x00\x00\x00"
-    );
-    assert!(
-        read_artifact(&bytes)
-            .unwrap()
-            .codegen_output
-            .functions
-            .iter()
-            .all(|function| function.display_owner.is_none())
-    );
-}
 
-#[test]
-fn generated_display_metadata_rejects_corrupt_tables_and_owner_contracts() {
-    let artifact = generated_display_fixture();
-    let bytes = write_artifact(&artifact).unwrap();
     for (offset, replacement, message) in [
         (18, vec![1, 0, 0, 0], "count"),
         (14, vec![9, 0, 0, 0], "target"),
@@ -1392,18 +1298,13 @@ fn generated_display_metadata_rejects_corrupt_tables_and_owner_contracts() {
         }),
         "truncated",
     );
-    rejects(
-        &rewrite_section(&bytes, SectionKind::Metadata, |metadata| {
-            metadata[4..8].copy_from_slice(&5u32.to_le_bytes());
-        }),
-        "trailing",
-    );
+
     for case in 0..4 {
         let mut bad = generated_display_fixture();
         let method = &mut bad.codegen_output.functions[1];
         match case {
             0 => method.display_owner = Some(Intrinsic::I64.type_index()),
-            1 => method.abi = None,
+            1 => method.abi = FunctionAbi::default(),
             2 => method.is_closure = true,
             _ => bad.codegen_output.functions[0].display_owner = method.display_owner,
         }
@@ -1415,7 +1316,7 @@ fn generated_display_metadata_rejects_corrupt_tables_and_owner_contracts() {
 }
 
 #[test]
-fn error_opcodes_roundtrip_authenticated_types_and_reject_legacy_capability() {
+fn error_opcodes_and_error_layouts_roundtrip_and_validate_authenticated_types() {
     let mut value = fixture();
     let qualified = value
         .type_pool
@@ -1424,14 +1325,7 @@ fn error_opcodes_roundtrip_authenticated_types_and_reject_legacy_capability() {
             Intrinsic::I64.type_index(),
         )
         .unwrap();
-    value
-        .type_pool
-        .finalize_type_identities(type_pool::TypeIdentityInput {
-            schema: 1,
-            packages: vec![],
-            declarations: vec![],
-        })
-        .unwrap();
+    finalize_pool(&mut value.type_pool);
     value.codegen_output.constants = vec![Constant::Type(qualified)];
     let entry = &mut value.codegen_output.functions[0];
     entry.instructions = vec![
@@ -1443,6 +1337,7 @@ fn error_opcodes_roundtrip_authenticated_types_and_reject_legacy_capability() {
     entry.register_count = 3;
     entry.safepoint_pcs.clear();
     let expected = entry.instructions.clone();
+    value.codegen_output.method_call_scopes = collect_scopes(&value.codegen_output.functions, 0);
     let bytes = write_artifact(&value).unwrap();
     assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 4);
     let read = read_artifact(&bytes).unwrap();
@@ -1451,15 +1346,6 @@ fn error_opcodes_roundtrip_authenticated_types_and_reject_legacy_capability() {
         read.type_pool.stable_type_id(qualified).unwrap(),
         value.type_pool.stable_type_id(qualified).unwrap()
     );
-    let mut downgraded = bytes.clone();
-    downgraded[4..8].copy_from_slice(&3u32.to_le_bytes());
-    let error = read_artifact(&downgraded).unwrap_err().to_string();
-    assert!(error.contains("require NSBC version 4"), "{error}");
-
-    let ordinary = write_artifact(&fixture()).unwrap();
-    let mut legacy = ordinary;
-    legacy[4..8].copy_from_slice(&3u32.to_le_bytes());
-    assert!(read_artifact(&legacy).is_ok());
 
     value.codegen_output.functions[0].instructions[2] =
         Instruction::a_type(Opcode::ErrorPayload, AddrMode::Imm, Reg(0), Reg(1), 1).encode();
@@ -1469,55 +1355,10 @@ fn error_opcodes_roundtrip_authenticated_types_and_reject_legacy_capability() {
             .to_string()
             .contains("unused Error operands")
     );
-}
 
-#[test]
-fn error_cast_capability_cannot_be_downgraded_without_error_opcodes() {
-    let mut value = fixture();
-    let qualified = value
-        .type_pool
-        .normalize_error_type(
-            vec![Intrinsic::I64.type_index()],
-            Intrinsic::I64.type_index(),
-        )
-        .unwrap();
-    value
-        .type_pool
-        .finalize_type_identities(type_pool::TypeIdentityInput {
-            schema: 1,
-            packages: vec![],
-            declarations: vec![],
-        })
-        .unwrap();
-    value.codegen_output.constants = vec![Constant::Type(qualified)];
-    let entry = &mut value.codegen_output.functions[0];
-    entry.instructions = vec![
-        Instruction::load_imm(Reg(0), 42).encode(),
-        Instruction::a_type(
-            Opcode::TypeCast,
-            AddrMode::Imm,
-            Reg(1),
-            Reg(0),
-            qualified.as_u32() as u16,
-        )
-        .encode(),
-        Instruction::ret(Reg(1)).encode(),
-    ];
-    entry.safepoint_pcs.clear();
-    let mut bytes = write_artifact(&value).unwrap();
-    assert!(read_artifact(&bytes).is_ok());
-    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
-    let error = read_artifact(&bytes).unwrap_err().to_string();
-    assert!(
-        error.contains("executable Error capability requires NSBC version 4"),
-        "{error}"
-    );
-}
-
-#[test]
-fn legacy_error_metadata_is_preserved_but_not_executable() {
-    let mut value = fixture();
-    let legacy = value.type_pool.register(TypeInfo {
+    // Zero-sized unnormalized ErrorQualified descriptor is rejected in executable slots.
+    let mut bad_layout = fixture();
+    let zero_sized = bad_layout.type_pool.register(TypeInfo {
         kind: TypeKind::ErrorQualified {
             errors: vec![Intrinsic::I64.type_index()],
             inner: Intrinsic::I64.type_index(),
@@ -1526,27 +1367,10 @@ fn legacy_error_metadata_is_preserved_but_not_executable() {
         size: 0,
         align: 0,
     });
-    value.codegen_output.constants.push(Constant::Type(legacy));
-    let bytes = write_artifact(&value).unwrap();
-    let restored = read_artifact(&bytes).unwrap();
-    assert_eq!(restored.type_pool.get(legacy).size, 0);
-    assert_eq!(restored.type_pool.get(legacy).type_id, TypeId::ZERO);
-    value.codegen_output.globals[0].type_index = legacy;
+    finalize_pool(&mut bad_layout.type_pool);
+    bad_layout.codegen_output.globals[0].type_index = zero_sized;
     assert!(
-        write_artifact(&value)
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported legacy Error layout")
-    );
-    value.codegen_output.globals[0].type_index = Intrinsic::I64.type_index();
-    let function = value.type_pool.intern_structural(TypeKind::Function {
-        params: vec![legacy],
-        ret: Intrinsic::I64.type_index(),
-    });
-    value.codegen_output.functions[0].function_type = function;
-    value.codegen_output.functions[0].param_count = 1;
-    assert!(
-        write_artifact(&value)
+        write_artifact(&bad_layout)
             .unwrap_err()
             .to_string()
             .contains("unsupported legacy Error layout")

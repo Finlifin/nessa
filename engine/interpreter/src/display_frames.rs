@@ -65,9 +65,9 @@ impl Vm {
             .type_pool
             .canonical_type(owner)
             .ok_or(VmError::InvalidType(owner))?;
-        let data_index = match code.abi.as_ref().and_then(|abi| abi.parameters.first()) {
-            Some(ParameterAbi::Value) => code.abi.as_ref().unwrap().capture_count(),
-            Some(ParameterAbi::TraitSelf { .. }) => code.abi.as_ref().unwrap().capture_count() + 1,
+        let data_index = match code.abi.parameters.first() {
+            Some(ParameterAbi::Value) => code.abi.capture_count(),
+            Some(ParameterAbi::TraitSelf { .. }) => code.abi.capture_count() + 1,
             _ => return Err(VmError::UnsupportedFunctionAbi),
         };
         let receiver = *arguments.get(data_index).ok_or(VmError::TypeError)?;
@@ -199,10 +199,10 @@ mod tests {
         let mut vm = crate::tests::make_vm();
         vm.add_function(runtime::FunctionCode {
             display_owner: None,
-            abi: Some(nsbc::FunctionAbi {
+            abi: nsbc::FunctionAbi {
                 captures: Vec::new(),
                 parameters: Vec::new(),
-            }),
+            },
             func_id: FuncId(0),
             instructions: Vec::new(),
             register_count: 1,

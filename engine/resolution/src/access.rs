@@ -141,7 +141,7 @@ mod tests {
             pool.trait_impls_snapshot()
                 .iter()
                 .flat_map(|record| &record.methods)
-                .all(|method| method.access != MethodAccess::LegacyUnknown)
+                .all(|method| method.access == MethodAccess::Public)
         );
     }
 

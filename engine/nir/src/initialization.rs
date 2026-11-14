@@ -385,6 +385,7 @@ impl<'a> Planner<'a> {
             .resolved
             .concat_calls
             .iter()
+            .chain(&self.resolved.equality_calls)
             .chain(&self.resolved.instance_methods)
             .chain(&self.resolved.application_calls)
             .chain(&self.resolved.update_calls)
@@ -400,9 +401,6 @@ impl<'a> Planner<'a> {
         // Generated Display bodies contain calls absent from the source AST.
         // Load each selected field implementation's namespace before startup can call it.
         for plan in &self.resolved.display_derivations {
-            if plan.mode != resolution::DisplayDerivationMode::FieldCalls {
-                continue;
-            }
             let Some(&owner) = self.node_owners.get(&plan.node) else {
                 continue;
             };
@@ -439,15 +437,23 @@ impl<'a> Planner<'a> {
                 functions.insert(SymbolId(method.func_id));
                 return;
             }
-            if !self.resolved.display_derivations.iter().any(|plan| {
-                plan.implementor == ty && plan.mode == resolution::DisplayDerivationMode::FieldCalls
-            }) {
+            if !self
+                .resolved
+                .display_derivations
+                .iter()
+                .any(|plan| plan.implementor == ty)
+            {
                 return;
             }
         }
         match &self.resolved.type_pool.get(ty).kind {
             TypeKind::Optional { inner } => {
                 self.display_component_functions(*inner, visited, functions)
+            }
+            TypeKind::Struct { fields, .. } => {
+                for field in fields {
+                    self.display_component_functions(field.ty, visited, functions);
+                }
             }
             TypeKind::Tuple { elements } => {
                 for &element in elements {
@@ -735,7 +741,7 @@ impl<'a> Planner<'a> {
         {
             dependencies.insert(owner);
         }
-        if let Some(plan) = self
+        if let Some(resolution::ForLoopPlan::Static(plan)) = self
             .body_facts(context, node)
             .map(|facts| &facts.for_loops)
             .unwrap_or(&self.resolved.for_loops)
@@ -743,6 +749,7 @@ impl<'a> Planner<'a> {
         {
             // Loop calls are implicit in the AST. Their exact source targets
             // were frozen by resolution, including each default adapter's facts.
+            // Dynamic loops select targets at runtime and use runtime checks.
             for call in plan.into_iter.iter().chain(std::iter::once(&plan.next)) {
                 let function = call
                     .function
@@ -933,6 +940,12 @@ impl<'a> Planner<'a> {
                 facts
                     .map(|facts| &facts.update_calls)
                     .unwrap_or(&self.resolved.update_calls)
+                    .get(&node)
+            })
+            .or_else(|| {
+                facts
+                    .map(|facts| &facts.equality_calls)
+                    .unwrap_or(&self.resolved.equality_calls)
                     .get(&node)
             })
         {

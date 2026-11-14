@@ -15,7 +15,17 @@ pub struct IteratorCall {
 }
 
 #[derive(Debug, Clone)]
-pub struct ForLoopPlan {
+pub enum ForLoopPlan {
+    /// The iterator protocol was selected from the static input type.
+    Static(StaticForLoop),
+    /// An `Any` input selects `IntoIterator`, or else `Iterator`, from its
+    /// runtime type in `query_scope`. Items are `Any`; a value implementing
+    /// neither protocol is a runtime type error.
+    Dynamic { query_scope: ScopeId },
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticForLoop {
     pub query_scope: ScopeId,
     pub iterator_type: TypeIndex,
     pub item_type: TypeIndex,
@@ -169,14 +179,8 @@ fn reject_interface(r: &Resolver<'_>, ty: TypeIndex) -> Result<(), String> {
     Ok(())
 }
 
-fn plan(
-    r: &mut Resolver<'_>,
-    node: NodeIndex,
-    iterable: NodeIndex,
-    ty: TypeIndex,
-) -> Result<ForLoopPlan, String> {
-    reject_interface(r, ty)?;
-    let mut scope = *r
+fn query_scope(r: &Resolver<'_>, node: NodeIndex, iterable: NodeIndex) -> Result<ScopeId, String> {
+    let scope = *r
         .node_scopes
         .get(&node)
         .ok_or("iterator query is missing its lexical scope")?;
@@ -189,8 +193,22 @@ fn plan(
             .is_some_and(|paths| paths.iter().any(Vec::is_empty))
         && let Some(visible) = context.scope
     {
-        scope = ScopeId(visible);
+        return Ok(ScopeId(visible));
     }
+    Ok(scope)
+}
+
+fn plan(
+    r: &mut Resolver<'_>,
+    node: NodeIndex,
+    iterable: NodeIndex,
+    ty: TypeIndex,
+) -> Result<ForLoopPlan, String> {
+    let scope = query_scope(r, node, iterable)?;
+    if r.type_pool.as_intrinsic(ty) == Some(type_pool::Intrinsic::Any) {
+        return Ok(ForLoopPlan::Dynamic { query_scope: scope });
+    }
+    reject_interface(r, ty)?;
     let into_iter = selection(r, ty, r.type_pool.well_known.into_iterator, scope)?;
     let iterator_type = if let Some(call) = &into_iter {
         binding(r, call, r.type_pool.well_known.into_iterator, "Iter")?
@@ -198,21 +216,35 @@ fn plan(
         ty
     };
     reject_interface(r, iterator_type)?;
-    let next = selection(r, iterator_type, r.type_pool.well_known.iterator, scope)?
-        .ok_or("for input must implement Iterator or IntoIterator with an Iterator Iter type")?;
+    let next =
+        selection(r, iterator_type, r.type_pool.well_known.iterator, scope)?.ok_or_else(|| {
+            format!(
+                "for input `{}` must implement Iterator or IntoIterator with an Iterator Iter type",
+                crate::typing::type_display_name(&r.type_pool, ty)
+            )
+        })?;
     let item_type = binding(r, &next, r.type_pool.well_known.iterator, "Item")?;
     let step_type = r
         .type_pool
         .intern_iteration_step(item_type)
         .map_err(|error| error.to_string())?;
-    Ok(ForLoopPlan {
+    Ok(ForLoopPlan::Static(StaticForLoop {
         query_scope: scope,
         iterator_type,
         item_type,
         step_type,
         into_iter,
         next,
-    })
+    }))
+}
+
+impl ForLoopPlan {
+    pub fn item_type(&self) -> TypeIndex {
+        match self {
+            Self::Static(plan) => plan.item_type,
+            Self::Dynamic { .. } => type_pool::Intrinsic::Any.type_index(),
+        }
+    }
 }
 
 pub(crate) fn type_loop(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) {
@@ -222,11 +254,18 @@ pub(crate) fn type_loop(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) {
         let ty = crate::default_methods::checked_self_value_type(r, ast, children[2], ty);
         match plan(r, node, children[2], ty) {
             Ok(plan) => {
-                crate::enums::pattern(r, ast, children[1], Some(plan.item_type));
+                crate::enums::pattern(r, ast, children[1], Some(plan.item_type()));
                 r.for_loops.insert(node, plan);
             }
             Err(error) => report(r, ast, node, error),
         }
+    } else {
+        report(
+            r,
+            ast,
+            children[2],
+            "for input has no statically known type; it cannot select an iterator",
+        );
     }
     crate::typing::resolve_types(r, ast, children[3]);
 }
@@ -285,6 +324,9 @@ fn freeze_call(
 }
 
 fn freeze_plan(r: &Resolver<'_>, plan: &mut ForLoopPlan) -> Result<(), String> {
+    let ForLoopPlan::Static(plan) = plan else {
+        return Ok(());
+    };
     if let Some(call) = &mut plan.into_iter {
         freeze_call(r, call, "into_iter", plan.iterator_type, plan.query_scope)?;
     }

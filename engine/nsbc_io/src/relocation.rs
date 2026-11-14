@@ -72,10 +72,25 @@ fn constant_reference(instruction: &Instruction) -> Option<u32> {
         InstructionData::E { payload } if instruction.opcode == Opcode::PushCapturingHandler => {
             Some(payload & 0x1ffff)
         }
-        InstructionData::E { payload } if instruction.opcode == Opcode::PushHandlerWide => {
-            Some(payload)
-        }
         _ => None,
+    }
+}
+
+fn has_unresolved_derive_target(instruction: &Instruction, constants: &[Constant]) -> bool {
+    let sentinel = u64::from(type_pool::DERIVE_FUNC_ID);
+    let constant_value = |index: u32| match constants.get(index as usize) {
+        Some(Constant::UInt(value)) => Some(*value),
+        Some(Constant::Int(value)) if *value >= 0 => Some(*value as u64),
+        _ => None,
+    };
+    match (instruction.opcode, instruction.data) {
+        (Opcode::NewClosureWide, InstructionData::A { imm12, .. }) => {
+            constant_value(imm12 as u32) == Some(sentinel)
+        }
+        (Opcode::CallFar, InstructionData::C { payload }) => {
+            constant_value(payload & 0x3fff) == Some(sentinel)
+        }
+        _ => false,
     }
 }
 
@@ -92,6 +107,11 @@ pub(super) fn encode(output: &CodegenOutput) -> io::Result<RelocatedCode> {
     {
         let instruction =
             Instruction::decode(*word).ok_or_else(|| invalid("invalid instruction"))?;
+        if has_unresolved_derive_target(&instruction, &output.constants) {
+            return Err(invalid(
+                "unresolved derived method sentinel in relocated function target",
+            ));
+        }
         if let Some(name) = method_name(&instruction, &output.constants)? {
             names.insert(name);
         }
@@ -255,17 +275,6 @@ pub(super) fn encode(output: &CodegenOutput) -> io::Result<RelocatedCode> {
                             (payload & !0x1ffff) | new,
                         );
                     }
-                    InstructionData::E { payload }
-                        if instruction.opcode == Opcode::PushHandlerWide =>
-                    {
-                        let new = relocated_index(payload)?;
-                        if new >= (1 << 22) {
-                            return Err(capacity(
-                                "relocated handler metadata exceeds the 22-bit constant capacity",
-                            ));
-                        }
-                        instruction = Instruction::e_type(Opcode::PushHandlerWide, new);
-                    }
                     _ => {}
                 }
             }
@@ -313,6 +322,11 @@ pub(super) fn restore(output: &mut CodegenOutput, methods: &[(u32, String)]) -> 
     {
         let instruction =
             Instruction::decode(*word).ok_or_else(|| corrupt("invalid instruction"))?;
+        if has_unresolved_derive_target(&instruction, &output.constants) {
+            return Err(corrupt(
+                "unresolved derived method sentinel in relocated function target",
+            ));
+        }
         match instruction.opcode {
             Opcode::CallMethod => {
                 return Err(corrupt(
@@ -350,15 +364,14 @@ pub(super) fn restore(output: &mut CodegenOutput, methods: &[(u32, String)]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nsbc::{CompiledFunction, FuncId, Reg};
+    use nsbc::{CompiledFunction, FuncId, FunctionAbi, Reg};
     use type_pool::TypeIndex;
 
     #[test]
     fn enum_descriptors_relocate_with_closure_and_method_metadata() {
         let method = str_interner::intern("enum_metadata_method");
         let output = CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: nsbc::ScopeCoverage::Calls,
+            method_call_scopes: vec![],
             globals: vec![],
             constants: vec![
                 Constant::UInt(77),
@@ -370,7 +383,7 @@ mod tests {
             ],
             functions: vec![CompiledFunction {
                 display_owner: None,
-                abi: None,
+                abi: FunctionAbi::default(),
                 func_id: FuncId(0),
                 name: str_interner::intern("entry"),
                 register_count: 32,
@@ -436,13 +449,12 @@ mod tests {
         words.push(Instruction::call_method(Reg(2), method.as_u32(), 0).encode());
         words.push(Instruction::load_const(Reg(7), 0).encode());
         let mut output = CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: nsbc::ScopeCoverage::Calls,
+            method_call_scopes: vec![],
             globals: vec![],
             constants: vec![Constant::UInt(77), Constant::UInt(0)],
             functions: vec![CompiledFunction {
                 display_owner: None,
-                abi: None,
+                abi: FunctionAbi::default(),
                 func_id: FuncId(0),
                 name: str_interner::intern("proof_relocation"),
                 register_count: 32,
@@ -467,5 +479,34 @@ mod tests {
             &output.functions[0].instructions[..instructions.len()],
             &instructions
         );
+    }
+
+    #[test]
+    fn relocation_rejects_unresolved_derive_sentinel_in_function_targets() {
+        let sentinel = u64::from(type_pool::DERIVE_FUNC_ID);
+        for instruction in [
+            Instruction::call_far(0, 0),
+            Instruction::new_closure_wide(Reg(0), 0, 0),
+        ] {
+            let mut output = CodegenOutput {
+                method_call_scopes: vec![],
+                globals: vec![],
+                constants: vec![Constant::UInt(sentinel)],
+                functions: vec![CompiledFunction {
+                    display_owner: None,
+                    abi: FunctionAbi::default(),
+                    func_id: FuncId(0),
+                    name: str_interner::intern("derive_target"),
+                    register_count: 2,
+                    param_count: 0,
+                    is_closure: false,
+                    function_type: TypeIndex::INVALID,
+                    safepoint_pcs: vec![],
+                    instructions: vec![instruction.encode()],
+                }],
+            };
+            assert!(encode(&output).is_err());
+            assert!(restore(&mut output, &[]).is_err());
+        }
     }
 }

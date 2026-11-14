@@ -316,15 +316,14 @@ fn malformed_source_never_emits_archive() {
 }
 
 #[test]
-fn genuinely_unfinalized_legacy_pool_retains_zero_and_exact_indices() {
+fn unfinalized_pool_and_legacy_tpol_revisions_are_rejected() {
     use nsbc::{
-        BuiltinImport, CodegenOutput, CompiledArtifact, CompiledFunction, FuncId, Instruction, Reg,
-        ScopeCoverage,
+        BuiltinImport, CodegenOutput, CompiledArtifact, CompiledFunction, FuncId, FunctionAbi,
+        Instruction, Reg,
     };
     let mut pool = TypePool::with_intrinsics();
-    let mut indices = vec![];
     for name in ["LegacyA", "LegacyB"] {
-        indices.push(pool.register(TypeInfo {
+        pool.register(TypeInfo {
             kind: TypeKind::Struct {
                 name: str_interner::intern(name),
                 fields: vec![],
@@ -332,7 +331,7 @@ fn genuinely_unfinalized_legacy_pool_retains_zero_and_exact_indices() {
             type_id: TypeId::ZERO,
             size: 0,
             align: 0,
-        }));
+        });
     }
     let signature = pool.intern_structural(TypeKind::Function {
         params: vec![],
@@ -340,10 +339,9 @@ fn genuinely_unfinalized_legacy_pool_retains_zero_and_exact_indices() {
     });
     assert!(pool.identity_input().is_none());
     assert_eq!(pool.lookup_by_id(TypeId::ZERO), None);
-    let artifact = CompiledArtifact {
+    let unfinalized = CompiledArtifact {
         codegen_output: CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: ScopeCoverage::Calls,
+            method_call_scopes: vec![],
             functions: vec![CompiledFunction {
                 display_owner: None,
                 func_id: FuncId(0),
@@ -357,7 +355,7 @@ fn genuinely_unfinalized_legacy_pool_retains_zero_and_exact_indices() {
                 param_count: 0,
                 is_closure: false,
                 function_type: signature,
-                abi: None,
+                abi: FunctionAbi::default(),
                 safepoint_pcs: vec![],
             }],
             constants: vec![],
@@ -365,33 +363,38 @@ fn genuinely_unfinalized_legacy_pool_retains_zero_and_exact_indices() {
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 1,
+        builtin_abi_version: 9,
         builtins: vec![BuiltinImport {
             id: 1,
             name: "println".into(),
         }],
     };
-    let bytes = nsbc_io::write_artifact(&artifact).unwrap();
-    let archive = Archive::read_from(&mut &bytes[..]).unwrap();
-    let metadata = archive.find_section(SectionKind::Metadata).unwrap();
-    let tpol = occurrence(metadata, b"TPOL");
-    let revision = u32::from_le_bytes(metadata[tpol + 4..tpol + 8].try_into().unwrap());
-    assert!((1..=10).contains(&revision));
-    let restored = nsbc_io::read_artifact(&bytes).unwrap();
-    assert!(restored.type_pool.identity_input().is_none());
-    for &index in &indices {
-        assert_eq!(restored.type_pool.get(index).type_id, TypeId::ZERO);
-        assert!(restored.type_pool.stable_type_id(index).is_err());
-    }
-    assert_ne!(indices[0], indices[1]);
-    assert_eq!(restored.type_pool.lookup_by_id(TypeId::ZERO), None);
-    assert_eq!(nsbc_io::write_artifact(&restored).unwrap(), bytes);
+    assert!(
+        nsbc_io::write_artifact(&unfinalized).is_err(),
+        "unfinalized type pool must not serialize under TPOL v11"
+    );
+
     let directory = Directory::new();
-    let path = directory.0.join("legacy.nsbc");
-    std::fs::write(&path, bytes).unwrap();
-    let result = cli("run", &path);
-    success(&result);
-    assert_eq!(result.stdout, b"42\n");
+    let valid = driver::Driver::new()
+        .compile("struct Valid{n:i64};fn main(){println(Valid{n:42}.n)}")
+        .into_artifact()
+        .unwrap();
+    let bytes = nsbc_io::write_artifact(&valid).unwrap();
+    for revision in 1u32..=10 {
+        let damaged = rewrite_metadata(&bytes, |metadata| {
+            let tpol = occurrence(metadata, b"TPOL");
+            metadata[tpol + 4..tpol + 8].copy_from_slice(&revision.to_le_bytes());
+        });
+        assert!(
+            nsbc_io::read_artifact(&damaged).is_err(),
+            "accepted legacy TPOL revision {revision}"
+        );
+        let path = directory.0.join(format!("tpol-{revision}.nsbc"));
+        std::fs::write(&path, &damaged).unwrap();
+        let result = cli("run", &path);
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+    }
 }
 
 // Transport-only encoder from the frozen TPOL11 schema, used to locate and replace
@@ -507,8 +510,8 @@ fn provenance_schema_paths_versions_and_completeness_reject_with_valid_container
 #[test]
 fn finalized_abstract_holder_roundtrips_metadata_but_never_becomes_executable() {
     use nsbc::{
-        AddrMode, CodegenOutput, CompiledArtifact, CompiledFunction, Constant, FuncId, GlobalInfo,
-        Instruction, Opcode, Reg, ScopeCoverage,
+        AddrMode, CodegenOutput, CompiledArtifact, CompiledFunction, Constant, FuncId, FunctionAbi,
+        GlobalInfo, Instruction, Opcode, Reg,
     };
     use type_pool::{
         FieldInfo, IdentityPathSegment, NominalTypeProvenance, PackageTypeContext,
@@ -591,8 +594,7 @@ fn finalized_abstract_holder_roundtrips_metadata_but_never_becomes_executable() 
     pool.validate().unwrap();
     let artifact = CompiledArtifact {
         codegen_output: CodegenOutput {
-            method_call_scopes: None,
-            scope_coverage: ScopeCoverage::Calls,
+            method_call_scopes: vec![],
             functions: vec![CompiledFunction {
                 display_owner: None,
                 func_id: FuncId(0),
@@ -602,7 +604,7 @@ fn finalized_abstract_holder_roundtrips_metadata_but_never_becomes_executable() 
                 param_count: 0,
                 is_closure: false,
                 function_type: signature,
-                abi: None,
+                abi: FunctionAbi::default(),
                 safepoint_pcs: vec![],
             }],
             constants: vec![],
@@ -610,7 +612,7 @@ fn finalized_abstract_holder_roundtrips_metadata_but_never_becomes_executable() 
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 1,
+        builtin_abi_version: 9,
         builtins: vec![],
     };
     let bytes = nsbc_io::write_artifact(&artifact).unwrap();

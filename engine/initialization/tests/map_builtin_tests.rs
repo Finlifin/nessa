@@ -10,7 +10,7 @@ fn invoke(id: u32, count: u8) -> VmResult {
     let mut engine = Engine::with_defaults();
     engine.vm_mut().add_function(FunctionCode {
         display_owner: None,
-        abi: None,
+        abi: nsbc::FunctionAbi::value_only(0),
         func_id: FuncId(0),
         instructions: [
             Instruction::load_imm(Reg(0), 42),

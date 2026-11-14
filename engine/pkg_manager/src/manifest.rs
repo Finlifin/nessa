@@ -77,53 +77,6 @@ impl ManifestDocument {
         crate::identity::identity(self, &BTreeMap::new())
     }
 
-    pub(crate) fn from_manifest(manifest: PackageManifest) -> Result<Self, PackageError> {
-        validate_name(&manifest.domain, &manifest.name)?;
-        if manifest.dependencies.len() > 65_536 {
-            return Err(PackageError::Capacity("manifest dependencies (65536)"));
-        }
-        let mut package = toml::Table::new();
-        package.insert("name".into(), manifest.name.clone().into());
-        package.insert("domain".into(), manifest.domain.clone().into());
-        package.insert("version".into(), manifest.version.to_string().into());
-        package.insert(
-            "type".into(),
-            match manifest.package_type {
-                PackageType::Exe => "exe",
-                PackageType::Lib => "lib",
-                PackageType::Tmp => "tmp",
-            }
-            .into(),
-        );
-        let mut dependencies = toml::Table::new();
-        for dependency in &manifest.dependencies {
-            validate_name(&dependency.domain, &dependency.name)?;
-            let name = format!("{}/{}", dependency.domain, dependency.name);
-            if dependencies
-                .insert(name.clone(), dependency.constraint.to_string().into())
-                .is_some()
-            {
-                return Err(PackageError::Manifest(format!(
-                    "duplicate dependency: {name}"
-                )));
-            }
-        }
-        let mut metadata = toml::Table::new();
-        metadata.insert("package".into(), package.into());
-        if !dependencies.is_empty() {
-            metadata.insert("dependencies".into(), dependencies.into());
-        }
-        let source_bytes = toml::Value::Table(metadata.clone()).to_string().len();
-        if source_bytes > 16 * 1024 * 1024 {
-            return Err(PackageError::Capacity("manifest bytes (16 MiB)"));
-        }
-        Ok(Self {
-            manifest,
-            metadata,
-            source_bytes,
-        })
-    }
-
     pub(crate) fn identity_metadata(&self) -> toml::Table {
         let mut metadata = self.metadata.clone();
         if let Some(package) = metadata

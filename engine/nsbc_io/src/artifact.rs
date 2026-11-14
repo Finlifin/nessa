@@ -1,12 +1,11 @@
-//! Complete artifact codec, explicitly distinguished from legacy CODE layout.
+//! Complete artifact codec on the single current NSAM v6 baseline.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use nsbc::{
     BuiltinImport, CaptureAbi, CodegenOutput, CompiledArtifact, CompiledFunction, FuncId,
-    FunctionAbi, GlobalInfo, MethodCallScope, ParameterAbi, ScopeCoverage, SectionKind,
-    validate_artifact,
+    FunctionAbi, GlobalInfo, MethodCallScope, ParameterAbi, SectionKind, validate_artifact,
 };
 use type_pool::TypeIndex;
 
@@ -124,50 +123,7 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
     let relocated = relocation::encode(&artifact.codegen_output)?;
     let mut metadata = Writer(Vec::new());
     metadata.data(METADATA_MAGIC)?;
-    let revision = match (
-        artifact.codegen_output.scope_coverage,
-        &artifact.codegen_output.method_call_scopes,
-    ) {
-        (ScopeCoverage::Calls, None) => 1,
-        (ScopeCoverage::Calls, Some(_)) => 2,
-        (ScopeCoverage::CallsAndTypes, Some(_)) => 3,
-        (ScopeCoverage::CallsAndTypes, None) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "complete call and type contexts require a scope table",
-            ));
-        }
-    };
-    let trait_self = artifact
-        .codegen_output
-        .functions
-        .iter()
-        .filter_map(|function| function.abi.as_ref())
-        .any(|abi| {
-            abi.parameters
-                .iter()
-                .any(|parameter| matches!(parameter, ParameterAbi::TraitSelf { .. }))
-        });
-    let revision = if artifact
-        .codegen_output
-        .functions
-        .iter()
-        .any(|function| function.display_owner.is_some())
-    {
-        METADATA_REVISION
-    } else if trait_self {
-        5
-    } else if artifact
-        .codegen_output
-        .functions
-        .iter()
-        .any(|function| function.abi.is_some())
-    {
-        4
-    } else {
-        revision
-    };
-    metadata.u32(revision)?;
+    metadata.u32(METADATA_REVISION)?;
     metadata.u32(TAGGED_ROOT_SCAN)?;
     metadata.u32(artifact.builtin_abi_version)?;
     metadata.u32(artifact.entry.map_or(u32::MAX, |entry| entry.0))?;
@@ -200,80 +156,64 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
         metadata.string(&builtin.name)?;
     }
 
-    if revision >= 4 {
-        metadata.data(&[match artifact.codegen_output.scope_coverage {
-            ScopeCoverage::Calls => 0,
-            ScopeCoverage::CallsAndTypes => 1,
-        }])?;
-        metadata.data(&[u8::from(
-            artifact.codegen_output.method_call_scopes.is_some(),
-        )])?;
+    let scopes = &artifact.codegen_output.method_call_scopes;
+    metadata.count(scopes.len())?;
+    for callsite in scopes {
+        metadata.u32(callsite.func_id.0)?;
+        metadata.u32(callsite.pc)?;
+        metadata.u32(callsite.scope)?;
     }
-    if let Some(scopes) = &artifact.codegen_output.method_call_scopes {
-        metadata.count(scopes.len())?;
-        for callsite in scopes {
-            metadata.u32(callsite.func_id.0)?;
-            metadata.u32(callsite.pc)?;
-            metadata.u32(callsite.scope)?;
-        }
+
+    let mut items = artifact.codegen_output.functions.len();
+    for function in &artifact.codegen_output.functions {
+        let abi = &function.abi;
+        items = items
+            .checked_add(abi.captures.len())
+            .and_then(|items| items.checked_add(abi.parameters.len()))
+            .filter(|&items| items <= MAX_ITEMS)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "function ABI cumulative item limit exceeded",
+                )
+            })?;
     }
-    if revision >= 4 {
-        let mut items = artifact.codegen_output.functions.len();
-        for function in &artifact.codegen_output.functions {
-            if let Some(abi) = &function.abi {
-                items = items
-                    .checked_add(abi.captures.len())
-                    .and_then(|items| items.checked_add(abi.parameters.len()))
-                    .filter(|&items| items <= MAX_ITEMS)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "function ABI cumulative item limit exceeded",
-                        )
-                    })?;
+    metadata.count(artifact.codegen_output.functions.len())?;
+    for function in &artifact.codegen_output.functions {
+        metadata.u32(function.func_id.0)?;
+        let abi = &function.abi;
+        metadata.count(abi.captures.len())?;
+        for capture in &abi.captures {
+            match capture {
+                CaptureAbi::Value => metadata.data(&[0])?,
+                CaptureAbi::TraitProof { view } => {
+                    metadata.data(&[1])?;
+                    metadata.u32(view.as_u32())?;
+                }
             }
         }
-        metadata.count(artifact.codegen_output.functions.len())?;
-        for function in &artifact.codegen_output.functions {
-            metadata.u32(function.func_id.0)?;
-            metadata.data(&[u8::from(function.abi.is_some())])?;
-            if let Some(abi) = &function.abi {
-                metadata.count(abi.captures.len())?;
-                for capture in &abi.captures {
-                    match capture {
-                        CaptureAbi::Value => metadata.data(&[0])?,
-                        CaptureAbi::TraitProof { view } => {
-                            metadata.data(&[1])?;
-                            metadata.u32(view.as_u32())?;
-                        }
-                    }
+        metadata.count(abi.parameters.len())?;
+        for parameter in &abi.parameters {
+            match parameter {
+                ParameterAbi::Value => metadata.data(&[0])?,
+                ParameterAbi::Trait { view } => {
+                    metadata.data(&[1])?;
+                    metadata.u32(view.as_u32())?;
                 }
-                metadata.count(abi.parameters.len())?;
-                for parameter in &abi.parameters {
-                    match parameter {
-                        ParameterAbi::Value => metadata.data(&[0])?,
-                        ParameterAbi::Trait { view } => {
-                            metadata.data(&[1])?;
-                            metadata.u32(view.as_u32())?;
-                        }
-                        ParameterAbi::TraitSelf { view } => {
-                            metadata.data(&[2])?;
-                            metadata.u32(view.as_u32())?;
-                        }
-                    }
+                ParameterAbi::TraitSelf { view } => {
+                    metadata.data(&[2])?;
+                    metadata.u32(view.as_u32())?;
                 }
             }
         }
     }
 
-    if revision >= 6 {
-        metadata.count(artifact.codegen_output.functions.len())?;
-        for function in &artifact.codegen_output.functions {
-            metadata.u32(function.func_id.0)?;
-            metadata.data(&[u8::from(function.display_owner.is_some())])?;
-            if let Some(owner) = function.display_owner {
-                metadata.u32(owner.as_u32())?;
-            }
+    metadata.count(artifact.codegen_output.functions.len())?;
+    for function in &artifact.codegen_output.functions {
+        metadata.u32(function.func_id.0)?;
+        metadata.data(&[u8::from(function.display_owner.is_some())])?;
+        if let Some(owner) = function.display_owner {
+            metadata.u32(owner.as_u32())?;
         }
     }
 
@@ -349,8 +289,7 @@ struct Metadata {
     entry: Option<FuncId>,
     builtin_abi_version: u32,
     builtins: Vec<BuiltinImport>,
-    method_call_scopes: Option<Vec<MethodCallScope>>,
-    scope_coverage: ScopeCoverage,
+    method_call_scopes: Vec<MethodCallScope>,
 }
 
 fn decode_metadata(bytes: &[u8]) -> io::Result<Metadata> {
@@ -359,8 +298,10 @@ fn decode_metadata(bytes: &[u8]) -> io::Result<Metadata> {
         return Err(invalid("missing complete artifact metadata magic"));
     }
     let revision = reader.u32()?;
-    if !matches!(revision, 1 | 2 | 3 | 4 | 5 | METADATA_REVISION) {
-        return Err(invalid("unsupported artifact metadata revision"));
+    if revision != METADATA_REVISION {
+        return Err(invalid(format!(
+            "unsupported artifact metadata revision {revision}; expected {METADATA_REVISION}"
+        )));
     }
     if reader.u32()? != TAGGED_ROOT_SCAN {
         return Err(invalid("unsupported artifact root scan mode"));
@@ -419,120 +360,91 @@ fn decode_metadata(bytes: &[u8]) -> io::Result<Metadata> {
             name: reader.string()?,
         });
     }
-    let scope_coverage = if revision >= 4 {
-        match reader.take(1)?[0] {
-            0 => ScopeCoverage::Calls,
-            1 => ScopeCoverage::CallsAndTypes,
-            _ => return Err(invalid("invalid scope coverage tag")),
+
+    let count = reader.count(12)?;
+    let mut method_call_scopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        method_call_scopes.push(MethodCallScope {
+            func_id: FuncId(reader.u32()?),
+            pc: reader.u32()?,
+            scope: reader.u32()?,
+        });
+    }
+
+    let mut budget = MAX_ITEMS;
+    let count = reader.abi_count(12, &mut budget)?;
+    if count != functions.len() {
+        return Err(invalid("function ABI count differs from function metadata"));
+    }
+    let mut seen = BTreeSet::new();
+    for _ in 0..count {
+        let id = reader.u32()?;
+        if !seen.insert(id) {
+            return Err(invalid("duplicate function ABI metadata"));
         }
-    } else if revision == 3 {
-        ScopeCoverage::CallsAndTypes
-    } else {
-        ScopeCoverage::Calls
-    };
-    let scopes_present = if revision >= 4 {
-        reader.presence("scope table")?
-    } else {
-        revision >= 2
-    };
-    let method_call_scopes = if scopes_present {
-        let count = reader.count(12)?;
-        let mut scopes = Vec::with_capacity(count);
+        let function = functions
+            .get_mut(&id)
+            .ok_or_else(|| invalid("unknown function ABI target"))?;
+        let count = reader.abi_count(1, &mut budget)?;
+        if count > nsbc::Reg::MAX_GP as usize {
+            return Err(invalid("capture ABI count exceeds the register limit"));
+        }
+        let mut captures = Vec::new();
+        captures
+            .try_reserve_exact(count)
+            .map_err(|_| invalid("cannot allocate capture ABI"))?;
         for _ in 0..count {
-            scopes.push(MethodCallScope {
-                func_id: FuncId(reader.u32()?),
-                pc: reader.u32()?,
-                scope: reader.u32()?,
+            captures.push(match reader.take(1)?[0] {
+                0 => CaptureAbi::Value,
+                1 => CaptureAbi::TraitProof {
+                    view: TypeIndex::from_raw(reader.u32()?),
+                },
+                _ => return Err(invalid("invalid capture ABI tag")),
             });
         }
-        Some(scopes)
-    } else {
-        None
-    };
-    if revision >= 4 {
-        let mut budget = MAX_ITEMS;
-        let count = reader.abi_count(5, &mut budget)?;
-        if count != functions.len() {
-            return Err(invalid("function ABI count differs from function metadata"));
+        let count = reader.abi_count(1, &mut budget)?;
+        if count > nsbc::Reg::MAX_GP as usize {
+            return Err(invalid("parameter ABI count exceeds the register limit"));
         }
-        let mut seen = BTreeSet::new();
+        let mut parameters = Vec::new();
+        parameters
+            .try_reserve_exact(count)
+            .map_err(|_| invalid("cannot allocate parameter ABI"))?;
         for _ in 0..count {
-            let id = reader.u32()?;
-            if !seen.insert(id) {
-                return Err(invalid("duplicate function ABI metadata"));
-            }
-            let function = functions
-                .get_mut(&id)
-                .ok_or_else(|| invalid("unknown function ABI target"))?;
-            if reader.presence("function ABI")? {
-                let count = reader.abi_count(1, &mut budget)?;
-                if count > nsbc::Reg::MAX_GP as usize {
-                    return Err(invalid("capture ABI count exceeds the register limit"));
-                }
-                let mut captures = Vec::new();
-                captures
-                    .try_reserve_exact(count)
-                    .map_err(|_| invalid("cannot allocate capture ABI"))?;
-                for _ in 0..count {
-                    captures.push(match reader.take(1)?[0] {
-                        0 => CaptureAbi::Value,
-                        1 => CaptureAbi::TraitProof {
-                            view: TypeIndex::from_raw(reader.u32()?),
-                        },
-                        _ => return Err(invalid("invalid capture ABI tag")),
-                    });
-                }
-                let count = reader.abi_count(1, &mut budget)?;
-                if count > nsbc::Reg::MAX_GP as usize {
-                    return Err(invalid("parameter ABI count exceeds the register limit"));
-                }
-                let mut parameters = Vec::new();
-                parameters
-                    .try_reserve_exact(count)
-                    .map_err(|_| invalid("cannot allocate parameter ABI"))?;
-                for _ in 0..count {
-                    parameters.push(match reader.take(1)?[0] {
-                        0 => ParameterAbi::Value,
-                        1 => ParameterAbi::Trait {
-                            view: TypeIndex::from_raw(reader.u32()?),
-                        },
-                        2 if revision >= 5 => ParameterAbi::TraitSelf {
-                            view: TypeIndex::from_raw(reader.u32()?),
-                        },
-                        2 => {
-                            return Err(invalid(
-                                "TraitSelf parameter requires metadata revision 5",
-                            ));
-                        }
-                        _ => return Err(invalid("invalid parameter ABI tag")),
-                    });
-                }
-                function.abi = Some(FunctionAbi {
-                    captures,
-                    parameters,
-                });
-            }
+            parameters.push(match reader.take(1)?[0] {
+                0 => ParameterAbi::Value,
+                1 => ParameterAbi::Trait {
+                    view: TypeIndex::from_raw(reader.u32()?),
+                },
+                2 => ParameterAbi::TraitSelf {
+                    view: TypeIndex::from_raw(reader.u32()?),
+                },
+                _ => return Err(invalid("invalid parameter ABI tag")),
+            });
         }
+        function.abi = Some(FunctionAbi {
+            captures,
+            parameters,
+        });
     }
-    if revision >= 6 {
-        let count = reader.count(5)?;
-        if count != functions.len() {
-            return Err(invalid(
-                "Display owner count differs from function metadata",
-            ));
+
+    let count = reader.count(5)?;
+    if count != functions.len() {
+        return Err(invalid(
+            "Display owner count differs from function metadata",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for _ in 0..count {
+        let id = reader.u32()?;
+        if !seen.insert(id) {
+            return Err(invalid("duplicate Display owner metadata"));
         }
-        let mut seen = BTreeSet::new();
-        for _ in 0..count {
-            let id = reader.u32()?;
-            if !seen.insert(id) {
-                return Err(invalid("duplicate Display owner metadata"));
-            }
-            let function = functions
-                .get_mut(&id)
-                .ok_or_else(|| invalid("unknown Display owner target"))?;
-            if reader.presence("Display owner")? {
-                function.display_owner = Some(TypeIndex::from_raw(reader.u32()?));
-            }
+        let function = functions
+            .get_mut(&id)
+            .ok_or_else(|| invalid("unknown Display owner target"))?;
+        if reader.presence("Display owner")? {
+            function.display_owner = Some(TypeIndex::from_raw(reader.u32()?));
         }
     }
     reader.finish()?;
@@ -545,7 +457,6 @@ fn decode_metadata(bytes: &[u8]) -> io::Result<Metadata> {
         builtin_abi_version,
         builtins,
         method_call_scopes,
-        scope_coverage,
     })
 }
 
@@ -599,6 +510,9 @@ fn decode_code(
         let function = metadata
             .remove(&id)
             .ok_or_else(|| invalid("missing or duplicate function metadata for CODE entry"))?;
+        let abi = function
+            .abi
+            .ok_or_else(|| invalid("missing function ABI metadata"))?;
         let safepoint_pcs = stack_maps
             .remove(&id)
             .ok_or_else(|| invalid("missing or duplicate function stack maps for CODE entry"))?;
@@ -610,7 +524,7 @@ fn decode_code(
             param_count: counts[1],
             is_closure: flags & 2 != 0,
             function_type: function.signature,
-            abi: function.abi,
+            abi,
             display_owner: function.display_owner,
             safepoint_pcs,
         });
@@ -644,13 +558,9 @@ fn decode_code(
 }
 
 /// Decode and validate a complete artifact before it can be installed in a VM.
-/// Legacy archives with missing metadata or a zero checksum cannot execute.
 pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
     let mut input = bytes;
     let archive = Archive::read_from(&mut input)?;
-    if archive.header.checksum == [0; 32] {
-        return Err(invalid("complete artifacts require a checksum"));
-    }
     crate::container::validate_target(&archive.header)?;
     for (entry, _) in &archive.sections {
         if entry.name_idx != 0 {
@@ -684,7 +594,6 @@ pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
     )?;
     let mut output = CodegenOutput {
         method_call_scopes: metadata.method_call_scopes,
-        scope_coverage: metadata.scope_coverage,
         functions,
         constants: archive.constants()?,
         globals: metadata.globals,
@@ -698,13 +607,6 @@ pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
         builtins: metadata.builtins,
     };
     validate_artifact(&artifact).map_err(|error| invalid(error.to_string()))?;
-    if archive.header.version == 3
-        && nsbc::uses_error_envelopes(&artifact).map_err(|error| invalid(error.to_string()))?
-    {
-        return Err(invalid(
-            "executable Error capability requires NSBC version 4",
-        ));
-    }
     Ok(artifact)
 }
 

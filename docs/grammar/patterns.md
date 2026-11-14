@@ -18,6 +18,7 @@ pattern ->
 	pattern_or |
 	pattern_not |
 	pattern_as_bind |
+	pattern_typed |
 	pattern_rest_bind |
 	pattern_option_some |
 	pattern_error_ok |
@@ -66,6 +67,37 @@ arm body、外部 guard 或 `for` body，也不覆盖外部同名变量。内部
 前缀 `!pattern` 是尚未实现的旧错误模式拼写，不表示逻辑否定；后缀 `pattern!`
 仍是独立的 Error 解包模式。声明与函数参数中的组合模式，以及其他尚未接通的
 模式仍需继续实现。Any 输入的 Tuple 解构仍要求先显式转换为静态 Tuple 类型。
+
+## 类型测试模式
+
+```ebnf
+pattern_typed -> (id | underscore) : type
+```
+
+`name: Type` 在运行时检查输入值是否属于 Type：成功时把值按 `.as(Type)` 的
+规则转换后绑定为 Type 类型的 `name`，`_: Type` 只测试不绑定。Type 为 trait 时
+按模式所在的词法作用域查找实现（作用域内的 `extend` 可见，外部不可见），
+绑定值携带该 trait 证明，可直接调用 trait 方法；Tuple、函数类型、Optional
+等目标沿用 VM 的类型检查规则。
+
+类型测试只用于静态类型为 Any 或 trait 类型的输入，其它输入的静态类型已决定
+测试结果，编译时报错。它可用于 `match`、`matches` 和 `for`（不匹配的元素
+跳过），也可嵌套在这些位置的 Tuple、List 和构造模式中，如
+`[n: i64, ...rest]`、`Slot.full(text: String)`。声明和参数中的 `name: Type`
+仍是类型标注，不是模式。类型部分的优先级与函数类型箭头相同：它在 `or`、
+`and … is`、`as` 和 guard 之前结束，如 `n: i64 if n > 0`、
+`a: i64 or a: i64`；`or` 两边仍要求名称与准确类型一致。
+
+```nessa
+fn describe(v: Any) -> String {
+    v match {
+        n: i64 if n < 0 => "negative",
+        n: i64 => "int {n}",
+        shown: Display => shown.to_string(),
+        _ => "other",
+    }
+}
+```
 
 ## 守卫与约束
 

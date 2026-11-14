@@ -302,6 +302,19 @@ impl FunctionBuilder {
             .get(&node)
             .copied()
     }
+    pub fn equality_call(
+        &self,
+        resolved: &resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<resolution::SymbolId> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.equality_calls)
+            .unwrap_or(&resolved.equality_calls)
+            .get(&node)
+            .copied()
+    }
     pub fn call_plan(
         &self,
         resolved: &resolution::ResolvedAst,

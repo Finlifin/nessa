@@ -160,45 +160,10 @@ unsafe fn forward(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) {
 
 /// Weak tracing writes forwarded addresses synchronously through mutable slots.
 /// Slots cannot escape this visit; only heap objects are queued for later work.
-fn visit_stack_slots(context: &mut StackContext, visitor: &mut dyn FnMut(NessaSlot)) {
-    let mut visit = |value: &mut TaggedValue| {
+pub(crate) fn visit_stack_slots(context: &mut StackContext, visitor: &mut dyn FnMut(NessaSlot)) {
+    context.visit_slots_mut(|value| {
         // SAFETY: mutable access to an aligned transparent u64 slot is exclusive
         // during STW. The GC visitor completes load/store before returning.
         visitor(unsafe { NessaSlot::from_raw_ptr((value as *mut TaggedValue).cast::<u64>()) });
-    };
-    if let Some(state) = &mut context.display_state {
-        for value in &mut state.ancestors {
-            visit(value);
-        }
-    }
-    if let Some(value) = &mut context.entry_closure_env {
-        visit(value);
-    }
-    for handler in &mut context.handler_stack {
-        if let Some(value) = &mut handler.closure_env {
-            visit(value);
-        }
-    }
-    for value in &mut context.local_slots {
-        visit(value);
-    }
-    for value in &mut context.registers.regs {
-        visit(value);
-    }
-    for frame in &mut context.call_stack {
-        if let Some(state) = &mut frame.display_state {
-            for value in &mut state.ancestors {
-                visit(value);
-            }
-        }
-        for value in &mut frame.local_slots {
-            visit(value);
-        }
-        for (_, value) in &mut frame.saved_regs {
-            visit(value);
-        }
-        if let Some(value) = &mut frame.closure_env {
-            visit(value);
-        }
-    }
+    });
 }

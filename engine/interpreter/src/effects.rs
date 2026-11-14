@@ -18,7 +18,11 @@ impl Vm {
         let register = Reg((payload >> 17) as u8);
         let (effect_type, continuation_param) =
             if instruction.opcode == Opcode::PushCapturingHandler {
-                let metadata = self.roots.constants.get(payload & 0x1FFFF);
+                let const_index = payload & 0x1FFFF;
+                let Some(&metadata) = self.roots.constants.values().get(const_index as usize)
+                else {
+                    return DispatchResult::Error(VmError::InvalidConstant(const_index));
+                };
                 let Some(packed) = metadata.as_u64() else {
                     return DispatchResult::Error(VmError::TypeError);
                 };
@@ -52,8 +56,7 @@ impl Vm {
         task.handler_stack.push(EffectHandler {
             effect_type,
             handler_func,
-            is_async: false,
-            closure_env: Some(closure),
+            closure_env: closure,
             continuation_param,
         });
         DispatchResult::Continue
@@ -82,16 +85,14 @@ impl Vm {
             Ok(code) => code,
             Err(error) => return DispatchResult::Error(error),
         };
-        // Legacy EffectCallDyn carries logical raw values and has no lexical
-        // acquisition context. A future physical effect opcode must preserve
+        // EffectCallDyn carries logical raw values and has no lexical
+        // acquisition context. A physical effect opcode would be needed to preserve
         // proofs for bare trait arguments; never guess handler authority here.
-        if code.abi.as_ref().is_some_and(|abi| {
-            abi.parameters.iter().any(|parameter| {
-                matches!(
-                    parameter,
-                    nsbc::ParameterAbi::Trait { .. } | nsbc::ParameterAbi::TraitSelf { .. }
-                )
-            })
+        if code.abi.parameters.iter().any(|parameter| {
+            matches!(
+                parameter,
+                nsbc::ParameterAbi::Trait { .. } | nsbc::ParameterAbi::TraitSelf { .. }
+            )
         }) {
             return DispatchResult::Error(VmError::UnsupportedFunctionAbi);
         }
@@ -106,9 +107,8 @@ impl Vm {
         };
         let args: Vec<TaggedValue> = task.registers.regs[..arg_count as usize].to_vec();
         let argument_count = args.len();
-        let has_environment = handler.closure_env.is_some();
         let mut values = args;
-        values.extend(handler.closure_env);
+        values.push(handler.closure_env);
         let base = self.roots.temporary_values.borrow().len();
         self.with_temporary_roots(&values, |vm| {
             if let Some(position) = handler.continuation_param {
@@ -139,16 +139,21 @@ impl Vm {
                 };
                 let roots = vm.roots.temporary_values.borrow();
                 let mut args = roots[base..base + argument_count].to_vec();
-                let environment = has_environment.then(|| roots[base + argument_count]);
+                let environment = roots[base + argument_count];
                 drop(roots);
                 args.insert(position as usize, continuation);
-                return Ok(vm.invoke_closure(task_id, handler.handler_func, environment, &args));
+                return Ok(vm.invoke_closure(
+                    task_id,
+                    handler.handler_func,
+                    Some(environment),
+                    &args,
+                ));
             }
             let roots = vm.roots.temporary_values.borrow();
             let args = roots[base..base + argument_count].to_vec();
-            let environment = has_environment.then(|| roots[base + argument_count]);
+            let environment = roots[base + argument_count];
             drop(roots);
-            Ok(vm.invoke_closure(task_id, handler.handler_func, environment, &args))
+            Ok(vm.invoke_closure(task_id, handler.handler_func, Some(environment), &args))
         })
         .unwrap_or_else(DispatchResult::Error)
     }
@@ -263,7 +268,6 @@ impl Vm {
             .expect("dispatched task exists");
         match task.stacks.enter_delimiters(&prompts, function, &captures) {
             Ok(()) => {
-                task.stacks.active_mut().entry_closure_env = Some(environment);
                 task.handler_stack = handlers;
                 DispatchResult::Continue
             }
@@ -294,7 +298,9 @@ impl Vm {
         )
     }
 
-    fn language_continuation_handle(continuation: TaggedValue) -> Result<ContinuationId, VmError> {
+    pub(super) fn language_continuation_handle(
+        continuation: TaggedValue,
+    ) -> Result<ContinuationId, VmError> {
         let Some(pointer) = continuation.as_heap_ptr() else {
             return Err(VmError::TypeError);
         };
@@ -473,7 +479,7 @@ impl Vm {
             });
         }
         // Save the caller before installing closure parameters, including captures.
-        let outcome = self.push_call_frame(task_id, function, environment, &parameters);
+        let outcome = self.push_call_frame(task_id, function, &parameters);
         if !matches!(outcome, DispatchResult::Continue) {
             return outcome;
         }

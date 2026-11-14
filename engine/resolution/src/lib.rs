@@ -12,12 +12,13 @@
 mod access;
 mod applications;
 mod arguments;
+mod assignments;
 mod associated;
 mod associated_types;
 mod collections;
 mod comparison_derivation;
 mod display_derivation;
-pub use display_derivation::{DerivedDisplayPlan, DisplayDerivationMode};
+pub use display_derivation::DerivedDisplayPlan;
 mod default_body;
 mod default_methods;
 mod defaults;
@@ -25,6 +26,7 @@ pub use default_methods::{DefaultBodyFacts, DefaultMethodPlan};
 mod effect;
 mod effect_contracts;
 mod enums;
+mod equality;
 mod error_coverage;
 mod error_matrix;
 mod error_patterns;
@@ -50,17 +52,20 @@ mod optional;
 mod ordering;
 mod pattern_bindings;
 mod post_do;
+mod ranges;
 pub(crate) mod resolver;
 mod self_provenance;
 mod structs;
 mod trait_loops;
-pub use trait_loops::{ForLoopPlan, IteratorCall};
+pub use trait_loops::{ForLoopPlan, IteratorCall, StaticForLoop};
 mod trait_schemas;
 mod trait_signatures;
 mod trait_typing;
 mod traits;
+mod trusted;
 mod tuples;
 mod type_factories;
+mod type_patterns;
 pub use enums::{EnumConstructionPlan, EnumVariantRef};
 pub use type_factories::TypeFactory;
 mod extended;
@@ -322,6 +327,8 @@ pub struct ResolvedAst {
     pub default_methods: Vec<DefaultMethodPlan>,
     /// Checked operator and instance method calls select a source function directly.
     pub concat_calls: HashMap<NodeIndex, SymbolId>,
+    /// `==`/`!=` between Any or tuple operands call the trusted std equality.
+    pub equality_calls: HashMap<NodeIndex, SymbolId>,
     pub instance_methods: HashMap<NodeIndex, SymbolId>,
     pub application_calls: HashMap<NodeIndex, SymbolId>,
     pub update_calls: HashMap<NodeIndex, SymbolId>,
@@ -516,5 +523,59 @@ mod tests {
             resolved.type_pool.get(my.type_index).kind,
             type_pool::TypeKind::Typealias { .. }
         ));
+    }
+
+    #[test]
+    fn builtin_views_resolve_from_local_type_pool_without_root_exposure() {
+        let src = "typealias MyI64 = .i64'builtin; typealias MyDisplay = .Display'builtin; typealias MyStep = .IterationStep'builtin";
+        let (tokens, _) = lexer::tokenize(src);
+        let sm = rustc_span::SourceMap::new(rustc_span::source_map::FilePathMapping::empty());
+        let sf = sm.new_source_file(rustc_span::FileName::Custom("t".into()), src.to_string());
+        let diag = diagnostic::DiagnosticContext::new(&sm);
+        let parser = parser::Parser::new(&tokens, src, &diag, sf.start_pos);
+        let ast = parser.parse();
+        let resolved = resolve_with_options(
+            ast,
+            &diag,
+            ResolveOptions {
+                builtin_access: true,
+                expose_root_builtins: false,
+                expose_root_types: false,
+                ..ResolveOptions::default()
+            },
+        );
+        assert!(!diag.has_errors(), "{:?}", diag.diagnostics());
+        let my_display = resolved
+            .symbols
+            .iter()
+            .find(|s| str_interner::get(s.name) == "MyDisplay")
+            .expect("MyDisplay symbol");
+        assert_eq!(
+            resolved.type_pool.canonical_type(my_display.type_index),
+            Some(resolved.type_pool.well_known.display)
+        );
+        let my_step = resolved
+            .symbols
+            .iter()
+            .find(|s| str_interner::get(s.name) == "MyStep")
+            .expect("MyStep symbol");
+        assert_eq!(
+            my_step.kind,
+            SymbolKind::TypeFactory(TypeFactory::IterationStep)
+        );
+
+        let bad_src = "typealias BadClosure = .Closure'builtin";
+        let (bad_tokens, _) = lexer::tokenize(bad_src);
+        let bad_sm = rustc_span::SourceMap::new(rustc_span::source_map::FilePathMapping::empty());
+        let bad_sf =
+            bad_sm.new_source_file(rustc_span::FileName::Custom("bad".into()), bad_src.into());
+        let bad_diag = diagnostic::DiagnosticContext::new(&bad_sm);
+        let bad_ast =
+            parser::Parser::new(&bad_tokens, bad_src, &bad_diag, bad_sf.start_pos).parse();
+        let _ = resolve_with_options(bad_ast, &bad_diag, ResolveOptions::for_builtin_package());
+        assert!(
+            bad_diag.has_errors(),
+            "Closure must not be exposed via 'builtin"
+        );
     }
 }

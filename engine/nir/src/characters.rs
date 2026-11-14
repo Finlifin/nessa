@@ -10,10 +10,11 @@ pub(crate) fn parse_literal(text: &str) -> Result<char, &'static str> {
             "n" => Ok('\n'),
             "t" => Ok('\t'),
             "r" => Ok('\r'),
+            "0" => Ok('\0'),
             "\\" => Ok('\\'),
             "\"" => Ok('"'),
             "'" => Ok('\''),
-            _ => Err("unsupported character escape"),
+            _ => decode_numeric_escape(escaped),
         };
     }
     let mut scalars = content.chars();
@@ -22,6 +23,23 @@ pub(crate) fn parse_literal(text: &str) -> Result<char, &'static str> {
         return Err("character literal must contain one scalar value");
     }
     Ok(value)
+}
+
+/// `\xHH` is one byte, which is always a scalar. `\uXXXX` is four hex digits
+/// and rejects surrogates. The brace form `\u{...}` is not a character escape.
+fn decode_numeric_escape(escaped: &str) -> Result<char, &'static str> {
+    let (digits, width) = if let Some(digits) = escaped.strip_prefix('x') {
+        (digits, 2)
+    } else if let Some(digits) = escaped.strip_prefix('u') {
+        (digits, 4)
+    } else {
+        return Err("unsupported character escape");
+    };
+    if digits.len() != width || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("unsupported character escape");
+    }
+    let value = u32::from_str_radix(digits, 16).map_err(|_| "unsupported character escape")?;
+    char::from_u32(value).ok_or("unicode escape is not a Unicode scalar value")
 }
 
 #[cfg(test)]
@@ -40,6 +58,10 @@ mod tests {
             ("'\\\\'", '\\'),
             ("'\\\"'", '"'),
             ("'\\''", '\''),
+            ("'\\0'", '\0'),
+            ("'\\x41'", 'A'),
+            ("'\\u00e9'", 'é'),
+            ("'\\u00E9'", 'é'),
         ] {
             assert_eq!(parse_literal(source), Ok(value));
             let (mut resolved, _) = crate::literal::tests::resolved_integer("42", false, "i64");
@@ -66,8 +88,10 @@ mod tests {
             "''",
             "'ab'",
             "'é'",
-            "'\\x41'",
+            "'\\x4'",
+            "'\\u12'",
             "'\\u{41}'",
+            "'\\uD800'",
             "'\\q'",
             "'\n'",
         ] {

@@ -1,6 +1,6 @@
 //! Bounded archive container I/O. Section payload decoding belongs to its
-//! subsystem. Executable artifacts additionally require a checked target and
-//! a nonzero checksum; legacy containers with zero checksums remain readable.
+//! subsystem. Every container requires the current format version and a
+//! non-zero matching SHA-256 checksum.
 
 use std::io::{self, Cursor, Read, Write};
 
@@ -101,7 +101,7 @@ pub(crate) fn read<R: Read>(r: &mut R) -> io::Result<(FileHeader, Sections)> {
     }
     let mut cursor = Cursor::new(bytes.as_slice());
     let header = FileHeader::read_from(&mut cursor)?;
-    if header.version != VERSION && header.version != 3 {
+    if header.version != VERSION {
         return Err(invalid(format!(
             "unsupported NSBC version {}; expected {VERSION}",
             header.version
@@ -168,8 +168,8 @@ pub(crate) fn read<R: Read>(r: &mut R) -> io::Result<(FileHeader, Sections)> {
         }
         previous_end = previous_end.max(end);
     }
-    if header.checksum != [0; 32]
-        && header.checksum != <[u8; 32]>::from(Sha256::digest(&bytes[FILE_HEADER_SIZE..]))
+    if header.checksum == [0; 32]
+        || header.checksum != <[u8; 32]>::from(Sha256::digest(&bytes[FILE_HEADER_SIZE..]))
     {
         return Err(invalid("archive checksum mismatch"));
     }
@@ -251,6 +251,7 @@ mod tests {
     fn header_and_sections_use_their_declared_offsets_and_padding() {
         let bytes = fixture();
         let (header, sections) = read(&mut bytes.as_slice()).unwrap();
+        assert_eq!(header.version, VERSION);
         assert_eq!(header.section_table_offset, FILE_HEADER_SIZE as u64);
         assert_eq!(sections[0].0.offset, 128);
         assert_eq!(sections[1].0.offset, 136);
@@ -259,6 +260,17 @@ mod tests {
         assert_eq!(sections[0].1, [10, 11, 12]);
         assert_eq!(sections[1].1, [20, 21, 22, 23]);
         assert_eq!(bytes.len(), 140);
+    }
+
+    #[test]
+    fn rejects_non_current_container_versions() {
+        let original = fixture();
+        for version in [0u32, 1, 2, 3, VERSION + 1, u32::MAX] {
+            let mut bytes = original.clone();
+            set_u32(&mut bytes, 4, version);
+            update_checksum(&mut bytes);
+            rejects(&bytes, "unsupported NSBC version");
+        }
     }
 
     #[test]
@@ -364,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn checksum_detects_payload_and_padding_corruption() {
+    fn checksum_detects_zero_payload_and_padding_corruption() {
         let original = fixture();
         assert_ne!(&original[8..40], &[0; 32]);
         for offset in [124, 128, 132, 136] {
@@ -372,10 +384,9 @@ mod tests {
             bytes[offset] ^= 1;
             rejects(&bytes, "checksum mismatch");
         }
-        // Low-level legacy inspection still accepts explicitly absent checksums.
-        let mut legacy = original;
-        legacy[8..40].fill(0);
-        read(&mut legacy.as_slice()).unwrap();
+        let mut zeroed = original;
+        zeroed[8..40].fill(0);
+        rejects(&zeroed, "checksum mismatch");
     }
 
     #[test]

@@ -3,12 +3,253 @@
 use .builtin.*
 
 pub const abs: fn(Any) -> Any = .abs'builtin
+const native_abs: fn(Any) -> Any = .abs'builtin
 pub const sin: fn(f64) -> f64 = .sin'builtin
 pub const cos: fn(f64) -> f64 = .cos'builtin
 pub const sqrt: fn(f64) -> f64 = .sqrt'builtin
+const native_sqrt: fn(f64) -> f64 = .sqrt'builtin
 pub const floor: fn(f64) -> f64 = .floor'builtin
+const native_floor: fn(f64) -> f64 = .floor'builtin
 pub const ceil: fn(f64) -> f64 = .ceil'builtin
+const native_ceil: fn(f64) -> f64 = .ceil'builtin
 pub const round: fn(f64) -> f64 = .round'builtin
+const native_round: fn(f64) -> f64 = .round'builtin
 -- Numeric native dispatch preserves integral powers; generic numeric signatures are pending.
 pub const pow: fn(Any, Any) -> Any = .pow'builtin
 pub const log: fn(f64) -> f64 = .log'builtin
+-- The result keeps one operand's numeric kind. Ties and unordered pairs (NaN)
+-- keep the left operand, so `min(1, 1.0)` is an i64 and `min(1.0, 1)` is an f64.
+pub const min: fn(Any, Any) -> Any = .min'builtin
+pub const max: fn(Any, Any) -> Any = .max'builtin
+-- Bounds are inclusive. A lower bound greater than the upper bound is a runtime error.
+pub const clamp: fn(Any, Any, Any) -> Any = .clamp'builtin
+-- `-1`, `0`, or `1`. NaN is null. Negative zero compares equal to zero.
+pub const sign: fn(Any) -> ?i64 = .sign'builtin
+const native_sign: fn(Any) -> ?i64 = .sign'builtin
+-- IEEE results, including infinity and NaN. Domain errors are NaN, not a runtime error.
+pub const exp: fn(f64) -> f64 = .exp'builtin
+pub const log2: fn(f64) -> f64 = .log2'builtin
+pub const log10: fn(f64) -> f64 = .log10'builtin
+pub const trunc: fn(f64) -> f64 = .trunc'builtin
+const native_trunc: fn(f64) -> f64 = .trunc'builtin
+pub const fract: fn(f64) -> f64 = .fract'builtin
+const native_fract: fn(f64) -> f64 = .fract'builtin
+pub const tan: fn(f64) -> f64 = .tan'builtin
+pub const asin: fn(f64) -> f64 = .asin'builtin
+pub const acos: fn(f64) -> f64 = .acos'builtin
+pub const atan: fn(f64) -> f64 = .atan'builtin
+-- Magnitude from the first argument, sign bit from the second, including -0.0.
+pub const copysign: fn(f64, f64) -> f64 = .copysign'builtin
+const native_copysign: fn(f64, f64) -> f64 = .copysign'builtin
+-- `atan2(y, x)` is the angle of the vector `(x, y)`.
+pub const atan2: fn(f64, f64) -> f64 = .atan2'builtin
+pub const hypot: fn(f64, f64) -> f64 = .hypot'builtin
+-- Classification reads the IEEE value. `is_sign_negative` is the sign bit, so
+-- negative zero and a negative NaN are true. `sign` still treats negative zero as zero.
+pub const is_nan: fn(f64) -> bool = .is_nan'builtin
+const native_is_nan: fn(f64) -> bool = .is_nan'builtin
+pub const is_infinite: fn(f64) -> bool = .is_infinite'builtin
+const native_is_infinite: fn(f64) -> bool = .is_infinite'builtin
+pub const is_finite: fn(f64) -> bool = .is_finite'builtin
+const native_is_finite: fn(f64) -> bool = .is_finite'builtin
+pub const is_sign_negative: fn(f64) -> bool = .is_sign_negative'builtin
+const native_is_sign_negative: fn(f64) -> bool = .is_sign_negative'builtin
+pub const is_sign_positive: fn(f64) -> bool = .is_sign_positive'builtin
+const native_is_sign_positive: fn(f64) -> bool = .is_sign_positive'builtin
+pub const sinh: fn(f64) -> f64 = .sinh'builtin
+pub const cosh: fn(f64) -> f64 = .cosh'builtin
+pub const tanh: fn(f64) -> f64 = .tanh'builtin
+pub const cbrt: fn(f64) -> f64 = .cbrt'builtin
+pub const exp2: fn(f64) -> f64 = .exp2'builtin
+pub const expm1: fn(f64) -> f64 = .expm1'builtin
+pub const log1p: fn(f64) -> f64 = .log1p'builtin
+-- `signum` is `1.0` or `-1.0`, including the sign of zero. NaN stays NaN.
+-- `recip(0)` is infinity, not a runtime error. `mul_add(a, b, c)` is `a * b + c`.
+-- Euclidean division rounds toward negative infinity.
+pub const signum: fn(f64) -> f64 = .signum'builtin
+const native_signum: fn(f64) -> f64 = .signum'builtin
+pub const recip: fn(f64) -> f64 = .recip'builtin
+const native_recip: fn(f64) -> f64 = .recip'builtin
+pub const mul_add: fn(f64, f64, f64) -> f64 = .mul_add'builtin
+const native_mul_add: fn(f64, f64, f64) -> f64 = .mul_add'builtin
+pub const div_euclid: fn(f64, f64) -> f64 = .div_euclid'builtin
+const native_div_euclid: fn(f64, f64) -> f64 = .div_euclid'builtin
+pub const rem_euclid: fn(f64, f64) -> f64 = .rem_euclid'builtin
+const native_rem_euclid: fn(f64, f64) -> f64 = .rem_euclid'builtin
+pub const to_radians: fn(f64) -> f64 = .to_radians'builtin
+const native_to_radians: fn(f64) -> f64 = .to_radians'builtin
+pub const to_degrees: fn(f64) -> f64 = .to_degrees'builtin
+const native_to_degrees: fn(f64) -> f64 = .to_degrees'builtin
+pub const next_up: fn(f64) -> f64 = .next_up'builtin
+const native_next_up: fn(f64) -> f64 = .next_up'builtin
+pub const next_down: fn(f64) -> f64 = .next_down'builtin
+const native_next_down: fn(f64) -> f64 = .next_down'builtin
+pub const midpoint: fn(f64, f64) -> f64 = .midpoint'builtin
+const native_midpoint: fn(f64, f64) -> f64 = .midpoint'builtin
+-- Half values round to the even integer.
+pub const round_ties_even: fn(f64) -> f64 = .round_ties_even'builtin
+const native_round_ties_even: fn(f64) -> f64 = .round_ties_even'builtin
+pub const asinh: fn(f64) -> f64 = .asinh'builtin
+const native_asinh: fn(f64) -> f64 = .asinh'builtin
+pub const acosh: fn(f64) -> f64 = .acosh'builtin
+const native_acosh: fn(f64) -> f64 = .acosh'builtin
+pub const atanh: fn(f64) -> f64 = .atanh'builtin
+const native_atanh: fn(f64) -> f64 = .atanh'builtin
+pub const is_normal: fn(f64) -> bool = .is_normal'builtin
+const native_is_normal: fn(f64) -> bool = .is_normal'builtin
+pub const is_subnormal: fn(f64) -> bool = .is_subnormal'builtin
+const native_is_subnormal: fn(f64) -> bool = .is_subnormal'builtin
+pub const to_bits: fn(f64) -> Any = .to_bits'builtin
+const native_to_bits: fn(f64) -> Any = .to_bits'builtin
+pub const powi: fn(f64, i64) -> f64 = .powi'builtin
+const native_powi: fn(f64, i64) -> f64 = .powi'builtin
+pub const log_base: fn(f64, f64) -> f64 = .log_base'builtin
+const native_log_base: fn(f64, f64) -> f64 = .log_base'builtin
+pub const total_cmp: fn(f64, f64) -> i64 = .total_cmp'builtin
+const native_total_cmp: fn(f64, f64) -> i64 = .total_cmp'builtin
+const native_f64_to_be_bytes: fn(f64) -> List = .f64_to_be_bytes'builtin
+const native_f64_to_le_bytes: fn(f64) -> List = .f64_to_le_bytes'builtin
+pub const f64_from_be_bytes: fn(List) -> f64 = .f64_from_be_bytes'builtin
+pub const f64_from_le_bytes: fn(List) -> f64 = .f64_from_le_bytes'builtin
+pub const f64_from_ne_bytes: fn(List) -> f64 = .f64_from_ne_bytes'builtin
+const native_f64_to_ne_bytes: fn(f64) -> List = .f64_to_ne_bytes'builtin
+const native_algebraic_add: fn(f64, f64) -> f64 = .algebraic_add'builtin
+const native_algebraic_sub: fn(f64, f64) -> f64 = .algebraic_sub'builtin
+const native_algebraic_mul: fn(f64, f64) -> f64 = .algebraic_mul'builtin
+const native_algebraic_div: fn(f64, f64) -> f64 = .algebraic_div'builtin
+const native_algebraic_rem: fn(f64, f64) -> f64 = .algebraic_rem'builtin
+const native_nan_to: fn(f64, f64) -> f64 = .f64_nan_to'builtin
+const native_f64_abs_diff: fn(f64, f64) -> f64 = .f64_abs_diff'builtin
+const native_f64_is_zero: fn(f64) -> bool = .f64_is_zero'builtin
+pub const f64_radix: fn() -> i64 = .f64_radix'builtin
+pub const f64_mantissa_digits: fn() -> i64 = .f64_mantissa_digits'builtin
+pub const f64_digits: fn() -> i64 = .f64_digits'builtin
+pub const f64_min_exp: fn() -> i64 = .f64_min_exp'builtin
+pub const f64_max_exp: fn() -> i64 = .f64_max_exp'builtin
+pub const f64_min_10_exp: fn() -> i64 = .f64_min_10_exp'builtin
+pub const f64_max_10_exp: fn() -> i64 = .f64_max_10_exp'builtin
+-- Exact IEEE-754 constants. `nan` is not equal to itself.
+pub const pi: fn() -> f64 = .pi'builtin
+pub const euler: fn() -> f64 = .euler'builtin
+pub const tau: fn() -> f64 = .tau'builtin
+pub const ln_2: fn() -> f64 = .ln_2'builtin
+pub const ln_10: fn() -> f64 = .ln_10'builtin
+pub const log2_e: fn() -> f64 = .log2_e'builtin
+pub const log10_e: fn() -> f64 = .log10_e'builtin
+pub const sqrt_2: fn() -> f64 = .sqrt_2'builtin
+pub const infinity: fn() -> f64 = .infinity'builtin
+pub const neg_infinity: fn() -> f64 = .neg_infinity'builtin
+pub const nan: fn() -> f64 = .nan'builtin
+pub const epsilon: fn() -> f64 = .epsilon'builtin
+pub const min_positive: fn() -> f64 = .min_positive'builtin
+pub const frac_pi_2: fn() -> f64 = .frac_pi_2'builtin
+pub const frac_pi_4: fn() -> f64 = .frac_pi_4'builtin
+pub const frac_1_sqrt_2: fn() -> f64 = .frac_1_sqrt_2'builtin
+pub const log2_10: fn() -> f64 = .log2_10'builtin
+pub const log10_2: fn() -> f64 = .log10_2'builtin
+pub const frac_1_pi: fn() -> f64 = .frac_1_pi'builtin
+pub const frac_2_pi: fn() -> f64 = .frac_2_pi'builtin
+pub const frac_2_sqrt_pi: fn() -> f64 = .frac_2_sqrt_pi'builtin
+pub const frac_pi_3: fn() -> f64 = .frac_pi_3'builtin
+pub const frac_pi_6: fn() -> f64 = .frac_pi_6'builtin
+pub const frac_pi_8: fn() -> f64 = .frac_pi_8'builtin
+pub const f64_min: fn() -> f64 = .f64_min'builtin
+pub const f64_max: fn() -> f64 = .f64_max'builtin
+pub const golden_ratio: fn() -> f64 = .golden_ratio'builtin
+pub const euler_gamma: fn() -> f64 = .euler_gamma'builtin
+pub const classify: fn(f64) -> String = .f64_classify'builtin
+const native_classify: fn(f64) -> String = .f64_classify'builtin
+const native_trunc_i64: fn(f64) -> Any = .trunc_i64'builtin
+const native_trunc_u64: fn(f64) -> Any = .trunc_u64'builtin
+const native_trunc_i128: fn(f64) -> Any = .trunc_i128'builtin
+const native_trunc_u128: fn(f64) -> Any = .trunc_u128'builtin
+-- Truncate toward zero. A non-finite value, or one that does not fit, is null.
+pub fn trunc_i64(value: f64) -> ?i64 {
+    let truncated = native_trunc_i64(value)
+    if truncated == null { null } else { truncated.as(i64) }
+}
+pub fn trunc_u64(value: f64) -> ?u64 {
+    let truncated = native_trunc_u64(value)
+    if truncated == null { null } else { truncated.as(u64) }
+}
+pub fn trunc_i128(value: f64) -> ?i128 {
+    let truncated = native_trunc_i128(value)
+    if truncated == null { null } else { truncated.as(i128) }
+}
+pub fn trunc_u128(value: f64) -> ?u128 {
+    let truncated = native_trunc_u128(value)
+    if truncated == null { null } else { truncated.as(u128) }
+}
+const native_from_bits: fn(u64) -> f64 = .from_bits'builtin
+-- Interpret the IEEE-754 bits of an unsigned 64-bit integer.
+pub fn f64_from_bits(bits: u64) -> f64 { native_from_bits(bits) }
+
+impl f64 {
+    -- Call the private bindings. The public functions share these names, and a
+    -- direct call would resolve to the method itself.
+    pub fn is_nan(self) -> bool { native_is_nan(self) }
+    pub fn is_infinite(self) -> bool { native_is_infinite(self) }
+    pub fn is_finite(self) -> bool { native_is_finite(self) }
+    pub fn is_sign_negative(self) -> bool { native_is_sign_negative(self) }
+    pub fn is_sign_positive(self) -> bool { native_is_sign_positive(self) }
+    pub fn abs(self) -> f64 { native_abs(self).as(f64) }
+    pub fn sign(self) -> ?i64 { native_sign(self) }
+    pub fn floor(self) -> f64 { native_floor(self) }
+    pub fn ceil(self) -> f64 { native_ceil(self) }
+    pub fn round(self) -> f64 { native_round(self) }
+    pub fn trunc(self) -> f64 { native_trunc(self) }
+    pub fn fract(self) -> f64 { native_fract(self) }
+    pub fn sqrt(self) -> f64 { native_sqrt(self) }
+    pub fn signum(self) -> f64 { native_signum(self) }
+    pub fn recip(self) -> f64 { native_recip(self) }
+    pub fn mul_add(self, factor: f64, addend: f64) -> f64 { native_mul_add(self, factor, addend) }
+    pub fn div_euclid(self, divisor: f64) -> f64 { native_div_euclid(self, divisor) }
+    pub fn rem_euclid(self, divisor: f64) -> f64 { native_rem_euclid(self, divisor) }
+    pub fn to_radians(self) -> f64 { native_to_radians(self) }
+    pub fn to_degrees(self) -> f64 { native_to_degrees(self) }
+    pub fn next_up(self) -> f64 { native_next_up(self) }
+    pub fn next_down(self) -> f64 { native_next_down(self) }
+    pub fn midpoint(self, other: f64) -> f64 { native_midpoint(self, other) }
+    pub fn round_ties_even(self) -> f64 { native_round_ties_even(self) }
+    pub fn asinh(self) -> f64 { native_asinh(self) }
+    pub fn acosh(self) -> f64 { native_acosh(self) }
+    pub fn atanh(self) -> f64 { native_atanh(self) }
+    pub fn is_normal(self) -> bool { native_is_normal(self) }
+    pub fn is_subnormal(self) -> bool { native_is_subnormal(self) }
+    -- `nan`, `infinite`, `zero`, `subnormal`, or `normal`. Both zeros are `zero`.
+    pub fn classify(self) -> String { native_classify(self) }
+    pub fn to_bits(self) -> u64 { native_to_bits(self).as(u64) }
+    pub fn powi(self, exponent: i64) -> f64 { native_powi(self, exponent) }
+    pub fn log_base(self, base: f64) -> f64 { native_log_base(self, base) }
+    pub fn trunc_i64(self) -> ?i64 {
+        let truncated = native_trunc_i64(self)
+        if truncated == null { null } else { truncated.as(i64) }
+    }
+    pub fn trunc_u64(self) -> ?u64 {
+        let truncated = native_trunc_u64(self)
+        if truncated == null { null } else { truncated.as(u64) }
+    }
+    pub fn trunc_i128(self) -> ?i128 {
+        let truncated = native_trunc_i128(self)
+        if truncated == null { null } else { truncated.as(i128) }
+    }
+    pub fn trunc_u128(self) -> ?u128 {
+        let truncated = native_trunc_u128(self)
+        if truncated == null { null } else { truncated.as(u128) }
+    }
+    pub fn total_cmp(self, other: f64) -> i64 { native_total_cmp(self, other) }
+    pub fn to_be_bytes(self) -> List { native_f64_to_be_bytes(self) }
+    pub fn to_le_bytes(self) -> List { native_f64_to_le_bytes(self) }
+    pub fn to_ne_bytes(self) -> List { native_f64_to_ne_bytes(self) }
+    pub fn copysign(self, sign: f64) -> f64 { native_copysign(self, sign) }
+    pub fn algebraic_add(self, other: f64) -> f64 { native_algebraic_add(self, other) }
+    pub fn algebraic_sub(self, other: f64) -> f64 { native_algebraic_sub(self, other) }
+    pub fn algebraic_mul(self, other: f64) -> f64 { native_algebraic_mul(self, other) }
+    pub fn algebraic_div(self, other: f64) -> f64 { native_algebraic_div(self, other) }
+    pub fn algebraic_rem(self, other: f64) -> f64 { native_algebraic_rem(self, other) }
+    -- A NaN becomes `replacement`. Infinities stay themselves.
+    pub fn nan_to(self, replacement: f64) -> f64 { native_nan_to(self, replacement) }
+    pub fn abs_diff(self, other: f64) -> f64 { native_f64_abs_diff(self, other) }
+    -- True for both +0.0 and -0.0.
+    pub fn is_zero(self) -> bool { native_f64_is_zero(self) }
+}
