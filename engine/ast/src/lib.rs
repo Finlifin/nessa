@@ -301,6 +301,14 @@ pub enum NodeKind {
     /// children: [0] expr  [1] type
     TypeCast,
 
+    /// `await_expr -> expr.await`
+    /// children: [0] expr
+    Await,
+
+    /// `spread_arg -> ...expr` (in call argument position)
+    /// children: [0] expr
+    SpreadArg,
+
     // ── Delimited continuations ─────────────────────────────────────
     /// `reset expr block`
     /// children: [0] prompt  [1] body
@@ -336,8 +344,8 @@ pub enum NodeKind {
     /// children: [0] pattern  [1] type  [2] value  [3] else_branch
     ConstDecl,
 
-    /// `var pattern (: expr)? = expr`
-    /// children: [0] pattern  [1] type  [2] value
+    /// `var_decl -> var pattern (: expr)? = expr (else expr)?`
+    /// children: [0] pattern  [1] type  [2] value  [3] else_branch
     VarDecl,
 
     /// `global_decl -> visibility_modifier? global id : expr = expr`
@@ -713,12 +721,11 @@ impl NodeKind {
             // 1 child
             Negative | BoolNot | ErrorConstruction | OptionalType | RangeFrom | RangeTo
             | RangeToInclusive | EffectPropagation | ErrorPropagation | OptionPropagation
-            | ExprStatement | DeferStatement | PatternNot | PatternError | PatternEffect
-            | PatternTypeFamily | PatternAsync | PatternOptionSome | PatternErrorOk
-            | PatternRestBind | PatternFromExpr | SuperPath | PackagePath | PathProjectionAll
-            | ElseConditionArm | Symbol | PubDef | PrivateDef | GlobalDecl | AssocDecl => {
-                SingleChild
-            }
+            | Await | SpreadArg | ExprStatement | DeferStatement | PatternNot | PatternError
+            | PatternEffect | PatternTypeFamily | PatternAsync | PatternOptionSome
+            | PatternErrorOk | PatternRestBind | PatternFromExpr | SuperPath | PackagePath
+            | PathProjectionAll | ElseConditionArm | Symbol | PubDef | PrivateDef | GlobalDecl
+            | AssocDecl => SingleChild,
 
             // 2 children
             Add | Sub | Mul | Div | Mod | Concat | BoolEq | BoolNotEq | BoolGt | BoolGtEq
@@ -733,14 +740,14 @@ impl NodeKind {
             | ResumeStatement | BreakStatement | ContinueStatement => DoubleChildren,
 
             // 3 children
-            VarDecl | AssocBinding | IfStatement | ShiftExpr | StructField | ParamOptional
-            | WhileLoop | PatternAndIs => TripleChildren,
+            AssocBinding | IfStatement | ShiftExpr | StructField | ParamOptional | WhileLoop
+            | PatternAndIs => TripleChildren,
 
             // 3 + multi
             HandlesStatement | TraitDefFn => TripleWithMulti,
 
             // 4 children
-            LetDecl | ConstDecl | LetHandler | ForLoop => QuadrupleChildren,
+            LetDecl | ConstDecl | VarDecl | LetHandler | ForLoop => QuadrupleChildren,
 
             // Multi only
             ListOf | Tuple | Object | Block | FileScope | PatternList | PatternTuple

@@ -33,6 +33,9 @@ impl Vm {
             TypeKind::Tuple { elements } if header.payload_words() == elements.len() => {
                 elements.get(index as usize).copied()
             }
+            TypeKind::Newtype { inner, .. } if header.payload_words() == 1 => {
+                (index == 0).then_some(*inner)
+            }
             _ => return Err(VmError::TypeError),
         }
         .ok_or(VmError::InvalidField(index))?;

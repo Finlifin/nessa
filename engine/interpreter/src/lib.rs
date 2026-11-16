@@ -13,6 +13,7 @@ use str_interner::StrId;
 use type_pool::{Intrinsic, TypeIndex, TypePool};
 
 mod builtin_ctx;
+mod bytes_obj;
 #[cfg(test)]
 mod callable_tests;
 mod closures;
@@ -32,16 +33,25 @@ mod error_value_tests;
 mod error_values;
 mod fields;
 mod function_abi;
+mod futures;
 mod globals;
+mod jit_bridge;
+pub mod json_kernel;
 mod maps;
 mod method_access;
 #[cfg(test)]
 mod moving_allocation_tests;
 mod numeric;
+pub mod resources;
 mod trait_proofs;
 mod tuples;
 mod types;
-pub use builtin_ctx::{BuiltinCtx, BuiltinFn, BuiltinFnTable, BuiltinOutcome, BuiltinRoot};
+pub use builtin_ctx::{
+    BuiltinCtx, BuiltinFn, BuiltinFnTable, BuiltinOutcome, BuiltinRoot, HostCallOutcome,
+    HostHandler, NativeValue,
+};
+pub use jit::{JitConfig, JitMode, JitStats};
+pub use resources::VmResourceTable;
 
 // ---------------------------------------------------------------------------
 // VM — the top-level virtual machine
@@ -66,6 +76,18 @@ struct VmState {
     trait_proofs: std::collections::HashMap<u64, trait_proofs::FrozenTraitProof>,
     trait_proof_cache: std::collections::HashMap<(usize, TypeIndex), TaggedValue>,
     pending_root_entries: std::collections::HashSet<TaskId>,
+    script_args: Vec<String>,
+    rng: resources::VmRng,
+    files: resources::VmFileTable,
+    json: json_kernel::VmJsonState,
+    resources: resources::VmResourceTable,
+    native_frame_depth: u32,
+    ffi_allowlist: Option<std::collections::HashSet<String>>,
+    next_future_id: u64,
+    next_handler_scope_id: u64,
+    slice_safepoints: u32,
+    host_handler: Option<Box<dyn HostHandler>>,
+    jit: jit::JitEngine,
 }
 
 /// The collector accesses only this independently stored root domain, never
@@ -78,6 +100,18 @@ struct VmRoots {
     native_pins: RefCell<Vec<TaggedValue>>,
     continuations:
         std::collections::HashMap<runtime::ContinuationId, continuation_roots::ManagedContinuation>,
+    weak_finalizers: Vec<continuation_roots::WeakFinalizer>,
+    promises: std::collections::HashMap<u64, futures::PromiseEntry>,
+    handler_scopes: std::collections::HashMap<u64, Vec<u64>>,
+    json_writer_ancestors: std::collections::HashMap<i64, Vec<TaggedValue>>,
+}
+
+impl Drop for VmRoots {
+    fn drop(&mut self) {
+        for mut finalizer in self.weak_finalizers.drain(..) {
+            finalizer.run_cleanup();
+        }
+    }
 }
 
 struct RootCell(UnsafeCell<VmRoots>);
@@ -161,6 +195,7 @@ impl Vm {
         self.state.type_pool = type_pool;
         self.state.method_call_scopes.clear();
         self.state.type_query_scope = None;
+        self.state.jit.invalidate_all();
     }
 
     /// Allocate, initialize and publish a constant in one operation.
@@ -190,6 +225,66 @@ impl Vm {
             .ok_or(VmError::TypeError)
     }
 
+    /// Return an owned `Option<String>` (`Ok(None)` when result register is `null`).
+    pub fn task_result_string(&mut self, task: TaskId) -> Result<Option<String>, VmError> {
+        let _operation = self.operation();
+        let value = self
+            .roots
+            .scheduler
+            .get_task(task)
+            .ok_or(VmError::InvalidTask)?
+            .registers
+            .get(Reg(0));
+        if value.is_null() {
+            return Ok(None);
+        }
+        builtin_ctx::heap_string_to_owned(value)
+            .map(Some)
+            .ok_or(VmError::TypeError)
+    }
+
+    /// Return an owned `Option<bool>` (`Ok(None)` when result register is `null`).
+    pub fn task_result_bool(&mut self, task: TaskId) -> Result<Option<bool>, VmError> {
+        let _operation = self.operation();
+        let value = self
+            .roots
+            .scheduler
+            .get_task(task)
+            .ok_or(VmError::InvalidTask)?
+            .registers
+            .get(Reg(0));
+        if value.is_null() {
+            return Ok(None);
+        }
+        value.as_bool().map(Some).ok_or(VmError::TypeError)
+    }
+
+    /// Return whether the finished task's `r0` holds `null`.
+    pub fn task_result_is_null(&self, task: TaskId) -> Result<bool, VmError> {
+        let _operation = self.operation();
+        Ok(self
+            .roots
+            .scheduler
+            .get_task(task)
+            .ok_or(VmError::InvalidTask)?
+            .registers
+            .get(Reg(0))
+            .is_null())
+    }
+
+    /// Return whether the finished task's `r0` holds `Unit`.
+    pub fn task_result_is_unit(&self, task: TaskId) -> Result<bool, VmError> {
+        let _operation = self.operation();
+        Ok(self
+            .roots
+            .scheduler
+            .get_task(task)
+            .ok_or(VmError::InvalidTask)?
+            .registers
+            .get(Reg(0))
+            .is_unit())
+    }
+
     pub fn active_stack_count(&self) -> usize {
         let _operation = self.operation();
         self.roots.scheduler.stack_pool().active_count()
@@ -206,6 +301,18 @@ impl Vm {
             trait_proofs: std::collections::HashMap::new(),
             trait_proof_cache: std::collections::HashMap::new(),
             pending_root_entries: std::collections::HashSet::new(),
+            script_args: Vec::new(),
+            rng: resources::VmRng::new(),
+            files: resources::VmFileTable::new(),
+            json: json_kernel::VmJsonState::new(),
+            resources: resources::VmResourceTable::new(),
+            native_frame_depth: 0,
+            ffi_allowlist: None,
+            next_future_id: 1,
+            next_handler_scope_id: 1,
+            slice_safepoints: 64,
+            host_handler: None,
+            jit: Self::new_default_jit(),
         });
         let roots = Box::new(RootCell(UnsafeCell::new(VmRoots {
             globals: GlobalTable::new(),
@@ -214,6 +321,10 @@ impl Vm {
             temporary_values: RefCell::new(Vec::new()),
             native_pins: RefCell::new(Vec::new()),
             continuations: std::collections::HashMap::new(),
+            weak_finalizers: Vec::new(),
+            promises: std::collections::HashMap::new(),
+            handler_scopes: std::collections::HashMap::new(),
+            json_writer_ancestors: std::collections::HashMap::new(),
         })));
         // SAFETY: the Box keeps its address when Vm moves. Vm drops its root
         // registration first; collection stops mutators before scanning state.
@@ -229,6 +340,213 @@ impl Vm {
             roots,
             state,
         }
+    }
+
+    /// Set command-line arguments visible to Nessa programs via `ENV_ARGS`.
+    pub fn set_script_args(&mut self, args: Vec<String>) {
+        self.state.script_args = args;
+    }
+
+    /// Access the host-owned monotonic resource registry.
+    pub fn resources(&self) -> &resources::VmResourceTable {
+        &self.state.resources
+    }
+
+    /// Mutably access the host-owned monotonic resource registry.
+    pub fn resources_mut(&mut self) -> &mut resources::VmResourceTable {
+        &mut self.state.resources
+    }
+
+    /// Current active native C/host frame nesting depth.
+    pub fn native_frame_depth(&self) -> u32 {
+        self.state.native_frame_depth
+    }
+
+    /// Execute `f` under an RAII native-frame guard (`native_frame_depth > 0`),
+    /// preventing effect handler / continuation jumps across the native stack frame.
+    pub fn with_native_frame<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        struct NativeFrameScope(*mut u32);
+        impl Drop for NativeFrameScope {
+            fn drop(&mut self) {
+                // SAFETY: `VmState` is boxed at a stable address and outlives `f`.
+                unsafe {
+                    *self.0 -= 1;
+                }
+            }
+        }
+        self.state.native_frame_depth = self
+            .state
+            .native_frame_depth
+            .checked_add(1)
+            .ok_or(VmError::NumericOverflow)?;
+        let _guard = NativeFrameScope(&raw mut self.state.native_frame_depth);
+        f(self)
+    }
+
+    /// Configure an optional runtime FFI library allowlist (`None` allows all manifest-authorized libraries).
+    pub fn set_ffi_allowlist(&mut self, allowlist: Option<std::collections::HashSet<String>>) {
+        self.state.ffi_allowlist = allowlist;
+    }
+
+    pub fn is_ffi_library_allowed(&self, name: &str) -> bool {
+        match &self.state.ffi_allowlist {
+            None => true,
+            Some(allowed) => allowed.contains(name),
+        }
+    }
+
+    /// Borrow a read-only `(ptr, len)` slice from a rooted `String` or `Bytes` value
+    /// inside a non-allocating native FFI call section.
+    pub fn raw_ro_slice(&self, val: TaggedValue) -> Result<(*const u8, usize), VmError> {
+        if let Some(slice) = bytes_obj::heap_str_slice(val) {
+            return Ok((slice.as_ptr(), slice.len()));
+        }
+        let layout = self.bytes_layout(val)?;
+        let slice = layout.as_slice();
+        Ok((slice.as_ptr(), slice.len()))
+    }
+
+    /// Borrow a writable `(ptr, logical_len, buffer_identity)` tuple from a uniquely-owned
+    /// (`share_count == 1`) rooted `Bytes` value inside a non-allocating native FFI call section.
+    pub fn raw_mut_bytes_buf(
+        &self,
+        val: TaggedValue,
+    ) -> Result<(*mut u8, usize, *const u8), VmError> {
+        let layout = self.bytes_layout(val)?;
+        if layout.buffer_payload.is_null() {
+            return Ok((
+                std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                0,
+                std::ptr::null(),
+            ));
+        }
+        if layout.share_count() != 1 {
+            return Err(VmError::InvalidArgument(
+                "mutable FFI Bytes buffer must be uniquely owned before native call",
+            ));
+        }
+        // SAFETY: `bytes_layout` checked `offset + length <= capacity` on a live uniquely-owned `ByteBuffer`.
+        let ptr = unsafe { layout.data_ptr.add(layout.offset) };
+        Ok((ptr, layout.length, layout.buffer_payload.cast_const()))
+    }
+
+    /// Return the configured script command-line arguments.
+    pub fn script_args(&self) -> &[String] {
+        &self.state.script_args
+    }
+
+    /// Install an embedder [`HostHandler`] invoked by privileged `__host_call` invocations.
+    pub fn set_host_handler(&mut self, handler: Box<dyn HostHandler>) {
+        self.state.host_handler = Some(handler);
+    }
+
+    /// Remove and return the currently installed [`HostHandler`], if any.
+    pub fn take_host_handler(&mut self) -> Option<Box<dyn HostHandler>> {
+        self.state.host_handler.take()
+    }
+
+    /// Resume a suspended task (`TaskId`) onto the scheduler ready queue.
+    pub fn wake_task(&mut self, task_id: TaskId) -> bool {
+        let _operation = self.operation();
+        let can_wake = self.roots.scheduler.get_task(task_id).is_some_and(|t| {
+            matches!(
+                t.status,
+                runtime::TaskStatus::Suspended | runtime::TaskStatus::Waiting
+            )
+        });
+        if can_wake {
+            self.roots.scheduler.resume(task_id);
+        }
+        can_wake
+    }
+
+    /// Return whether at least one task is currently in the ready queue.
+    pub fn has_ready_tasks(&self) -> bool {
+        let _operation = self.operation();
+        self.roots.scheduler.has_other_ready_tasks()
+    }
+
+    /// Return whether any task is currently suspended waiting for wakeup.
+    pub fn has_suspended_tasks(&self) -> bool {
+        let _operation = self.operation();
+        (0..self.roots.scheduler.task_count()).any(|raw| {
+            self.roots
+                .scheduler
+                .get_task(TaskId(raw as u64))
+                .is_some_and(|t| {
+                    matches!(
+                        t.status,
+                        runtime::TaskStatus::Suspended | runtime::TaskStatus::Waiting
+                    )
+                })
+        })
+    }
+
+    pub(crate) fn format_backtrace(
+        &self,
+        task_id: TaskId,
+        msg: Option<&str>,
+        skip_frames: usize,
+    ) -> Result<String, VmError> {
+        let task = self
+            .roots
+            .scheduler
+            .get_task(task_id)
+            .ok_or(VmError::InvalidTask)?;
+
+        let mut frames: Vec<(FuncId, u32)> = Vec::new();
+        for segment in task.stacks.active_chain() {
+            frames.push((segment.current_func, segment.pc));
+            for caller in segment.call_stack.iter().rev() {
+                frames.push((caller.func_id, caller.return_pc.saturating_sub(1)));
+            }
+        }
+
+        let mut out = String::new();
+        if let Some(prefix) = msg {
+            out.push_str(prefix);
+            out.push('\n');
+        }
+        out.push_str("stack traceback:");
+
+        let total = frames.len();
+        for (idx, (func_id, pc)) in frames.into_iter().enumerate().skip(skip_frames) {
+            out.push_str("\n\t");
+            if idx + 1 == total && func_id.0 == 0 {
+                out.push_str(&format!("[fn#0]:pc {pc}: in main chunk"));
+            } else if let Some(label) = self.describe_function_frame(func_id) {
+                out.push_str(&format!(
+                    "[fn#{}]:pc {pc}: in function '{label}'",
+                    func_id.0
+                ));
+            } else {
+                out.push_str(&format!(
+                    "[fn#{}]:pc {pc}: in function <fn#{}>",
+                    func_id.0, func_id.0
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    fn describe_function_frame(&self, func_id: FuncId) -> Option<String> {
+        for raw in 0..self.state.type_pool.len() {
+            let ty = TypeIndex::from_raw(raw as u32);
+            for slot in self.state.type_pool.methods_of(ty) {
+                if slot.func_id == func_id.0
+                    && let Some(method_name) = str_interner::try_get(slot.name)
+                {
+                    if let Some(owner_name) = self.state.type_pool.display_name(ty) {
+                        return Some(format!("{owner_name}.{method_name}"));
+                    }
+                    return Some(method_name.to_string());
+                }
+            }
+        }
+        None
     }
 
     /// Register a native builtin implementation.
@@ -310,14 +628,49 @@ impl Vm {
             let result = self.execute_task(task_id);
             match result {
                 ExecOutcome::Finished => {
+                    let (spawned_promise, val) = self
+                        .roots
+                        .scheduler
+                        .get_task(task_id)
+                        .map(|t| (t.spawned_promise, t.registers.get(Reg(0))))
+                        .unwrap_or((None, TaggedValue::UNIT));
                     self.roots.scheduler.finish(task_id);
+                    if let Some(fid) = spawned_promise {
+                        self.complete_promise(fid, val);
+                    }
                 }
                 ExecOutcome::Error(e) => {
-                    self.roots.scheduler.finish(task_id);
-                    return VmResult::Error(e);
+                    let spawned_promise = self
+                        .roots
+                        .scheduler
+                        .get_task(task_id)
+                        .and_then(|t| t.spawned_promise);
+                    if let Some(fid) = spawned_promise {
+                        let children = self
+                            .roots
+                            .scheduler
+                            .get_task(task_id)
+                            .map(|t| t.children.clone())
+                            .unwrap_or_default();
+                        for child in children {
+                            self.cancel_task_subtree(child);
+                        }
+                        self.roots.scheduler.finish(task_id);
+                        self.fail_promise(fid, e);
+                    } else {
+                        self.roots.scheduler.finish(task_id);
+                        return VmResult::Error(e);
+                    }
                 }
                 ExecOutcome::Yield => {
                     self.roots.scheduler.yield_task(task_id);
+                }
+                ExecOutcome::Suspend => {
+                    self.roots.scheduler.suspend(task_id);
+                }
+                ExecOutcome::Cancelled => {
+                    self.cancel_task_subtree(task_id);
+                    self.roots.scheduler.finish(task_id);
                 }
             }
         }
@@ -325,20 +678,32 @@ impl Vm {
 
     /// Execute one task until it finishes, suspends, errors, or yields.
     fn execute_task(&mut self, task_id: TaskId) -> ExecOutcome {
+        const SLICE_SAFEPOINT_BUDGET: u32 = 64;
+        self.state.slice_safepoints = SLICE_SAFEPOINT_BUDGET;
         // Bytecode is immutable while a task runs, so a function's checked
         // entry contract only needs revalidation when control changes function.
         let mut validated_func = None;
+        let mut last_entered_frame: Option<(FuncId, usize, usize)> = None;
         loop {
             // No instruction temporaries or mutable task borrows survive here.
             self.state.heap.safe_point();
-            // Get current task's PC and function.
-            let (pc, func_id) = {
+            // Get current task's PC, function, and active frame identity.
+            let (mut pc, func_id, is_cancelled, frame_sig) = {
                 let task = match self.roots.scheduler.get_task(task_id) {
                     Some(t) => t,
                     None => return ExecOutcome::Error(VmError::InvalidTask),
                 };
-                (task.pc, task.current_func)
+                let ctx_addr = std::ptr::from_ref::<runtime::StackContext>(task) as usize;
+                (
+                    task.pc,
+                    task.current_func,
+                    task.cancelled,
+                    (task.current_func, task.call_stack.len(), ctx_addr),
+                )
             };
+            if is_cancelled {
+                return ExecOutcome::Cancelled;
+            }
 
             let checked = if validated_func == Some(func_id) {
                 self.state
@@ -348,16 +713,62 @@ impl Vm {
             } else {
                 self.checked_function(func_id)
             };
-            let func = match checked {
-                Ok(function) => function,
+            let func_len = match checked {
+                Ok(function) => function.instructions.len(),
                 Err(error) => return ExecOutcome::Error(error),
             };
             validated_func = Some(func_id);
-            if pc as usize >= func.instructions.len() {
+            if pc as usize >= func_len {
                 return ExecOutcome::Finished;
             }
 
-            let word = func.instructions[pc as usize];
+            if last_entered_frame != Some(frame_sig) {
+                last_entered_frame = Some(frame_sig);
+                if pc == 0 {
+                    self.maybe_compile_on_hotness(func_id, jit::ENTRY_HOTNESS_INCREMENT);
+                }
+            }
+
+            if let Some(jit_outcome) = self.try_run_jit(task_id, func_id, pc) {
+                match jit_outcome {
+                    jit_bridge::JitStepOutcome::Finished => return ExecOutcome::Finished,
+                    jit_bridge::JitStepOutcome::Return { ret_pc, val } => {
+                        if let Some(outcome) = self.complete_return(task_id, ret_pc, val) {
+                            return outcome;
+                        }
+                        continue;
+                    }
+                    jit_bridge::JitStepOutcome::TierUp(osr_pc) => {
+                        self.compile_jit_function(func_id, true);
+                        if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                            task.pc = osr_pc;
+                        }
+                        continue;
+                    }
+                    jit_bridge::JitStepOutcome::Yield(resume_pc) => {
+                        if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                            task.pc = resume_pc;
+                        }
+                        return ExecOutcome::Yield;
+                    }
+                    jit_bridge::JitStepOutcome::SuspendRetry(retry_pc) => {
+                        if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                            task.pc = retry_pc;
+                        }
+                        return ExecOutcome::Suspend;
+                    }
+                    jit_bridge::JitStepOutcome::Cancelled => return ExecOutcome::Cancelled,
+                    jit_bridge::JitStepOutcome::Error(err) => return ExecOutcome::Error(err),
+                    jit_bridge::JitStepOutcome::InterpretOne(interp_pc) => {
+                        pc = interp_pc;
+                        if pc as usize >= func_len {
+                            return ExecOutcome::Finished;
+                        }
+                    }
+                }
+            }
+
+            let word = self.state.bytecode.get_function(func_id).instructions[pc as usize];
             let instr = match Instruction::decode(word) {
                 Some(i) => i,
                 None => return ExecOutcome::Error(VmError::InvalidInstruction(word)),
@@ -371,40 +782,72 @@ impl Vm {
             match self.dispatch(task_id, instr) {
                 DispatchResult::Continue => {}
                 DispatchResult::Return(val) => {
-                    if let Err(error) = self.check_display_return(task_id, val) {
-                        return ExecOutcome::Error(error);
-                    }
-                    // Pop call frame.
-                    let should_finish = {
-                        let task = self.roots.scheduler.get_task_mut(task_id).unwrap();
-                        if let Some(frame) = task.call_stack.pop() {
-                            // Restore PC and function.
-                            task.pc = frame.return_pc;
-                            task.current_func = frame.func_id;
-                            task.local_slots = frame.local_slots;
-                            task.display_state = frame.display_state;
-                            // Restore saved registers.
-                            for (reg, saved_val) in &frame.saved_regs {
-                                task.registers.set(*reg, *saved_val);
-                            }
-                            // Return value goes into r0.
-                            task.registers.set(Reg(0), val);
-                            false
-                        } else if task.stacks.return_from_delimiter(val) {
-                            false
-                        } else {
-                            // No frames left — task is finished.
-                            task.registers.set(Reg(0), val);
-                            true
-                        }
-                    };
-                    if should_finish {
-                        return ExecOutcome::Finished;
+                    if let Some(outcome) = self.complete_return(task_id, pc, val) {
+                        return outcome;
                     }
                 }
                 DispatchResult::Yield => return ExecOutcome::Yield,
+                DispatchResult::SuspendRetry => {
+                    if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                        task.pc = pc;
+                    }
+                    return ExecOutcome::Suspend;
+                }
+                DispatchResult::Cancelled => return ExecOutcome::Cancelled,
                 DispatchResult::Error(e) => return ExecOutcome::Error(e),
             }
+        }
+    }
+
+    fn complete_return(
+        &mut self,
+        task_id: TaskId,
+        ret_pc: u32,
+        val: TaggedValue,
+    ) -> Option<ExecOutcome> {
+        if let Err(error) = self.check_display_return(task_id, val) {
+            return Some(ExecOutcome::Error(error));
+        }
+        let at_root = self
+            .roots
+            .scheduler
+            .get_task(task_id)
+            .is_some_and(|t| t.stacks.is_at_task_root());
+        if at_root {
+            match self.check_task_root_return(task_id, val) {
+                Ok(Some(_)) => {
+                    if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                        task.pc = ret_pc;
+                    }
+                    return Some(ExecOutcome::Suspend);
+                }
+                Ok(None) => {}
+                Err(err) => return Some(ExecOutcome::Error(err)),
+            }
+        }
+        let should_finish = {
+            let task = self.roots.scheduler.get_task_mut(task_id).unwrap();
+            if let Some(frame) = task.call_stack.pop() {
+                task.pc = frame.return_pc;
+                task.current_func = frame.func_id;
+                task.local_slots = frame.local_slots;
+                task.display_state = frame.display_state;
+                for (reg, saved_val) in &frame.saved_regs {
+                    task.registers.set(*reg, *saved_val);
+                }
+                task.registers.set(Reg(0), val);
+                false
+            } else if task.stacks.return_from_delimiter(val) {
+                false
+            } else {
+                task.registers.set(Reg(0), val);
+                true
+            }
+        };
+        if should_finish {
+            Some(ExecOutcome::Finished)
+        } else {
+            None
         }
     }
 
@@ -676,6 +1119,7 @@ impl Vm {
                 let words = match &self.state.type_pool.get(type_idx).kind {
                     type_pool::TypeKind::Struct { fields, .. } => fields.len(),
                     type_pool::TypeKind::Tuple { elements } => elements.len(),
+                    type_pool::TypeKind::Newtype { .. } => 1,
                     _ => return DispatchResult::Error(VmError::TypeError),
                 };
                 let Ok(words) = u16::try_from(words) else {
@@ -711,18 +1155,14 @@ impl Vm {
                 }
                 let value = task!().registers.get(source);
                 let result = match instr.opcode {
-                    Opcode::ErrorOk | Opcode::ErrorErr => {
-                        self.constant_value(index as u32).and_then(|constant| {
-                            match constant.as_type() {
-                                Some(target) => self.construct_error(
-                                    value,
-                                    target,
-                                    instr.opcode == Opcode::ErrorOk,
-                                ),
-                                None => Err(VmError::TypeError),
+                    Opcode::ErrorOk | Opcode::ErrorErr => self
+                        .constant_value(index as u32)
+                        .and_then(|constant| match constant.as_type() {
+                            Some(target) => {
+                                self.construct_error(value, target, instr.opcode == Opcode::ErrorOk)
                             }
-                        })
-                    }
+                            None => Err(VmError::TypeError),
+                        }),
                     _ if index != 0 => Err(VmError::TypeError),
                     _ => self.error_layout(value, 0).and_then(|layout| {
                         let layout = layout.ok_or(VmError::TypeError)?;
@@ -811,43 +1251,89 @@ impl Vm {
             // ── Control flow (J-type) ─────────────────────────────
             Opcode::Jmp | Opcode::JmpFar => {
                 let (_, offset) = j_fields(&instr);
-                let t = task!();
-                t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                let cur_fn = {
+                    let t = task!();
+                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                    t.current_func
+                };
+                if offset <= 0 {
+                    self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
+                }
                 DispatchResult::Continue
             }
             Opcode::JmpIf => {
                 let (cond, offset) = j_fields(&instr);
-                let t = task!();
-                let val = t.registers.get(cond);
-                if is_truthy(val) {
-                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                let taken_fn = {
+                    let t = task!();
+                    let val = t.registers.get(cond);
+                    if is_truthy(val) {
+                        t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                        Some(t.current_func)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(cur_fn) = taken_fn
+                    && offset <= 0
+                {
+                    self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
                 }
                 DispatchResult::Continue
             }
             Opcode::JmpIfNot => {
                 let (cond, offset) = j_fields(&instr);
-                let t = task!();
-                let val = t.registers.get(cond);
-                if !is_truthy(val) {
-                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                let taken_fn = {
+                    let t = task!();
+                    let val = t.registers.get(cond);
+                    if !is_truthy(val) {
+                        t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                        Some(t.current_func)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(cur_fn) = taken_fn
+                    && offset <= 0
+                {
+                    self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
                 }
                 DispatchResult::Continue
             }
             Opcode::JmpIfNull => {
                 let (cond, offset) = j_fields(&instr);
-                let t = task!();
-                let val = t.registers.get(cond);
-                if val.is_null() {
-                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                let taken_fn = {
+                    let t = task!();
+                    let val = t.registers.get(cond);
+                    if val.is_null() {
+                        t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                        Some(t.current_func)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(cur_fn) = taken_fn
+                    && offset <= 0
+                {
+                    self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
                 }
                 DispatchResult::Continue
             }
             Opcode::JmpIfNotNull => {
                 let (cond, offset) = j_fields(&instr);
-                let t = task!();
-                let val = t.registers.get(cond);
-                if !val.is_null() {
-                    t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                let taken_fn = {
+                    let t = task!();
+                    let val = t.registers.get(cond);
+                    if !val.is_null() {
+                        t.pc = ((t.pc as i64) + (offset as i64) - 1) as u32;
+                        Some(t.current_func)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(cur_fn) = taken_fn
+                    && offset <= 0
+                {
+                    self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
                 }
                 DispatchResult::Continue
             }
@@ -1007,19 +1493,28 @@ impl Vm {
             Opcode::ResumeContinuation | Opcode::ResumeContinuationOnce => {
                 self.dispatch_language_resume(task_id, &instr)
             }
-            Opcode::PopHandler => {
-                task!().handler_stack.pop();
-                DispatchResult::Continue
-            }
+            Opcode::PopHandler => self.dispatch_pop_handler(task_id),
+            Opcode::AwaitPopHandler => self.dispatch_await_pop_handler(task_id),
+            Opcode::AwaitFuture => self.dispatch_await_future(task_id, &instr),
 
             // ── System (E-type) ───────────────────────────────────
             Opcode::Safepoint => {
                 self.state.heap.safe_point();
+                if task!().cancelled {
+                    return DispatchResult::Cancelled;
+                }
                 if GC_FLAGS
                     .preempt_requested
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     return DispatchResult::Yield;
+                }
+                self.state.slice_safepoints = self.state.slice_safepoints.saturating_sub(1);
+                if self.state.slice_safepoints == 0 {
+                    self.state.slice_safepoints = 64;
+                    if self.roots.scheduler.has_other_ready_tasks() {
+                        return DispatchResult::Yield;
+                    }
                 }
                 DispatchResult::Continue
             }
@@ -1347,6 +1842,8 @@ impl Vm {
         }
         match ctx.take_outcome() {
             BuiltinOutcome::Continue => DispatchResult::Continue,
+            BuiltinOutcome::Yield => DispatchResult::Yield,
+            BuiltinOutcome::SuspendRetry => DispatchResult::SuspendRetry,
             BuiltinOutcome::Exit(code) => {
                 std::process::exit(code);
             }
@@ -1421,6 +1918,8 @@ enum DispatchResult {
     Continue,
     Return(TaggedValue),
     Yield,
+    SuspendRetry,
+    Cancelled,
     Error(VmError),
 }
 
@@ -1428,6 +1927,8 @@ enum DispatchResult {
 enum ExecOutcome {
     Finished,
     Yield,
+    Suspend,
+    Cancelled,
     Error(VmError),
 }
 
@@ -1439,10 +1940,11 @@ pub enum VmResult {
 }
 
 /// VM runtime errors.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VmError {
     InvalidInstruction(u32),
     InvalidTask,
+    TaskCancelled,
     InvalidFunction(FuncId),
     InvalidSlot(u32),
     InvalidField(u32),
@@ -1488,6 +1990,7 @@ pub enum VmError {
     MissingMethodContext,
     TraitLookup(type_pool::TraitLookupError),
     MissingTraitContext,
+    EffectAcrossNativeFrame,
     Panic(String),
 }
 
@@ -1496,6 +1999,7 @@ impl std::fmt::Display for VmError {
         match self {
             Self::InvalidInstruction(word) => write!(f, "invalid instruction {word:#010x}"),
             Self::InvalidTask => f.write_str("invalid task"),
+            Self::TaskCancelled => f.write_str("awaited task was cancelled"),
             Self::InvalidFunction(id) => write!(f, "invalid function id {}", id.0),
             Self::InvalidSlot(index) => write!(f, "invalid local slot {index}"),
             Self::InvalidField(index) => write!(f, "invalid field index {index}"),
@@ -1541,6 +2045,9 @@ impl std::fmt::Display for VmError {
             Self::MissingMethodContext => f.write_str("missing lexical method call context"),
             Self::TraitLookup(error) => write!(f, "trait lookup error: {error:?}"),
             Self::MissingTraitContext => f.write_str("missing lexical trait context"),
+            Self::EffectAcrossNativeFrame => {
+                f.write_str("cannot capture or suspend continuation across active native FFI frame")
+            }
             Self::Panic(message) => write!(f, "panic: {message}"),
         }
     }
@@ -1578,6 +2085,16 @@ unsafe fn scan_vm_roots(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) 
     }
     for value in vm.temporary_values.get_mut() {
         visit(value);
+    }
+    for entry in vm.promises.values_mut() {
+        if let futures::PromiseState::Completed(ref mut value) = entry.state {
+            visit(value);
+        }
+    }
+    for stack in vm.json_writer_ancestors.values_mut() {
+        for value in stack.iter_mut() {
+            visit(value);
+        }
     }
     // Copy only scalar task IDs; scheduler storage is neither resized nor moved
     // during stopped-world enumeration or subsequent root processing.
@@ -1811,7 +2328,8 @@ mod tests {
             Instruction::call(1, 1),
             Instruction::ret(Reg(0)),
         ]);
-        let func1_code = encode_instrs(&[Instruction::load_imm(Reg(1), 10), Instruction::ret(Reg(1))]);
+        let func1_code =
+            encode_instrs(&[Instruction::load_imm(Reg(1), 10), Instruction::ret(Reg(1))]);
 
         vm.add_function(FunctionCode {
             display_owner: None,

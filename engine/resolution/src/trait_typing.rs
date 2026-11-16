@@ -25,9 +25,9 @@ fn contains_trait(r: &Resolver<'_>, ty: TypeIndex, remaining: usize) -> bool {
         TypeKind::Tuple { elements } => elements
             .iter()
             .any(|&ty| contains_trait(r, ty, remaining - 1)),
-        TypeKind::IterationStepTemplate { item: inner } | TypeKind::Optional { inner } => {
-            contains_trait(r, *inner, remaining - 1)
-        }
+        TypeKind::IterationStepTemplate { item: inner }
+        | TypeKind::Optional { inner }
+        | TypeKind::Future { inner } => contains_trait(r, *inner, remaining - 1),
         TypeKind::ErrorQualified { inner, errors } => {
             contains_trait(r, *inner, remaining - 1)
                 || errors

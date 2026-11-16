@@ -292,9 +292,13 @@ fn fresh_single_use_handler_binding_resumes_without_branch_copying() {
     let source = "effect choose(catch k) -> i64\nfn compute() { choose()# + 2 }\nfn main() { compute()# { choose(k) => k(40) } }";
     let result = driver::Driver::new().compile(source);
     assert!(!result.has_errors, "{:?}", result.diagnostics);
-    let opcodes: Vec<_> = result
+    let user_start = result
         .codegen_output
         .functions
+        .iter()
+        .position(|function| str_interner::get(function.name) == "compute")
+        .unwrap();
+    let opcodes: Vec<_> = result.codegen_output.functions[user_start..]
         .iter()
         .flat_map(|function| &function.instructions)
         .map(|&word| nsbc::Instruction::decode(word).unwrap().opcode)
@@ -321,10 +325,19 @@ fn escaped_aliased_and_repeated_continuations_keep_multishot_calls() {
     ] {
         let result = driver::Driver::new().compile(source);
         assert!(!result.has_errors, "{:?}", result.diagnostics);
+        let user_start = result
+            .codegen_output
+            .functions
+            .iter()
+            .position(|function| {
+                matches!(
+                    str_interner::get(function.name).as_str(),
+                    "main" | "invoke" | "route"
+                )
+            })
+            .unwrap();
         assert!(
-            result
-                .codegen_output
-                .functions
+            result.codegen_output.functions[user_start..]
                 .iter()
                 .flat_map(|function| &function.instructions)
                 .any(|&word| nsbc::Instruction::decode(word).unwrap().opcode

@@ -127,7 +127,10 @@ pub(crate) fn register(r: &mut Resolver<'_>, ast: &Ast) {
             let comparison = comparison_name(r, trait_type).is_some();
             let aggregate = matches!(
                 r.type_pool.get(implementor).kind,
-                TypeKind::Struct { .. } | TypeKind::Enum { .. } | TypeKind::Tuple { .. }
+                TypeKind::Struct { .. }
+                    | TypeKind::Enum { .. }
+                    | TypeKind::Tuple { .. }
+                    | TypeKind::Newtype { .. }
             );
             if comparison && aggregate {
                 if !registered.insert((implementor, trait_type)) {
@@ -178,19 +181,19 @@ pub(crate) fn register(r: &mut Resolver<'_>, ast: &Ast) {
                     methods: vec![method],
                     visible_scope: None,
                 });
-            } else {
-                // Display preserves legacy Struct formatting and generates Enum/Tuple field calls.
-                let display = aggregate && trait_type == r.type_pool.well_known.display;
-                if !display {
+            } else if r.traits.iter().any(|ti| ti.type_index == trait_type) {
+                // User-defined traits are validated and instantiated in traits::resolve_traits.
+                continue;
+            } else if trait_type == r.type_pool.well_known.json {
+                if !aggregate {
+                    let ty_name = crate::typing::type_display_name(&r.type_pool, implementor);
                     report(
                         r,
                         ast,
                         node,
-                        if trait_type == r.type_pool.well_known.hash {
-                            "Hash derivation is not implemented"
-                        } else {
-                            "derivation of this trait for this type is not implemented"
-                        },
+                        format!(
+                            "Json derivation supports only struct, enum, tuple typealias, and newtype targets, found `{ty_name}`"
+                        ),
                     );
                     continue;
                 }
@@ -205,7 +208,48 @@ pub(crate) fn register(r: &mut Resolver<'_>, ast: &Ast) {
                     );
                     continue;
                 }
-                crate::display_derivation::register_display(r, node, implementor);
+                if !crate::json_derivation::register_json(r, ast, node, implementor) {
+                    continue;
+                }
+                let methods = crate::traits::generate_derive_methods(r, implementor, trait_type);
+                for method in &methods {
+                    r.type_pool.add_method(implementor, method.clone());
+                }
+                r.type_pool.add_trait_impl(TraitImplRecord {
+                    trait_type,
+                    implementor,
+                    methods,
+                    visible_scope: None,
+                });
+            } else {
+                // Display and Hash preserve aggregate formatting/hashing and generate field calls.
+                let display = aggregate && trait_type == r.type_pool.well_known.display;
+                let hash = aggregate && trait_type == r.type_pool.well_known.hash;
+                if !display && !hash {
+                    report(
+                        r,
+                        ast,
+                        node,
+                        "derivation of this trait for this type is not implemented",
+                    );
+                    continue;
+                }
+                if !registered.insert((implementor, trait_type))
+                    || r.type_pool.has_trait_impl(implementor, trait_type)
+                {
+                    report(
+                        r,
+                        ast,
+                        node,
+                        "cannot derive a trait already implemented for this type",
+                    );
+                    continue;
+                }
+                if display {
+                    crate::display_derivation::register_display(r, node, implementor);
+                } else {
+                    crate::hash_derivation::register_hash(r, node, implementor);
+                }
                 let methods = crate::traits::generate_derive_methods(r, implementor, trait_type);
                 for method in &methods {
                     r.type_pool.add_method(implementor, method.clone());
@@ -331,6 +375,7 @@ fn components(r: &Resolver<'_>, ty: TypeIndex) -> Vec<TypeIndex> {
             .flat_map(|variant| variant.fields.iter().map(|field| field.ty))
             .collect(),
         TypeKind::Tuple { elements } => elements.clone(),
+        TypeKind::Newtype { inner, .. } => vec![*inner],
         _ => Vec::new(),
     }
 }
@@ -395,7 +440,9 @@ fn comparable(
     let Some(ty) = r.type_pool.canonical_type(ty) else {
         return false;
     };
-    if r.type_pool.is_reserved_collection_role(ty) {
+    if r.type_pool.is_reserved_collection_role(ty)
+        && r.type_pool.collection_role(ty) != Some(type_pool::CollectionRole::Bytes)
+    {
         return false;
     }
     if !visited.insert((ty, trait_type)) {
@@ -427,7 +474,7 @@ fn comparable(
                     .all(|&element| comparable(r, ast, element, trait_type, scope, visited))
             })
         }
-        TypeKind::Struct { .. } | TypeKind::Enum { .. } => {
+        TypeKind::Struct { .. } | TypeKind::Enum { .. } | TypeKind::Newtype { .. } => {
             checked_trait_comparison(r, ast, ty, trait_type, scope, visited).unwrap_or(false)
         }
         _ => false,
@@ -559,14 +606,17 @@ mod tests {
             );
         }
         for source in [
-            "struct X { x:i64 }\nderive Hash for X",
+            "derive Hash for i64",
             "enum E { a, }\nderive Ord for E",
-            "trait Unknown {}\nstruct X { x:i64 }\nderive Unknown for X",
+            "trait Unknown { def fn req(self) -> i64 }\nstruct X { x:i64 }\nderive Unknown for X",
         ] {
             let (resolved, errors) = resolve(source);
             assert!(!errors.is_empty(), "{source}");
             assert!(resolved.type_pool.trait_impls_snapshot().is_empty());
         }
+        let (resolved, errors) = resolve("trait Marker {}\nstruct X {}\nderive Marker, Hash for X");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(resolved.type_pool.trait_impls_snapshot().len(), 2);
     }
 
     #[test]

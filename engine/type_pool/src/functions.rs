@@ -178,7 +178,9 @@ impl TypePool {
             || impl_updates.len() != impl_sentinel_count
             || table_updates.len() != vtable_sentinel_count
         {
-            return Err(fail("unresolved derived method sentinel remains in TypePool"));
+            return Err(fail(
+                "unresolved derived method sentinel remains in TypePool",
+            ));
         }
         for (owner, slot, function) in method_updates {
             self.methods[owner][slot].func_id = function;

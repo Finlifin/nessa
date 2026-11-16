@@ -1,6 +1,6 @@
 //! Plain impl blocks share a type namespace while retaining declaration scopes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ast::{Ast, NodeIndex, NodeKind};
 use str_interner::StrId;
@@ -86,58 +86,70 @@ fn expression_symbol(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option<Sym
     }
 }
 
-fn target_type(
+pub(crate) fn target_type(
     r: &mut Resolver<'_>,
     ast: &Ast,
-    symbol: SymbolId,
-    depth: usize,
+    mut symbol: SymbolId,
 ) -> Option<TypeIndex> {
-    if depth >= r.symbols.len() {
-        return None;
-    }
-    let entry = r.symbols[symbol.0 as usize].clone();
-    if !matches!(entry.kind, SymbolKind::Type | SymbolKind::Module) {
-        return None;
-    }
-    if let Some(ty) = r.type_pool.canonical_type(entry.type_index) {
-        return Some(ty);
-    }
-    // Forward aliases have not completed their TypePool target yet. Follow the
-    // bound declaration in its lexical scope without mutating its identity.
-    if !entry.def_node.is_null() && ast.node(entry.def_node).kind == NodeKind::Typealias {
-        let value = ast.fixed_children(entry.def_node)[1];
-        if !value.is_null() && matches!(ast.node(value).kind, NodeKind::Tuple | NodeKind::Call) {
-            bind_forward_type_names(r, ast, value, entry.scope);
-            return crate::typing::resolve_type_expr_inner(r, ast, value);
+    let mut visited = HashSet::new();
+    let mut chain = Vec::new();
+    let propagate_factory = |r: &mut Resolver<'_>, chain: &[SymbolId], factory| {
+        for &alias_id in chain {
+            r.symbols[alias_id.0 as usize].kind = SymbolKind::TypeFactory(factory);
         }
-        if !value.is_null() && ast.node(value).kind == NodeKind::View {
-            let children = ast.fixed_children(value);
-            let object = children[0];
-            if (r.options.builtin_access || r.options.privileged_nodes.contains(&value))
-                && !object.is_null()
-                && ast.node(object).kind == NodeKind::Symbol
-                && str_interner::get(ast.node(children[1]).str_id) == "builtin"
+    };
+    while visited.insert(symbol) {
+        let (entry_id, entry_kind, entry_ty, def_node, entry_scope) = {
+            let sym = &r.symbols[symbol.0 as usize];
+            (sym.id, sym.kind, sym.type_index, sym.def_node, sym.scope)
+        };
+        if let SymbolKind::TypeFactory(factory) = entry_kind {
+            propagate_factory(r, &chain, factory);
+            return None;
+        }
+        if !matches!(entry_kind, SymbolKind::Type | SymbolKind::Module) {
+            return None;
+        }
+        if let Some(ty) = r.type_pool.canonical_type(entry_ty) {
+            return Some(ty);
+        }
+        // Forward aliases have not completed their TypePool target yet. Follow the
+        // bound declaration in its lexical scope without mutating its identity.
+        if !def_node.is_null() && ast.node(def_node).kind == NodeKind::Typealias {
+            let value = ast.fixed_children(def_node)[1];
+            if !value.is_null() && matches!(ast.node(value).kind, NodeKind::Tuple | NodeKind::Call)
             {
-                let name = ast.fixed_children(object)[0];
-                let name = str_interner::get(ast.node(name).str_id);
-                if let Some(symbol) = r.resolve_builtin_view(value, &name) {
-                    r.node_symbols.insert(value, symbol);
-                    if let Some(factory) = crate::type_factories::identity(r, value) {
-                        r.symbols[entry.id.0 as usize].kind = SymbolKind::TypeFactory(factory);
-                        return None;
+                bind_forward_type_names(r, ast, value, entry_scope);
+                return crate::typing::resolve_type_expr_inner(r, ast, value);
+            }
+            if !value.is_null() && ast.node(value).kind == NodeKind::View {
+                let children = ast.fixed_children(value);
+                let object = children[0];
+                if (r.options.builtin_access || r.options.privileged_nodes.contains(&value))
+                    && !object.is_null()
+                    && ast.node(object).kind == NodeKind::Symbol
+                    && str_interner::get(ast.node(children[1]).str_id) == "builtin"
+                {
+                    let name = ast.fixed_children(object)[0];
+                    let name = str_interner::get(ast.node(name).str_id);
+                    if let Some(builtin_sym) = r.resolve_builtin_view(value, &name) {
+                        r.node_symbols.insert(value, builtin_sym);
+                        if let Some(factory) = crate::type_factories::identity(r, value) {
+                            r.symbols[entry_id.0 as usize].kind = SymbolKind::TypeFactory(factory);
+                            propagate_factory(r, &chain, factory);
+                            return None;
+                        }
+                        return r
+                            .type_pool
+                            .canonical_type(r.symbols[builtin_sym.0 as usize].type_index);
                     }
-                    return r
-                        .type_pool
-                        .canonical_type(r.symbols[symbol.0 as usize].type_index);
                 }
             }
+            chain.push(entry_id);
+            symbol = expression_symbol_in_scope(r, ast, value, entry_scope)?;
+            continue;
         }
-        let target = expression_symbol_in_scope(r, ast, value, entry.scope)?;
-        let result = target_type(r, ast, target, depth + 1);
-        if let SymbolKind::TypeFactory(factory) = r.symbols[target.0 as usize].kind {
-            r.symbols[entry.id.0 as usize].kind = SymbolKind::TypeFactory(factory);
-        }
-        return result;
+        return None;
     }
     None
 }
@@ -161,7 +173,7 @@ fn bind_forward_type_names(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex, sco
     }
 }
 
-fn expression_symbol_in_scope(
+pub(crate) fn expression_symbol_in_scope(
     r: &Resolver<'_>,
     ast: &Ast,
     node: NodeIndex,
@@ -204,7 +216,7 @@ pub(crate) fn attach(r: &mut Resolver<'_>, ast: &Ast) -> bool {
         let previous_kind = r.symbols[alias.0 as usize].kind;
         let index = r.symbols[alias.0 as usize].type_index;
         if r.type_pool.canonical_type(index).is_none()
-            && let Some(target) = target_type(r, ast, alias, 0)
+            && let Some(target) = target_type(r, ast, alias)
         {
             if index == TypeIndex::INVALID {
                 let name = r.symbols[alias.0 as usize].name;
@@ -247,7 +259,7 @@ pub(crate) fn attach(r: &mut Resolver<'_>, ast: &Ast) -> bool {
             bind_forward_type_names(r, ast, target, r.current_scope);
             crate::typing::resolve_type_expr_inner(r, ast, target)
         } else {
-            expression_symbol(r, ast, target).and_then(|symbol| target_type(r, ast, symbol, 0))
+            expression_symbol(r, ast, target).and_then(|symbol| target_type(r, ast, symbol))
         };
         if let Some(ty) = ty {
             if ast.node(target).kind == NodeKind::Call && !r.node_symbols.contains_key(&target) {
@@ -270,6 +282,7 @@ pub(crate) fn attach(r: &mut Resolver<'_>, ast: &Ast) -> bool {
             changed = true;
         }
     }
+    changed |= crate::json_derivation::attach_pending_derives(r, ast);
     r.current_scope = original;
     changed
 }
@@ -441,6 +454,13 @@ pub(crate) fn resolve_constructor(r: &mut Resolver<'_>, ast: &Ast, call: NodeInd
         return;
     }
     let ty = r.symbols[symbol.0 as usize].type_index;
+    let canon = r
+        .type_pool
+        .canonical_type(ty)
+        .or_else(|| target_type(r, ast, symbol));
+    if canon.is_some_and(|canon| matches!(r.type_pool.get(canon).kind, TypeKind::Newtype { .. })) {
+        return;
+    }
     match member(r, ty, str_interner::intern("new")) {
         Ok(constructor) => {
             r.node_symbols.insert(callee, constructor);
@@ -457,6 +477,9 @@ pub(crate) fn resolve_constructor(r: &mut Resolver<'_>, ast: &Ast, call: NodeInd
 
 pub(crate) fn validate_constructors(r: &Resolver<'_>, ast: &Ast) {
     for &call in r.constructor_types.keys() {
+        if r.newtype_constructions.contains_key(&call) || r.newtype_wraps.contains_key(&call) {
+            continue;
+        }
         let callee = ast.fixed_children(call)[0];
         let Some(&symbol) = r.node_symbols.get(&callee) else {
             continue;

@@ -90,5 +90,9 @@ ResolvedPackageGraph.to_lock生成，resolve_document_locked只使用锁定的�
 
 lock schema1包括 schema_version、identity_schema、root表和packages数组；
 root含qualified_name/version/identity，package项另有dependencies限定名数组。
-这种包身份和lock API尚不等于源码包编译、包下载、跨包链接或源码TypeId赋值。
-确切字节编码、资源预算和验证结果见[实施记录](../dev/package-identity-audit.md)。
+上述内存依赖图身份与 `ResolvedPackageGraph` lock API 服务于注册表/目录求解，确切字节编码、资源预算和验证结果见[实施记录](../dev/package-identity-audit.md)。
+
+对于磁盘本地路径依赖工作区（`[dependencies]` 中的 `dep = { path = "../dep", version = "^1.0.0" }` 或 `"domain/dep" = { path = "../dep" }`），`pkg_manager::load_package_workspace` 递归发现并校验无环依赖图、不同 domain 下的同名短名包以及同限定包名的路径唯一性：
+- 磁盘 `package.lock`（`pkg_manager::Lockfile`，`version = 1`）按 `(name, domain)` 确定性排序记录每个本地依赖的 `name`、`domain`、`version`、规范化相对 `path` 以及覆盖 `package.toml` 与全部已发现 `.ns` 源文件的域分离 `sha256` 摘要。
+- `nessa build <dir>` 编译生成自包含 `package.nsbc` 并写入或同步更新 `package.lock`；`nessa build --locked <dir>` 要求 `package.lock` 存在且严格匹配磁盘依赖，不会改写锁文件。
+- `nessa check <dir>`、`nessa run <dir>` 与 `nessa disasm <dir>` 不创建锁文件，但若目录中已存在 `package.lock` 则严格校验其内容（亦支持 `--locked` 强制要求锁文件存在），任何摘要、版本或路径篡改都会被拒绝。远程包注册表下载尚未接入。

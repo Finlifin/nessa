@@ -8,7 +8,7 @@ pub type BuiltinFnId = u32;
 
 /// Version of the stable builtin IDs and calling semantics stored in artifacts.
 /// Increment when an ID changes meaning or compilation requires new native capabilities.
-pub const BUILTIN_ABI_VERSION: u32 = 9;
+pub const BUILTIN_ABI_VERSION: u32 = 11;
 
 // ---------------------------------------------------------------------------
 // Stable builtin function IDs (sparse ranges by domain)
@@ -991,6 +991,207 @@ pub mod ids {
     pub const STR_COUNT_CHAR: BuiltinFnId = 571;
     /// Independent map with the same keys and values.
     pub const MAP_COPY: BuiltinFnId = 572;
+
+    // ── Formatting, hashing, patterns, binary pack, and host resources (ABI9) ──
+    /// Coherent 64-bit hash across Unit, null, bool, char, String, and numeric scalars.
+    pub const SCALAR_HASH: BuiltinFnId = 573;
+    /// Lua 5.4 / C `printf` formatter returning `(err_code, formatted_or_msg)`.
+    pub const FMT_SPRINTF: BuiltinFnId = 574;
+    /// Fixed-point decimal formatting with `0..=100` fractional digits.
+    pub const F64_TO_FIXED: BuiltinFnId = 575;
+    /// Exponential decimal formatting (`digits == -1` shortest, `0..=100` fixed).
+    pub const F64_TO_EXP: BuiltinFnId = 576;
+    /// Significant-figures decimal formatting with `1..=100` digits.
+    pub const F64_TO_PRECISION: BuiltinFnId = 577;
+    /// Decompose `x = m * 2^e` into `(m, e)` with `0.5 <= |m| < 1.0`.
+    pub const F64_FREXP: BuiltinFnId = 578;
+    /// Scale `m * 2^exp` handling clamping, subnormals, and overflow cleanly.
+    pub const F64_LDEXP: BuiltinFnId = 579;
+    /// Lua 5.4 byte-offset pattern or plain search returning `(start, end, captures, err)`.
+    pub const PAT_FIND: BuiltinFnId = 580;
+    /// Lua 5.4 pattern global substitution with template replacement.
+    pub const PAT_GSUB: BuiltinFnId = 581;
+    /// Lua 5.4 binary pack returning `(byte_list, err_msg)`.
+    pub const BYTES_PACK: BuiltinFnId = 582;
+    /// Lua 5.4 fixed binary format size returning `(size, err_msg)`.
+    pub const BYTES_PACKSIZE: BuiltinFnId = 583;
+    /// Lua 5.4 binary unpack from 0-based byte offset returning `(values, next_pos, err_msg)`.
+    pub const BYTES_UNPACK: BuiltinFnId = 584;
+    /// Base-aware integer parser (`base == 0` auto prefix, or `2..=36`).
+    pub const STR_PARSE_INT_RADIX: BuiltinFnId = 585;
+    /// Construct a String from a List of Unicode scalar code points, or null if out of range.
+    pub const STR_FROM_CODES: BuiltinFnId = 586;
+    /// 0-based UTF-8 scalar boundary navigation (`utf8.offset` adaptation).
+    pub const STR_UTF8_OFFSET: BuiltinFnId = 587;
+    /// Write formatted value to stderr and flush.
+    pub const IO_EPRINT: BuiltinFnId = 588;
+    /// Write formatted value with newline to stderr.
+    pub const IO_EPRINTLN: BuiltinFnId = 589;
+    /// Flush standard output returning `(err_code, err_msg)`.
+    pub const IO_FLUSH_STDOUT: BuiltinFnId = 590;
+    /// Flush standard error returning `(err_code, err_msg)`.
+    pub const IO_FLUSH_STDERR: BuiltinFnId = 591;
+    /// Open a host file handle returning `(err_code, file_id, err_msg)`.
+    pub const FILE_OPEN: BuiltinFnId = 592;
+    /// Open an anonymous read+write temporary file handle returning `(err_code, file_id, err_msg)`.
+    pub const FILE_TEMP: BuiltinFnId = 593;
+    /// Close a dynamic file handle returning `(err_code, err_msg)`.
+    pub const FILE_CLOSE: BuiltinFnId = 594;
+    /// True when `id` names a standard stream (`0..=2`) or an open file handle.
+    pub const FILE_IS_OPEN: BuiltinFnId = 595;
+    /// Flush an open file handle returning `(err_code, err_msg)`.
+    pub const FILE_FLUSH: BuiltinFnId = 596;
+    /// Read remaining UTF-8 text from a file handle returning `(err_code, text_or_err)`.
+    pub const FILE_READ_ALL: BuiltinFnId = 597;
+    /// Read one UTF-8 line returning `(err_code, ?line, err_msg)`.
+    pub const FILE_READ_LINE: BuiltinFnId = 598;
+    /// Read up to `count` UTF-8 scalars returning `(err_code, ?text, err_msg)`.
+    pub const FILE_READ_CHARS: BuiltinFnId = 599;
+    /// Read raw bytes as a List of `i64` (`0..=255`) returning `(err_code, bytes, err_msg)`.
+    pub const FILE_READ_BYTES: BuiltinFnId = 600;
+    /// Skip whitespace and parse one numeric token returning `(err_code, ?f64, err_msg)`.
+    pub const FILE_READ_NUMBER: BuiltinFnId = 601;
+    /// Write UTF-8 text to a file handle returning `(err_code, err_msg)`.
+    pub const FILE_WRITE_STR: BuiltinFnId = 602;
+    /// Write raw bytes (`0..=255`) from a List to a file handle returning `(err_code, err_msg)`.
+    pub const FILE_WRITE_BYTES: BuiltinFnId = 603;
+    /// Seek a file handle (`0 = Start`, `1 = Current`, `2 = End`) returning `(err_code, pos, err_msg)`.
+    pub const FILE_SEEK: BuiltinFnId = 604;
+    /// True if a filesystem path exists.
+    pub const FS_EXISTS: BuiltinFnId = 605;
+    /// True if a filesystem path is a regular file.
+    pub const FS_IS_FILE: BuiltinFnId = 606;
+    /// True if a filesystem path is a directory.
+    pub const FS_IS_DIR: BuiltinFnId = 607;
+    /// Query filesystem metadata `(err_code, size, is_file, is_dir, is_symlink, mtime_secs, err_msg)`.
+    pub const FS_METADATA: BuiltinFnId = 608;
+    /// Create a directory (optionally recursive) returning `(err_code, err_msg)`.
+    pub const FS_CREATE_DIR: BuiltinFnId = 609;
+    /// Remove a file or directory (optionally recursive) returning `(err_code, err_msg)`.
+    pub const FS_REMOVE: BuiltinFnId = 610;
+    /// Rename/move a filesystem path returning `(err_code, err_msg)`.
+    pub const FS_RENAME: BuiltinFnId = 611;
+    /// Copy a file returning `(err_code, bytes_copied, err_msg)`.
+    pub const FS_COPY: BuiltinFnId = 612;
+    /// Sorted directory entry names returning `(err_code, list_of_names, err_msg)`.
+    pub const FS_READ_DIR: BuiltinFnId = 613;
+    /// Canonicalize a filesystem path returning `(err_code, canonical_or_err)`.
+    pub const FS_CANONICALIZE: BuiltinFnId = 614;
+    /// Atomically create an empty temporary file and return `(err_code, path_or_err)`.
+    pub const FS_TEMP_PATH: BuiltinFnId = 615;
+    /// Script command-line arguments as a List of Strings.
+    pub const ENV_ARGS: BuiltinFnId = 616;
+    /// Read a process environment variable, or null if unset/non-UTF-8.
+    pub const ENV_GET: BuiltinFnId = 617;
+    /// Snapshot all valid UTF-8 environment variables as a Map.
+    pub const ENV_VARS: BuiltinFnId = 618;
+    /// Current working directory returning `(err_code, path_or_err)`.
+    pub const ENV_CURRENT_DIR: BuiltinFnId = 619;
+    /// Change current working directory returning `(err_code, err_msg)`.
+    pub const ENV_SET_CURRENT_DIR: BuiltinFnId = 620;
+    /// Host operating system identifier (`std::env::consts::OS`).
+    pub const ENV_OS: BuiltinFnId = 621;
+    /// Host CPU architecture identifier (`std::env::consts::ARCH`).
+    pub const ENV_ARCH: BuiltinFnId = 622;
+    /// Current Unix epoch timestamp in seconds.
+    pub const TIME_UNIX_SECS: BuiltinFnId = 623;
+    /// Current Unix epoch timestamp in milliseconds.
+    pub const TIME_UNIX_MILLIS: BuiltinFnId = 624;
+    /// Monotonic elapsed nanoseconds since engine process origin.
+    pub const TIME_MONOTONIC_NANOS: BuiltinFnId = 625;
+    /// Process CPU time consumed in seconds.
+    pub const TIME_CPU_SECS: BuiltinFnId = 626;
+    /// Sleep the current thread for `ms` milliseconds.
+    pub const TIME_SLEEP_MS: BuiltinFnId = 627;
+    /// Break down Unix seconds into `(year, month, day, hour, min, sec, wday_sun1, yday_1, is_dst)`.
+    pub const TIME_BREAKDOWN: BuiltinFnId = 628;
+    /// Convert calendar components (with normalization) to Unix seconds, or null if out of range.
+    pub const TIME_MAKE_UNIX: BuiltinFnId = 629;
+    /// Format Unix seconds using `strftime` / Lua `os.date` specifiers returning `(err_code, text)`.
+    pub const TIME_STRFTIME: BuiltinFnId = 630;
+    /// Execute a child process with argument list and optional stdin returning `(err, code, out, err_out)`.
+    pub const PROC_EXEC: BuiltinFnId = 631;
+    /// Execute a shell command with optional stdin returning `(err, code, out, err_out)`.
+    pub const PROC_SHELL: BuiltinFnId = 632;
+    /// Current OS process ID.
+    pub const PROC_PID: BuiltinFnId = 633;
+    /// Next 64-bit pseudorandom integer from the VM's Xoshiro256** PRNG.
+    pub const RNG_NEXT_U64: BuiltinFnId = 634;
+    /// Seed the VM's Xoshiro256** PRNG (`0` = entropy, `1` = `s1`, `2` = `(s1, s2)`).
+    pub const RNG_SEED: BuiltinFnId = 635;
+    /// Trigger GC (`mode == 0`) or query collection count (`mode == 1`).
+    pub const RT_GC_COLLECT: BuiltinFnId = 636;
+    /// Format a stack backtrace for the active task, optionally prefixed with `msg`.
+    pub const RT_BACKTRACE: BuiltinFnId = 637;
+    /// Cooperatively yield the current task to the scheduler ready queue.
+    pub const TASK_YIELD: BuiltinFnId = 638;
+    /// Await all `Future` elements in a `List` and return a `List` of their results.
+    pub const TASK_AWAIT_ALL: BuiltinFnId = 639;
+    /// Await the first completing `Future` in a non-empty `List`, cancelling the rest.
+    pub const TASK_AWAIT_ANY: BuiltinFnId = 640;
+    /// Return whether a `Future` has already resolved (completed, failed, or cancelled).
+    pub const TASK_IS_READY: BuiltinFnId = 641;
+    /// Await the first completing `Future` in a non-empty `List`, returning `(winner_idx, val)` and cancelling the rest.
+    pub const TASK_AWAIT_INDEXED: BuiltinFnId = 642;
+    /// Invoke an embedder-provided `HostHandler` operation `(op: String, args: List) -> (bool, Any)`.
+    pub const HOST_CALL: BuiltinFnId = 643;
+    /// Read directory entries with file-type/size/mtime metadata in a single pass.
+    pub const FS_READ_DIR_ENTRIES: BuiltinFnId = 644;
+    /// Recursively walk files under `root` up to `max_depth` returning sorted relative paths.
+    pub const FS_WALK_DIR: BuiltinFnId = 645;
+    /// Execute a child process with optional `stdin` and optional `cwd`.
+    pub const PROC_EXEC_CWD: BuiltinFnId = 646;
+    /// Execute a shell command with optional `stdin` and optional `cwd`.
+    pub const PROC_SHELL_CWD: BuiltinFnId = 647;
+
+    // ── Compact Bytes, Safe C FFI, Native JSON & JIT Introspection (ABI11) ──
+    pub const BYTES_NEW: BuiltinFnId = 648;
+    pub const BYTES_LEN: BuiltinFnId = 649;
+    pub const BYTES_CAP: BuiltinFnId = 650;
+    pub const BYTES_GET: BuiltinFnId = 651;
+    pub const BYTES_SET: BuiltinFnId = 652;
+    pub const BYTES_PUSH: BuiltinFnId = 653;
+    pub const BYTES_CLEAR: BuiltinFnId = 654;
+    pub const BYTES_SLICE: BuiltinFnId = 655;
+    pub const BYTES_COPY: BuiltinFnId = 656;
+    pub const BYTES_EXTEND: BuiltinFnId = 657;
+    pub const BYTES_FROM_STR: BuiltinFnId = 658;
+    pub const BYTES_TO_STR: BuiltinFnId = 659;
+    pub const BYTES_FROM_LIST: BuiltinFnId = 660;
+    pub const BYTES_TO_LIST: BuiltinFnId = 661;
+    pub const BYTES_FIND: BuiltinFnId = 662;
+    pub const BYTES_EQ: BuiltinFnId = 663;
+
+    pub const FFI_DLOPEN: BuiltinFnId = 664;
+    pub const FFI_DLSYM: BuiltinFnId = 665;
+    pub const FFI_CALL: BuiltinFnId = 666;
+    pub const FFI_CALL4: BuiltinFnId = 667;
+    pub const FFI_CALL6: BuiltinFnId = 668;
+    pub const BYTES_READ_U64_LE: BuiltinFnId = 669;
+
+    pub const JSON_PARSE_DYNAMIC: BuiltinFnId = 670;
+    pub const JSON_STRINGIFY_DYNAMIC: BuiltinFnId = 671;
+    pub const JSON_TAPE_OPEN: BuiltinFnId = 672;
+    pub const JSON_TAPE_CLOSE: BuiltinFnId = 673;
+    pub const JSON_TAPE_KIND: BuiltinFnId = 674;
+    pub const JSON_TAPE_OBJ_GET: BuiltinFnId = 675;
+    pub const JSON_TAPE_OBJ_UNKNOWN: BuiltinFnId = 676;
+    pub const JSON_TAPE_OBJ_SINGLE_VARIANT: BuiltinFnId = 677;
+    pub const JSON_TAPE_ARR_LEN: BuiltinFnId = 678;
+    pub const JSON_TAPE_ARR_AT: BuiltinFnId = 679;
+    pub const JSON_TAPE_READ_BOOL: BuiltinFnId = 680;
+    pub const JSON_TAPE_READ_INT: BuiltinFnId = 681;
+    pub const JSON_TAPE_READ_FLOAT: BuiltinFnId = 682;
+    pub const JSON_TAPE_READ_STR: BuiltinFnId = 683;
+    pub const JSON_WRITER_NEW: BuiltinFnId = 684;
+    pub const JSON_WRITER_OP: BuiltinFnId = 685;
+    pub const JSON_WRITER_FINISH: BuiltinFnId = 686;
+    pub const JSON_WRITER_CLOSE: BuiltinFnId = 687;
+
+    pub const RT_JIT_ENABLED: BuiltinFnId = 688;
+    pub const RT_JIT_COMPILED_FNS: BuiltinFnId = 689;
+    pub const RT_JIT_CODE_BYTES: BuiltinFnId = 690;
+    pub const RT_JIT_DEOPT_COUNT: BuiltinFnId = 691;
 }
 
 /// Static metadata for a builtin function (no function pointer).
@@ -2934,6 +3135,482 @@ pub const BUILTIN_FN_META: &[BuiltinFnMeta] = &[
         id: ids::MAP_COPY,
         name: "map_copy",
     },
+    BuiltinFnMeta {
+        id: ids::SCALAR_HASH,
+        name: "__scalar_hash",
+    },
+    BuiltinFnMeta {
+        id: ids::FMT_SPRINTF,
+        name: "__fmt_sprintf",
+    },
+    BuiltinFnMeta {
+        id: ids::F64_TO_FIXED,
+        name: "f64_to_fixed",
+    },
+    BuiltinFnMeta {
+        id: ids::F64_TO_EXP,
+        name: "f64_to_exp",
+    },
+    BuiltinFnMeta {
+        id: ids::F64_TO_PRECISION,
+        name: "f64_to_precision",
+    },
+    BuiltinFnMeta {
+        id: ids::F64_FREXP,
+        name: "f64_frexp",
+    },
+    BuiltinFnMeta {
+        id: ids::F64_LDEXP,
+        name: "f64_ldexp",
+    },
+    BuiltinFnMeta {
+        id: ids::PAT_FIND,
+        name: "__pat_find",
+    },
+    BuiltinFnMeta {
+        id: ids::PAT_GSUB,
+        name: "__pat_gsub",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_PACK,
+        name: "__bytes_pack",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_PACKSIZE,
+        name: "__bytes_packsize",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_UNPACK,
+        name: "__bytes_unpack",
+    },
+    BuiltinFnMeta {
+        id: ids::STR_PARSE_INT_RADIX,
+        name: "__str_parse_int_radix",
+    },
+    BuiltinFnMeta {
+        id: ids::STR_FROM_CODES,
+        name: "str_from_codes",
+    },
+    BuiltinFnMeta {
+        id: ids::STR_UTF8_OFFSET,
+        name: "str_utf8_offset",
+    },
+    BuiltinFnMeta {
+        id: ids::IO_EPRINT,
+        name: "eprint",
+    },
+    BuiltinFnMeta {
+        id: ids::IO_EPRINTLN,
+        name: "eprintln",
+    },
+    BuiltinFnMeta {
+        id: ids::IO_FLUSH_STDOUT,
+        name: "__io_flush_stdout",
+    },
+    BuiltinFnMeta {
+        id: ids::IO_FLUSH_STDERR,
+        name: "__io_flush_stderr",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_OPEN,
+        name: "__file_open",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_TEMP,
+        name: "__file_temp",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_CLOSE,
+        name: "__file_close",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_IS_OPEN,
+        name: "__file_is_open",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_FLUSH,
+        name: "__file_flush",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_READ_ALL,
+        name: "__file_read_all",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_READ_LINE,
+        name: "__file_read_line",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_READ_CHARS,
+        name: "__file_read_chars",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_READ_BYTES,
+        name: "__file_read_bytes",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_READ_NUMBER,
+        name: "__file_read_number",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_WRITE_STR,
+        name: "__file_write_str",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_WRITE_BYTES,
+        name: "__file_write_bytes",
+    },
+    BuiltinFnMeta {
+        id: ids::FILE_SEEK,
+        name: "__file_seek",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_EXISTS,
+        name: "__fs_exists",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_IS_FILE,
+        name: "__fs_is_file",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_IS_DIR,
+        name: "__fs_is_dir",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_METADATA,
+        name: "__fs_metadata",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_CREATE_DIR,
+        name: "__fs_create_dir",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_REMOVE,
+        name: "__fs_remove",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_RENAME,
+        name: "__fs_rename",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_COPY,
+        name: "__fs_copy",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_READ_DIR,
+        name: "__fs_read_dir",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_CANONICALIZE,
+        name: "__fs_canonicalize",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_TEMP_PATH,
+        name: "__fs_temp_path",
+    },
+    BuiltinFnMeta {
+        id: ids::ENV_ARGS,
+        name: "__env_args",
+    },
+    BuiltinFnMeta {
+        id: ids::ENV_GET,
+        name: "__env_get",
+    },
+    BuiltinFnMeta {
+        id: ids::ENV_VARS,
+        name: "__env_vars",
+    },
+    BuiltinFnMeta {
+        id: ids::ENV_CURRENT_DIR,
+        name: "__env_current_dir",
+    },
+    BuiltinFnMeta {
+        id: ids::ENV_SET_CURRENT_DIR,
+        name: "__env_set_current_dir",
+    },
+    BuiltinFnMeta {
+        id: ids::ENV_OS,
+        name: "__env_os",
+    },
+    BuiltinFnMeta {
+        id: ids::ENV_ARCH,
+        name: "__env_arch",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_UNIX_SECS,
+        name: "__time_unix_secs",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_UNIX_MILLIS,
+        name: "__time_unix_millis",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_MONOTONIC_NANOS,
+        name: "__time_monotonic_nanos",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_CPU_SECS,
+        name: "__time_cpu_secs",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_SLEEP_MS,
+        name: "__time_sleep_ms",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_BREAKDOWN,
+        name: "__time_breakdown",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_MAKE_UNIX,
+        name: "__time_make_unix",
+    },
+    BuiltinFnMeta {
+        id: ids::TIME_STRFTIME,
+        name: "__time_strftime",
+    },
+    BuiltinFnMeta {
+        id: ids::PROC_EXEC,
+        name: "__proc_exec",
+    },
+    BuiltinFnMeta {
+        id: ids::PROC_SHELL,
+        name: "__proc_shell",
+    },
+    BuiltinFnMeta {
+        id: ids::PROC_PID,
+        name: "__proc_pid",
+    },
+    BuiltinFnMeta {
+        id: ids::RNG_NEXT_U64,
+        name: "__rng_next_u64",
+    },
+    BuiltinFnMeta {
+        id: ids::RNG_SEED,
+        name: "__rng_seed",
+    },
+    BuiltinFnMeta {
+        id: ids::RT_GC_COLLECT,
+        name: "__rt_gc_collect",
+    },
+    BuiltinFnMeta {
+        id: ids::RT_BACKTRACE,
+        name: "__rt_backtrace",
+    },
+    BuiltinFnMeta {
+        id: ids::TASK_YIELD,
+        name: "__task_yield",
+    },
+    BuiltinFnMeta {
+        id: ids::TASK_AWAIT_ALL,
+        name: "__task_await_all",
+    },
+    BuiltinFnMeta {
+        id: ids::TASK_AWAIT_ANY,
+        name: "__task_await_any",
+    },
+    BuiltinFnMeta {
+        id: ids::TASK_IS_READY,
+        name: "__task_is_ready",
+    },
+    BuiltinFnMeta {
+        id: ids::TASK_AWAIT_INDEXED,
+        name: "__task_await_indexed",
+    },
+    BuiltinFnMeta {
+        id: ids::HOST_CALL,
+        name: "__host_call",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_READ_DIR_ENTRIES,
+        name: "__fs_read_dir_entries",
+    },
+    BuiltinFnMeta {
+        id: ids::FS_WALK_DIR,
+        name: "__fs_walk_dir",
+    },
+    BuiltinFnMeta {
+        id: ids::PROC_EXEC_CWD,
+        name: "__proc_exec_cwd",
+    },
+    BuiltinFnMeta {
+        id: ids::PROC_SHELL_CWD,
+        name: "__proc_shell_cwd",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_NEW,
+        name: "__bytes_new",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_LEN,
+        name: "__bytes_len",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_CAP,
+        name: "__bytes_cap",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_GET,
+        name: "__bytes_get",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_SET,
+        name: "__bytes_set",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_PUSH,
+        name: "__bytes_push",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_CLEAR,
+        name: "__bytes_clear",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_SLICE,
+        name: "__bytes_slice",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_COPY,
+        name: "__bytes_copy",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_EXTEND,
+        name: "__bytes_extend",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_FROM_STR,
+        name: "__bytes_from_str",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_TO_STR,
+        name: "__bytes_to_str",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_FROM_LIST,
+        name: "__bytes_from_list",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_TO_LIST,
+        name: "__bytes_to_list",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_FIND,
+        name: "__bytes_find",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_EQ,
+        name: "__bytes_eq",
+    },
+    BuiltinFnMeta {
+        id: ids::FFI_DLOPEN,
+        name: "__ffi_dlopen",
+    },
+    BuiltinFnMeta {
+        id: ids::FFI_DLSYM,
+        name: "__ffi_dlsym",
+    },
+    BuiltinFnMeta {
+        id: ids::FFI_CALL,
+        name: "__ffi_call",
+    },
+    BuiltinFnMeta {
+        id: ids::FFI_CALL4,
+        name: "__ffi_call4",
+    },
+    BuiltinFnMeta {
+        id: ids::FFI_CALL6,
+        name: "__ffi_call6",
+    },
+    BuiltinFnMeta {
+        id: ids::BYTES_READ_U64_LE,
+        name: "__bytes_read_u64_le",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_PARSE_DYNAMIC,
+        name: "__json_parse_dynamic",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_STRINGIFY_DYNAMIC,
+        name: "__json_stringify_dynamic",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_OPEN,
+        name: "__json_tape_open",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_CLOSE,
+        name: "__json_tape_close",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_KIND,
+        name: "__json_tape_kind",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_OBJ_GET,
+        name: "__json_tape_obj_get",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_OBJ_UNKNOWN,
+        name: "__json_tape_obj_unknown",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_OBJ_SINGLE_VARIANT,
+        name: "__json_tape_obj_single_variant",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_ARR_LEN,
+        name: "__json_tape_arr_len",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_ARR_AT,
+        name: "__json_tape_arr_at",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_READ_BOOL,
+        name: "__json_tape_read_bool",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_READ_INT,
+        name: "__json_tape_read_int",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_READ_FLOAT,
+        name: "__json_tape_read_float",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_TAPE_READ_STR,
+        name: "__json_tape_read_str",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_WRITER_NEW,
+        name: "__json_writer_new",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_WRITER_OP,
+        name: "__json_writer_op",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_WRITER_FINISH,
+        name: "__json_writer_finish",
+    },
+    BuiltinFnMeta {
+        id: ids::JSON_WRITER_CLOSE,
+        name: "__json_writer_close",
+    },
+    BuiltinFnMeta {
+        id: ids::RT_JIT_ENABLED,
+        name: "__rt_jit_enabled",
+    },
+    BuiltinFnMeta {
+        id: ids::RT_JIT_COMPILED_FNS,
+        name: "__rt_jit_compiled_fns",
+    },
+    BuiltinFnMeta {
+        id: ids::RT_JIT_CODE_BYTES,
+        name: "__rt_jit_code_bytes",
+    },
+    BuiltinFnMeta {
+        id: ids::RT_JIT_DEOPT_COUNT,
+        name: "__rt_jit_deopt_count",
+    },
 ];
 
 /// Look up a builtin function id by its language-facing name.
@@ -2952,9 +3629,12 @@ pub fn lookup_builtin_fn_meta(id: BuiltinFnId) -> Option<&'static BuiltinFnMeta>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn fn_ids_are_stable_and_named() {
+        assert_eq!(BUILTIN_ABI_VERSION, 11);
+        assert!(lookup_builtin_fn_meta(120).is_none());
         assert_eq!(lookup_builtin_fn_id("print"), Some(ids::PRINT));
         assert_eq!(lookup_builtin_fn_id("str_concat"), Some(ids::STR_CONCAT));
         assert_eq!(lookup_builtin_fn_id("nope"), None);
@@ -2962,5 +3642,22 @@ mod tests {
             lookup_builtin_fn_meta(ids::LIST_INIT).unwrap().name,
             "__list_init"
         );
+
+        let mut seen_ids = HashSet::new();
+        let mut seen_names = HashSet::new();
+        for meta in BUILTIN_FN_META {
+            assert!(seen_ids.insert(meta.id), "duplicate builtin id {}", meta.id);
+            assert!(
+                seen_names.insert(meta.name),
+                "duplicate builtin name {}",
+                meta.name
+            );
+            assert_eq!(lookup_builtin_fn_id(meta.name), Some(meta.id));
+        }
+        for id in ids::SCALAR_HASH..=ids::RT_JIT_DEOPT_COUNT {
+            let meta = lookup_builtin_fn_meta(id)
+                .unwrap_or_else(|| panic!("missing metadata for builtin id {id}"));
+            assert_eq!(lookup_builtin_fn_id(meta.name), Some(id));
+        }
     }
 }

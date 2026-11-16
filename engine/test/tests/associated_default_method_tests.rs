@@ -94,23 +94,25 @@ fn nested_source_self_parameters_keep_their_own_frozen_proof_and_item_parameters
     assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
     let view=type_pool::TypeIndex::from_raw(compiled.type_pool.snapshot().types.iter().position(|info|
         matches!(&info.kind,type_pool::TypeKind::Trait{name,..} if str_interner::get(*name)=="Source")).unwrap() as u32);
-    assert!(
-        compiled
-            .codegen_output
-            .functions
-            .iter()
-            .any(|function| function.is_closure
-                && function.abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }]
-                && function
-                    .abi
-                    .captures
-                    .contains(&nsbc::CaptureAbi::TraitProof { view }))
-    );
+    assert!(compiled.codegen_output.functions.iter().any(|function| {
+        function.is_closure
+            && function.abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }]
+            && function
+                .abi
+                .captures
+                .contains(&nsbc::CaptureAbi::TraitProof { view })
+    }));
     let p=type_pool::TypeIndex::from_raw(compiled.type_pool.snapshot().types.iter().position(|info|
         matches!(&info.kind,type_pool::TypeKind::Struct{name,..} if str_interner::get(*name)=="P")).unwrap() as u32);
-    assert!(compiled.codegen_output.functions.iter().any(|function|function.is_closure &&
-        matches!(&compiled.type_pool.get(function.function_type).kind,type_pool::TypeKind::Function{params,ret} if params==&[p] && *ret==p)
-        && function.abi.parameters == [nsbc::ParameterAbi::Value]));
+    assert!(compiled.codegen_output.functions.iter().any(|function| {
+        function.is_closure
+            && function.function_type != type_pool::TypeIndex::INVALID
+            && matches!(
+                &compiled.type_pool.get(function.function_type).kind,
+                type_pool::TypeKind::Function { params, ret } if params == &[p] && *ret == p
+            )
+            && function.abi.parameters == [nsbc::ParameterAbi::Value]
+    }));
     assert_eq!(common::run_value(source).unwrap(), 42);
     let named = "struct P{x:i64};trait Source{assoc Item:Type=Self;fn next(self)->Item;derive fn named(self)->fn(Self)->Item{fn inner(other:Self)->Item{other.next()};inner}};mod a{extend Source for P{pub fn next(self)->P{P{x:40}}};pub fn callback()->fn(P)->P{P{x:0}.named()}};mod b{extend Source for P{pub fn next(self)->P{P{x:2}}};pub fn answer()->i64{let f=a.callback();f(P{x:0}).x+40}};fn main(){b.answer()}";
     assert_eq!(common::run_value(named).unwrap(), 42);
@@ -125,8 +127,7 @@ fn nested_source_self_parameters_keep_their_own_frozen_proof_and_item_parameters
     let contextual = driver::Driver::new().compile(&contextual);
     assert!(!contextual.has_errors, "{:?}", contextual.diagnostics);
     assert!(contextual.codegen_output.functions.iter().any(|function| {
-        function.is_closure
-            && function.abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }]
+        function.is_closure && function.abi.parameters == [nsbc::ParameterAbi::TraitSelf { view }]
     }));
 }
 

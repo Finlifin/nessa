@@ -1,9 +1,37 @@
--- std.io — input / output and basic conversions
+-- std.io — input / output streams, file handles, warnings, and conversions.
 
 use .builtin.*
 
 const print_native: fn(Any) -> Unit = .print'builtin
 const println_native: fn(Any) -> Unit = .println'builtin
+const eprint_native: fn(Any) -> Unit = .eprint'builtin
+const eprintln_native: fn(Any) -> Unit = .eprintln'builtin
+
+private const _io_flush_stdout: fn() -> (i64, String) = .__io_flush_stdout'builtin
+private const _io_flush_stderr: fn() -> (i64, String) = .__io_flush_stderr'builtin
+private const _file_open: fn(String, String) -> (i64, i64, String) = .__file_open'builtin
+private const _file_temp: fn() -> (i64, i64, String) = .__file_temp'builtin
+private const _file_close: fn(i64) -> (i64, String) = .__file_close'builtin
+private const _file_is_open: fn(i64) -> bool = .__file_is_open'builtin
+private const _file_flush: fn(i64) -> (i64, String) = .__file_flush'builtin
+private const _file_read_all: fn(i64) -> (i64, String) = .__file_read_all'builtin
+private const _file_read_line: fn(i64, bool) -> (i64, ?String, String) = .__file_read_line'builtin
+private const _file_read_chars: fn(i64, i64) -> (i64, ?String, String) = .__file_read_chars'builtin
+private const _file_read_bytes: fn(i64, i64) -> (i64, List, String) = .__file_read_bytes'builtin
+private const _file_read_number: fn(i64) -> (i64, ?f64, String) = .__file_read_number'builtin
+private const _file_write_str: fn(i64, String) -> (i64, String) = .__file_write_str'builtin
+private const _file_write_bytes: fn(i64, List) -> (i64, String) = .__file_write_bytes'builtin
+private const _file_seek: fn(i64, i64, i64) -> (i64, i64, String) = .__file_seek'builtin
+
+private const _parse_int_radix: fn(String, i64) -> ?i64 = .__str_parse_int_radix'builtin
+private const _parse_f64: fn(String) -> ?f64 = .str_parse_f64'builtin
+private const _trim_ascii: fn(String) -> String = .str_trim_ascii'builtin
+private const _str_is_empty: fn(String) -> bool = .str_is_empty'builtin
+private const _str_len: fn(String) -> i64 = .str_len'builtin
+private const _str_byte_at: fn(String, i64) -> i64 = .str_byte_at'builtin
+private const _list_len: fn(List) -> i64 = .__list_len'builtin
+private const _list_get: fn(List, usize) -> Any = .__list_get'builtin
+private const _panic: fn(Any) -> NoReturn = .panic'builtin
 
 -- Values with a Display implementation visible here print their Display
 -- text; all other values keep the native representation.
@@ -21,7 +49,432 @@ pub fn println(value: Any) -> Unit {
     }
 }
 
+pub fn eprint(value: Any) -> Unit {
+    value match {
+        shown: Display => eprint_native(shown.to_string()),
+        _ => eprint_native(value),
+    }
+}
+
+pub fn eprintln(value: Any) -> Unit {
+    value match {
+        shown: Display => eprintln_native(shown.to_string()),
+        _ => eprintln_native(value),
+    }
+}
+
 pub const type_of: fn(Any) -> Type = .type_of'builtin
 pub const to_i64: fn(Any) -> i64 = .to_i64'builtin
 pub const to_f64: fn(Any) -> f64 = .to_f64'builtin
 pub const to_string: fn(Any) -> String = .to_string'builtin
+private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+
+private fn _format_any(value: Any) -> String {
+    value match {
+        shown: Display => shown.to_string(),
+        _ => to_string(value),
+    }
+}
+
+pub fn warn(...messages: List) -> Unit {
+    var out = "warning: "
+    let count = _list_len(messages)
+    var index: usize = 0
+    while index < count {
+        out = out ++ _format_any(_list_get(messages, index))
+        index += 1
+    }
+    eprintln_native(out)
+}
+
+-- Checks whether an ASCII float string fits within finite IEEE-754 f64 range
+-- before calling `_parse_f64` (which raises `NumericOverflow` on `+-Inf`).
+private fn _f64_text_within_range(text: String) -> bool {
+    let n = _str_len(text)
+    if n == 0 { return false }
+    var i = 0
+    let b0 = _str_byte_at(text, 0)
+    if b0 == 43 or b0 == 45 {
+        i += 1
+        if i >= n { return false }
+    }
+    var first_nz_pos = -1
+    var digit_pos = 0
+    var dot_pos = -1
+    var saw_digit = false
+    while i < n {
+        let b = _str_byte_at(text, i)
+        if b >= 48 and b <= 57 {
+            saw_digit = true
+            if b != 48 and first_nz_pos < 0 {
+                first_nz_pos = digit_pos
+            }
+            digit_pos += 1
+            i += 1
+        } else if b == 46 and dot_pos < 0 {
+            if not saw_digit { return false }
+            dot_pos = digit_pos
+            i += 1
+            if i >= n { return false }
+            let after_dot = _str_byte_at(text, i)
+            if after_dot < 48 or after_dot > 57 { return false }
+        } else {
+            break
+        }
+    }
+    if not saw_digit { return false }
+    if dot_pos < 0 { dot_pos = digit_pos }
+
+    var exp_val = 0
+    if i < n {
+        let eb = _str_byte_at(text, i)
+        if eb != 101 and eb != 69 { return false }
+        i += 1
+        if i >= n { return false }
+        var exp_neg = false
+        let es = _str_byte_at(text, i)
+        if es == 43 or es == 45 {
+            exp_neg = es == 45
+            i += 1
+            if i >= n { return false }
+        }
+        var exp_digits = 0
+        while i < n {
+            let db = _str_byte_at(text, i)
+            if db < 48 or db > 57 { return false }
+            exp_digits += 1
+            if exp_val < 1000000 {
+                exp_val = exp_val * 10 + (db - 48)
+            }
+            i += 1
+        }
+        if exp_digits == 0 { return false }
+        if exp_neg { exp_val = -exp_val }
+    }
+    if first_nz_pos < 0 {
+        return true
+    }
+    let sci_exp = (dot_pos - 1 - first_nz_pos) + exp_val
+    if sci_exp > 308 { return false }
+    if sci_exp < 308 { return true }
+    -- When sci_exp == 308, compare first 17 significant digits against DBL_MAX
+    -- ("17976931348623157...").
+    let max_digits = "17976931348623157"
+    var sig_idx = 0
+    var scan = 0
+    let start_b = _str_byte_at(text, 0)
+    if start_b == 43 or start_b == 45 { scan = 1 }
+    var started = false
+    while scan < n and sig_idx < 17 {
+        let b = _str_byte_at(text, scan)
+        if b == 101 or b == 69 { break }
+        if b == 46 {
+            scan += 1
+        } else if (not started) and b == 48 {
+            scan += 1
+        } else if b >= 48 and b <= 57 {
+            started = true
+            let mb = _str_byte_at(max_digits, sig_idx)
+            if b < mb { return true }
+            if b > mb { return false }
+            sig_idx += 1
+            scan += 1
+        } else {
+            break
+        }
+    }
+    while sig_idx < 17 {
+        let mb = _str_byte_at(max_digits, sig_idx)
+        if 48 < mb { return true }
+        sig_idx += 1
+    }
+    true
+}
+
+pub fn tonumber(value: Any, .base: i64 = 0) -> Any {
+    if base == 0 {
+        value match {
+            v: i64 => v,
+            v: i32 => v,
+            v: i16 => v,
+            v: i8 => v,
+            v: i128 => v,
+            v: isize => v,
+            v: u64 => v,
+            v: u32 => v,
+            v: u16 => v,
+            v: u8 => v,
+            v: u128 => v,
+            v: usize => v,
+            v: f64 => v,
+            v: f32 => v,
+            s: String => {
+                let trimmed = _trim_ascii(s)
+                if _str_is_empty(trimmed) { return null }
+                _parse_int_radix(trimmed, 0) match {
+                    n? => n,
+                    _ => {
+                        if _f64_text_within_range(trimmed) {
+                            _parse_f64(trimmed)
+                        } else {
+                            null
+                        }
+                    },
+                }
+            },
+            _ => null,
+        }
+    } else {
+        if base < 2 or base > 36 {
+            _panic("tonumber: base out of range (expected 2..=36)")
+        }
+        value match {
+            s: String => {
+                let trimmed = _trim_ascii(s)
+                if _str_is_empty(trimmed) { null } else { _parse_int_radix(trimmed, base) }
+            },
+            _ => null,
+        }
+    }
+}
+
+pub enum IoError {
+    pub NotFound(message: String),
+    pub PermissionDenied(message: String),
+    pub AlreadyExists(message: String),
+    pub InvalidInput(message: String),
+    pub UnexpectedEof(message: String),
+    pub Closed(message: String),
+    pub BrokenPipe(message: String),
+    pub Other(message: String),
+}
+derive Eq, PartialEq for IoError
+
+impl Display for IoError {
+    pub fn to_string(self) -> String {
+        self match {
+            IoError.NotFound(message) => "NotFound: " ++ message,
+            IoError.PermissionDenied(message) => "PermissionDenied: " ++ message,
+            IoError.AlreadyExists(message) => "AlreadyExists: " ++ message,
+            IoError.InvalidInput(message) => "InvalidInput: " ++ message,
+            IoError.UnexpectedEof(message) => "UnexpectedEof: " ++ message,
+            IoError.Closed(message) => "Closed: " ++ message,
+            IoError.BrokenPipe(message) => "BrokenPipe: " ++ message,
+            IoError.Other(message) => "Other: " ++ message,
+        }
+    }
+}
+
+pub fn io_error_from_code(code: i64, message: String) -> IoError {
+    when {
+        code == 1 => IoError.NotFound(message)
+        code == 2 => IoError.PermissionDenied(message)
+        code == 3 => IoError.AlreadyExists(message)
+        code == 4 => IoError.InvalidInput(message)
+        code == 5 => IoError.UnexpectedEof(message)
+        code == 6 => IoError.Closed(message)
+        code == 7 => IoError.BrokenPipe(message)
+        else => IoError.Other(message)
+    }
+}
+
+pub enum SeekFrom {
+    pub start(offset: i64),
+    pub current(offset: i64),
+    pub end(offset: i64),
+}
+derive Eq, PartialEq for SeekFrom
+
+impl Display for SeekFrom {
+    pub fn to_string(self) -> String {
+        self match {
+            SeekFrom.start(offset) => "SeekFrom.start(" ++ _to_string_raw(offset) ++ ")",
+            SeekFrom.current(offset) => "SeekFrom.current(" ++ _to_string_raw(offset) ++ ")",
+            SeekFrom.end(offset) => "SeekFrom.end(" ++ _to_string_raw(offset) ++ ")",
+        }
+    }
+}
+
+pub fn flush_stdout() -> !IoError Unit {
+    let (code, msg) = _io_flush_stdout()
+    if code == 0 { () } else { error io_error_from_code(code, msg) }
+}
+
+pub fn flush_stderr() -> !IoError Unit {
+    let (code, msg) = _io_flush_stderr()
+    if code == 0 { () } else { error io_error_from_code(code, msg) }
+}
+
+pub struct File {
+    handle_id: i64,
+}
+derive Eq, PartialEq for File
+
+impl Display for File {
+    pub fn to_string(self) -> String {
+        if _file_is_open(self.handle_id) {
+            "file (open)"
+        } else {
+            "file (closed)"
+        }
+    }
+}
+
+impl File {
+    pub fn stdin() -> File = File { handle_id: 0 }
+    pub fn stdout() -> File = File { handle_id: 1 }
+    pub fn stderr() -> File = File { handle_id: 2 }
+
+    pub fn open(path: String, .mode: String = "r") -> !IoError File {
+        let (code, id, msg) = _file_open(path, mode)
+        if code == 0 {
+            File { handle_id: id }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn create(path: String) -> !IoError File {
+        File.open(path, mode = "w")
+    }
+
+    pub fn append(path: String) -> !IoError File {
+        File.open(path, mode = "a")
+    }
+
+    pub fn temp() -> !IoError File {
+        let (code, id, msg) = _file_temp()
+        if code == 0 {
+            File { handle_id: id }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn close(self) -> !IoError Unit {
+        let (code, msg) = _file_close(self.handle_id)
+        if code == 0 { () } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn is_open(self) -> bool = _file_is_open(self.handle_id)
+
+    pub fn flush(self) -> !IoError Unit {
+        let (code, msg) = _file_flush(self.handle_id)
+        if code == 0 { () } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn read_to_string(self) -> !IoError String {
+        let (code, content) = _file_read_all(self.handle_id)
+        if code == 0 { content } else { error io_error_from_code(code, content) }
+    }
+
+    pub fn read_line(self, .keep_newline: bool = false) -> !IoError ?String {
+        let (code, line, msg) = _file_read_line(self.handle_id, keep_newline)
+        if code == 0 { line } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn read_chars(self, count: i64) -> !IoError ?String {
+        let (code, chunk, msg) = _file_read_chars(self.handle_id, count)
+        if code == 0 { chunk } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn read_bytes(self, .max_bytes: i64 = -1) -> !IoError List {
+        let (code, bytes, msg) = _file_read_bytes(self.handle_id, max_bytes)
+        if code == 0 { bytes } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn read_number(self) -> !IoError ?f64 {
+        let (code, num, msg) = _file_read_number(self.handle_id)
+        if code == 0 { num } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn write(self, text: String) -> !IoError Unit {
+        let (code, msg) = _file_write_str(self.handle_id, text)
+        if code == 0 { () } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn write_line(self, text: String) -> !IoError Unit {
+        self.write(text ++ "\n")
+    }
+
+    pub fn write_bytes(self, data: List) -> !IoError Unit {
+        let (code, msg) = _file_write_bytes(self.handle_id, data)
+        if code == 0 { () } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn seek(self, pos: SeekFrom) -> !IoError i64 {
+        let (whence, offset) = pos match {
+            SeekFrom.start(off) => (0, off),
+            SeekFrom.current(off) => (1, off),
+            SeekFrom.end(off) => (2, off),
+        }
+        let (code, new_pos, msg) = _file_seek(self.handle_id, whence, offset)
+        if code == 0 { new_pos } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn position(self) -> !IoError i64 {
+        self.seek(SeekFrom.current(0))
+    }
+
+    pub fn lines(self, .keep_newline: bool = false, .close_on_eof: bool = false) -> FileLinesIter {
+        FileLinesIter {
+            file: self,
+            keep_newline: keep_newline,
+            close_on_eof: close_on_eof,
+            finished: false,
+        }
+    }
+}
+
+pub struct FileLinesIter {
+    file: File,
+    keep_newline: bool,
+    close_on_eof: bool,
+    finished: bool,
+}
+
+impl Iterator for FileLinesIter {
+    assoc Item: Type = String
+    pub fn next(self) -> IterationStep(String) {
+        if self.finished {
+            return IterationStep(String).done
+        }
+        self.file.read_line(keep_newline = self.keep_newline) match {
+            line_opt! => line_opt match {
+                line? => IterationStep(String).yielded(line),
+                _ => {
+                    self.finished = true
+                    if self.close_on_eof {
+                        let _ = self.file.close()
+                    }
+                    IterationStep(String).done
+                },
+            },
+            error err => {
+                self.finished = true
+                if self.close_on_eof {
+                    let _ = self.file.close()
+                }
+                _panic(err.to_string())
+            },
+        }
+    }
+}
+
+impl IntoIterator for FileLinesIter {
+    assoc Iter: Type = FileLinesIter
+    pub fn into_iter(self) -> FileLinesIter = self
+}
+
+pub fn stdin() -> File = File.stdin()
+pub fn stdout() -> File = File.stdout()
+pub fn stderr() -> File = File.stderr()
+
+pub fn open_file(path: String, .mode: String = "r") -> !IoError File {
+    File.open(path, mode = mode)
+}
+
+pub fn read_lines(path: String, .keep_newline: bool = false) -> !IoError FileLinesIter {
+    let file = File.open(path, mode = "r")!
+    file.lines(keep_newline = keep_newline, close_on_eof = true)
+}

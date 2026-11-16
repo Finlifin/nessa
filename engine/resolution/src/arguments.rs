@@ -9,9 +9,17 @@ use crate::resolver::Resolver;
 use crate::{SymbolId, SymbolKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpreadPackPlan {
+    pub source_indices: Vec<usize>,
+    pub fixed_count: usize,
+    pub has_variadic_tail: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallArgumentPlan {
     pub declaration: NodeIndex,
     pub parameters: Vec<CallParameterBinding>,
+    pub spread_pack: Option<SpreadPackPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +38,13 @@ pub enum CallArgumentValue {
     Variadic {
         source_indices: Vec<usize>,
     },
+    /// Positional slot unpacked at runtime from `CallArgumentPlan::spread_pack`.
+    Unpacked {
+        unpack_index: usize,
+        target_type: Option<type_pool::TypeIndex>,
+    },
+    /// Variadic tail sliced at runtime from `CallArgumentPlan::spread_pack`.
+    UnpackedTail,
     /// Source-ordered properties packed into one Map; repeated keys replace earlier values.
     MapVariadic {
         source_properties: Vec<(str_interner::StrId, usize)>,
@@ -177,6 +192,11 @@ pub(crate) fn known_declaration(
         return Some(callee);
     }
     let symbol = &r.symbols[r.node_symbols.get(&callee)?.0 as usize];
+    if symbol.kind == SymbolKind::Function
+        && let Some(&template) = r.synthetic_call_templates.get(&symbol.id)
+    {
+        return Some(template);
+    }
     if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Effect)
         || symbol.def_node.is_null()
     {
@@ -200,8 +220,11 @@ pub(crate) fn plan_call(
     ast: &Ast,
     call: NodeIndex,
 ) -> Option<CallArgumentPlan> {
-    let callee = ast.fixed_children(call)[0];
-    let arguments = ast.multi_children(call);
+    let (callee, arguments) = if ast.node(call).kind == NodeKind::InfixFnCall {
+        (call, ast.fixed_children(call))
+    } else {
+        (ast.fixed_children(call)[0], ast.multi_children(call))
+    };
     if let Some(&method) = r.instance_methods.get(&callee) {
         let declaration = r.symbols[method.0 as usize].def_node;
         return plan_method(r, ast, call, declaration, arguments, None);
@@ -367,80 +390,187 @@ pub(crate) fn plan_parameters(
             positional.push(index);
         }
     }
+    let has_spread = arguments
+        .iter()
+        .any(|&arg| !arg.is_null() && ast.node(arg).kind == NodeKind::SpreadArg);
     let mut values = vec![None; parameters.len()];
-    if let Some(index) = variadic {
-        values[index] = Some(CallArgumentValue::Variadic {
-            source_indices: Vec::new(),
-        });
-    }
-    let mut next_position = 0;
+    let mut spread_pack = None;
     let mut valid = true;
-    for (source_index, &argument) in arguments.iter().enumerate() {
-        let index = if assignment_rhs == Some(source_index) && variadic.is_none() {
-            let Some(&index) = positional.last() else {
-                report(
-                    r,
-                    ast,
-                    argument,
-                    "update requires a positional parameter for the assigned value",
-                );
-                valid = false;
-                continue;
-            };
-            index
-        } else if ast.node(argument).kind == NodeKind::NamedArg {
-            let name = ast.node(ast.fixed_children(argument)[0]).str_id;
-            let Some(&index) = by_name.get(&name) else {
-                report(
-                    r,
-                    ast,
-                    argument,
-                    format!("unknown parameter `{}`", str_interner::get(name)),
-                );
-                valid = false;
-                continue;
-            };
-            if Some(index) == variadic {
-                report(
-                    r,
-                    ast,
-                    argument,
-                    "variadic parameters collect positional arguments and cannot be supplied by name",
-                );
-                valid = false;
-                continue;
-            }
-            index
-        } else {
-            let Some(&index) = positional.get(next_position) else {
-                if let Some(index) = variadic
-                    && let Some(CallArgumentValue::Variadic { source_indices }) = &mut values[index]
-                {
-                    source_indices.push(source_index);
+
+    if has_spread {
+        if assignment_rhs.is_some() {
+            report(
+                r,
+                ast,
+                call,
+                "spread arguments are not supported in indexed assignment",
+            );
+            return None;
+        }
+        let mut pos_sources = Vec::new();
+        for (source_index, &argument) in arguments.iter().enumerate() {
+            if ast.node(argument).kind == NodeKind::NamedArg {
+                let name = ast.node(ast.fixed_children(argument)[0]).str_id;
+                let Some(&index) = by_name.get(&name) else {
+                    report(
+                        r,
+                        ast,
+                        argument,
+                        format!("unknown parameter `{}`", str_interner::get(name)),
+                    );
+                    valid = false;
+                    continue;
+                };
+                if Some(index) == variadic {
+                    report(
+                        r,
+                        ast,
+                        argument,
+                        "variadic parameters collect positional arguments and cannot be supplied by name",
+                    );
+                    valid = false;
                     continue;
                 }
+                if values[index].is_some() {
+                    report(r, ast, argument, "parameter supplied more than once");
+                    valid = false;
+                } else {
+                    values[index] = Some(CallArgumentValue::Explicit { source_index });
+                    let pattern = parameter_pattern(ast, parameters[index]);
+                    if let Some(&symbol) = r.node_symbols.get(&pattern) {
+                        r.node_symbols
+                            .insert(ast.fixed_children(argument)[0], symbol);
+                    }
+                }
+            } else {
+                pos_sources.push(source_index);
+            }
+        }
+        let unbound_positional: Vec<usize> = positional
+            .iter()
+            .copied()
+            .filter(|&idx| values[idx].is_none())
+            .collect();
+        let first_spread = pos_sources
+            .iter()
+            .position(|&src| ast.node(arguments[src]).kind == NodeKind::SpreadArg)
+            .unwrap_or(0);
+        if let Some(var_idx) = variadic
+            && first_spread >= unbound_positional.len()
+        {
+            for (&param_idx, &source_index) in unbound_positional
+                .iter()
+                .zip(&pos_sources[..unbound_positional.len()])
+            {
+                values[param_idx] = Some(CallArgumentValue::Explicit { source_index });
+            }
+            values[var_idx] = Some(CallArgumentValue::Variadic {
+                source_indices: pos_sources[unbound_positional.len()..].to_vec(),
+            });
+        } else {
+            let min_explicit_count = pos_sources
+                .iter()
+                .filter(|&&src| ast.node(arguments[src]).kind != NodeKind::SpreadArg)
+                .count();
+            if variadic.is_none() && min_explicit_count > unbound_positional.len() {
                 report(
                     r,
                     ast,
-                    argument,
+                    call,
                     "too many positional arguments; optional parameters must be supplied by name",
                 );
                 valid = false;
-                continue;
+            }
+            for (unpack_index, &param_idx) in unbound_positional.iter().enumerate() {
+                values[param_idx] = Some(CallArgumentValue::Unpacked {
+                    unpack_index,
+                    target_type: None,
+                });
+            }
+            if let Some(var_idx) = variadic {
+                values[var_idx] = Some(CallArgumentValue::UnpackedTail);
+            }
+            spread_pack = Some(SpreadPackPlan {
+                source_indices: pos_sources,
+                fixed_count: unbound_positional.len(),
+                has_variadic_tail: variadic.is_some(),
+            });
+        }
+    } else {
+        if let Some(index) = variadic {
+            values[index] = Some(CallArgumentValue::Variadic {
+                source_indices: Vec::new(),
+            });
+        }
+        let mut next_position = 0;
+        for (source_index, &argument) in arguments.iter().enumerate() {
+            let index = if assignment_rhs == Some(source_index) && variadic.is_none() {
+                let Some(&index) = positional.last() else {
+                    report(
+                        r,
+                        ast,
+                        argument,
+                        "update requires a positional parameter for the assigned value",
+                    );
+                    valid = false;
+                    continue;
+                };
+                index
+            } else if ast.node(argument).kind == NodeKind::NamedArg {
+                let name = ast.node(ast.fixed_children(argument)[0]).str_id;
+                let Some(&index) = by_name.get(&name) else {
+                    report(
+                        r,
+                        ast,
+                        argument,
+                        format!("unknown parameter `{}`", str_interner::get(name)),
+                    );
+                    valid = false;
+                    continue;
+                };
+                if Some(index) == variadic {
+                    report(
+                        r,
+                        ast,
+                        argument,
+                        "variadic parameters collect positional arguments and cannot be supplied by name",
+                    );
+                    valid = false;
+                    continue;
+                }
+                index
+            } else {
+                let Some(&index) = positional.get(next_position) else {
+                    if let Some(index) = variadic
+                        && let Some(CallArgumentValue::Variadic { source_indices }) =
+                            &mut values[index]
+                    {
+                        source_indices.push(source_index);
+                        continue;
+                    }
+                    report(
+                        r,
+                        ast,
+                        argument,
+                        "too many positional arguments; optional parameters must be supplied by name",
+                    );
+                    valid = false;
+                    continue;
+                };
+                next_position += 1;
+                index
             };
-            next_position += 1;
-            index
-        };
-        if values[index].is_some() {
-            report(r, ast, argument, "parameter supplied more than once");
-            valid = false;
-        } else {
-            values[index] = Some(CallArgumentValue::Explicit { source_index });
-            if ast.node(argument).kind == NodeKind::NamedArg {
-                let pattern = parameter_pattern(ast, parameters[index]);
-                if let Some(&symbol) = r.node_symbols.get(&pattern) {
-                    r.node_symbols
-                        .insert(ast.fixed_children(argument)[0], symbol);
+            if values[index].is_some() {
+                report(r, ast, argument, "parameter supplied more than once");
+                valid = false;
+            } else {
+                values[index] = Some(CallArgumentValue::Explicit { source_index });
+                if ast.node(argument).kind == NodeKind::NamedArg {
+                    let pattern = parameter_pattern(ast, parameters[index]);
+                    if let Some(&symbol) = r.node_symbols.get(&pattern) {
+                        r.node_symbols
+                            .insert(ast.fixed_children(argument)[0], symbol);
+                    }
                 }
             }
         }
@@ -485,6 +615,7 @@ pub(crate) fn plan_parameters(
     valid.then_some(CallArgumentPlan {
         declaration,
         parameters: bindings,
+        spread_pack,
     })
 }
 

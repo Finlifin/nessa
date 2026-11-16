@@ -20,6 +20,8 @@ pub(crate) fn selected_defaults(
                     }
                     CallArgumentValue::Explicit { .. }
                     | CallArgumentValue::Variadic { .. }
+                    | CallArgumentValue::Unpacked { .. }
+                    | CallArgumentValue::UnpackedTail
                     | CallArgumentValue::MapVariadic { .. } => None,
                 })
         });

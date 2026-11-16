@@ -35,6 +35,7 @@ pub fn validate_display_owner(
             }
         }
         TypeKind::Tuple { elements } if elements.len() <= u16::MAX as usize => {}
+        TypeKind::Newtype { .. } if pool.get(owner).size == 8 && pool.get(owner).align == 8 => {}
         TypeKind::Enum { variants, .. }
             if variants
                 .iter()

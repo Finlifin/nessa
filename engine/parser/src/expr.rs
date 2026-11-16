@@ -131,7 +131,7 @@ pub fn get_expr_op_info(kind: TokenKind) -> OpInfo {
         },
 
         // Infix function call
-        TokenKind::Id => OpInfo {
+        TokenKind::Id | TokenKind::ArbitraryId => OpInfo {
             node_kind: NodeKind::InfixFnCall,
             prec: 70,
         },
@@ -263,7 +263,16 @@ fn try_expr_pratt(p: &mut Parser, min_prec: i32, option: ExprOption) -> ParseRes
         }
 
         // Consume operator token and parse right operand (infix)
-        p.next_token();
+        let op_tok = p.next_token();
+        let fn_str_id = if op.node_kind == NodeKind::InfixFnCall {
+            let raw = p.token_text(op_tok);
+            Some(str_interner::intern(basic::unquote_ident_text(
+                op_tok.kind,
+                raw,
+            )))
+        } else {
+            None
+        };
         let right = try_expr_pratt(p, op.prec + 1, option)?;
         if right.is_null() {
             let _ = p.err_with_label(
@@ -276,12 +285,11 @@ fn try_expr_pratt(p: &mut Parser, min_prec: i32, option: ExprOption) -> ParseRes
         }
 
         let span = p.current_span();
-        left = p
-            .ast()
-            .builder(op.node_kind, span)
-            .add_child(left)
-            .add_child(right)
-            .build();
+        let mut builder = p.ast().builder(op.node_kind, span);
+        if let Some(str_id) = fn_str_id {
+            builder.set_str_id(str_id);
+        }
+        left = builder.add_child(left).add_child(right).build();
     }
 
     Ok(left)
@@ -304,6 +312,7 @@ fn try_prefix_expr(p: &mut Parser, option: ExprOption) -> ParseResult {
         | TokenKind::String
         | TokenKind::Char
         | TokenKind::Id
+        | TokenKind::ArbitraryId
         | TokenKind::KwFalse
         | TokenKind::KwTrue
         | TokenKind::KwSelfCap
@@ -372,6 +381,7 @@ fn parse_call_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     let mut args = try_multi_with_bracket(
         p,
         &[
+            Rule::comma("spread argument", try_spread_arg),
             Rule::comma("named argument", basic::try_named_arg),
             Rule::comma("optional argument", try_property_assign),
             Rule::comma("function argument", try_expr),
@@ -386,7 +396,9 @@ fn parse_call_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
         if p.ast().node(*arg).kind == NodeKind::PropertyAssignment {
             p.ast().nodes[arg.0 as usize].kind = NodeKind::NamedArg;
         }
-        *arg = maybe_wrap_tacit_lambda(p, *arg);
+        if p.ast().node(*arg).kind != NodeKind::SpreadArg {
+            *arg = maybe_wrap_tacit_lambda(p, *arg);
+        }
     }
     let span = p.current_span();
     let idx = p
@@ -396,6 +408,30 @@ fn parse_call_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
         .add_multi_children(&args)
         .build();
     Ok(idx)
+}
+
+fn try_spread_arg(p: &mut Parser) -> ParseResult {
+    let _g = p.enter();
+    if !p.peek(&[TokenKind::Dot, TokenKind::Dot, TokenKind::Dot]) {
+        return Ok(NULL);
+    }
+    p.eat_tokens(3);
+    let inner = try_expr(p)?;
+    if inner.is_null() {
+        let _ = p.err_with_label(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected expression after `...` in spread argument",
+            p.next_token_span(),
+            format!("found `{}`", p.peek_token().kind.lexeme()),
+        );
+    }
+    let inner = maybe_wrap_tacit_lambda(p, inner);
+    let span = p.current_span();
+    Ok(p.ast()
+        .builder(NodeKind::SpreadArg, span)
+        .add_child(inner)
+        .build())
 }
 
 fn parse_extended_call_expr(p: &mut Parser, left: NodeIndex, option: ExprOption) -> ParseResult {
@@ -430,8 +466,20 @@ fn parse_dot_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     match next.kind {
         TokenKind::KwUse => parse_handler_apply_expr(p, left),
         TokenKind::KwAs => parse_type_cast_expr(p, left),
+        TokenKind::KwAwait if !p.peek(&[TokenKind::KwAwait, TokenKind::LParen]) => {
+            parse_await_expr(p, left)
+        }
         _ => parse_projection_expr(p, left),
     }
+}
+
+fn parse_await_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
+    p.expect_token(TokenKind::KwAwait)?;
+    let span = p.current_span();
+    Ok(p.ast()
+        .builder(NodeKind::Await, span)
+        .add_child(left)
+        .build())
 }
 
 /// `expr ' id` — view, same shape as projection (`expr . id`).
@@ -588,7 +636,10 @@ fn parse_effect_handling_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
 
     let arms = try_multi_with_bracket(
         p,
-        &[Rule::comma("effect handling arm", try_pattern_arm)],
+        &[Rule::comma_or_semicolon(
+            "effect handling arm",
+            try_pattern_arm,
+        )],
         TokenKind::LBrace,
         TokenKind::RBrace,
     )?;
@@ -619,8 +670,8 @@ fn parse_error_handling_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     let arms = try_multi_with_bracket(
         p,
         &[
-            Rule::comma("catching arm", try_catch_arm),
-            Rule::comma("error handling arm", try_pattern_arm),
+            Rule::comma_or_semicolon("catching arm", try_catch_arm),
+            Rule::comma_or_semicolon("error handling arm", try_pattern_arm),
         ],
         TokenKind::LBrace,
         TokenKind::RBrace,
@@ -939,7 +990,25 @@ fn try_effect_qualified_type(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    let effs = try_expr_pratt(p, 90, ExprOption::new())?;
+    let mut effs = try_expr_pratt(p, 101, ExprOption::new())?;
+    while p.eat_token(TokenKind::PlusPlus) {
+        let right = try_expr_pratt(p, 101, ExprOption::new())?;
+        if right.is_null() {
+            p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected effect set after concat",
+            )?;
+            return Ok(NULL);
+        }
+        let span = p.current_span();
+        effs = p
+            .ast()
+            .builder(NodeKind::Concat, span)
+            .add_child(effs)
+            .add_child(right)
+            .build();
+    }
     if effs.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,

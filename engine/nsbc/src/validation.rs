@@ -1,6 +1,7 @@
 //! Validate executable artifacts before installing any code or heap constants.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 
 use type_pool::{TypeIndex, TypeKind, TypePool};
@@ -40,13 +41,41 @@ const MAX_INSTRUCTIONS: usize = 1 << 24;
 const MAX_CONSTANTS: usize = 1 << 22;
 const MAX_SLOTS: u32 = 1 << 17;
 
+#[derive(Clone, Copy)]
+enum VContext {
+    Static(&'static str),
+    Global(usize),
+    EnumConst(usize),
+    Function(u32),
+    ControlFlow(u32),
+    Pc(u32, usize),
+}
+
+impl VContext {
+    fn render(self) -> String {
+        match self {
+            Self::Static(text) => text.to_owned(),
+            Self::Global(index) => format!("global {index}"),
+            Self::EnumConst(index) => format!("enum constant {index}"),
+            Self::Function(id) => format!("function {id}"),
+            Self::ControlFlow(id) => format!("function {id} control flow"),
+            Self::Pc(id, pc) => format!("function {id} PC {pc}"),
+        }
+    }
+}
+
+#[cold]
+fn ctx_err(context: VContext, message: impl Into<String>) -> ArtifactError {
+    ArtifactError::new(context.render(), message)
+}
+
 /// Collect native function IDs from actual call operands, never numeric constants.
 pub fn builtin_references(output: &CodegenOutput) -> Result<BTreeSet<u32>, ArtifactError> {
     let mut references = BTreeSet::new();
     for function in &output.functions {
+        let id = function.func_id.0;
         for (pc, &word) in function.instructions.iter().enumerate() {
-            let context = format!("function {} PC {pc}", function.func_id.0);
-            let instruction = decode(word, &context)?;
+            let instruction = decode(word, VContext::Pc(id, pc))?;
             if let (Opcode::CallBuiltin, InstructionData::C { payload }) =
                 (instruction.opcode, instruction.data)
             {
@@ -66,24 +95,30 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
             "function or constant limit exceeded",
         ));
     }
-    let mut functions = BTreeMap::new();
+    let mut dense_functions = vec![None; output.functions.len()];
+    let mut seen_ids = BTreeSet::new();
     let mut words = 0usize;
     for function in &output.functions {
         words = words
             .checked_add(function.instructions.len())
             .filter(|&count| count <= MAX_INSTRUCTIONS)
             .ok_or_else(|| ArtifactError::new("artifact", "instruction limit exceeded"))?;
-        if functions.insert(function.func_id.0, function).is_some() {
+        if !seen_ids.insert(function.func_id.0) {
             return Err(ArtifactError::new("functions", "duplicate function ID"));
         }
+        if let Some(slot) = dense_functions.get_mut(function.func_id.0 as usize) {
+            *slot = Some(function);
+        }
     }
-    for (expected, &actual) in functions.keys().enumerate() {
-        if actual as usize != expected {
+    let mut functions = Vec::with_capacity(output.functions.len());
+    for slot in dense_functions {
+        let Some(function) = slot else {
             return Err(ArtifactError::new(
                 "functions",
                 "function IDs must be dense from zero",
             ));
-        }
+        };
+        functions.push(function);
     }
     artifact
         .type_pool
@@ -95,10 +130,30 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
             "unresolved derived method sentinel in executable artifact",
         ));
     }
+    let pool_len = artifact.type_pool.len();
+    let max_trait_slots = artifact
+        .type_pool
+        .trait_schemas_snapshot()
+        .iter()
+        .map(|schema| schema.slots.len())
+        .max()
+        .unwrap_or(0);
+    let func_len = functions.len();
     let validator = Validator {
         artifact,
         pool: &artifact.type_pool,
         functions,
+        max_trait_slots,
+        has_list_roles: artifact.type_pool.list_type().is_some()
+            && artifact.type_pool.list_buffer_type().is_some(),
+        has_map_roles: artifact.type_pool.map_type().is_some()
+            && artifact.type_pool.map_buffer_type().is_some(),
+        validated_runtime_types: RefCell::new(vec![None; pool_len]),
+        validated_error_ctors: RefCell::new(vec![false; pool_len]),
+        validated_captures: RefCell::new(vec![None; func_len]),
+        validated_strings: RefCell::new(HashSet::new()),
+        cf_depths: RefCell::new(Vec::new()),
+        cf_pending: RefCell::new(Vec::new()),
     };
     let mut names = BTreeSet::new();
     let mut builtins = BTreeSet::new();
@@ -121,7 +176,7 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
         ));
     }
     for (index, global) in output.globals.iter().enumerate() {
-        validator.runtime_type(global.type_index, &format!("global {index}"))?;
+        validator.runtime_type(global.type_index, VContext::Global(index))?;
     }
     if output.globals.len() > MAX_SLOTS as usize {
         return Err(ArtifactError::new("globals", "global slot limit exceeded"));
@@ -129,13 +184,13 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
     for (index, constant) in output.constants.iter().enumerate() {
         match constant {
             Constant::Type(index) => {
-                validator.type_index(*index, "Type constant")?;
+                validator.type_index(*index, VContext::Static("Type constant"))?;
             }
             Constant::Enum {
                 type_index,
                 variant,
             } => {
-                validator.enum_variant(*type_index, *variant, &format!("enum constant {index}"))?;
+                validator.enum_variant(*type_index, *variant, VContext::EnumConst(index))?;
             }
             _ => {}
         }
@@ -144,7 +199,7 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
         validator.function(function)?;
     }
     if let Some(entry) = artifact.entry {
-        let entry = validator.target(entry.0, "entry")?;
+        let entry = validator.target(entry.0, VContext::Static("entry"))?;
         if entry.is_closure || entry.param_count != 0 {
             return Err(ArtifactError::new(
                 "entry",
@@ -157,14 +212,11 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
     Ok(())
 }
 
-fn decode(word: u32, context: &str) -> Result<Instruction, ArtifactError> {
+fn decode(word: u32, context: VContext) -> Result<Instruction, ArtifactError> {
     let instruction = Instruction::decode(word)
-        .ok_or_else(|| ArtifactError::new(context, format!("invalid instruction {word:#010x}")))?;
+        .ok_or_else(|| ctx_err(context, format!("invalid instruction {word:#010x}")))?;
     if (!instruction.opcode.uses_amode() && word & (3 << 22) != 0) || instruction.encode() != word {
-        return Err(ArtifactError::new(
-            context,
-            "reserved instruction bits are nonzero",
-        ));
+        return Err(ctx_err(context, "reserved instruction bits are nonzero"));
     }
     Ok(instruction)
 }
@@ -172,7 +224,16 @@ fn decode(word: u32, context: &str) -> Result<Instruction, ArtifactError> {
 struct Validator<'a> {
     artifact: &'a CompiledArtifact,
     pool: &'a TypePool,
-    functions: BTreeMap<u32, &'a CompiledFunction>,
+    functions: Vec<&'a CompiledFunction>,
+    max_trait_slots: usize,
+    has_list_roles: bool,
+    has_map_roles: bool,
+    validated_runtime_types: RefCell<Vec<Option<TypeIndex>>>,
+    validated_error_ctors: RefCell<Vec<bool>>,
+    validated_captures: RefCell<Vec<Option<u8>>>,
+    validated_strings: RefCell<HashSet<u32>>,
+    cf_depths: RefCell<Vec<Option<u32>>>,
+    cf_pending: RefCell<Vec<(usize, u32)>>,
 }
 
 impl Validator<'_> {
@@ -180,14 +241,15 @@ impl Validator<'_> {
         self.pool
     }
 
-    fn type_index(&self, index: TypeIndex, context: &str) -> Result<TypeIndex, ArtifactError> {
-        let ty = self.pool().canonical_type(index).ok_or_else(|| {
-            ArtifactError::new(context, format!("invalid type index {}", index.as_u32()))
-        })?;
+    fn type_index(&self, index: TypeIndex, context: VContext) -> Result<TypeIndex, ArtifactError> {
+        let ty = self
+            .pool()
+            .canonical_type(index)
+            .ok_or_else(|| ctx_err(context, format!("invalid type index {}", index.as_u32())))?;
         // Abstract associated leaves belong to declarations, not executable
         // signatures, global slots, type constants or instruction operands.
         if self.pool().contains_associated_type(ty) {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 "unresolved associated type is not an executable type",
             ));
@@ -195,20 +257,40 @@ impl Validator<'_> {
         Ok(ty)
     }
 
-    fn runtime_type(&self, index: TypeIndex, context: &str) -> Result<TypeIndex, ArtifactError> {
+    fn runtime_type(
+        &self,
+        index: TypeIndex,
+        context: VContext,
+    ) -> Result<TypeIndex, ArtifactError> {
         let root = self.type_index(index, context)?;
+        if let Some(Some(cached)) = self
+            .validated_runtime_types
+            .borrow()
+            .get(root.as_u32() as usize)
+            .copied()
+        {
+            return Ok(cached);
+        }
         let mut pending = vec![root];
-        let mut seen = BTreeSet::new();
+        let mut seen = HashSet::new();
         while let Some(index) = pending.pop() {
             let index = self.type_index(index, context)?;
-            if !seen.insert(index) {
+            if self
+                .validated_runtime_types
+                .borrow()
+                .get(index.as_u32() as usize)
+                .copied()
+                .flatten()
+                .is_some()
+                || !seen.insert(index)
+            {
                 continue;
             }
             let info = self.pool().get(index);
             match &info.kind {
                 TypeKind::ErrorQualified { inner, errors } => {
                     if info.size != 24 || info.align != 8 {
-                        return Err(ArtifactError::new(
+                        return Err(ctx_err(
                             context,
                             "unsupported legacy Error layout in executable type",
                         ));
@@ -217,7 +299,7 @@ impl Validator<'_> {
                         || self.pool().identity_input().is_none()
                         || self.pool().stable_type_id(index).is_err()
                     {
-                        return Err(ArtifactError::new(
+                        return Err(ctx_err(
                             context,
                             "Error executable type requires authenticated identity",
                         ));
@@ -226,7 +308,7 @@ impl Validator<'_> {
                     // data/proof pair. Concrete specialized payloads are valid.
                     let mut payloads = vec![*inner];
                     payloads.extend(errors.iter().copied());
-                    let mut payload_seen = BTreeSet::new();
+                    let mut payload_seen = HashSet::new();
                     while let Some(payload) = payloads.pop() {
                         let payload = self.type_index(payload, context)?;
                         if !payload_seen.insert(payload) {
@@ -234,12 +316,13 @@ impl Validator<'_> {
                         }
                         match &self.pool().get(payload).kind {
                             TypeKind::Trait { .. } => {
-                                return Err(ArtifactError::new(
+                                return Err(ctx_err(
                                     context,
                                     "Error payload trait storage requires an unsupported proof carrier",
                                 ));
                             }
                             TypeKind::Optional { inner }
+                            | TypeKind::Future { inner }
                             | TypeKind::EffectQualified { inner, .. } => payloads.push(*inner),
                             TypeKind::Tuple { elements } => payloads.extend(elements),
                             _ => {}
@@ -249,7 +332,7 @@ impl Validator<'_> {
                     for &member in errors {
                         if member != type_pool::Intrinsic::Any.type_index() {
                             if self.pool().stable_type_id(member).is_err() {
-                                return Err(ArtifactError::new(
+                                return Err(ctx_err(
                                     context,
                                     "Error member requires a concrete stable identity",
                                 ));
@@ -259,6 +342,7 @@ impl Validator<'_> {
                     }
                 }
                 TypeKind::Optional { inner }
+                | TypeKind::Future { inner }
                 | TypeKind::Newtype { inner, .. }
                 | TypeKind::EffectQualified { inner, .. } => pending.push(*inner),
                 TypeKind::Tuple { elements } => pending.extend(elements),
@@ -277,6 +361,14 @@ impl Validator<'_> {
                 _ => {}
             }
         }
+        {
+            let mut cache = self.validated_runtime_types.borrow_mut();
+            for verified in seen {
+                if let Some(slot) = cache.get_mut(verified.as_u32() as usize) {
+                    *slot = Some(verified);
+                }
+            }
+        }
         Ok(root)
     }
 
@@ -284,32 +376,29 @@ impl Validator<'_> {
         &self,
         ty: TypeIndex,
         tag: u32,
-        context: &str,
+        context: VContext,
     ) -> Result<&type_pool::VariantInfo, ArtifactError> {
         let ty = self.type_index(ty, context)?;
         let TypeKind::Enum { variants, .. } = &self.pool().get(ty).kind else {
-            return Err(ArtifactError::new(
-                context,
-                "enum descriptor requires an enum type",
-            ));
+            return Err(ctx_err(context, "enum descriptor requires an enum type"));
         };
         variants
             .iter()
             .find(|variant| variant.tag == tag)
-            .ok_or_else(|| ArtifactError::new(context, "unknown enum variant tag"))
+            .ok_or_else(|| ctx_err(context, "unknown enum variant tag"))
     }
 
     fn enum_descriptor(
         &self,
         index: u32,
-        context: &str,
+        context: VContext,
     ) -> Result<&type_pool::VariantInfo, ArtifactError> {
         let Constant::Enum {
             type_index,
             variant,
         } = self.constant(index, context)?
         else {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 "enum instruction requires an enum descriptor constant",
             ));
@@ -318,7 +407,7 @@ impl Validator<'_> {
         self.enum_variant(*type_index, *variant, context)
     }
 
-    fn load_constant(&self, index: u32, context: &str) -> Result<(), ArtifactError> {
+    fn load_constant(&self, index: u32, context: VContext) -> Result<(), ArtifactError> {
         if let Constant::Enum {
             type_index,
             variant,
@@ -328,7 +417,7 @@ impl Validator<'_> {
                 .fields
                 .is_empty()
         {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 "payload enum descriptor cannot be loaded as a nullary value",
             ));
@@ -336,53 +425,59 @@ impl Validator<'_> {
         Ok(())
     }
 
-    fn target(&self, id: u32, context: &str) -> Result<&CompiledFunction, ArtifactError> {
+    fn target(&self, id: u32, context: VContext) -> Result<&CompiledFunction, ArtifactError> {
         self.functions
-            .get(&id)
+            .get(id as usize)
             .copied()
-            .ok_or_else(|| ArtifactError::new(context, format!("unknown function {id}")))
+            .ok_or_else(|| ctx_err(context, format!("unknown function {id}")))
     }
 
-    fn constant(&self, index: u32, context: &str) -> Result<&Constant, ArtifactError> {
+    fn constant(&self, index: u32, context: VContext) -> Result<&Constant, ArtifactError> {
         self.artifact
             .codegen_output
             .constants
             .get(index as usize)
-            .ok_or_else(|| ArtifactError::new(context, format!("invalid constant index {index}")))
+            .ok_or_else(|| ctx_err(context, format!("invalid constant index {index}")))
     }
 
-    fn integer(&self, index: u32, context: &str) -> Result<u64, ArtifactError> {
+    fn integer(&self, index: u32, context: VContext) -> Result<u64, ArtifactError> {
         match self.constant(index, context)? {
             Constant::UInt(value) => Ok(*value),
             Constant::Int(value) if *value >= 0 => Ok(*value as u64),
-            _ => Err(ArtifactError::new(
+            _ => Err(ctx_err(
                 context,
                 "metadata constant must be a nonnegative 64-bit integer",
             )),
         }
     }
 
-    fn integer_u32(&self, index: u32, context: &str) -> Result<u32, ArtifactError> {
+    fn integer_u32(&self, index: u32, context: VContext) -> Result<u32, ArtifactError> {
         u32::try_from(self.integer(index, context)?)
-            .map_err(|_| ArtifactError::new(context, "metadata integer exceeds u32"))
+            .map_err(|_| ctx_err(context, "metadata integer exceeds u32"))
     }
 
-    fn string(&self, id: u32, context: &str) -> Result<(), ArtifactError> {
-        str_interner::try_get(str_interner::StrId::from_raw(id))
-            .map(|_| ())
-            .ok_or_else(|| ArtifactError::new(context, format!("invalid string ID {id}")))
+    fn string(&self, id: u32, context: VContext) -> Result<(), ArtifactError> {
+        if self.validated_strings.borrow().contains(&id) {
+            return Ok(());
+        }
+        if str_interner::try_get(str_interner::StrId::from_raw(id)).is_some() {
+            self.validated_strings.borrow_mut().insert(id);
+            Ok(())
+        } else {
+            Err(ctx_err(context, format!("invalid string ID {id}")))
+        }
     }
 
-    fn call(&self, id: u32, count: u8, context: &str) -> Result<(), ArtifactError> {
+    fn call(&self, id: u32, count: u8, context: VContext) -> Result<(), ArtifactError> {
         let target = self.target(id, context)?;
         if target.is_closure && self.captures(target, context)? != 0 {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 "direct call target requires a closure environment",
             ));
         }
         if target.param_count != count {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 format!(
                     "direct call supplies {count} parameters but function {id} requires {}; default/variadic argument adaptation is not encoded",
@@ -393,18 +488,26 @@ impl Validator<'_> {
         Ok(())
     }
 
-    fn effect(&self, index: u32, context: &str) -> Result<usize, ArtifactError> {
+    fn effect(&self, index: u32, context: VContext) -> Result<usize, ArtifactError> {
         let ty = self.runtime_type(TypeIndex::from_raw(index), context)?;
         match &self.pool().get(ty).kind {
             TypeKind::Effect { params, .. } => Ok(params.len()),
-            _ => Err(ArtifactError::new(
+            _ => Err(ctx_err(
                 context,
                 "effect operand does not reference an effect type",
             )),
         }
     }
 
-    fn captures(&self, function: &CompiledFunction, context: &str) -> Result<u8, ArtifactError> {
+    fn captures(
+        &self,
+        function: &CompiledFunction,
+        context: VContext,
+    ) -> Result<u8, ArtifactError> {
+        let slot_index = function.func_id.0 as usize;
+        if let Some(Some(cached)) = self.validated_captures.borrow().get(slot_index).copied() {
+            return Ok(cached);
+        }
         if let Some(owner) = function.display_owner {
             crate::validate_display_owner(
                 self.pool(),
@@ -415,13 +518,13 @@ impl Validator<'_> {
                 function.param_count,
                 function.is_closure,
             )
-            .map_err(|message| ArtifactError::new(context, message))?;
+            .map_err(|message| ctx_err(context, message))?;
         }
         let abi = &function.abi;
         if abi.physical_parameter_count() != function.param_count as usize
             || (!function.is_closure && abi.capture_count() != 0)
         {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 "explicit function ABI disagrees with physical entry",
             ));
@@ -429,13 +532,10 @@ impl Validator<'_> {
         if function.function_type != TypeIndex::INVALID {
             let ty = self.runtime_type(function.function_type, context)?;
             let TypeKind::Function { params, .. } = &self.pool().get(ty).kind else {
-                return Err(ArtifactError::new(
-                    context,
-                    "function metadata is not a Function type",
-                ));
+                return Err(ctx_err(context, "function metadata is not a Function type"));
             };
             if params.len() != abi.logical_parameter_count() {
-                return Err(ArtifactError::new(
+                return Err(ctx_err(
                     context,
                     "explicit function ABI disagrees with logical signature",
                 ));
@@ -445,7 +545,7 @@ impl Validator<'_> {
                     ParameterAbi::Value => {}
                     ParameterAbi::Trait { view } => {
                         if self.pool().canonical_type(view) != self.pool().canonical_type(ty) {
-                            return Err(ArtifactError::new(
+                            return Err(ctx_err(
                                 context,
                                 "trait proof view disagrees with logical parameter",
                             ));
@@ -468,7 +568,7 @@ impl Validator<'_> {
                                         .is_ok()
                             })
                         {
-                            return Err(ArtifactError::new(
+                            return Err(ctx_err(
                                 context,
                                 "specialized Self proof requires a concrete implementation",
                             ));
@@ -481,7 +581,7 @@ impl Validator<'_> {
             .iter()
             .any(|parameter| matches!(parameter, ParameterAbi::TraitSelf { .. }))
         {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 "specialized Self proof requires a logical signature",
             ));
@@ -506,10 +606,7 @@ impl Validator<'_> {
         for view in views {
             let view = self.type_index(view, context)?;
             if !matches!(self.pool().get(view).kind, TypeKind::Trait { .. }) {
-                return Err(ArtifactError::new(
-                    context,
-                    "proof view must be a trait type",
-                ));
+                return Err(ctx_err(context, "proof view must be a trait type"));
             }
         }
         for parameter in &abi.parameters {
@@ -517,9 +614,9 @@ impl Validator<'_> {
                 && self
                     .pool()
                     .trait_has_associated_types(*view)
-                    .map_err(|error| ArtifactError::new(context, error.to_string()))?
+                    .map_err(|error| ctx_err(context, error.to_string()))?
             {
-                return Err(ArtifactError::new(
+                return Err(ctx_err(
                     context,
                     "associated trait proof ABI is not supported",
                 ));
@@ -529,22 +626,26 @@ impl Validator<'_> {
             if matches!(capture, CaptureAbi::TraitProof { .. })
                 && (index == 0 || abi.captures[index - 1] != CaptureAbi::Value)
             {
-                return Err(ArtifactError::new(
+                return Err(ctx_err(
                     context,
                     "trait proof capture must follow its data capture",
                 ));
             }
         }
-        Ok(abi.capture_count() as u8)
+        let count = abi.capture_count() as u8;
+        if let Some(slot) = self.validated_captures.borrow_mut().get_mut(slot_index) {
+            *slot = Some(count);
+        }
+        Ok(count)
     }
 
-    fn closure(&self, id: u32, count: u8, context: &str) -> Result<(), ArtifactError> {
+    fn closure(&self, id: u32, count: u8, context: VContext) -> Result<(), ArtifactError> {
         let target = self.target(id, context)?;
         if count > target.param_count
             || (!target.is_closure && count != 0)
             || self.captures(target, context)? != count
         {
-            return Err(ArtifactError::new(
+            return Err(ctx_err(
                 context,
                 "closure capture count disagrees with target metadata",
             ));
@@ -555,20 +656,32 @@ impl Validator<'_> {
     fn methods(&self) -> Result<(), ArtifactError> {
         for schema in self.pool().trait_schemas_snapshot() {
             for slot in &schema.slots {
-                self.string(slot.name.as_u32(), "trait dispatch schema")?;
+                self.string(
+                    slot.name.as_u32(),
+                    VContext::Static("trait dispatch schema"),
+                )?;
             }
         }
         for index in 0..self.pool().len() {
             for method in self.pool().methods_of(TypeIndex::from_raw(index as u32)) {
-                let target = self.target(method.func_id, "method table")?;
-                self.call(method.func_id, target.param_count, "method table")?;
-                self.string(method.name.as_u32(), "method table")?;
+                let target = self.target(method.func_id, VContext::Static("method table"))?;
+                self.call(
+                    method.func_id,
+                    target.param_count,
+                    VContext::Static("method table"),
+                )?;
+                self.string(method.name.as_u32(), VContext::Static("method table"))?;
             }
         }
         for implementation in self.pool().trait_impls_snapshot() {
             for method in &implementation.methods {
-                let target = self.target(method.func_id, "trait implementation")?;
-                self.call(method.func_id, target.param_count, "trait implementation")?;
+                let target =
+                    self.target(method.func_id, VContext::Static("trait implementation"))?;
+                self.call(
+                    method.func_id,
+                    target.param_count,
+                    VContext::Static("trait implementation"),
+                )?;
             }
         }
         for (index, table) in self.pool().vtables_snapshot().iter().enumerate() {
@@ -586,7 +699,8 @@ impl Validator<'_> {
                         name: descriptor.name,
                         signature: descriptor.signature,
                     };
-                    let target = self.target(descriptor.func_id, "vtable interface")?;
+                    let target =
+                        self.target(descriptor.func_id, VContext::Static("vtable interface"))?;
                     self.pool()
                         .check_trait_method_signature_in_impl(
                             &key,
@@ -601,30 +715,31 @@ impl Validator<'_> {
                 }
             }
             for &id in &table.entries {
-                let target = self.target(id, "vtable")?;
-                self.call(id, target.param_count, "vtable")?;
+                let target = self.target(id, VContext::Static("vtable"))?;
+                self.call(id, target.param_count, VContext::Static("vtable"))?;
             }
         }
         Ok(())
     }
 
     fn function(&self, function: &CompiledFunction) -> Result<(), ArtifactError> {
-        let context = format!("function {}", function.func_id.0);
+        let id = function.func_id.0;
+        let context = VContext::Function(id);
         if function.register_count > Reg::MAX_GP
             || function.param_count > function.register_count
             || function.instructions.is_empty()
         {
-            return Err(ArtifactError::new(
-                &context,
+            return Err(ctx_err(
+                context,
                 "invalid register/parameter count or empty function",
             ));
         }
-        self.string(function.name.as_u32(), &context)?;
+        self.string(function.name.as_u32(), context)?;
         if function.function_type != TypeIndex::INVALID {
-            self.runtime_type(function.function_type, &context)?;
+            self.runtime_type(function.function_type, context)?;
         }
-        self.captures(function, &context)?;
-        let slots = match decode(function.instructions[0], &context)?.data {
+        self.captures(function, context)?;
+        let slots = match decode(function.instructions[0], context)?.data {
             InstructionData::E { payload }
                 if function.instructions[0] >> 24 == Opcode::AllocateSlots as u32 =>
             {
@@ -633,26 +748,25 @@ impl Validator<'_> {
             _ => 0,
         };
         if slots > MAX_SLOTS {
-            return Err(ArtifactError::new(&context, "local slot limit exceeded"));
+            return Err(ctx_err(context, "local slot limit exceeded"));
         }
-        let mut safepoints = BTreeSet::new();
-        for &pc in &function.safepoint_pcs {
-            if pc as usize >= function.instructions.len() || !safepoints.insert(pc) {
-                return Err(ArtifactError::new(
-                    &context,
-                    "safepoint PC is duplicate or outside function",
-                ));
-            }
-            if function.instructions[pc as usize] >> 24 != Opcode::Safepoint as u32 {
-                return Err(ArtifactError::new(
-                    &context,
-                    "safepoint PC does not point to Safepoint",
-                ));
+        if !function.safepoint_pcs.is_empty() {
+            let mut safepoints = HashSet::with_capacity(function.safepoint_pcs.len());
+            for &pc in &function.safepoint_pcs {
+                if pc as usize >= function.instructions.len() || !safepoints.insert(pc) {
+                    return Err(ctx_err(
+                        context,
+                        "safepoint PC is duplicate or outside function",
+                    ));
+                }
+                if function.instructions[pc as usize] >> 24 != Opcode::Safepoint as u32 {
+                    return Err(ctx_err(context, "safepoint PC does not point to Safepoint"));
+                }
             }
         }
         for (pc, &word) in function.instructions.iter().enumerate() {
-            let context = format!("function {} PC {pc}", function.func_id.0);
-            self.instruction(function, pc, slots, decode(word, &context)?, &context)?;
+            let pc_context = VContext::Pc(id, pc);
+            self.instruction(function, pc, slots, decode(word, pc_context)?, pc_context)?;
         }
         self.control_flow(function)?;
         Ok(())
@@ -661,39 +775,40 @@ impl Validator<'_> {
     // A loop must not accumulate handlers indefinitely. Joins require equal
     // local handler depth; handlers inherited from callers are left untouched.
     fn control_flow(&self, function: &CompiledFunction) -> Result<(), ArtifactError> {
-        let context = format!("function {} control flow", function.func_id.0);
-        let mut depths = vec![None; function.instructions.len()];
-        let mut pending = vec![(0usize, 0u32)];
+        let context = VContext::ControlFlow(function.func_id.0);
+        let mut depths = self.cf_depths.borrow_mut();
+        depths.clear();
+        depths.resize(function.instructions.len(), None);
+        let mut pending = self.cf_pending.borrow_mut();
+        pending.clear();
+        pending.push((0usize, 0u32));
         while let Some((pc, depth)) = pending.pop() {
             if let Some(previous) = depths[pc] {
                 if previous != depth {
-                    return Err(ArtifactError::new(
-                        &context,
+                    return Err(ctx_err(
+                        context,
                         "inconsistent handler depth at control-flow join",
                     ));
                 }
                 continue;
             }
             depths[pc] = Some(depth);
-            let instruction = decode(function.instructions[pc], &context)?;
+            let instruction = decode(function.instructions[pc], context)?;
             let mut depth = depth;
             match instruction.opcode {
                 Opcode::PushHandlerClosure | Opcode::PushCapturingHandler => {
                     depth += 1;
                 }
-                Opcode::PopHandler => {
+                Opcode::PopHandler | Opcode::AwaitPopHandler => {
                     depth = depth
                         .checked_sub(1)
-                        .ok_or_else(|| ArtifactError::new(&context, "handler stack underflow"))?;
+                        .ok_or_else(|| ctx_err(context, "handler stack underflow"))?;
                 }
                 Opcode::ResetClosure => {
                     if let InstructionData::E { payload } = instruction.data
                         && ((payload >> 12) & 31) > depth
                     {
-                        return Err(ArtifactError::new(
-                            &context,
-                            "reset consumes unavailable handlers",
-                        ));
+                        return Err(ctx_err(context, "reset consumes unavailable handlers"));
                     }
                 }
                 _ => {}
@@ -711,8 +826,8 @@ impl Validator<'_> {
                 }
             }
             if pc + 1 >= function.instructions.len() {
-                return Err(ArtifactError::new(
-                    &context,
+                return Err(ctx_err(
+                    context,
                     "execution falls off function without a terminator",
                 ));
             }
@@ -727,10 +842,10 @@ impl Validator<'_> {
         pc: usize,
         slots: u32,
         instruction: Instruction,
-        context: &str,
+        context: VContext,
     ) -> Result<(), ArtifactError> {
         use Opcode::*;
-        let fail = |message| ArtifactError::new(context, message);
+        let fail = |message| ctx_err(context, message);
         let register = |reg: Reg| {
             if reg.0 >= function.register_count {
                 Err(fail("register outside declared register count"))
@@ -812,23 +927,38 @@ impl Validator<'_> {
                         let TypeKind::ErrorQualified { errors, .. } = &info.kind else {
                             return Err(fail("Error construction requires a qualified type"));
                         };
-                        if info.size != 24
-                            || info.align != 8
-                            || errors.is_empty()
-                            || self.pool().identity_input().is_none()
-                            || self.pool().stable_type_id(ty).is_err()
-                        {
-                            return Err(fail(
-                                "Error construction requires authenticated executable metadata",
-                            ));
-                        }
-                        for &member in errors {
-                            if member != type_pool::Intrinsic::Any.type_index()
-                                && self.pool().stable_type_id(member).is_err()
+                        let already_checked = self
+                            .validated_error_ctors
+                            .borrow()
+                            .get(ty.as_u32() as usize)
+                            .copied()
+                            .unwrap_or(false);
+                        if !already_checked {
+                            if info.size != 24
+                                || info.align != 8
+                                || errors.is_empty()
+                                || self.pool().identity_input().is_none()
+                                || self.pool().stable_type_id(ty).is_err()
                             {
                                 return Err(fail(
-                                    "Error member requires a concrete stable identity",
+                                    "Error construction requires authenticated executable metadata",
                                 ));
+                            }
+                            for &member in errors {
+                                if member != type_pool::Intrinsic::Any.type_index()
+                                    && self.pool().stable_type_id(member).is_err()
+                                {
+                                    return Err(fail(
+                                        "Error member requires a concrete stable identity",
+                                    ));
+                                }
+                            }
+                            if let Some(slot) = self
+                                .validated_error_ctors
+                                .borrow_mut()
+                                .get_mut(ty.as_u32() as usize)
+                            {
+                                *slot = true;
                             }
                         }
                     }
@@ -884,9 +1014,10 @@ impl Validator<'_> {
                         let words = match &self.pool().get(ty).kind {
                             TypeKind::Struct { fields, .. } => fields.len(),
                             TypeKind::Tuple { elements } => elements.len(),
+                            TypeKind::Newtype { .. } => 1,
                             _ => {
                                 return Err(fail(
-                                    "object allocation requires struct or tuple type",
+                                    "object allocation requires struct, tuple, or newtype",
                                 ));
                             }
                         };
@@ -911,11 +1042,7 @@ impl Validator<'_> {
                             return Err(fail("index operand is not a register"));
                         }
                         register(Reg(index as u8))?;
-                        let list = self.pool().list_type().is_some()
-                            && self.pool().list_buffer_type().is_some();
-                        let map = self.pool().map_type().is_some()
-                            && self.pool().map_buffer_type().is_some();
-                        if !list && !map {
+                        if !self.has_list_roles && !self.has_map_roles {
                             return Err(fail(
                                 "index instruction requires List or Map paired roles",
                             ));
@@ -926,9 +1053,7 @@ impl Validator<'_> {
                         if base.0 != 0 {
                             return Err(fail("unused list allocation operand is nonzero"));
                         }
-                        if self.pool().list_type().is_none()
-                            || self.pool().list_buffer_type().is_none()
-                        {
+                        if !self.has_list_roles {
                             return Err(fail(
                                 "collection instruction requires List and Buffer roles",
                             ));
@@ -939,9 +1064,7 @@ impl Validator<'_> {
                         if base.0 != 0 {
                             return Err(fail("unused map allocation operand is nonzero"));
                         }
-                        if self.pool().map_type().is_none()
-                            || self.pool().map_buffer_type().is_none()
-                        {
+                        if !self.has_map_roles {
                             return Err(fail("map instruction requires Map and MapBuffer roles"));
                         }
                     }
@@ -995,12 +1118,7 @@ impl Validator<'_> {
                             "trait call requires receiver data and a separate proof register",
                         ));
                     }
-                    if !self
-                        .pool()
-                        .trait_schemas_snapshot()
-                        .iter()
-                        .any(|schema| (slot as usize) < schema.slots.len())
-                    {
+                    if (slot as usize) >= self.max_trait_slots {
                         return Err(fail("trait call slot is outside every interface schema"));
                     }
                 }
@@ -1067,7 +1185,7 @@ impl Validator<'_> {
                         return Err(fail("unused reset bits are nonzero"));
                     }
                 }
-                ResumeContinuation | ResumeContinuationOnce => {
+                ResumeContinuation | ResumeContinuationOnce | AwaitFuture => {
                     let (first, second) = Instruction::e_control_regs(payload);
                     register(first)?;
                     register(second)?;
@@ -1075,7 +1193,7 @@ impl Validator<'_> {
                         return Err(fail("unused continuation bits are nonzero"));
                     }
                 }
-                PopHandler | Safepoint | Unreachable | Nop | MatchFail => {
+                PopHandler | AwaitPopHandler | Safepoint | Unreachable | Nop | MatchFail => {
                     if payload != 0 {
                         return Err(fail("unused system payload is nonzero"));
                     }
@@ -1809,9 +1927,10 @@ mod tests {
             Instruction::a_type(Opcode::LoadIndex, AddrMode::Imm, Reg(1), Reg(0), 32).encode();
         rejected(&artifact, "index operand");
         artifact.codegen_output.functions[0].instructions[1] = Instruction::return_unit().encode();
+        let list_index = artifact.type_pool.list_type().unwrap().as_u32() as usize;
         let mut snapshot = artifact.type_pool.snapshot();
-        snapshot.types.truncate(snapshot.types.len() - 4);
-        snapshot.methods.truncate(snapshot.methods.len() - 4);
+        snapshot.types.truncate(list_index);
+        snapshot.methods.truncate(list_index);
         artifact.type_pool = TypePool::restore(snapshot).unwrap();
         rejected(&artifact, "requires List and Buffer");
     }
@@ -1824,6 +1943,8 @@ mod tests {
             artifact.type_pool.list_buffer_type().unwrap(),
             artifact.type_pool.map_type().unwrap(),
             artifact.type_pool.map_buffer_type().unwrap(),
+            artifact.type_pool.bytes_type().unwrap(),
+            artifact.type_pool.bytes_buffer_type().unwrap(),
         ] {
             artifact.codegen_output.functions[0].instructions[0] =
                 Instruction::new_object(Reg(0), ty).encode();
@@ -1963,9 +2084,10 @@ mod tests {
         rejected(&artifact, "unused map allocation operand");
         artifact.codegen_output.functions[0].instructions[0] =
             Instruction::a_type(Opcode::NewMap, AddrMode::Imm, Reg(0), Reg(0), 0).encode();
+        let map_index = artifact.type_pool.map_type().unwrap().as_u32() as usize;
         let mut snapshot = artifact.type_pool.snapshot();
-        snapshot.types.truncate(snapshot.types.len() - 2);
-        snapshot.methods.truncate(snapshot.methods.len() - 2);
+        snapshot.types.truncate(map_index);
+        snapshot.methods.truncate(map_index);
         artifact.type_pool = TypePool::restore(snapshot).unwrap();
         rejected(&artifact, "requires Map and MapBuffer roles");
         let mut snapshot = TypePool::with_intrinsics().snapshot();

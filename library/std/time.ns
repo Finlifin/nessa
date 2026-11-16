@@ -1,0 +1,155 @@
+-- std.time — clocks, durations, instants, calendar broken-down time, and strftime.
+
+use .builtin.*
+use .io.IoError
+use .ordering.*
+use .string.*
+use .traits.*
+
+private const _time_unix_secs: fn() -> i64 = .__time_unix_secs'builtin
+private const _time_unix_millis: fn() -> i64 = .__time_unix_millis'builtin
+private const _time_monotonic_nanos: fn() -> i64 = .__time_monotonic_nanos'builtin
+private const _time_cpu_secs: fn() -> f64 = .__time_cpu_secs'builtin
+private const _time_sleep_ms: fn(i64) -> Unit = .__time_sleep_ms'builtin
+private const _time_breakdown: fn(i64, bool) -> (i64, i64, i64, i64, i64, i64, i64, i64, bool) = .__time_breakdown'builtin
+private const _time_make_unix: fn(i64, i64, i64, i64, i64, i64, i64, bool) -> ?i64 = .__time_make_unix'builtin
+private const _time_strftime: fn(String, i64, bool) -> (i64, String) = .__time_strftime'builtin
+
+pub fn unix_secs() -> i64 = _time_unix_secs()
+pub fn unix_millis() -> i64 = _time_unix_millis()
+pub fn difftime(t2: i64, t1: i64) -> f64 = (t2 - t1).as(f64)
+pub fn monotonic_nanos() -> i64 = _time_monotonic_nanos()
+pub fn cpu_secs() -> f64 = _time_cpu_secs()
+pub fn sleep_ms(ms: i64) -> Unit = _time_sleep_ms(ms)
+
+pub struct Duration {
+    pub nanos: i64,
+}
+derive Eq, PartialEq, Ord, PartialOrd, Display for Duration
+
+impl Duration {
+    pub fn from_nanos(nanos: i64) -> Duration = Duration { nanos: nanos }
+    pub fn from_millis(millis: i64) -> Duration = Duration { nanos: millis * 1000000 }
+    pub fn from_secs(secs: i64) -> Duration = Duration { nanos: secs * 1000000000 }
+    pub fn as_nanos(self) -> i64 = self.nanos
+    pub fn as_millis(self) -> i64 = self.nanos / 1000000
+    pub fn as_secs_f64(self) -> f64 = self.nanos.as(f64) / 1000000000.0
+}
+
+pub struct Instant {
+    pub nanos: i64,
+}
+derive Eq, PartialEq, Ord, PartialOrd, Display for Instant
+
+impl Instant {
+    pub fn now() -> Instant = Instant { nanos: _time_monotonic_nanos() }
+
+    pub fn duration_since(self, earlier: Instant) -> Duration {
+        let diff = self.nanos - earlier.nanos
+        Duration { nanos: if diff < 0 { 0 } else { diff } }
+    }
+
+    pub fn elapsed(self) -> Duration {
+        Instant.now().duration_since(self)
+    }
+}
+
+pub struct DateTime {
+    pub year: i64,
+    pub month: i64,
+    pub day: i64,
+    pub hour: i64 = 12,
+    pub min: i64 = 0,
+    pub sec: i64 = 0,
+    pub wday: i64 = 0,
+    pub yday: i64 = 0,
+    pub is_dst: bool = false,
+}
+derive Eq, PartialEq, Display for DateTime
+
+impl DateTime {
+    pub fn new(
+        year: i64,
+        month: i64,
+        day: i64,
+        .hour: i64 = 12,
+        .min: i64 = 0,
+        .sec: i64 = 0,
+        .wday: i64 = 0,
+        .yday: i64 = 0,
+        .is_dst: bool = false
+    ) -> DateTime {
+        DateTime {
+            year: year,
+            month: month,
+            day: day,
+            hour: hour,
+            min: min,
+            sec: sec,
+            wday: wday,
+            yday: yday,
+            is_dst: is_dst,
+        }
+    }
+
+    pub fn from_unix_utc(ts: i64) -> DateTime {
+        let (year, month, day, hour, min, sec, wday, yday, is_dst) = _time_breakdown(ts, true)
+        DateTime {
+            year: year,
+            month: month,
+            day: day,
+            hour: hour,
+            min: min,
+            sec: sec,
+            wday: wday,
+            yday: yday,
+            is_dst: is_dst,
+        }
+    }
+
+    pub fn from_unix_local(ts: i64) -> DateTime {
+        let (year, month, day, hour, min, sec, wday, yday, is_dst) = _time_breakdown(ts, false)
+        DateTime {
+            year: year,
+            month: month,
+            day: day,
+            hour: hour,
+            min: min,
+            sec: sec,
+            wday: wday,
+            yday: yday,
+            is_dst: is_dst,
+        }
+    }
+
+    pub fn now_utc() -> DateTime = DateTime.from_unix_utc(_time_unix_secs())
+    pub fn now_local() -> DateTime = DateTime.from_unix_local(_time_unix_secs())
+
+    pub fn to_unix_utc(self) -> ?i64 {
+        _time_make_unix(self.year, self.month, self.day, self.hour, self.min, self.sec, 0, true)
+    }
+
+    pub fn to_unix_local(self) -> ?i64 {
+        let dst_flag = if self.is_dst { 1 } else { -1 }
+        _time_make_unix(self.year, self.month, self.day, self.hour, self.min, self.sec, dst_flag, false)
+    }
+}
+
+pub fn format_date(.fmt: String = "%c", .timestamp: ?i64 = null, .utc: bool = false) -> !IoError String {
+    let ts = timestamp match {
+        val? => val,
+        _ => _time_unix_secs(),
+    }
+    var use_utc = utc
+    var actual_fmt = fmt
+    if actual_fmt.starts_with("!") {
+        use_utc = true
+        actual_fmt = actual_fmt.drop(1)
+    }
+    let (code, text) = _time_strftime(actual_fmt, ts, use_utc)
+    if code == 0 {
+        text
+    } else {
+        error IoError.InvalidInput(text)
+    }
+}

@@ -1,0 +1,253 @@
+-- std.path — pure-Nessa lexical path manipulation across POSIX and Windows.
+
+use .builtin.*
+use .collections.*
+use .string.*
+
+private const _env_os: fn() -> String = .__env_os'builtin
+
+pub const SEPARATOR: String = if _env_os() == "windows" { "\\" } else { "/" }
+
+private fn _is_sep_byte(b: i64) -> bool {
+    b == 47 or b == 92
+}
+
+private fn _is_ascii_alpha_byte(b: i64) -> bool {
+    (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+}
+
+-- Returns `(root, rest_start_byte)` where `root` is `""`, `"/"`, or `"C:/"`.
+private fn _split_root(p: String) -> (String, i64) {
+    let n = p.len()
+    if n == 0 { return ("", 0) }
+    if _is_sep_byte(p.byte_at(0)) {
+        var i = 1
+        while i < n and _is_sep_byte(p.byte_at(i)) {
+            i += 1
+        }
+        return (SEPARATOR, i)
+    }
+    if n >= 3 and _is_ascii_alpha_byte(p.byte_at(0)) and p.byte_at(1) == 58 and _is_sep_byte(p.byte_at(2)) {
+        var i = 3
+        while i < n and _is_sep_byte(p.byte_at(i)) {
+            i += 1
+        }
+        let drive = p.get(0, 2).as(String) ++ SEPARATOR
+        return (drive, i)
+    }
+    ("", 0)
+}
+
+private fn _trim_trailing_seps(p: String) -> String {
+    let (root, rest_start) = _split_root(p)
+    let n = p.len()
+    if root != "" and rest_start >= n {
+        return root
+    }
+    var end_idx = n
+    while end_idx > rest_start and _is_sep_byte(p.byte_at(end_idx - 1)) {
+        end_idx -= 1
+    }
+    p.get(0, end_idx).as(String)
+}
+
+private fn _last_sep_byte(p: String, min_idx: i64) -> i64 {
+    var i = p.len() - 1
+    while i >= min_idx {
+        if _is_sep_byte(p.byte_at(i)) {
+            return i
+        }
+        i -= 1
+    }
+    -1
+}
+
+pub fn is_absolute(p: String) -> bool {
+    let (root, _) = _split_root(p)
+    root != ""
+}
+
+pub fn join(base: String, child: String) -> String {
+    if child.is_empty() { return base }
+    if base.is_empty() or is_absolute(child) { return child }
+    let last_b = base.byte_at(base.len() - 1)
+    if _is_sep_byte(last_b) {
+        base ++ child
+    } else {
+        base ++ SEPARATOR ++ child
+    }
+}
+
+pub fn join_all(parts: List) -> String {
+    var acc = ""
+    var idx: usize = 0
+    while idx < parts.len() {
+        let part = parts.get(idx).as(String)
+        acc = join(acc, part)
+        idx += 1
+    }
+    acc
+}
+
+pub fn components(p: String) -> List {
+    let out = List()
+    if p.is_empty() { return out }
+    let (root, rest_start) = _split_root(p)
+    if root != "" {
+        out.push(root)
+    }
+    let n = p.len()
+    var i = rest_start
+    while i < n {
+        while i < n and _is_sep_byte(p.byte_at(i)) {
+            i += 1
+        }
+        if i >= n { break }
+        let seg_start = i
+        while i < n and (not _is_sep_byte(p.byte_at(i))) {
+            i += 1
+        }
+        let seg = p.get(seg_start, i).as(String)
+        if not seg.is_empty() {
+            out.push(seg)
+        }
+    }
+    out
+}
+
+pub fn normalize(p: String) -> String {
+    if p.is_empty() { return "." }
+    let (root, rest_start) = _split_root(p)
+    let stack = List()
+    let n = p.len()
+    var i = rest_start
+    while i < n {
+        while i < n and _is_sep_byte(p.byte_at(i)) {
+            i += 1
+        }
+        if i >= n { break }
+        let seg_start = i
+        while i < n and (not _is_sep_byte(p.byte_at(i))) {
+            i += 1
+        }
+        let seg = p.get(seg_start, i).as(String)
+        if seg == "" or seg == "." {
+            -- skip redundant current-directory segments
+        } else if seg == ".." {
+            if (not stack.is_empty()) and stack.last().as(String) != ".." {
+                let _ = stack.pop()
+            } else if root == "" {
+                stack.push("..")
+            }
+        } else {
+            stack.push(seg)
+        }
+    }
+    if root != "" {
+        if stack.is_empty() {
+            root
+        } else {
+            root ++ stack.join(SEPARATOR)
+        }
+    } else {
+        if stack.is_empty() {
+            "."
+        } else {
+            stack.join(SEPARATOR)
+        }
+    }
+}
+
+pub fn parent(p: String) -> ?String {
+    if p.is_empty() { return null }
+    let (root, rest_start) = _split_root(p)
+    let trimmed = _trim_trailing_seps(p)
+    if root != "" and trimmed == root {
+        return null
+    }
+    let sep_idx = _last_sep_byte(trimmed, rest_start)
+    if sep_idx < 0 {
+        if root != "" {
+            return root
+        }
+        return null
+    }
+    var end_idx = sep_idx
+    while end_idx > rest_start and _is_sep_byte(trimmed.byte_at(end_idx - 1)) {
+        end_idx -= 1
+    }
+    if end_idx == 0 {
+        return SEPARATOR
+    }
+    trimmed.get(0, end_idx)
+}
+
+pub fn file_name(p: String) -> ?String {
+    if p.is_empty() { return null }
+    let (root, rest_start) = _split_root(p)
+    let trimmed = _trim_trailing_seps(p)
+    if root != "" and trimmed == root {
+        return null
+    }
+    let sep_idx = _last_sep_byte(trimmed, rest_start)
+    let name = if sep_idx < 0 {
+        if root != "" {
+            trimmed.get(rest_start, trimmed.len()).as(String)
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed.get(sep_idx + 1, trimmed.len()).as(String)
+    }
+    if name.is_empty() or name == "." or name == ".." {
+        null
+    } else {
+        name
+    }
+}
+
+private fn _last_dot_in_name(name: String) -> i64 {
+    var i = name.len() - 1
+    while i > 0 {
+        if name.byte_at(i) == 46 {
+            return i
+        }
+        i -= 1
+    }
+    -1
+}
+
+pub fn file_stem(p: String) -> ?String {
+    let name? = file_name(p) else { return null }
+    let dot_idx = _last_dot_in_name(name)
+    if dot_idx <= 0 {
+        name
+    } else {
+        name.get(0, dot_idx)
+    }
+}
+
+pub fn extension(p: String) -> ?String {
+    let name? = file_name(p) else { return null }
+    let dot_idx = _last_dot_in_name(name)
+    if dot_idx <= 0 {
+        null
+    } else {
+        name.get(dot_idx + 1, name.len())
+    }
+}
+
+pub fn with_extension(p: String, ext: String) -> String {
+    let name? = file_name(p) else { return p }
+    let trimmed = _trim_trailing_seps(p)
+    let prefix_len = trimmed.len() - name.len()
+    let dir_prefix = trimmed.get(0, prefix_len).as(String)
+    let dot_idx = _last_dot_in_name(name)
+    let stem = if dot_idx <= 0 { name } else { name.get(0, dot_idx).as(String) }
+    let clean_ext = if ext.starts_with(".") { ext.drop(1) } else { ext }
+    if clean_ext.is_empty() {
+        dir_prefix ++ stem
+    } else {
+        dir_prefix ++ stem ++ "." ++ clean_ext
+    }
+}

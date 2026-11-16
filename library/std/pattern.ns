@@ -1,0 +1,379 @@
+-- std.pattern — Lua 5.4 pattern matching, captures, iteration, and substitution.
+
+use .builtin.*
+use .collections.*
+use .traits.*
+
+const native_pat_find: fn(String, String, i64, bool) -> (i64, i64, List, String) = .__pat_find'builtin
+const native_pat_gsub: fn(String, String, String, i64) -> (String, i64, String) = .__pat_gsub'builtin
+const native_str_len: fn(String) -> i64 = .str_len'builtin
+const native_str_get: fn(String, i64, i64) -> Any = .str_get'builtin
+const native_str_bytes: fn(String) -> List = .str_bytes'builtin
+const native_from_utf8_lossy: fn(List) -> String = .str_from_utf8_lossy'builtin
+const native_char_at_byte: fn(String, i64) -> ?char = .str_char_at_byte'builtin
+const native_char_utf8_len: fn(char) -> i64 = .char_utf8_len'builtin
+const native_starts_with: fn(String, String) -> bool = .str_starts_with'builtin
+const native_chars: fn(String) -> List = .str_chars'builtin
+const native_into_string: fn(char) -> String = .char_into_string'builtin
+const native_to_string: fn(Any) -> String = .to_string'builtin
+const native_panic: fn(Any) -> NoReturn = .panic'builtin
+
+pub enum PatternError {
+    pub InvalidPattern(message: String),
+}
+
+derive Eq, PartialEq for PatternError
+
+impl Display for PatternError {
+    pub fn to_string(self) -> String {
+        self match {
+            PatternError.InvalidPattern(message) => "invalid pattern: " ++ message,
+        }
+    }
+}
+
+pub struct Match {
+    pub start: i64,
+    pub end: i64,
+    pub text: String,
+    pub captures: List,
+}
+
+impl PartialEq for Match {
+    pub fn eq(self, other: Self) -> bool {
+        self.start == other.start
+            and self.end == other.end
+            and self.text == other.text
+            and self.captures == other.captures
+    }
+}
+
+impl Display for Match {
+    pub fn to_string(self) -> String {
+        "Match(" ++ self.start.to_string() ++ ".." ++ self.end.to_string() ++ ", " ++ self.text ++ ")"
+    }
+}
+
+fn slice_bytes_lossy(text: String, start: i64, end_byte: i64) -> String {
+    if start >= end_byte {
+        return ""
+    }
+    let direct = native_str_get(text, start, end_byte)
+    if direct != null {
+        return direct.as(String)
+    }
+    let raw = native_str_bytes(text)
+    let sub = List()
+    var idx = start
+    while idx < end_byte and idx < raw.len() {
+        sub.push(raw.get(idx.as(usize)))
+        idx += 1
+    }
+    native_from_utf8_lossy(sub)
+}
+
+fn next_search_byte(text: String, pos: i64, text_len: i64) -> i64 {
+    if pos >= text_len {
+        return text_len + 1
+    }
+    native_char_at_byte(text, pos) match {
+        ch? => pos + native_char_utf8_len(ch),
+        _ => pos + 1,
+    }
+}
+
+fn value_to_display_string(val: Any) -> String {
+    val match {
+        shown: Display => shown.to_string(),
+        _ => native_to_string(val),
+    }
+}
+
+-- Find the first match of `pat` in `text` starting at 0-based byte offset `init`.
+-- Negative `init` counts from the end of `text`. When `plain` is true, magic characters are literal.
+pub fn try_find(text: String, pat: String, .init: i64 = 0, .plain: bool = false) -> !PatternError ?Match {
+    let (start, end_byte, cap_list, err_msg) = native_pat_find(text, pat, init, plain)
+    if err_msg != "" {
+        return error PatternError.InvalidPattern(err_msg)
+    }
+    if start < 0 {
+        return null
+    }
+    Match {
+        start: start,
+        end: end_byte,
+        text: slice_bytes_lossy(text, start, end_byte),
+        captures: cap_list,
+    }
+}
+
+-- Find the first match of `pat` in `text`, panicking if `pat` is malformed.
+pub fn find(text: String, pat: String, .init: i64 = 0, .plain: bool = false) -> ?Match {
+    try_find(text, pat, init = init, plain = plain) match {
+        res! => res,
+        error err => native_panic(err.to_string()),
+    }
+}
+
+-- Return the first capture as a String (or the full matched text when `pat` has no captures).
+pub fn match_once(text: String, pat: String, .init: i64 = 0) -> ?String {
+    let found? = find(text, pat, init = init) else {
+        return null
+    }
+    if found.captures.len() > 0 {
+        value_to_display_string(found.captures.get(0))
+    } else {
+        found.text
+    }
+}
+
+-- Return the capture list if `pat` has captures, `[matched_text]` if not, or `null` if unmatched.
+pub fn captures(text: String, pat: String, .init: i64 = 0) -> ?List {
+    let found? = find(text, pat, init = init) else {
+        return null
+    }
+    if found.captures.len() > 0 {
+        found.captures
+    } else {
+        [found.text]
+    }
+}
+
+pub struct PatternIter {
+    text: String,
+    pat: String,
+    text_len: i64,
+    pos: i64,
+    last_match_end: i64,
+    anchored: bool,
+    finished: bool,
+}
+
+impl Iterator for PatternIter {
+    assoc Item: Type = Match
+
+    pub fn next(self) -> IterationStep(Match) {
+        while (not self.finished) and self.pos <= self.text_len {
+            let (start, end_byte, cap_list, err_msg) = native_pat_find(self.text, self.pat, self.pos, false)
+            if err_msg != "" {
+                self.finished = true
+                native_panic("invalid pattern: " ++ err_msg)
+            }
+            if start < 0 {
+                self.finished = true
+                return IterationStep(Match).done
+            }
+            if start == end_byte and end_byte == self.last_match_end {
+                if self.anchored or self.pos >= self.text_len {
+                    self.finished = true
+                    return IterationStep(Match).done
+                }
+                self.pos = next_search_byte(self.text, self.pos, self.text_len)
+            } else {
+                let item = Match {
+                    start: start,
+                    end: end_byte,
+                    text: slice_bytes_lossy(self.text, start, end_byte),
+                    captures: cap_list,
+                }
+                self.last_match_end = end_byte
+                if self.anchored {
+                    self.finished = true
+                } else if start == end_byte {
+                    if end_byte >= self.text_len {
+                        self.finished = true
+                    } else {
+                        self.pos = next_search_byte(self.text, end_byte, self.text_len)
+                    }
+                } else {
+                    self.pos = end_byte
+                }
+                return IterationStep(Match).yielded(item)
+            }
+        }
+        self.finished = true
+        IterationStep(Match).done
+    }
+}
+
+impl IntoIterator for PatternIter {
+    assoc Iter: Type = PatternIter
+
+    pub fn into_iter(self) -> PatternIter {
+        self
+    }
+}
+
+-- Validate `pat` and return an iterator over all non-overlapping matches in `text`.
+pub fn gmatch(text: String, pat: String) -> !PatternError PatternIter {
+    let (_, _, _, err_msg) = native_pat_find("", pat, 0, false)
+    if err_msg != "" {
+        return error PatternError.InvalidPattern(err_msg)
+    }
+    PatternIter {
+        text: text,
+        pat: pat,
+        text_len: native_str_len(text),
+        pos: 0,
+        last_match_end: -1,
+        anchored: native_starts_with(pat, "^"),
+        finished: false,
+    }
+}
+
+-- Panicking convenience wrapper around `gmatch` for `for m in pattern.gmatch_iter(s, pat)`.
+pub fn gmatch_iter(text: String, pat: String) -> PatternIter {
+    gmatch(text, pat) match {
+        iter! => iter,
+        error err => native_panic(err.to_string()),
+    }
+}
+
+-- Substitute matches of `pat` using a Lua replacement template (`%0`, `%1`..`%9`, `%%`).
+pub fn try_gsub(text: String, pat: String, repl: String, .limit: i64 = -1) -> !PatternError (String, i64) {
+    let (out, count, err_msg) = native_pat_gsub(text, pat, repl, limit)
+    if err_msg != "" {
+        return error PatternError.InvalidPattern(err_msg)
+    }
+    (out, count)
+}
+
+-- Panicking wrapper around `try_gsub`.
+pub fn gsub(text: String, pat: String, repl: String, .limit: i64 = -1) -> (String, i64) {
+    try_gsub(text, pat, repl, limit = limit) match {
+        res! => res,
+        error err => native_panic(err.to_string()),
+    }
+}
+
+-- Substitute matches of `pat` by calling `replacer(m)`. Returning `null` keeps the original match text.
+pub fn gsub_with(text: String, pat: String, replacer: fn(Match) -> ?String, .limit: i64 = -1) -> !PatternError (String, i64) {
+    let (_, _, _, init_err) = native_pat_find("", pat, 0, false)
+    if init_err != "" {
+        return error PatternError.InvalidPattern(init_err)
+    }
+    if limit == 0 {
+        return (text, 0)
+    }
+    let text_len = native_str_len(text)
+    let anchored = native_starts_with(pat, "^")
+    let pieces = List()
+    var search_pos: i64 = 0
+    var copy_from: i64 = 0
+    var last_match_end: i64 = -1
+    var count: i64 = 0
+
+    while search_pos <= text_len {
+        if limit >= 0 and count >= limit {
+            break
+        }
+        let (start, end_byte, cap_list, err_msg) = native_pat_find(text, pat, search_pos, false)
+        if err_msg != "" {
+            return error PatternError.InvalidPattern(err_msg)
+        }
+        if start < 0 {
+            break
+        }
+        if start == end_byte and end_byte == last_match_end {
+            if anchored or search_pos >= text_len {
+                break
+            }
+            search_pos = next_search_byte(text, search_pos, text_len)
+        } else {
+            if start > copy_from {
+                pieces.push(slice_bytes_lossy(text, copy_from, start))
+            }
+            let matched_text = slice_bytes_lossy(text, start, end_byte)
+            let item = Match {
+                start: start,
+                end: end_byte,
+                text: matched_text,
+                captures: cap_list,
+            }
+            let replaced = replacer(item) match {
+                s? => s,
+                _ => matched_text,
+            }
+            pieces.push(replaced)
+            count += 1
+            copy_from = end_byte
+            last_match_end = end_byte
+            if anchored {
+                break
+            }
+            if start == end_byte {
+                if end_byte >= text_len {
+                    break
+                }
+                search_pos = next_search_byte(text, end_byte, text_len)
+            } else {
+                search_pos = end_byte
+            }
+        }
+    }
+
+    if copy_from < text_len {
+        pieces.push(slice_bytes_lossy(text, copy_from, text_len))
+    }
+    (pieces.join(""), count)
+}
+
+-- Substitute matches of `pat` by looking up the first capture (or full match) in `table`.
+pub fn gsub_map(text: String, pat: String, table: Map, .limit: i64 = -1) -> !PatternError (String, i64) {
+    gsub_with(
+        text,
+        pat,
+        |item: Match| -> ?String {
+            let key = if item.captures.len() > 0 {
+                value_to_display_string(item.captures.get(0))
+            } else {
+                item.text
+            }
+            if table.contains(key) {
+                let found = table.get(key)
+                if found == null or found == false {
+                    null
+                } else {
+                    value_to_display_string(found)
+                }
+            } else {
+                null
+            }
+        },
+        limit = limit,
+    )
+}
+
+fn is_pattern_magic(ch: char) -> bool {
+    ch == '^'
+        or ch == '$'
+        or ch == '('
+        or ch == ')'
+        or ch == '%'
+        or ch == '.'
+        or ch == '['
+        or ch == ']'
+        or ch == '*'
+        or ch == '+'
+        or ch == '-'
+        or ch == '?'
+}
+
+-- Pattern matching one UTF-8 byte sequence (Lua 5.4 `utf8.charpattern`: `[\0-\x7F\xC2-\xFD][\x80-\xBF]*`).
+pub const UTF8_CHARPATTERN: String = "[%B00-%B7F%BC2-%BFD][%B80-%BBF]*"
+
+-- Escape all Lua pattern magic characters (`^$()%.[]*+-?`) with `%`.
+pub fn escape(text: String) -> String {
+    let chars = native_chars(text)
+    let pieces = List()
+    var idx: usize = 0
+    while idx < chars.len() {
+        let ch = chars.get(idx).as(char)
+        if is_pattern_magic(ch) {
+            pieces.push("%")
+        }
+        pieces.push(native_into_string(ch))
+        idx += 1
+    }
+    pieces.join("")
+}

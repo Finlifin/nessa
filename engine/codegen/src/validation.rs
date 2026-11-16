@@ -263,7 +263,8 @@ fn invalid_operands(expression: &NirExpr, count: u32) -> bool {
         | NirExpr::TypeCast(value, _)
         | NirExpr::TypeAssert(value, _)
         | NirExpr::TraitProof(value, _)
-        | NirExpr::TraitProject(value, _) => invalid_local(*value, count),
+        | NirExpr::TraitProject(value, _)
+        | NirExpr::Await(value) => invalid_local(*value, count),
         NirExpr::TraitAssert(value, proof, _) => {
             invalid_local(*value, count) || invalid_local(*proof, count)
         }

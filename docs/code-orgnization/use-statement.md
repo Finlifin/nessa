@@ -99,5 +99,4 @@ path ->
 定义仍优先。普通表达式中的依赖名称需要先用 `use dep` 引入。
 
 外部源码包的父路径不能越过包根；`@` 始终从当前包根开始。各包分别导入
-弱 std prelude，消费者的声明不成为依赖包的词法外层。当前入口不推断磁盘
-依赖路径或下载规则，目录 CLI 的依赖获取仍待接入。
+弱 std prelude，消费者的声明不成为依赖包的词法外层。对于磁盘包目录，`pkg_manager::load_package_workspace` 与目录 CLI（`nessa check`/`run`/`build`/`disasm`）已接入本地路径依赖（`{ path = "..." }`）递归加载与 `package.lock` 校验；远程依赖下载仍待后续接入。

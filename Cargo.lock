@@ -414,6 +414,7 @@ dependencies = [
  "resolution",
  "runtime",
  "rustc_span",
+ "sha2",
  "str_interner",
  "type_pool",
 ]
@@ -497,6 +498,16 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+
+[[package]]
+name = "ffi"
+version = "0.1.0"
+dependencies = [
+ "interpreter",
+ "libc",
+ "libloading",
+ "runtime",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -749,9 +760,11 @@ dependencies = [
 name = "initialization"
 version = "0.1.0"
 dependencies = [
+ "ffi",
  "gc",
  "interpreter",
  "nsbc",
+ "regex_ffi",
  "runtime",
  "scheduler",
  "stack_pool",
@@ -763,6 +776,9 @@ name = "interpreter"
 version = "0.1.0"
 dependencies = [
  "gc",
+ "itoa",
+ "jit",
+ "memchr",
  "nsbc",
  "runtime",
  "scheduler",
@@ -825,6 +841,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "jit"
+version = "0.1.0"
+dependencies = [
+ "gc",
+ "libc",
+ "nsbc",
+ "runtime",
+ "type_pool",
 ]
 
 [[package]]
@@ -1050,6 +1077,7 @@ dependencies = [
  "codegen",
  "diagnostic",
  "driver",
+ "ffi",
  "gc",
  "initialization",
  "interpreter",
@@ -1058,6 +1086,8 @@ dependencies = [
  "nsbc",
  "nsbc_io",
  "parser",
+ "pkg_manager",
+ "regex_ffi",
  "resolution",
  "runtime",
  "rustc_span",
@@ -1365,6 +1395,13 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "regex_ffi"
+version = "0.1.0"
+dependencies = [
+ "regex-automata",
+]
 
 [[package]]
 name = "resolution"

@@ -1,0 +1,417 @@
+-- std.bytes — binary packing/unpacking (Lua 5.4 string.pack) plus UTF-8, hex, and RFC 4648 Base64.
+
+use .builtin.*
+pub use .builtin.Bytes
+use .collections.*
+use .traits.*
+
+const native_bytes_pack: fn(String, List) -> (List, String) = .__bytes_pack'builtin
+const native_bytes_packsize: fn(String) -> (i64, String) = .__bytes_packsize'builtin
+const native_bytes_unpack: fn(String, List, i64) -> (List, i64, String) = .__bytes_unpack'builtin
+const native_str_bytes: fn(String) -> List = .str_bytes'builtin
+const native_from_utf8: fn(List) -> Any = .str_from_utf8'builtin
+const native_from_utf8_lossy: fn(List) -> String = .str_from_utf8_lossy'builtin
+const native_contains: fn(String, String) -> bool = .str_contains'builtin
+const native_char_from_code: fn(i64) -> ?char = .char_from_code'builtin
+const native_into_string: fn(char) -> String = .char_into_string'builtin
+const native_panic: fn(Any) -> NoReturn = .panic'builtin
+
+pub enum PackError {
+    pub InvalidFormat(message: String),
+    pub DataTooShort(message: String),
+    pub ValueOutOfRange(message: String),
+    pub PackFailed(message: String),
+}
+
+derive Eq, PartialEq for PackError
+
+impl Display for PackError {
+    pub fn to_string(self) -> String {
+        self match {
+            PackError.InvalidFormat(message) => "invalid pack format: " ++ message,
+            PackError.DataTooShort(message) => "pack data too short: " ++ message,
+            PackError.ValueOutOfRange(message) => "pack value out of range: " ++ message,
+            PackError.PackFailed(message) => "pack operation failed: " ++ message,
+        }
+    }
+}
+
+fn classify_pack_error(err_msg: String) -> PackError {
+    if native_contains(err_msg, "data string too short")
+        or native_contains(err_msg, "unfinished string for format 'z'") {
+        return PackError.DataTooShort(err_msg)
+    }
+    if native_contains(err_msg, "invalid format option")
+        or native_contains(err_msg, "missing size")
+        or native_contains(err_msg, "size overflow")
+        or native_contains(err_msg, "integral size")
+        or native_contains(err_msg, "alignment")
+        or native_contains(err_msg, "invalid next option")
+        or native_contains(err_msg, "variable-length format")
+        or native_contains(err_msg, "format result too large") {
+        return PackError.InvalidFormat(err_msg)
+    }
+    if native_contains(err_msg, "integer overflow")
+        or native_contains(err_msg, "unsigned overflow")
+        or native_contains(err_msg, "does not fit")
+        or native_contains(err_msg, "longer than given size")
+        or native_contains(err_msg, "byte value out of range")
+        or native_contains(err_msg, "initial position out of string")
+        or native_contains(err_msg, "string contains zeros") {
+        return PackError.ValueOutOfRange(err_msg)
+    }
+    PackError.PackFailed(err_msg)
+}
+
+-- Pack `values` into a List of byte values (`0..=255`) according to `fmt`.
+pub fn pack_list(fmt: String, values: List) -> !PackError List {
+    let (packed, err_msg) = native_bytes_pack(fmt, values)
+    if err_msg != "" {
+        return error classify_pack_error(err_msg)
+    }
+    packed
+}
+
+-- Variadic wrapper around `pack_list` (Lua `string.pack(fmt, ...)`).
+pub fn pack(fmt: String, ...values: List) -> !PackError List {
+    pack_list(fmt, values)
+}
+
+-- Compute the fixed byte size of `fmt`, or fail on variable-length options (`s`, `z`).
+pub fn pack_size(fmt: String) -> !PackError i64 {
+    let (sz, err_msg) = native_bytes_packsize(fmt)
+    if err_msg != "" or sz < 0 {
+        return error classify_pack_error(err_msg)
+    }
+    sz
+}
+
+-- Unpack values from `data` starting at 0-based byte offset `pos`, returning `(values, next_pos)`.
+pub fn unpack(fmt: String, data: List, .pos: i64 = 0) -> !PackError (List, i64) {
+    let (values, next_pos, err_msg) = native_bytes_unpack(fmt, data, pos)
+    if err_msg != "" {
+        return error classify_pack_error(err_msg)
+    }
+    (values, next_pos)
+}
+
+-- Convert a UTF-8 String into a List of byte values (`0..=255`).
+pub fn from_string(text: String) -> List {
+    native_str_bytes(text)
+}
+
+-- Decode a List of byte values (`0..=255`) as strict UTF-8, returning `null` if invalid.
+pub fn to_utf8(data: List) -> ?String {
+    let decoded = native_from_utf8(data)
+    if decoded == null { null } else { decoded.as(String) }
+}
+
+-- Decode a List of byte values (`0..=255`) as UTF-8, replacing invalid sequences with U+FFFD.
+pub fn to_utf8_lossy(data: List) -> String {
+    native_from_utf8_lossy(data)
+}
+
+fn require_byte(val: Any) -> i64 {
+    let b = val.as(i64)
+    if b < 0 or b > 255 {
+        native_panic("byte value out of range 0..=255")
+    }
+    b
+}
+
+fn nibble_to_hex_str(nib: i64) -> String {
+    let code = if nib < 10 { 48 + nib } else { 87 + nib }
+    native_into_string(native_char_from_code(code).as(char))
+}
+
+fn hex_byte_to_nibble(b: i64) -> i64 {
+    when {
+        b >= 48 and b <= 57 => b - 48
+        b >= 65 and b <= 70 => b - 55
+        b >= 97 and b <= 102 => b - 87
+        else => -1
+    }
+}
+
+-- Encode a List of bytes (`0..=255`) as lowercase hexadecimal text.
+pub fn to_hex(data: List) -> String {
+    let pieces = List()
+    var idx: usize = 0
+    while idx < data.len() {
+        let b = require_byte(data.get(idx))
+        pieces.push(nibble_to_hex_str(b / 16))
+        pieces.push(nibble_to_hex_str(b % 16))
+        idx += 1
+    }
+    pieces.join("")
+}
+
+-- Decode hexadecimal text into a List of bytes (`0..=255`), or `null` if odd-length or non-hex.
+pub fn from_hex(hex: String) -> ?List {
+    let raw = native_str_bytes(hex)
+    if raw.len() % 2 != 0 {
+        return null
+    }
+    let out = List()
+    var idx: usize = 0
+    while idx < raw.len() {
+        let hi = hex_byte_to_nibble(raw.get(idx).as(i64))
+        let lo = hex_byte_to_nibble(raw.get(idx + 1).as(i64))
+        if hi < 0 or lo < 0 {
+            return null
+        }
+        out.push(hi * 16 + lo)
+        idx += 2
+    }
+    out
+}
+
+fn b64_encode_sextet(v: i64) -> String {
+    let code = when {
+        v < 26 => 65 + v
+        v < 52 => 97 + (v - 26)
+        v < 62 => 48 + (v - 52)
+        v == 62 => 43
+        else => 47
+    }
+    native_into_string(native_char_from_code(code).as(char))
+}
+
+fn b64_decode_byte(b: i64) -> i64 {
+    when {
+        b >= 65 and b <= 90 => b - 65
+        b >= 97 and b <= 122 => b - 97 + 26
+        b >= 48 and b <= 57 => b - 48 + 52
+        b == 43 => 62
+        b == 47 => 63
+        else => -1
+    }
+}
+
+-- Encode a List of bytes (`0..=255`) using standard RFC 4648 Base64 with `=` padding.
+pub fn base64_encode(data: List) -> String {
+    let total = data.len()
+    let pieces = List()
+    var idx: usize = 0
+    while idx + 3 <= total {
+        let b0 = require_byte(data.get(idx))
+        let b1 = require_byte(data.get(idx + 1))
+        let b2 = require_byte(data.get(idx + 2))
+        pieces.push(b64_encode_sextet(b0 / 4))
+        pieces.push(b64_encode_sextet((b0 % 4) * 16 + (b1 / 16)))
+        pieces.push(b64_encode_sextet((b1 % 16) * 4 + (b2 / 64)))
+        pieces.push(b64_encode_sextet(b2 % 64))
+        idx += 3
+    }
+    let rem = total - idx.as(i64)
+    if rem == 1 {
+        let b0 = require_byte(data.get(idx))
+        pieces.push(b64_encode_sextet(b0 / 4))
+        pieces.push(b64_encode_sextet((b0 % 4) * 16))
+        pieces.push("=")
+        pieces.push("=")
+    } else if rem == 2 {
+        let b0 = require_byte(data.get(idx))
+        let b1 = require_byte(data.get(idx + 1))
+        pieces.push(b64_encode_sextet(b0 / 4))
+        pieces.push(b64_encode_sextet((b0 % 4) * 16 + (b1 / 16)))
+        pieces.push(b64_encode_sextet((b1 % 16) * 4))
+        pieces.push("=")
+    }
+    pieces.join("")
+}
+
+-- Decode standard RFC 4648 Base64 with `=` padding into a List of bytes (`0..=255`), or `null` if invalid.
+pub fn base64_decode(encoded: String) -> ?List {
+    let raw = native_str_bytes(encoded)
+    let total = raw.len()
+    if total == 0 {
+        return List()
+    }
+    if total % 4 != 0 {
+        return null
+    }
+    let out = List()
+    var idx: usize = 0
+    while idx < total {
+        let c0 = raw.get(idx).as(i64)
+        let c1 = raw.get(idx + 1).as(i64)
+        let c2 = raw.get(idx + 2).as(i64)
+        let c3 = raw.get(idx + 3).as(i64)
+        let is_last = (idx.as(i64) + 4) == total
+
+        let v0 = b64_decode_byte(c0)
+        let v1 = b64_decode_byte(c1)
+        if v0 < 0 or v1 < 0 {
+            return null
+        }
+
+        if c2 == 61 {
+            if (not is_last) or c3 != 61 or (v1 % 16) != 0 {
+                return null
+            }
+            out.push(v0 * 4 + (v1 / 16))
+        } else if c3 == 61 {
+            if not is_last {
+                return null
+            }
+            let v2 = b64_decode_byte(c2)
+            if v2 < 0 or (v2 % 4) != 0 {
+                return null
+            }
+            out.push(v0 * 4 + (v1 / 16))
+            out.push((v1 % 16) * 16 + (v2 / 4))
+        } else {
+            let v2 = b64_decode_byte(c2)
+            let v3 = b64_decode_byte(c3)
+            if v2 < 0 or v3 < 0 {
+                return null
+            }
+            out.push(v0 * 4 + (v1 / 16))
+            out.push((v1 % 16) * 16 + (v2 / 4))
+            out.push((v2 % 4) * 64 + v3)
+        }
+        idx += 4
+    }
+    out
+}
+
+-- ============================================================================
+-- Compact GC No-Scan `Bytes` (O(1) zero-copy slicing + Copy-on-Write mutation)
+-- ============================================================================
+
+private const _bytes_new: fn(usize) -> Bytes = .__bytes_new'builtin
+private const _bytes_new_zeroed: fn(usize, usize) -> Bytes = .__bytes_new'builtin
+private const _bytes_len: fn(Bytes) -> usize = .__bytes_len'builtin
+private const _bytes_cap: fn(Bytes) -> usize = .__bytes_cap'builtin
+private const _bytes_get: fn(Bytes, usize) -> u8 = .__bytes_get'builtin
+private const _bytes_set: fn(Bytes, usize, u8) -> Unit = .__bytes_set'builtin
+private const _bytes_push: fn(Bytes, u8) -> Unit = .__bytes_push'builtin
+private const _bytes_clear: fn(Bytes) -> Unit = .__bytes_clear'builtin
+private const _bytes_slice: fn(Bytes, usize, usize) -> Bytes = .__bytes_slice'builtin
+private const _bytes_copy: fn(Bytes) -> Bytes = .__bytes_copy'builtin
+private const _bytes_extend: fn(Bytes, Any) -> Unit = .__bytes_extend'builtin
+private const _bytes_from_str: fn(String) -> Bytes = .__bytes_from_str'builtin
+private const _bytes_to_str: fn(Bytes) -> Any = .__bytes_to_str'builtin
+private const _bytes_from_list: fn(List) -> Bytes = .__bytes_from_list'builtin
+private const _bytes_to_list: fn(Bytes) -> List = .__bytes_to_list'builtin
+private const _bytes_find: fn(Bytes, Any, usize) -> Any = .__bytes_find'builtin
+private const _bytes_read_u64_le: fn(Bytes, usize) -> u64 = .__bytes_read_u64_le'builtin
+
+impl Bytes {
+    pub fn new() -> Bytes {
+        _bytes_new(0)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Bytes {
+        _bytes_new(capacity)
+    }
+
+    pub fn zeroed(len: usize) -> Bytes {
+        _bytes_new_zeroed(len, len)
+    }
+
+    pub fn from_string(text: String) -> Bytes {
+        _bytes_from_str(text)
+    }
+
+    pub fn from_list(items: List) -> Bytes {
+        _bytes_from_list(items)
+    }
+
+    pub fn to_list(self) -> List {
+        _bytes_to_list(self)
+    }
+
+    pub fn to_utf8(self) -> ?String {
+        let decoded = _bytes_to_str(self)
+        if decoded == null { null } else { decoded.as(String) }
+    }
+
+    pub fn decode_utf8(self) -> ?String {
+        self.to_utf8()
+    }
+
+    pub fn to_utf8_lossy(self) -> String {
+        let decoded = _bytes_to_str(self)
+        if decoded != null {
+            decoded.as(String)
+        } else {
+            native_from_utf8_lossy(_bytes_to_list(self))
+        }
+    }
+
+    pub fn len(self) -> usize {
+        _bytes_len(self)
+    }
+
+    pub fn is_empty(self) -> bool {
+        _bytes_len(self) == 0
+    }
+
+    pub fn capacity(self) -> usize {
+        _bytes_cap(self)
+    }
+
+    pub fn get(self, index: usize) -> u8 {
+        _bytes_get(self, index)
+    }
+
+    pub fn apply(self, index: usize) -> u8 {
+        _bytes_get(self, index)
+    }
+
+    pub fn set(self, index: usize, value: u8) -> Unit {
+        _bytes_set(self, index, value)
+    }
+
+    pub fn update(self, index: usize, value: u8) -> Unit {
+        _bytes_set(self, index, value)
+    }
+
+    pub fn push(self, value: u8) -> Unit {
+        _bytes_push(self, value)
+    }
+
+    pub fn append(self, other: Bytes) -> Unit {
+        _bytes_extend(self, other)
+    }
+
+    pub fn `extend`(self, other: Bytes) -> Unit {
+        _bytes_extend(self, other)
+    }
+
+    pub fn append_str(self, text: String) -> Unit {
+        _bytes_extend(self, text)
+    }
+
+    pub fn extend_str(self, text: String) -> Unit {
+        _bytes_extend(self, text)
+    }
+
+    pub fn clear(self) -> Unit {
+        _bytes_clear(self)
+    }
+
+    pub fn slice(self, start: usize, end: usize) -> Bytes {
+        _bytes_slice(self, start, end)
+    }
+
+    pub fn copy(self) -> Bytes {
+        _bytes_copy(self)
+    }
+
+    pub fn find(self, needle: Bytes, .start: usize = 0) -> ?usize {
+        let pos = _bytes_find(self, needle, start)
+        if pos == null { null } else { pos.as(usize) }
+    }
+
+    pub fn find_str(self, needle: String, .start: usize = 0) -> ?usize {
+        let pos = _bytes_find(self, needle, start)
+        if pos == null { null } else { pos.as(usize) }
+    }
+
+    pub fn read_u64_le(self, offset: usize) -> u64 {
+        _bytes_read_u64_le(self, offset)
+    }
+}

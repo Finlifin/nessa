@@ -60,8 +60,14 @@ pub(crate) fn standard_library_identity() -> Result<SourcePackageIdentity, Strin
     let document =
         pkg_manager::ManifestDocument::parse(include_str!("../../../library/std/package.toml"))
             .map_err(|error| error.to_string())?;
+    bundled_package_identity(&document)
+}
+
+pub(crate) fn bundled_package_identity(
+    document: &pkg_manager::ManifestDocument,
+) -> Result<SourcePackageIdentity, String> {
     let graph = pkg_manager::PackageResolver::new()
-        .resolve_document(&document)
+        .resolve_document(document)
         .map_err(|error| error.to_string())?;
     Ok(CompilationIdentityContext::from_graph(&graph)?.into_source())
 }

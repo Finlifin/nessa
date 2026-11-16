@@ -35,7 +35,39 @@ pub(crate) fn lower_tuple(
     NirValue::Local(local)
 }
 
-/// The resolver checks tuple shape and annotates every leaf before lowering.
+pub(crate) fn is_irrefutable_binding(resolved: &ResolvedAst, pattern: NodeIndex) -> bool {
+    if pattern.is_null() {
+        return false;
+    }
+    match resolved.ast.node(pattern).kind {
+        NodeKind::Id => !resolved.enum_variants.contains_key(&pattern),
+        NodeKind::Underscore => true,
+        NodeKind::PatternTuple => resolved
+            .ast
+            .multi_children(pattern)
+            .iter()
+            .all(|&child| is_irrefutable_binding(resolved, child)),
+        NodeKind::PatternTyped => {
+            resolved.annotation_typed_patterns.contains(&pattern)
+                && is_irrefutable_binding(resolved, resolved.ast.fixed_children(pattern)[0])
+        }
+        NodeKind::PatternExtendedCall => {
+            resolved.struct_patterns.get(&pattern).is_some_and(|plan| {
+                plan.fields
+                    .iter()
+                    .all(|&(_, subpat)| is_irrefutable_binding(resolved, subpat))
+            })
+        }
+        NodeKind::PatternCall => {
+            resolved.newtype_patterns.contains_key(&pattern)
+                && resolved.ast.multi_children(pattern).len() == 1
+                && is_irrefutable_binding(resolved, resolved.ast.multi_children(pattern)[0])
+        }
+        _ => false,
+    }
+}
+
+/// The resolver checks tuple/struct shape and annotates every leaf before lowering.
 /// Values are already evaluated; projections never evaluate the source again.
 pub(crate) fn bind_pattern(
     resolved: &ResolvedAst,
@@ -56,22 +88,74 @@ pub(crate) fn bind_pattern(
                 bind_pattern(resolved, element, NirValue::Local(local), builder, block);
             }
         }
+        NodeKind::PatternExtendedCall => {
+            let value = snapshot(value, builder, block);
+            let fields = builder
+                .struct_pattern(resolved, pattern)
+                .map(|plan| plan.fields.clone())
+                .unwrap_or_default();
+            for (slot, subpat) in fields {
+                let local = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    local,
+                    NirExpr::FieldAccess(value, slot).in_source_scope(resolved, pattern),
+                ));
+                bind_pattern(resolved, subpat, NirValue::Local(local), builder, block);
+            }
+        }
+        NodeKind::PatternCall => {
+            let value = snapshot(value, builder, block);
+            if let Some(&subpat) = resolved.ast.multi_children(pattern).first() {
+                let local = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    local,
+                    NirExpr::FieldAccess(value, 0).in_source_scope(resolved, pattern),
+                ));
+                bind_pattern(resolved, subpat, NirValue::Local(local), builder, block);
+            }
+        }
+        NodeKind::PatternTyped => {
+            let children = resolved.ast.fixed_children(pattern);
+            let value = snapshot(value, builder, block);
+            if let Some(target) = builder.node_type(resolved, children[1])
+                && resolved.type_pool.as_intrinsic(target) != Some(type_pool::Intrinsic::Any)
+                && ast::NodeKind::Underscore != resolved.ast.node(children[0]).kind
+            {
+                let converted =
+                    crate::expr::lower_cast(resolved, pattern, value, target, builder, block);
+                bind_pattern(
+                    resolved,
+                    children[0],
+                    NirValue::Local(converted),
+                    builder,
+                    block,
+                );
+            } else {
+                bind_pattern(resolved, children[0], value, builder, block);
+            }
+        }
         NodeKind::Id => {
             if let Some(symbol) = builder.node_symbol(resolved, pattern) {
-                let local = builder.local_for_symbol(symbol);
-                crate::trait_parameters::bind_local_type(
-                    resolved,
-                    local,
-                    builder.symbol_type(resolved, symbol),
-                    builder,
-                );
-                crate::trait_parameters::copy_proof(local, value, builder, block);
-                builder.blocks[block.0 as usize]
-                    .stmts
-                    .push(NirStmt::Assign(local, NirExpr::Use(value)));
+                if let Some(&global) = builder.global_map.get(&symbol) {
+                    builder.blocks[block.0 as usize].stmts.push(
+                        NirStmt::StoreGlobal(global, value).in_source_scope(resolved, pattern),
+                    );
+                } else {
+                    let local = builder.local_for_symbol(symbol);
+                    crate::trait_parameters::bind_local_type(
+                        resolved,
+                        local,
+                        builder.symbol_type(resolved, symbol),
+                        builder,
+                    );
+                    crate::trait_parameters::copy_proof(local, value, builder, block);
+                    builder.blocks[block.0 as usize]
+                        .stmts
+                        .push(NirStmt::Assign(local, NirExpr::Use(value)));
+                }
             }
         }
         NodeKind::Underscore => {}
-        _ => unreachable!("resolver admits only irrefutable tuple bindings"),
+        _ => unreachable!("resolver admits only irrefutable destructuring bindings"),
     }
 }

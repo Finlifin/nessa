@@ -275,6 +275,34 @@ fn test_arbitrary_id_newline() {
     assert!(e.iter().any(|e| e.kind == LexErrorKind::InvalidArbitraryId));
 }
 
+#[test]
+fn test_arbitrary_id_empty_rejected() {
+    let (k, e) = lex("``");
+    assert_eq!(k, vec![TokenKind::Invalid]);
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].kind, LexErrorKind::InvalidArbitraryId);
+    assert_eq!(e[0].message, "empty arbitrary identifier");
+    assert_eq!((e[0].from, e[0].to), (0, 2));
+
+    let (k2, e2) = lex("let `` = 1");
+    assert_eq!(
+        k2,
+        vec![
+            TokenKind::KwLet,
+            TokenKind::Invalid,
+            TokenKind::Eq,
+            TokenKind::Integer
+        ]
+    );
+    assert_eq!(e2.len(), 1);
+    assert_eq!(e2[0].kind, LexErrorKind::InvalidArbitraryId);
+    assert_eq!((e2[0].from, e2[0].to), (4, 6));
+
+    for valid in ["`a`", "`match`", "`my-var`"] {
+        assert_eq!(kinds_ok(valid), vec![TokenKind::ArbitraryId]);
+    }
+}
+
 // =========================================================================
 // Integer literals
 // =========================================================================
@@ -544,6 +572,43 @@ fn test_nested_block_comment() {
 fn test_code_around_block_comment() {
     let k = kinds_ok("a {- comment -} b");
     assert_eq!(k, vec![TokenKind::Id, TokenKind::Id]);
+}
+
+#[test]
+fn test_unterminated_block_comment_at_eof() {
+    let src = "{- unterminated";
+    let (k, e) = lex(src);
+    assert_eq!(k, vec![TokenKind::Invalid]);
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].kind, LexErrorKind::UnterminatedBlockComment);
+    assert_eq!(e[0].message, "unterminated block comment");
+    assert_eq!((e[0].from, e[0].to), (0, src.len() as u32));
+}
+
+#[test]
+fn test_unterminated_nested_block_comment_at_eof() {
+    let nested = "{- outer {- inner -} still open";
+    let (k, e) = lex(nested);
+    assert_eq!(k, vec![TokenKind::Invalid]);
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].kind, LexErrorKind::UnterminatedBlockComment);
+    assert_eq!((e[0].from, e[0].to), (0, nested.len() as u32));
+
+    let after_code = "let x = 1 {- unclosed";
+    let (k2, e2) = lex(after_code);
+    assert_eq!(
+        k2,
+        vec![
+            TokenKind::KwLet,
+            TokenKind::Id,
+            TokenKind::Eq,
+            TokenKind::Integer,
+            TokenKind::Invalid
+        ]
+    );
+    assert_eq!(e2.len(), 1);
+    assert_eq!(e2[0].kind, LexErrorKind::UnterminatedBlockComment);
+    assert_eq!((e2[0].from, e2[0].to), (10, after_code.len() as u32));
 }
 
 // =========================================================================

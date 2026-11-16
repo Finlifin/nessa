@@ -48,7 +48,7 @@ fn method_name(instruction: &Instruction, constants: &[Constant]) -> io::Result<
         .ok_or_else(|| invalid("invalid interned method name"))
 }
 
-fn constant_reference(instruction: &Instruction) -> Option<u32> {
+pub(crate) fn constant_reference(instruction: &Instruction) -> Option<u32> {
     match instruction.data {
         InstructionData::A { imm12, .. }
             if instruction.opcode == Opcode::Load && instruction.amode == AddrMode::Const

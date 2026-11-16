@@ -2453,3 +2453,24 @@ builtin。
   `pkg_manager` 移除旧字符串报错的 `PackageResolver::{register, resolve}` 与 `ResolvedPackages`；
   CLI `nessa check` 补齐诊断输出。
 
+## 语言设计特性补齐、异步效应结构化并发与标准库建设（2026-11-15）
+
+本阶段围绕 `docs/` 中的语言规范与 Lua 5.4 + Nessa 惯用标准库目标，打通了词法/语法、名称与类型/效应解析、NIR 降级、NSBC 字节码与归档读写、调度器与解释器运行时、CLI 工具链以及 `library/std/*.ns` 模块：
+
+- **核心语法与控制流语义**：
+  - 词法与语法支持反引号转义任意标识符 `` `id` ``、嵌套块注释 `{- ... -}`、多分支 `when { cond => body, else => ... }`、`case pat => body | case ...` 偏函数链（无匹配分支在运行时报告 `VmError::NoMatchingCase`）、块级 LIFO `defer`（覆盖正常退出、`return`、`break`/`continue`、`?`/`!` 传播，编译期拒绝在 `defer` 内跨边界跳转）、`let`/`const`/`var ... else` 发散解构绑定、模块级元组解构、结构体解构模式 `Struct { field, ... }`、调用参数展开 `f(...tuple_or_list)`、绑定方法值 `receiver.method`、`!Err T` 的 `.unwrap()`，以及非穷尽 `match` 静态警告。
+- **包管理与 CLI 工具链**：
+  - `pkg_manager`、`driver` 与 `nessa` CLI 支持多包本地路径依赖拓扑解析、循环依赖与版本冲突诊断、`package.lock` 生成与校验、`nessa disasm <file.ns|file.nsbc|dir>` 与 `--emit-bc-dump` 字节码反汇编输出，以及 `nessa run ... -- <args...>` 脚本参数透传。
+- **名义类型、派生、孤儿规则与能力（Capability）机制**：
+  - 实现名义 `newtype Name = Inner`（独立 `TypeId`、构造器、`.as(...)` 显式转换、构造器模式匹配、递归自引用诊断）；新增内置 `Hash` trait（标量一致性哈希与结构体/枚举/元组/`newtype` 的组合式 `derive Hash`）以及 `newtype` 的 `Eq`/`PartialEq`/`Ord`/`PartialOrd`/`Display`/`Hash` 派生；支持全部方法均带 `derive fn` 默认实现且满足父 trait 约束的用户自定义 `derive Trait for Type`。
+  - 实施跨包 `impl` / `derive` 孤儿规则（`extend` 保持词法作用域扩展）；扩展 `impl Trait for T`、`extend T` 与 `extend Trait for T` 内的共享绑定与 `fn __init__()` 初始化块。
+  - 完整实现效应集合（`#[e1, e2] T`、`#[] T`、`++` 拼接与 `const` 别名）、能力方法 `handles(eff)`、`.use(provider)`、`handles` 作用域语句与 `handles(eff) let` 绑定。
+- **异步代数效应、`Future(T)` 与任务树结构化并发**：
+  - 类型池、字节码元数据（`TypeKind::Future` tag `15`）与反汇编器新增一等 `Future(T)`；新增 E 型指令 `Opcode::AwaitFuture (0xCF)` 与 `Opcode::AwaitPopHandler (0xDF)`。
+  - `async effect` 调用派生子任务并立即返回 `Future(T)` 句柄（`VmRoots::promises` 纳入精确移动 GC 根扫描）；子任务沿任务树 `parent` 链动态查找祖先同步/异步 handler。
+  - 实现结构化并发边界：handler 作用域（`# { ... }`、`.use(...)`、`handles` 语句、`handles(...) let`）正常退出发射 `AwaitPopHandler` 自动等待未显式 `.await` 的子任务；提前 `return` 或 `!` 错误展开沿 `PopHandler` 级联取消未完成子任务子树；`Opcode::Safepoint` 支持取消终止与多任务就绪时的时间片抢占；新增内建 ID `638..=642` 与 `std.task`（`Either`、`yield_now`、`is_ready`、`await_all`、`await_any`、`await_first`）及 `List.{await_all, await_any}`。
+- **标准库（`library/std/` 与原生内建 `573..=642`）**：
+  - 完成 `scalar`、`fmt`、`pattern`、`string`（含完整 UTF-8 编解码与校验）、`bytes`（完整 `pack`/`pack_size`/`unpack`、Hex、Base64）、`math`、`rand`、`io`（含 `File` 流）、`fs`、`path`、`env`、`time`、`process`、`collections`（含原地归并排序 `List`、`HashMap`、`Set`、`Deque`）、`coroutine`（基于多提示符延续的有状态协程与 `Generator`）、`runtime`（GC 与调用栈回溯）、`json`、`task` 共 22 个功能模块（详见 `docs/standard-library/overview.md`）。
+- **未纳入本次范围的空占位设计目录**：
+  - 仓库内 0 字节空文件 `docs/ffi/{intro,c,wasm}.md` 与 `docs/disaster-recovery-and-vm-exception-handling/intro.md` 尚无规范正文，保持未实现状态，未添加任何伪造占位行为。
+

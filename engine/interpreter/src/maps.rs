@@ -84,6 +84,17 @@ impl MapLayout {
         Ok(buckets)
     }
 
+    pub(super) fn snapshot_entries(&self) -> Result<Vec<(String, TaggedValue)>, VmError> {
+        let buckets = self.occupied_buckets()?;
+        let mut out = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let k = string_key(self.slot(bucket, 2))?;
+            let v = self.slot(bucket, 3);
+            out.push((k, v));
+        }
+        Ok(out)
+    }
+
     fn find(&self, key: &str, hash: u64) -> Result<(Option<usize>, Option<usize>), VmError> {
         let mut available = None;
         for offset in 0..self.capacity {

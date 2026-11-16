@@ -1,0 +1,74 @@
+-- std.fmt — printf / Lua string.format style formatting.
+
+use .builtin.*
+use .traits.*
+
+const native_sprintf: fn(String, List) -> (i64, String) = .__fmt_sprintf'builtin
+const native_concat: fn(String, String) -> String = .str_concat'builtin
+const native_print: fn(Any) -> Unit = .print'builtin
+const native_eprint: fn(Any) -> Unit = .eprint'builtin
+const native_panic: fn(Any) -> NoReturn = .panic'builtin
+
+pub enum FormatError {
+    pub InvalidSpec(message: String),
+    pub MissingArg(message: String),
+    pub TypeMismatch(message: String),
+    pub OutOfRange(message: String),
+}
+
+derive Eq, PartialEq for FormatError
+
+impl Display for FormatError {
+    pub fn to_string(self) -> String {
+        self match {
+            FormatError.InvalidSpec(message) => native_concat("invalid format specifier: ", message),
+            FormatError.MissingArg(message) => native_concat("missing format argument: ", message),
+            FormatError.TypeMismatch(message) => native_concat("format type mismatch: ", message),
+            FormatError.OutOfRange(message) => native_concat("format argument out of range: ", message),
+        }
+    }
+}
+
+-- Format `args` according to `spec`, returning a typed `FormatError` on failure.
+pub fn try_sprintf_list(spec: String, args: List) -> !FormatError String {
+    let (code, payload) = native_sprintf(spec, args)
+    when {
+        code == 0 => payload
+        code == 1 => error FormatError.InvalidSpec(payload)
+        code == 2 => error FormatError.MissingArg(payload)
+        code == 3 => error FormatError.TypeMismatch(payload)
+        code == 4 => error FormatError.OutOfRange(payload)
+        else => error FormatError.InvalidSpec(payload)
+    }
+}
+
+-- Variadic wrapper around `try_sprintf_list`.
+pub fn try_sprintf(spec: String, ...args: List) -> !FormatError String {
+    try_sprintf_list(spec, args)
+}
+
+-- Format `args` according to `spec`, panicking with the diagnostic message on error.
+pub fn format(spec: String, ...args: List) -> String {
+    try_sprintf_list(spec, args) match {
+        formatted! => formatted,
+        error err => native_panic(err.to_string()),
+    }
+}
+
+-- Format and write directly to stdout without adding a trailing newline.
+pub fn printf(spec: String, ...args: List) -> Unit {
+    let rendered = try_sprintf_list(spec, args) match {
+        formatted! => formatted,
+        error err => native_panic(err.to_string()),
+    }
+    native_print(rendered)
+}
+
+-- Format and write directly to stderr without adding a trailing newline.
+pub fn eprintf(spec: String, ...args: List) -> Unit {
+    let rendered = try_sprintf_list(spec, args) match {
+        formatted! => formatted,
+        error err => native_panic(err.to_string()),
+    }
+    native_eprint(rendered)
+}

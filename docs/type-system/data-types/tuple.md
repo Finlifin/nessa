@@ -73,7 +73,7 @@ tuple_type -> (expr, expr*)
 局部 `let` / `var` 支持嵌套元组绑定及 `_`；绑定必须匹配元素数量和类型。
 带显式 Tuple 注解的函数及 lambda 参数也可嵌套解构，返回值/类型别名保留完整
 Tuple 形状。`var (a, b)` 使局部绑定可赋值，不表示修改原 Tuple 对象。
-Module/全局可以通过单个标识符保存 typed Tuple 值，例如：
+Module/全局既可以通过单个标识符保存 typed Tuple 值，也支持不可反驳的嵌套 Tuple 解构（`let (a, b) = ...`），例如：
 
 ```nessa
 typealias Pair = (i64, String)
@@ -107,8 +107,6 @@ TypeIndex/字段指令编码边界限制，超限明确诊断。
 - 无静态Tuple形状的动态模式分派；静态已知shape的Tuple `match` / `matches`
   已在后续Enum阶段接通，可递归包含Enum、字面量、绑定与guard。
 - 没有静态shape的Any直接数字投影或解构；先通过具体Tuple类型边界检查后使用。
-- Module/全局声明的Tuple解构；这些作用域目前须用单个标识符保存完整Tuple。
-- List.fold等Iterator API尚未实现，上文min_max例子仍是语言设计示例。
+- Module/全局作用域带 `else` 分支的可反驳解构绑定（不可反驳的嵌套 Tuple 解构 `let (a, b) = ...` 已支持）。
 
-携带值enum构造与递归Enum/Tuple模式已在后续阶段接通；复杂Or/AsBind等其余
-模式、完整复合类型/trait规则与其余类型系统目标仍是后续工作。
+`List.fold`/`map`/`filter`/`reduce` 及 `Iterator` 协议已在 `std.collections` 与 `std.traits` 中提供；携带值enum构造、递归Enum/Tuple/Struct（`Point { x, ... }`）/List（`[head, ...tail]`）模式以及组合模式（`p1 or p2`、`pat as x`、`not pat`）均已接通；区间模式与泛型复合类型参数化仍是后续工作。

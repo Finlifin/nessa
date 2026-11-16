@@ -268,7 +268,7 @@ fn try_prefix_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
         | TokenKind::KwTrue
         | TokenKind::KwNull => basic::try_atomic(p),
 
-        TokenKind::Id => {
+        TokenKind::Id | TokenKind::ArbitraryId => {
             let binder = basic::try_id(p)?;
             try_typed_binding(p, binder, option)
         }
@@ -449,6 +449,25 @@ fn try_object_pattern(p: &mut Parser, _option: PatternOption) -> ParseResult {
 /// `id: pattern` - named property in object pattern
 fn try_pattern_property_item(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
+
+    if p.peek(&[TokenKind::Dot, TokenKind::Dot, TokenKind::Dot]) {
+        for _ in 0..3 {
+            p.next_token();
+        }
+        let inner = if p.peek_token().kind == TokenKind::Underscore {
+            let span = p.next_token_span();
+            p.next_token();
+            p.ast().builder(NodeKind::Underscore, span).build()
+        } else {
+            basic::try_id(p)?
+        };
+        let span = p.current_span();
+        return Ok(p
+            .ast()
+            .builder(NodeKind::PatternRestBind, span)
+            .add_child(inner)
+            .build());
+    }
 
     let id = basic::try_id(p)?;
     if id.is_null() {
@@ -668,7 +687,7 @@ fn parse_des_call_brace(p: &mut Parser, left: NodeIndex, option: PatternOption) 
 
     let args = try_multi_with_bracket(
         p,
-        &[Rule::comma(
+        &[Rule::comma_or_semicolon(
             "destructor property",
             try_pattern_property_item,
         )],
@@ -688,6 +707,9 @@ fn parse_des_call_brace(p: &mut Parser, left: NodeIndex, option: PatternOption) 
 
 /// Postfix: `pat.id` - property access in pattern
 fn parse_pattern_property(p: &mut Parser, left: NodeIndex) -> ParseResult {
+    if p.peek(&[TokenKind::Dot, TokenKind::Dot]) {
+        return Ok(NULL);
+    }
     let _g = p.enter();
     p.expect_token(TokenKind::Dot)?;
 

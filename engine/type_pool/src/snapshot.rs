@@ -98,7 +98,7 @@ impl TypePool {
             null_type: snapshot.null_type,
             identity_input: snapshot.identity_input,
             identity_dirty: std::sync::atomic::AtomicBool::new(false),
-            identity_known: [TypeIndex::INVALID; 8],
+            identity_known: [TypeIndex::INVALID; 9],
             concrete_types: std::sync::Mutex::new(Vec::new()),
         };
         pool.identity_known = crate::identity::known_traits(&pool);
@@ -135,6 +135,11 @@ impl TypePool {
                     || info.align != 0
                 {
                     return Err(invalid("invalid IterationStep template descriptor"));
+                }
+            } else if matches!(kind, TypeKind::Future { .. }) {
+                let info = self.get(index);
+                if info.size != 8 || info.align != 8 {
+                    return Err(invalid("invalid Future descriptor layout"));
                 }
             } else if !matches!(
                 kind,
@@ -344,6 +349,12 @@ impl TypePoolSnapshot {
                 TypeKind::Optional { inner } => {
                     self.index(*inner)?;
                 }
+                TypeKind::Future { inner } => {
+                    if info.size != 8 || info.align != 8 {
+                        return Err(invalid("invalid Future descriptor layout"));
+                    }
+                    self.index(*inner)?;
+                }
                 TypeKind::ErrorQualified { errors, inner } => {
                     for &ty in errors {
                         self.index(ty)?;
@@ -397,6 +408,7 @@ impl TypePoolSnapshot {
             self.well_known.partial_ord,
             self.well_known.iterator,
             self.well_known.into_iterator,
+            self.well_known.json,
         ];
         let mut seen = HashSet::new();
         for (ty, expected) in known.into_iter().zip(WellKnownTraits::NAMES) {
@@ -546,7 +558,11 @@ impl TypePoolSnapshot {
             TypeKind::IterationStepTemplate { item } if !traits => edges.push(*item),
             TypeKind::Typealias { target, .. } => edges.push(*target),
             TypeKind::Trait { parents, .. } if traits => edges.extend(parents),
-            TypeKind::Newtype { inner, .. } | TypeKind::Optional { inner } if !traits => {
+            TypeKind::Newtype { inner, .. }
+            | TypeKind::Optional { inner }
+            | TypeKind::Future { inner }
+                if !traits =>
+            {
                 edges.push(*inner)
             }
             TypeKind::Tuple { elements } if !traits => edges.extend(elements),
@@ -574,6 +590,7 @@ fn structural_key(kind: &TypeKind) -> (u8, Vec<u32>) {
     let indices = |types: &[TypeIndex]| types.iter().map(|ty| ty.as_u32()).collect::<Vec<_>>();
     match kind {
         TypeKind::IterationStepTemplate { item } => (7, vec![item.as_u32()]),
+        TypeKind::Future { inner } => (8, vec![inner.as_u32()]),
         TypeKind::Tuple { elements } => (0, indices(elements)),
         TypeKind::Function { params, ret } => {
             let mut key = indices(params);

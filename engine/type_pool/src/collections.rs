@@ -13,12 +13,19 @@ pub const MAP_TYPE_ID: TypeId = TypeId(COLLECTION_NAMESPACE, 0x0000_0001_0000_00
 /// Engine opaque four-tagged-words-per-bucket buffer identity, revision one.
 pub const MAP_BUFFER_TYPE_ID: TypeId = TypeId(COLLECTION_NAMESPACE, 0x0000_0001_0000_0004);
 
+/// Engine compact Bytes wrapper identity, layout revision one.
+pub const BYTES_TYPE_ID: TypeId = TypeId(COLLECTION_NAMESPACE, 0x0000_0001_0000_0005);
+/// Engine GC No-Scan raw byte buffer identity, layout revision one.
+pub const BYTES_BUFFER_TYPE_ID: TypeId = TypeId(COLLECTION_NAMESPACE, 0x0000_0001_0000_0006);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionRole {
     List,
     Buffer,
     Map,
     MapBuffer,
+    Bytes,
+    BytesBuffer,
 }
 
 impl CollectionRole {
@@ -28,6 +35,8 @@ impl CollectionRole {
             Self::Buffer => LIST_BUFFER_TYPE_ID,
             Self::Map => MAP_TYPE_ID,
             Self::MapBuffer => MAP_BUFFER_TYPE_ID,
+            Self::Bytes => BYTES_TYPE_ID,
+            Self::BytesBuffer => BYTES_BUFFER_TYPE_ID,
         }
     }
 
@@ -37,6 +46,8 @@ impl CollectionRole {
             LIST_BUFFER_TYPE_ID => Some(Self::Buffer),
             MAP_TYPE_ID => Some(Self::Map),
             MAP_BUFFER_TYPE_ID => Some(Self::MapBuffer),
+            BYTES_TYPE_ID => Some(Self::Bytes),
+            BYTES_BUFFER_TYPE_ID => Some(Self::BytesBuffer),
             _ => None,
         }
     }
@@ -44,16 +55,16 @@ impl CollectionRole {
 
 impl TypePool {
     pub(crate) fn register_collection_roles(&mut self) {
+        let field = |name: &str, ty, offset| FieldInfo {
+            name: str_interner::intern(name),
+            ty,
+            has_default: false,
+            offset,
+        };
         for (wrapper, buffer, name, buffer_name) in [
             (LIST_TYPE_ID, LIST_BUFFER_TYPE_ID, "List", "__ListBuffer"),
             (MAP_TYPE_ID, MAP_BUFFER_TYPE_ID, "Map", "__MapBuffer"),
         ] {
-            let field = |name: &str, ty, offset| FieldInfo {
-                name: str_interner::intern(name),
-                ty,
-                has_default: false,
-                offset,
-            };
             self.register(TypeInfo {
                 kind: TypeKind::Struct {
                     name: str_interner::intern(name),
@@ -77,6 +88,29 @@ impl TypePool {
                 align: 8,
             });
         }
+        self.register(TypeInfo {
+            kind: TypeKind::Struct {
+                name: str_interner::intern("Bytes"),
+                fields: vec![
+                    field("len", Intrinsic::U64.type_index(), 0),
+                    field("offset", Intrinsic::U64.type_index(), 8),
+                    field("capacity", Intrinsic::U64.type_index(), 16),
+                    field("buffer", Intrinsic::Any.type_index(), 24),
+                ],
+            },
+            type_id: BYTES_TYPE_ID,
+            size: 32,
+            align: 8,
+        });
+        self.register(TypeInfo {
+            kind: TypeKind::Struct {
+                name: str_interner::intern("__BytesBuffer"),
+                fields: Vec::new(),
+            },
+            type_id: BYTES_BUFFER_TYPE_ID,
+            size: 0,
+            align: 8,
+        });
     }
 
     /// Identify a reserved collection layout, following transparent aliases.
@@ -126,16 +160,24 @@ impl TypePool {
         self.collection_type(CollectionRole::MapBuffer)
     }
 
+    pub fn bytes_type(&self) -> Option<TypeIndex> {
+        self.collection_type(CollectionRole::Bytes)
+    }
+
+    pub fn bytes_buffer_type(&self) -> Option<TypeIndex> {
+        self.collection_type(CollectionRole::BytesBuffer)
+    }
+
     fn collection_type(&self, role: CollectionRole) -> Option<TypeIndex> {
         let index = self.lookup_by_id(role.type_id())?;
         let info = self.types.get(index.as_u32() as usize)?;
         (info.type_id == role.type_id() && validate_layout(info, role).is_ok()).then_some(index)
     }
 
-    /// Legacy registries may omit either collection pair. Present roles must be unique,
+    /// Legacy registries may omit any collection pair. Present roles must be unique,
     /// paired, and have the exact tagged-slot layout expected by the VM.
     pub fn validate_collection_layouts(&self) -> Result<(), SnapshotError> {
-        let mut seen_roles = [false; 4];
+        let mut seen_roles = [false; 6];
         for info in &self.types {
             if info.type_id.hi() != COLLECTION_NAMESPACE {
                 continue;
@@ -162,6 +204,8 @@ impl TypePool {
                 CollectionRole::Buffer => &mut seen_roles[1],
                 CollectionRole::Map => &mut seen_roles[2],
                 CollectionRole::MapBuffer => &mut seen_roles[3],
+                CollectionRole::Bytes => &mut seen_roles[4],
+                CollectionRole::BytesBuffer => &mut seen_roles[5],
             };
             if *seen {
                 return Err(SnapshotError::new("duplicate reserved collection identity"));
@@ -169,7 +213,10 @@ impl TypePool {
             *seen = true;
             validate_layout(info, role)?;
         }
-        if seen_roles[0] != seen_roles[1] || seen_roles[2] != seen_roles[3] {
+        if seen_roles[0] != seen_roles[1]
+            || seen_roles[2] != seen_roles[3]
+            || seen_roles[4] != seen_roles[5]
+        {
             return Err(SnapshotError::new(
                 "collection roles must be present together",
             ));
@@ -199,7 +246,26 @@ fn validate_layout(info: &TypeInfo, role: CollectionRole) -> Result<(), Snapshot
                             && !field.has_default
                     })
         }
-        CollectionRole::Buffer | CollectionRole::MapBuffer => {
+        CollectionRole::Bytes => {
+            info.size == 32
+                && info.align == 8
+                && fields.len() == 4
+                && fields
+                    .iter()
+                    .zip([
+                        Intrinsic::U64,
+                        Intrinsic::U64,
+                        Intrinsic::U64,
+                        Intrinsic::Any,
+                    ])
+                    .enumerate()
+                    .all(|(index, (field, kind))| {
+                        field.ty == kind.type_index()
+                            && field.offset == index as u32 * 8
+                            && !field.has_default
+                    })
+        }
+        CollectionRole::Buffer | CollectionRole::MapBuffer | CollectionRole::BytesBuffer => {
             fields.is_empty() && info.size == 0 && info.align == 8
         }
     };
@@ -216,7 +282,10 @@ mod tests {
     #[test]
     fn roles_preserve_prefix_and_survive_exact_index_restore_and_aliases() {
         let mut pool = TypePool::with_intrinsics();
-        assert_eq!(pool.null_type().as_u32(), Intrinsic::COUNT as u32 + 8);
+        assert_eq!(
+            pool.null_type().as_u32(),
+            (Intrinsic::COUNT + crate::WellKnownTraits::NAMES.len()) as u32
+        );
         let list = pool.list_type().unwrap();
         let buffer = pool.list_buffer_type().unwrap();
         assert_eq!(pool.collection_role(list), Some(CollectionRole::List));
@@ -254,12 +323,25 @@ mod tests {
     #[test]
     fn legacy_pool_without_roles_is_valid() {
         let pool = TypePool::with_intrinsics();
+        let mut without_bytes = pool.snapshot();
+        without_bytes.types.truncate(without_bytes.types.len() - 2);
+        without_bytes
+            .methods
+            .truncate(without_bytes.methods.len() - 2);
+        let restored_no_bytes = TypePool::restore(without_bytes).unwrap();
+        assert!(restored_no_bytes.list_type().is_some());
+        assert!(restored_no_bytes.map_type().is_some());
+        assert_eq!(restored_no_bytes.bytes_type(), None);
+        assert_eq!(restored_no_bytes.bytes_buffer_type(), None);
+
         let mut snapshot = pool.snapshot();
-        snapshot.types.truncate(snapshot.types.len() - 4);
-        snapshot.methods.truncate(snapshot.methods.len() - 4);
+        snapshot.types.truncate(snapshot.types.len() - 6);
+        snapshot.methods.truncate(snapshot.methods.len() - 6);
         let restored = TypePool::restore(snapshot).unwrap();
         assert_eq!(restored.list_type(), None);
         assert_eq!(restored.list_buffer_type(), None);
+        assert_eq!(restored.map_type(), None);
+        assert_eq!(restored.bytes_type(), None);
     }
 
     #[test]
@@ -304,11 +386,19 @@ mod tests {
             pool.collection_role(pool.map_buffer_type().unwrap()),
             Some(CollectionRole::MapBuffer)
         );
-        for (keep_list, keep_map) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (keep_list, keep_map, keep_bytes) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
             let mut snapshot = pool.snapshot();
             let retain = |info: &TypeInfo| match CollectionRole::from_id(info.type_id) {
                 Some(CollectionRole::List | CollectionRole::Buffer) => keep_list,
                 Some(CollectionRole::Map | CollectionRole::MapBuffer) => keep_map,
+                Some(CollectionRole::Bytes | CollectionRole::BytesBuffer) => keep_bytes,
                 None => true,
             };
             snapshot.methods = snapshot
@@ -321,6 +411,7 @@ mod tests {
             let restored = TypePool::restore(snapshot).unwrap();
             assert_eq!(restored.list_type().is_some(), keep_list);
             assert_eq!(restored.map_type().is_some(), keep_map);
+            assert_eq!(restored.bytes_type().is_some(), keep_bytes);
             assert_eq!(restored.null_type(), pool.null_type());
         }
         let restored = TypePool::restore(pool.snapshot()).unwrap();

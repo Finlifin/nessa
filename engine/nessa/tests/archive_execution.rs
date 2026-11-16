@@ -1853,7 +1853,15 @@ fn archive_executes_escaping_closure_with_explicit_function_abi() {
         .codegen_output
         .functions
         .iter()
-        .filter(|function| !function.abi.captures.is_empty())
+        .filter(|function| {
+            !function.abi.captures.is_empty()
+                && function.function_type != type_pool::TypeIndex::INVALID
+                && matches!(
+                    &artifact.type_pool.get(function.function_type).kind,
+                    type_pool::TypeKind::Function { params, ret }
+                        if params.is_empty() && *ret == type_pool::Intrinsic::I64.type_index()
+                )
+        })
         .collect();
     assert_eq!(captured.len(), 1);
     assert!(captured[0].is_closure);
@@ -2085,7 +2093,7 @@ fn archive_executes_generated_display_and_comparison_methods_through_trait_proof
             println(partial(Partial{number:42},Partial{number:2}))
         }
         "#,
-        "Displayed { number: 42, text: 你好 }\ntrue\nfalse\ntrue\nfalse\n",
+        "Displayed { number: 42, text: \"你好\" }\ntrue\nfalse\ntrue\nfalse\n",
     );
 }
 
@@ -3286,7 +3294,7 @@ fn generated_enum_and_tuple_display_archives_require_exact_quote_native_capabili
     let compiled = driver::Driver::new().compile(source);
     assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
     let artifact = compiled.into_artifact().unwrap();
-    assert_eq!(artifact.builtin_abi_version, 9);
+    assert_eq!(artifact.builtin_abi_version, 11);
     assert!(
         artifact
             .builtins

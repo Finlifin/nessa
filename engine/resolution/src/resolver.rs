@@ -39,12 +39,26 @@ pub(crate) struct Resolver<'a> {
     pub(crate) current_call_callee: Option<NodeIndex>,
     pub(crate) constructor_types: HashMap<NodeIndex, SymbolId>,
     pub(crate) struct_constructions: HashMap<NodeIndex, crate::StructConstructionPlan>,
+    pub(crate) struct_patterns: HashMap<NodeIndex, crate::StructPatternPlan>,
     pub(crate) enum_constructions: HashMap<NodeIndex, crate::EnumConstructionPlan>,
     pub(crate) enum_variants: HashMap<NodeIndex, crate::EnumVariantRef>,
+    pub(crate) newtype_constructions: HashMap<NodeIndex, TypeIndex>,
+    pub(crate) newtype_wraps: HashMap<NodeIndex, TypeIndex>,
+    pub(crate) newtype_patterns: HashMap<NodeIndex, TypeIndex>,
     pub(crate) for_loops: HashMap<NodeIndex, crate::ForLoopPlan>,
     pub(crate) derived_comparisons: Vec<crate::DerivedComparisonPlan>,
     pub(crate) display_derivations: Vec<crate::DerivedDisplayPlan>,
+    pub(crate) hash_derivations: Vec<crate::DerivedHashPlan>,
+    pub(crate) json_derivations: Vec<crate::DerivedJsonPlan>,
+    pub(crate) pending_derives: Vec<(ScopeId, NodeIndex)>,
+    pub(crate) attached_json_derives: HashSet<NodeIndex>,
+    pub(crate) derived_from_json_symbols: HashMap<TypeIndex, SymbolId>,
+    pub(crate) synthetic_call_templates: HashMap<SymbolId, NodeIndex>,
     pub(crate) default_methods: Vec<crate::DefaultMethodPlan>,
+    pub(crate) capabilities: Vec<crate::CapabilityDecl>,
+    pub(crate) handler_applications: HashMap<NodeIndex, crate::HandlerApplicationPlan>,
+    pub(crate) handles_statements: HashMap<NodeIndex, crate::HandlesStmtPlan>,
+    pub(crate) let_handlers: HashMap<NodeIndex, crate::LetHandlerPlan>,
     pub(crate) default_body_context: Option<crate::default_methods::DefaultBodyContext>,
     pub(crate) concat_calls: HashMap<NodeIndex, SymbolId>,
     pub(crate) equality_calls: HashMap<NodeIndex, SymbolId>,
@@ -58,6 +72,7 @@ pub(crate) struct Resolver<'a> {
     pub(crate) effects: Vec<EffectInfo>,
     /// Resume inputs known from stable catch bindings and snapshot aliases.
     pub(crate) continuation_inputs: HashMap<SymbolId, TypeIndex>,
+    pub(crate) assigned_symbols: HashSet<SymbolId>,
     /// CaseArm is shared by ordinary matches and independently called handlers.
     pub(crate) handler_arms: HashSet<NodeIndex>,
     pub(crate) traits: Vec<TraitInfo>,
@@ -72,6 +87,9 @@ pub(crate) struct Resolver<'a> {
     pub(crate) enum_variant_indices: HashMap<SymbolId, u32>,
     /// Maps Projection node → field index (populated in type resolution).
     pub(crate) node_field_indices: HashMap<NodeIndex, u32>,
+    pub(crate) pipeline_calls: HashSet<NodeIndex>,
+    pub(crate) annotation_typed_patterns: HashSet<NodeIndex>,
+    pub(crate) restricted_dlopen_views: HashMap<NodeIndex, HashSet<String>>,
     next_symbol_id: u32,
     pub(crate) current_scope: ScopeId,
 }
@@ -102,12 +120,26 @@ impl<'a> Resolver<'a> {
             current_call_callee: None,
             constructor_types: HashMap::new(),
             struct_constructions: HashMap::new(),
+            struct_patterns: HashMap::new(),
             enum_constructions: HashMap::new(),
             enum_variants: HashMap::new(),
+            newtype_constructions: HashMap::new(),
+            newtype_wraps: HashMap::new(),
+            newtype_patterns: HashMap::new(),
             for_loops: HashMap::new(),
             derived_comparisons: Vec::new(),
             display_derivations: Vec::new(),
+            hash_derivations: Vec::new(),
+            json_derivations: Vec::new(),
+            pending_derives: Vec::new(),
+            attached_json_derives: HashSet::new(),
+            derived_from_json_symbols: HashMap::new(),
+            synthetic_call_templates: HashMap::new(),
             default_methods: Vec::new(),
+            capabilities: Vec::new(),
+            handler_applications: HashMap::new(),
+            handles_statements: HashMap::new(),
+            let_handlers: HashMap::new(),
             default_body_context: None,
             concat_calls: HashMap::new(),
             equality_calls: HashMap::new(),
@@ -121,6 +153,7 @@ impl<'a> Resolver<'a> {
             inferred_returns: Vec::new(),
             effects: Vec::new(),
             continuation_inputs: HashMap::new(),
+            assigned_symbols: HashSet::new(),
             handler_arms: HashSet::new(),
             traits: Vec::new(),
             trait_obligations: Vec::new(),
@@ -131,6 +164,9 @@ impl<'a> Resolver<'a> {
             builtin_fns: HashMap::new(),
             enum_variant_indices: HashMap::new(),
             node_field_indices: HashMap::new(),
+            pipeline_calls: HashSet::new(),
+            annotation_typed_patterns: HashSet::new(),
+            restricted_dlopen_views: HashMap::new(),
             next_symbol_id: 0,
             current_scope: ScopeId::ROOT,
         };
@@ -174,11 +210,17 @@ impl<'a> Resolver<'a> {
                 NodeIndex::NULL,
                 Visibility::Public,
             );
+            self.define_symbol(
+                str_interner::intern("Future"),
+                SymbolKind::TypeFactory(crate::TypeFactory::Future),
+                NodeIndex::NULL,
+                Visibility::Public,
+            );
         }
         self.register_well_known_traits();
     }
 
-    fn well_known_trait_indices(&self) -> [TypeIndex; 8] {
+    fn well_known_trait_indices(&self) -> [TypeIndex; 9] {
         let wk = self.type_pool.well_known;
         [
             wk.display,
@@ -189,6 +231,7 @@ impl<'a> Resolver<'a> {
             wk.partial_ord,
             wk.iterator,
             wk.into_iterator,
+            wk.json,
         ]
     }
 
@@ -212,7 +255,7 @@ impl<'a> Resolver<'a> {
 
     /// Run the full resolution pipeline on the given AST.
     pub(crate) fn resolve(mut self, mut ast: Ast) -> ResolvedAst {
-        crate::post_do::normalize(&mut ast);
+        self.pipeline_calls = crate::post_do::normalize(&mut ast);
         // Phase 3a: Name resolution — walk the AST, build scope tree, resolve names.
         crate::name::resolve_names(&mut self, &ast, ast.root);
         crate::associated::validate(&self, &ast);
@@ -222,7 +265,9 @@ impl<'a> Resolver<'a> {
         crate::traits::prepare_trait_parents(&mut self, &ast);
         crate::associated_types::prepare(&mut self, &ast);
         crate::typing::prepare_type_aliases(&mut self, &ast);
+        crate::newtype::prepare(&mut self, &ast);
         crate::ordering::prepare(&mut self);
+        crate::json_derivation::prepare_signatures(&mut self, &ast);
         crate::access::publish_scopes(&mut self);
         crate::associated_types::stage_implementations(&mut self, &ast);
         // Effect annotations can use prepared aliases and associated types.
@@ -234,6 +279,7 @@ impl<'a> Resolver<'a> {
         crate::associated::validate_constructors(&self, &ast);
         crate::defaults::validate_default_expansions(&self, &ast);
         crate::typing::validate_native_values(&self, &ast);
+        crate::typing::validate_restricted_ffi_dlopen(&self, &ast);
         crate::initialization::validate(&self, &ast);
 
         // Phase 3d: Trait & method resolution.
@@ -242,6 +288,7 @@ impl<'a> Resolver<'a> {
         crate::associated_types::validate_dynamic_functions(&self, &ast);
         crate::associated_types::validate_abstract_values(&self, &ast);
         crate::default_methods::bind_calls(&mut self, &ast);
+        crate::capability::finalize(&mut self, &ast);
         crate::trait_typing::validate(&self, &ast);
         crate::trait_loops::validate(&mut self, &ast);
         if !self.diag_ctx.has_errors()
@@ -269,12 +316,22 @@ impl<'a> Resolver<'a> {
             call_arguments: self.call_arguments,
             constructor_types: self.constructor_types,
             struct_constructions: self.struct_constructions,
+            struct_patterns: self.struct_patterns,
             enum_constructions: self.enum_constructions,
             enum_variants: self.enum_variants,
+            newtype_constructions: self.newtype_constructions,
+            newtype_wraps: self.newtype_wraps,
+            newtype_patterns: self.newtype_patterns,
             for_loops: self.for_loops,
             derived_comparisons: self.derived_comparisons,
             display_derivations: self.display_derivations,
+            hash_derivations: self.hash_derivations,
+            json_derivations: self.json_derivations,
             default_methods: self.default_methods,
+            capabilities: self.capabilities,
+            handler_applications: self.handler_applications,
+            handles_statements: self.handles_statements,
+            let_handlers: self.let_handlers,
             concat_calls: self.concat_calls,
             equality_calls: self.equality_calls,
             instance_methods: self.instance_methods,
@@ -288,6 +345,8 @@ impl<'a> Resolver<'a> {
             builtin_fns: self.builtin_fns,
             enum_variant_indices: self.enum_variant_indices,
             node_field_indices: self.node_field_indices,
+            pipeline_calls: self.pipeline_calls,
+            annotation_typed_patterns: self.annotation_typed_patterns,
         }
     }
 
@@ -476,9 +535,17 @@ impl<'a> Resolver<'a> {
                 view_node,
             ));
         }
+        if symbol_name == "Future" {
+            return Some(self.alloc_unbound_symbol(
+                name,
+                SymbolKind::TypeFactory(crate::TypeFactory::Future),
+                view_node,
+            ));
+        }
         let builtin_type = match symbol_name {
             "List" => Some(self.type_pool.list_type()?),
             "Map" => Some(self.type_pool.map_type()?),
+            "Bytes" => Some(self.type_pool.bytes_type()?),
             _ => Intrinsic::ALL
                 .iter()
                 .copied()

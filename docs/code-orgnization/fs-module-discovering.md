@@ -87,12 +87,11 @@ manifest 1 MiB、单个源码文件 16 MiB、源码合计 64 MiB。忽略的普�
 `compile_package_sources` 接受拥有文本的 `PackageSources`，不重新读取其中的物理路径；
 调用者构造的树同样检查默认深度、模块数、单文件及总源码字节限制。
 
-CLI 的 `run`、`check`、`build` 接受包目录。`build` 输出目录内的 `package.nsbc`，
-`--emit-ast-dump` 输出 `package.lisp`；单文件输入仍输出同名扩展名文件。源码错误
-保留各文件的物理路径和准确位置，诊断输出到 stderr。NSBC 归档可在删除源码后运行。
+CLI 的 `run`、`check`、`build`、`disasm` 均接受包目录。`build` 输出目录内的 `package.nsbc`（含依赖时同步生成/更新确定性 `package.lock`，配合 `--locked` 则只读校验锁文件），
+`--emit-ast-dump` 输出 `package.lisp`，`--emit-bc-dump` 输出可读反汇编 `package.bc`；单文件输入仍输出同名扩展名文件。源码错误
+保留各文件的物理路径和准确位置，诊断输出到 stderr。NSBC 归档可在删除源码后独立运行。
 
-依赖源码选择、跨包名称解析和外部库归档链接仍需继续实现；已声明但不能解析的依赖
-返回错误，不会被默默省略。目录编译不等于完整包管理。
+`pkg_manager::load_package_workspace` 支持 `[dependencies]` 中的本地路径依赖（`{ path = "..." }`）递归发现、跨包名称解析与合并编译，已存在 `package.lock` 时在 `check`/`run`/`disasm` 中自动校验摘要与版本；已声明但不能解析的依赖返回错误，不会被默默省略。远程注册表下载与预编译库归档单独链接仍待后续扩展。
 
 ## 与内联模块的关系
 

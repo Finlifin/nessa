@@ -1,0 +1,719 @@
+-- regex — linear-time O(N) regular expressions backed by the native C-ABI `nessa_regex_ffi` library.
+-- Zero compiler or VM regex magic: all automata operations cross the capability-gated C FFI
+-- using pinned read-only UTF-8/Bytes slices and preallocated Span Buffer `Bytes` batches.
+
+use std.bytes.*
+
+private const _ffi_dlopen: fn(String) -> i64 = .__ffi_dlopen'builtin
+private const _ffi_dlsym: fn(i64, String, String) -> i64 = .__ffi_dlsym'builtin
+
+private global _ffi_ready: bool = false
+private global _lib_handle: i64 = 0
+private global _sym_compile: i64 = 0
+private global _sym_free: i64 = 0
+private global _sym_free_on_gc: i64 = 0
+private global _sym_group_count: i64 = 0
+private global _sym_group_by_name: i64 = 0
+private global _sym_is_match: i64 = 0
+private global _sym_captures: i64 = 0
+private global _sym_find_batch: i64 = 0
+private global _sym_find_bytes: i64 = 0
+
+private fn _ensure_ffi() -> Unit {
+    if _ffi_ready {
+        return
+    }
+    let lib = _ffi_dlopen("nessa_regex_ffi")
+    if lib <= 0 {
+        panic("failed to load native nessa_regex_ffi library")
+    }
+    _lib_handle = lib
+    _sym_compile = _ffi_dlsym(lib, "nessa_regex_compile", "slice_ro,u32,usize,usize,buf_mut->i64")
+    _sym_free = _ffi_dlsym(lib, "nessa_regex_free", "i64->void")
+    _sym_free_on_gc = _ffi_dlsym(lib, "nessa_regex_free", "on_gc:any,i64->void")
+    _sym_group_count = _ffi_dlsym(lib, "nessa_regex_group_count", "i64->isize")
+    _sym_group_by_name = _ffi_dlsym(lib, "nessa_regex_group_index_by_name", "i64,slice_ro->isize")
+    _sym_is_match = _ffi_dlsym(lib, "nessa_regex_is_match", "i64,slice_ro,usize,u32->i32")
+    _sym_captures = _ffi_dlsym(lib, "nessa_regex_captures", "i64,slice_ro,usize,buf_mut->i32")
+    _sym_find_batch = _ffi_dlsym(lib, "nessa_regex_find_batch", "i64,slice_ro,usize,isize,buf_mut->isize")
+    _sym_find_bytes = _ffi_dlsym(lib, "nessa_regex_find_bytes", "i64,slice_ro,usize,buf_mut->i32")
+    _ffi_ready = true
+}
+
+private fn _slice_utf8_bytes(text: String, start: usize, end: usize) -> String {
+    let sub = text.get(start.as(i64), end.as(i64))
+    if sub == null {
+        panic("invalid UTF-8 byte span in regex match")
+    }
+    sub.as(String)
+}
+
+private fn _check_str_start(text: String, start: usize) -> Unit {
+    let byte_len = text.len().as(usize)
+    if start > byte_len {
+        panic("regex start offset out of bounds")
+    }
+    if not text.is_char_boundary(start.as(i64)) {
+        panic("regex start offset is not on a UTF-8 character boundary")
+    }
+}
+
+private fn _check_bytes_start(data: Bytes, start: usize) -> Unit {
+    if start > data.len() {
+        panic("regex start offset out of bounds")
+    }
+}
+
+private struct _RegexGuard {
+    raw_id: i64,
+}
+
+pub enum RegexError {
+    pub InvalidSyntax(message: String),
+    pub CompiledTooLarge(limit: usize),
+}
+derive Eq, PartialEq for RegexError
+
+impl Display for RegexError {
+    pub fn to_string(self) -> String {
+        self match {
+            RegexError.InvalidSyntax(message) => "regex syntax error: " ++ message,
+            RegexError.CompiledTooLarge(limit) => "compiled regex exceeded size limit: " ++ limit.to_string(),
+        }
+    }
+}
+
+pub struct SpanMatch {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+derive Eq, PartialEq, Display for SpanMatch
+
+impl SpanMatch {
+    pub fn as_str(self) -> String {
+        self.text
+    }
+
+    pub fn len(self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+}
+
+pub struct ByteMatch {
+    pub start: usize,
+    pub end: usize,
+    pub data: Bytes,
+}
+derive Eq, PartialEq, Display for ByteMatch
+
+impl ByteMatch {
+    pub fn as_bytes(self) -> Bytes {
+        self.data
+    }
+
+    pub fn len(self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+}
+
+pub struct Regex {
+    pat: String,
+    handle: i64,
+    groups: usize,
+    guard: _RegexGuard,
+}
+
+pub struct Captures {
+    re: Regex,
+    text: String,
+    slots: Bytes,
+    count: usize,
+}
+
+impl Captures {
+    pub fn len(self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.count == 0
+    }
+
+    pub fn span(self, index: usize) -> ?(usize, usize) {
+        if index >= self.count {
+            return null
+        }
+        let sentinel: u64 = 0xffffffffffffffff
+        let s = self.slots.read_u64_le(index * 16)
+        if s == sentinel {
+            return null
+        }
+        let e = self.slots.read_u64_le(index * 16 + 8)
+        (s.as(usize), e.as(usize))
+    }
+
+    pub fn get(self, index: usize) -> ?String {
+        let sp = self.span(index)
+        if sp == null {
+            return null
+        }
+        let (s, e) = sp.as((usize, usize))
+        _slice_utf8_bytes(self.text, s, e)
+    }
+
+    pub fn match_at(self, index: usize) -> ?SpanMatch {
+        let sp = self.span(index)
+        if sp == null {
+            return null
+        }
+        let (s, e) = sp.as((usize, usize))
+        SpanMatch {
+            start: s,
+            end: e,
+            text: _slice_utf8_bytes(self.text, s, e),
+        }
+    }
+
+    pub fn name_span(self, group_name: String) -> ?(usize, usize) {
+        let idx = _group_index_by_name(self.re, group_name)
+        if idx < 0 {
+            return null
+        }
+        self.span(idx.as(usize))
+    }
+
+    pub fn name(self, group_name: String) -> ?String {
+        let idx = _group_index_by_name(self.re, group_name)
+        if idx < 0 {
+            return null
+        }
+        self.get(idx.as(usize))
+    }
+}
+
+private fn _live_handle(re: Regex) -> i64 {
+    let h = re.handle
+    if h <= 0 {
+        panic("regex handle has already been closed")
+    }
+    h
+}
+
+private fn _group_index_by_name(re: Regex, group_name: String) -> i64 {
+    _ensure_ffi()
+    let h = _live_handle(re)
+    let call_two: fn(i64, i64, String) -> i64 = .__ffi_call4'builtin
+    call_two(_sym_group_by_name, h, group_name)
+}
+
+pub struct MatchIter {
+    re: Regex,
+    text: String,
+    buf: Bytes,
+    batch_idx: usize,
+    batch_len: usize,
+    next_start: usize,
+    last_match_end: isize,
+    finished: bool,
+}
+
+private fn _refill_match_iter(it: MatchIter) -> bool {
+    if it.finished {
+        return false
+    }
+    _ensure_ffi()
+    let h = _live_handle(it.re)
+    let call_batch: fn(i64, i64, String, usize, isize, Bytes) -> i64 = .__ffi_call6'builtin
+    let written = call_batch(_sym_find_batch, h, it.text, it.next_start, it.last_match_end, it.buf)
+    if written < 0 {
+        panic("regex UTF-8 matching failed (closed handle or non-UTF-8 byte pattern)")
+    }
+    if written == 0 {
+        it.finished = true
+        it.batch_idx = 0
+        it.batch_len = 0
+        return false
+    }
+    let count = written.as(usize)
+    it.batch_idx = 0
+    it.batch_len = count
+    let last_end = it.buf.read_u64_le((count - 1) * 16 + 8).as(usize)
+    it.next_start = last_end
+    it.last_match_end = last_end.as(isize)
+    if count < 64 {
+        it.finished = true
+    }
+    true
+}
+
+impl Iterator for MatchIter {
+    assoc Item: Type = SpanMatch
+
+    pub fn next(self) -> IterationStep(SpanMatch) {
+        if self.batch_idx >= self.batch_len {
+            if not _refill_match_iter(self) {
+                return IterationStep(SpanMatch).done
+            }
+        }
+        let offset: usize = self.batch_idx * 16
+        let s = self.buf.read_u64_le(offset).as(usize)
+        let e = self.buf.read_u64_le(offset + 8).as(usize)
+        self.batch_idx = self.batch_idx + 1
+        IterationStep(SpanMatch).yielded(SpanMatch {
+            start: s,
+            end: e,
+            text: _slice_utf8_bytes(self.text, s, e),
+        })
+    }
+}
+
+impl IntoIterator for MatchIter {
+    assoc Iter: Type = MatchIter
+
+    pub fn into_iter(self) -> MatchIter {
+        self
+    }
+}
+
+impl MatchIter {
+    pub fn to_list(self) -> List {
+        let out = List()
+        for m in self {
+            out.push(m)
+        }
+        out
+    }
+
+    pub fn collect(self) -> List {
+        self.to_list()
+    }
+
+    pub fn count(self) -> usize {
+        var n: usize = 0
+        for _ in self {
+            n += 1
+        }
+        n
+    }
+}
+
+private fn _is_ascii_digit_byte(b: i64) -> bool {
+    b >= 48 and b <= 57
+}
+
+private fn _is_ident_start_byte(b: i64) -> bool {
+    (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
+}
+
+private fn _is_ident_continue_byte(b: i64) -> bool {
+    _is_ident_start_byte(b) or _is_ascii_digit_byte(b)
+}
+
+private fn _expand_replacement(out: Bytes, caps: Captures, replacement: String) -> Unit {
+    let rep_len = replacement.len()
+    var i: i64 = 0
+    var seg_start: i64 = 0
+    while i < rep_len {
+        let b = replacement.byte_at(i)
+        if b != 36 {
+            i += 1
+        } else {
+            if i > seg_start {
+                out.extend_str(_slice_utf8_bytes(replacement, seg_start.as(usize), i.as(usize)))
+            }
+            if i + 1 >= rep_len {
+                out.push(36)
+                i += 1
+                seg_start = i
+            } else {
+                let next_b = replacement.byte_at(i + 1)
+                if next_b == 36 {
+                    out.push(36)
+                    i += 2
+                    seg_start = i
+                } else if next_b == 123 {
+                    var close_idx = i + 2
+                    while close_idx < rep_len and replacement.byte_at(close_idx) != 125 {
+                        close_idx += 1
+                    }
+                    if close_idx < rep_len {
+                        let key = _slice_utf8_bytes(replacement, (i + 2).as(usize), close_idx.as(usize))
+                        if key != "" and key.is_ascii_digit() {
+                            let parsed = key.parse_usize()
+                            if parsed != null {
+                                let val = caps.get(parsed.as(usize))
+                                if val != null {
+                                    out.extend_str(val.as(String))
+                                }
+                            }
+                        } else if key != "" {
+                            let val = caps.name(key)
+                            if val != null {
+                                out.extend_str(val.as(String))
+                            }
+                        }
+                        i = close_idx + 1
+                        seg_start = i
+                    } else {
+                        out.push(36)
+                        i += 1
+                        seg_start = i
+                    }
+                } else if _is_ascii_digit_byte(next_b) {
+                    var end_idx = i + 2
+                    while end_idx < rep_len and _is_ascii_digit_byte(replacement.byte_at(end_idx)) {
+                        end_idx += 1
+                    }
+                    let digits = _slice_utf8_bytes(replacement, (i + 1).as(usize), end_idx.as(usize))
+                    let parsed = digits.parse_usize()
+                    if parsed != null {
+                        let val = caps.get(parsed.as(usize))
+                        if val != null {
+                            out.extend_str(val.as(String))
+                        }
+                    }
+                    i = end_idx
+                    seg_start = i
+                } else if _is_ident_start_byte(next_b) {
+                    var end_idx = i + 2
+                    while end_idx < rep_len and _is_ident_continue_byte(replacement.byte_at(end_idx)) {
+                        end_idx += 1
+                    }
+                    let name = _slice_utf8_bytes(replacement, (i + 1).as(usize), end_idx.as(usize))
+                    let val = caps.name(name)
+                    if val != null {
+                        out.extend_str(val.as(String))
+                    }
+                    i = end_idx
+                    seg_start = i
+                } else {
+                    out.push(36)
+                    i += 1
+                    seg_start = i
+                }
+            }
+        }
+    }
+    if seg_start < rep_len {
+        out.extend_str(_slice_utf8_bytes(replacement, seg_start.as(usize), rep_len.as(usize)))
+    }
+}
+
+impl Regex {
+    pub fn compile(
+        pattern: String,
+        .case_insensitive: bool = false,
+        .multi_line: bool = false,
+        .dot_matches_new_line: bool = false,
+        .unicode: bool = true,
+        .size_limit: usize = 10485760,
+        .dfa_size_limit: usize = 2097152,
+    ) -> !RegexError Regex {
+        _ensure_ffi()
+        var flags: u32 = 0
+        if case_insensitive {
+            flags = flags + 1
+        }
+        if multi_line {
+            flags = flags + 2
+        }
+        if dot_matches_new_line {
+            flags = flags + 4
+        }
+        if unicode {
+            flags = flags + 8
+        }
+        let err_buf = Bytes.zeroed(1024)
+        let call_compile: fn(i64, String, u32, usize, usize, Bytes) -> i64 = .__ffi_call6'builtin
+        let handle = call_compile(_sym_compile, pattern, flags, size_limit, dfa_size_limit, err_buf)
+        if handle <= 0 {
+            let msg_len = err_buf.read_u64_le(0).as(usize)
+            let msg_bytes = err_buf.slice(8, 8 + msg_len)
+            let msg = msg_bytes.to_utf8_lossy()
+            if handle == -2 {
+                let parsed = msg.parse_usize()
+                let lim = if parsed != null { parsed.as(usize) } else { size_limit }
+                return error RegexError.CompiledTooLarge(lim)
+            }
+            return error RegexError.InvalidSyntax(msg)
+        }
+        let call_gc: fn(i64, Any, i64) -> Unit = .__ffi_call4'builtin
+        let call_one: fn(i64, i64) -> i64 = .__ffi_call4'builtin
+        let gcount = call_one(_sym_group_count, handle)
+        let guard = _RegexGuard { raw_id: handle }
+        call_gc(_sym_free_on_gc, guard, handle)
+        Regex {
+            pat: pattern,
+            handle: handle,
+            groups: if gcount > 0 { gcount.as(usize) } else { 1 },
+            guard: guard,
+        }
+    }
+
+    pub fn pattern(self) -> String {
+        self.pat
+    }
+
+    pub fn group_count(self) -> usize {
+        self.groups
+    }
+
+    pub fn is_closed(self) -> bool {
+        self.handle <= 0
+    }
+
+    pub fn close(self) -> Unit {
+        let h = self.handle
+        if h > 0 {
+            _ensure_ffi()
+            self.handle = 0
+            let call_free: fn(i64, i64) -> Unit = .__ffi_call4'builtin
+            call_free(_sym_free, h)
+        }
+    }
+
+    pub fn is_match(self, text: String, .start: usize = 0) -> bool {
+        _check_str_start(text, start)
+        _ensure_ffi()
+        let h = _live_handle(self)
+        let call_is_match: fn(i64, i64, String, usize, u32) -> i64 = .__ffi_call4'builtin
+        let rc = call_is_match(_sym_is_match, h, text, start, 0)
+        if rc < 0 {
+            panic("regex UTF-8 is_match failed (non-UTF-8 byte pattern used on String)")
+        }
+        rc == 1
+    }
+
+    pub fn find(self, text: String, .start: usize = 0) -> ?SpanMatch {
+        _check_str_start(text, start)
+        _ensure_ffi()
+        let h = _live_handle(self)
+        let buf = Bytes.zeroed(16)
+        let call_batch: fn(i64, i64, String, usize, isize, Bytes) -> i64 = .__ffi_call6'builtin
+        let n = call_batch(_sym_find_batch, h, text, start, -1, buf)
+        if n < 0 {
+            panic("regex UTF-8 find failed (non-UTF-8 byte pattern used on String)")
+        }
+        if n == 0 {
+            return null
+        }
+        let s = buf.read_u64_le(0).as(usize)
+        let e = buf.read_u64_le(8).as(usize)
+        SpanMatch {
+            start: s,
+            end: e,
+            text: _slice_utf8_bytes(text, s, e),
+        }
+    }
+
+    pub fn captures(self, text: String, .start: usize = 0) -> ?Captures {
+        _check_str_start(text, start)
+        _ensure_ffi()
+        let h = _live_handle(self)
+        let slots = Bytes.zeroed(self.groups * 16)
+        let call_caps: fn(i64, i64, String, usize, Bytes) -> i64 = .__ffi_call4'builtin
+        let rc = call_caps(_sym_captures, h, text, start, slots)
+        if rc < 0 {
+            panic("regex UTF-8 captures failed (non-UTF-8 byte pattern used on String)")
+        }
+        if rc == 0 {
+            return null
+        }
+        Captures {
+            re: self,
+            text: text,
+            slots: slots,
+            count: self.groups,
+        }
+    }
+
+    pub fn find_all(self, text: String) -> MatchIter {
+        let _ = _live_handle(self)
+        MatchIter {
+            re: self,
+            text: text,
+            buf: Bytes.zeroed(1024),
+            batch_idx: 0,
+            batch_len: 0,
+            next_start: 0,
+            last_match_end: -1,
+            finished: false,
+        }
+    }
+
+    pub fn find_iter(self, text: String) -> MatchIter {
+        self.find_all(text)
+    }
+
+    pub fn split(self, text: String, .limit: usize = 0) -> List {
+        let _ = _live_handle(self)
+        let out = List()
+        if limit == 1 {
+            out.push(text)
+            return out
+        }
+        let byte_len = text.len().as(usize)
+        var last: usize = 0
+        var pieces: usize = 0
+        for m in self.find_all(text) {
+            out.push(_slice_utf8_bytes(text, last, m.start))
+            last = m.end
+            pieces += 1
+            if limit > 0 and pieces + 1 >= limit {
+                break
+            }
+        }
+        out.push(_slice_utf8_bytes(text, last, byte_len))
+        out
+    }
+
+    pub fn replace(self, text: String, replacement: String) -> String {
+        if not replacement.contains_char('$') {
+            let m_opt = self.find(text)
+            if m_opt == null {
+                return text
+            }
+            let m = m_opt.as(SpanMatch)
+            let byte_len = text.len().as(usize)
+            let out = Bytes.with_capacity(byte_len + replacement.len().as(usize))
+            if m.start > 0 {
+                out.extend_str(_slice_utf8_bytes(text, 0, m.start))
+            }
+            out.extend_str(replacement)
+            if m.end < byte_len {
+                out.extend_str(_slice_utf8_bytes(text, m.end, byte_len))
+            }
+            return out.to_utf8().as(String)
+        }
+
+        let caps_opt = self.captures(text)
+        if caps_opt == null {
+            return text
+        }
+        let caps = caps_opt.as(Captures)
+        let (s, e) = caps.span(0).as((usize, usize))
+        let byte_len = text.len().as(usize)
+        let out = Bytes.with_capacity(byte_len + replacement.len().as(usize))
+        if s > 0 {
+            out.extend_str(_slice_utf8_bytes(text, 0, s))
+        }
+        _expand_replacement(out, caps, replacement)
+        if e < byte_len {
+            out.extend_str(_slice_utf8_bytes(text, e, byte_len))
+        }
+        out.to_utf8().as(String)
+    }
+
+    pub fn replace_all(self, text: String, replacement: String) -> String {
+        let byte_len = text.len().as(usize)
+        if not replacement.contains_char('$') {
+            let out = Bytes.with_capacity(byte_len)
+            var last: usize = 0
+            var any_matched: bool = false
+            for m in self.find_all(text) {
+                any_matched = true
+                if m.start > last {
+                    out.extend_str(_slice_utf8_bytes(text, last, m.start))
+                }
+                out.extend_str(replacement)
+                last = m.end
+            }
+            if not any_matched {
+                return text
+            }
+            if last < byte_len {
+                out.extend_str(_slice_utf8_bytes(text, last, byte_len))
+            }
+            return out.to_utf8().as(String)
+        }
+
+        let out = Bytes.with_capacity(byte_len)
+        var last_copied: usize = 0
+        var search_pos: usize = 0
+        var prev_end: isize = -1
+        var any_matched: bool = false
+        while search_pos <= byte_len {
+            let caps_opt = self.captures(text, start = search_pos)
+            if caps_opt == null {
+                break
+            }
+            var caps = caps_opt.as(Captures)
+            var sp = caps.span(0).as((usize, usize))
+            var s = sp.0
+            var e = sp.1
+            if s == e and prev_end >= 0 and e == prev_end.as(usize) {
+                if search_pos >= byte_len {
+                    break
+                }
+                let stepped = text.ceil_char_boundary((search_pos + 1).as(i64)).as(usize)
+                search_pos = stepped
+                let next_caps_opt = self.captures(text, start = search_pos)
+                if next_caps_opt == null {
+                    break
+                }
+                caps = next_caps_opt.as(Captures)
+                sp = caps.span(0).as((usize, usize))
+                s = sp.0
+                e = sp.1
+            }
+            any_matched = true
+            if s > last_copied {
+                out.extend_str(_slice_utf8_bytes(text, last_copied, s))
+            }
+            _expand_replacement(out, caps, replacement)
+            last_copied = e
+            prev_end = e.as(isize)
+            search_pos = e
+        }
+        if not any_matched {
+            return text
+        }
+        if last_copied < byte_len {
+            out.extend_str(_slice_utf8_bytes(text, last_copied, byte_len))
+        }
+        out.to_utf8().as(String)
+    }
+
+    pub fn is_match_bytes(self, data: Bytes, .start: usize = 0) -> bool {
+        _check_bytes_start(data, start)
+        _ensure_ffi()
+        let h = _live_handle(self)
+        let call_is_match: fn(i64, i64, Bytes, usize, u32) -> i64 = .__ffi_call4'builtin
+        let rc = call_is_match(_sym_is_match, h, data, start, 1)
+        if rc < 0 {
+            panic("regex binary is_match_bytes failed")
+        }
+        rc == 1
+    }
+
+    pub fn find_bytes(self, data: Bytes, .start: usize = 0) -> ?ByteMatch {
+        _check_bytes_start(data, start)
+        _ensure_ffi()
+        let h = _live_handle(self)
+        let buf = Bytes.zeroed(16)
+        let call_find_bytes: fn(i64, i64, Bytes, usize, Bytes) -> i64 = .__ffi_call4'builtin
+        let rc = call_find_bytes(_sym_find_bytes, h, data, start, buf)
+        if rc < 0 {
+            panic("regex binary find_bytes failed")
+        }
+        if rc == 0 {
+            return null
+        }
+        let s = buf.read_u64_le(0).as(usize)
+        let e = buf.read_u64_le(8).as(usize)
+        ByteMatch {
+            start: s,
+            end: e,
+            data: data.slice(s, e),
+        }
+    }
+}

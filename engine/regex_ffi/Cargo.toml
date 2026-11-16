@@ -1,0 +1,11 @@
+[package]
+name = "regex_ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "nessa_regex_ffi"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+regex-automata.workspace = true

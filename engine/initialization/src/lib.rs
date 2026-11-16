@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gc::GcConfig;
 use interpreter::Vm;
+pub use interpreter::{JitConfig, JitMode, JitStats};
 use stack_pool::StackPool;
 use type_pool::TypePool;
 
@@ -19,6 +20,8 @@ pub mod builtin_fns;
 pub struct EngineConfig {
     /// GC configuration.
     pub gc: GcConfig,
+    /// Tiered JIT configuration.
+    pub jit: JitConfig,
     /// Whether to enable debug instrumentation.
     pub debug: bool,
 }
@@ -48,6 +51,7 @@ impl Engine {
 
         // Create the VM with MMTk-backed GC and shared stack pool.
         let mut vm = Vm::new(type_pool, &config.gc, Arc::clone(&stack_pool));
+        vm.set_jit_config(config.jit);
 
         // Register all native builtins (fn pointers + type catalog names).
         builtin_fns::register_all(&mut vm);
@@ -107,10 +111,12 @@ mod tests {
                 heap_size: 1024 * 1024,
                 ..Default::default()
             },
+            jit: JitConfig::with_mode(JitMode::Off),
             debug: true,
         };
         let engine = Engine::new(config.clone());
         assert_eq!(engine.config.gc.heap_size, 1024 * 1024);
+        assert_eq!(engine.vm.jit_config().mode, JitMode::Off);
         assert!(engine.config.debug);
     }
 }

@@ -55,6 +55,38 @@ pub(crate) fn branch_payload(
     {
         return;
     }
+    if let Some(nt_ty) = builder.newtype_pattern(resolved, pattern) {
+        let payload = builder.new_block();
+        test(
+            builder,
+            block,
+            NirExpr::TypeCheck(value, nt_ty).in_source_scope(resolved, pattern),
+            payload,
+            failure,
+        );
+        let args = ast.multi_children(pattern);
+        if let Some(&subpat) = args.first() {
+            let local = builder.alloc_local();
+            builder.blocks[payload.0 as usize]
+                .stmts
+                .push(NirStmt::Assign(
+                    local,
+                    NirExpr::FieldAccess(value, 0).in_source_scope(resolved, pattern),
+                ));
+            branch_payload(
+                resolved,
+                subpat,
+                NirValue::Local(local),
+                builder,
+                payload,
+                success,
+                failure,
+            );
+        } else {
+            builder.blocks[payload.0 as usize].terminator = Terminator::Goto(success);
+        }
+        return;
+    }
     if let Some(variant) = builder.enum_variant(resolved, pattern) {
         let payload = builder.new_block();
         test(
@@ -163,6 +195,42 @@ pub(crate) fn branch_payload(
             }
             builder.blocks[current.0 as usize].terminator = Terminator::Goto(success);
         }
+        NodeKind::PatternExtendedCall => {
+            let Some(plan) = builder.struct_pattern(resolved, pattern).cloned() else {
+                builder.blocks[block.0 as usize].terminator = Terminator::Goto(failure);
+                return;
+            };
+            let payload = builder.new_block();
+            test(
+                builder,
+                block,
+                NirExpr::TypeCheck(value, plan.type_index).in_source_scope(resolved, pattern),
+                payload,
+                failure,
+            );
+            let mut current = payload;
+            for (slot, subpat) in plan.fields {
+                let local = builder.alloc_local();
+                builder.blocks[current.0 as usize]
+                    .stmts
+                    .push(NirStmt::Assign(
+                        local,
+                        NirExpr::FieldAccess(value, slot).in_source_scope(resolved, pattern),
+                    ));
+                let next = builder.new_block();
+                branch_payload(
+                    resolved,
+                    subpat,
+                    NirValue::Local(local),
+                    builder,
+                    current,
+                    next,
+                    failure,
+                );
+                current = next;
+            }
+            builder.blocks[current.0 as usize].terminator = Terminator::Goto(success);
+        }
         NodeKind::PatternAndIs => {
             let children = ast.fixed_children(pattern);
             let mut computed = builder.new_block();
@@ -237,6 +305,18 @@ pub(crate) fn branch_payload(
         }
         NodeKind::PatternTyped => {
             let children = ast.fixed_children(pattern);
+            if resolved.annotation_typed_patterns.contains(&pattern) {
+                branch_payload(
+                    resolved,
+                    children[0],
+                    value,
+                    builder,
+                    block,
+                    success,
+                    failure,
+                );
+                return;
+            }
             let target = builder
                 .node_type(resolved, children[1])
                 .expect("checked typed pattern");
@@ -248,18 +328,21 @@ pub(crate) fn branch_payload(
                 binding,
                 failure,
             );
-            if ast.node(children[0]).kind == NodeKind::Id {
+            if ast.node(children[0]).kind == NodeKind::Underscore {
+                builder.blocks[binding.0 as usize].terminator = Terminator::Goto(success);
+            } else {
                 let converted =
                     crate::expr::lower_cast(resolved, pattern, value, target, builder, binding);
-                crate::tuples::bind_pattern(
+                branch_payload(
                     resolved,
                     children[0],
                     NirValue::Local(converted),
                     builder,
                     binding,
+                    success,
+                    failure,
                 );
             }
-            builder.blocks[binding.0 as usize].terminator = Terminator::Goto(success);
         }
         NodeKind::PatternIfGuard => {
             let children = ast.fixed_children(pattern);

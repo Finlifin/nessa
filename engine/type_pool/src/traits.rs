@@ -308,6 +308,11 @@ impl TypePool {
             };
             return self.subtype_with_scope(source, inner, remaining - 1, caller);
         }
+        if let (TypeKind::Future { inner: source }, TypeKind::Future { inner: target }) =
+            (&self.get(sub).kind, &self.get(sup).kind)
+        {
+            return self.subtype_with_scope(*source, *target, remaining - 1, caller);
+        }
         if let TypeKind::ErrorQualified { errors, inner } = &self.get(sup).kind {
             if !matches!(self.get(sub).kind, TypeKind::ErrorQualified { .. })
                 && self.subtype_with_scope(sub, *inner, remaining - 1, caller)?
@@ -326,6 +331,36 @@ impl TypePool {
                         .ok_or(TraitLookupError::InvalidType(source))?;
                     let mut found = false;
                     for &target in errors {
+                        let target = self
+                            .canonical_type(target)
+                            .ok_or(TraitLookupError::InvalidType(target))?;
+                        found |= source == target;
+                    }
+                    if !found {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        if let TypeKind::EffectQualified { effects, inner } = &self.get(sup).kind {
+            if !matches!(self.get(sub).kind, TypeKind::EffectQualified { .. })
+                && self.subtype_with_scope(sub, *inner, remaining - 1, caller)?
+            {
+                return Ok(true);
+            }
+            if let TypeKind::EffectQualified {
+                effects: source_effects,
+                inner: source_inner,
+            } = &self.get(sub).kind
+                && self.subtype_with_scope(*source_inner, *inner, remaining - 1, caller)?
+            {
+                for &source in source_effects {
+                    let source = self
+                        .canonical_type(source)
+                        .ok_or(TraitLookupError::InvalidType(source))?;
+                    let mut found = false;
+                    for &target in effects {
                         let target = self
                             .canonical_type(target)
                             .ok_or(TraitLookupError::InvalidType(target))?;

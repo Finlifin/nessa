@@ -69,6 +69,7 @@ pub fn try_definition_or_statement(p: &mut Parser) -> ParseResult {
 fn try_statement(p: &mut Parser) -> ParseResult {
     let token = p.peek_token();
     match token.kind {
+        TokenKind::KwHandles => definition::try_handles_def(p),
         TokenKind::KwLet => try_let_statement(p),
         TokenKind::KwConst => try_const_statement(p),
         TokenKind::KwVar => try_var_statement(p),
@@ -117,7 +118,7 @@ fn try_var_statement(p: &mut Parser) -> ParseResult {
 }
 
 fn parse_binding(p: &mut Parser, decl_kind: NodeKind) -> ParseResult {
-    let pat = pattern::try_pattern_without_extended_call(p)?;
+    let pat = pattern::try_pattern(p)?;
     if pat.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -151,9 +152,7 @@ fn parse_binding(p: &mut Parser, decl_kind: NodeKind) -> ParseResult {
         );
     }
 
-    let else_branch = if decl_kind == NodeKind::VarDecl {
-        NULL
-    } else if p.eat_token(TokenKind::KwElse) {
+    let else_branch = if p.eat_token(TokenKind::KwElse) {
         let b = basic::try_block_or_statement(p)?;
         if b.is_null() {
             let _ = p.err(
@@ -168,22 +167,14 @@ fn parse_binding(p: &mut Parser, decl_kind: NodeKind) -> ParseResult {
     };
 
     let span = p.current_span();
-    let idx = if decl_kind == NodeKind::VarDecl {
-        p.ast()
-            .builder(decl_kind, span)
-            .add_child(pat)
-            .add_child(type_ann)
-            .add_child(value)
-            .build()
-    } else {
-        p.ast()
-            .builder(decl_kind, span)
-            .add_child(pat)
-            .add_child(type_ann)
-            .add_child(value)
-            .add_child(else_branch)
-            .build()
-    };
+    let idx = p
+        .ast()
+        .builder(decl_kind, span)
+        .add_child(pat)
+        .add_child(type_ann)
+        .add_child(value)
+        .add_child(else_branch)
+        .build();
     Ok(idx)
 }
 
@@ -539,8 +530,8 @@ pub fn try_when_statement(p: &mut Parser) -> ParseResult {
         p,
         "`when`",
         &[
-            Rule::semicolon("else condition arm", try_else_condition_arm),
-            Rule::semicolon("condition arm", try_condition_arm),
+            Rule::comma_or_semicolon("else condition arm", try_else_condition_arm),
+            Rule::comma_or_semicolon("condition arm", try_condition_arm),
         ],
     )?;
 

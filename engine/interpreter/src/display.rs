@@ -14,6 +14,7 @@ const MAX_DISPLAY_DEPTH: usize = 128;
 enum AggregateShape {
     List,
     Map(Vec<usize>),
+    Bytes(usize),
     Tuple,
     Enum(String),
     Error(bool),
@@ -78,7 +79,18 @@ impl Vm {
                     element_types: None,
                 }));
             }
-            Some(CollectionRole::Buffer | CollectionRole::MapBuffer) => {
+            Some(CollectionRole::Bytes) => {
+                let layout = self.bytes_layout(value)?;
+                return Ok(Some(AggregateLayout {
+                    pointer: std::ptr::null(),
+                    length: 0,
+                    shape: AggregateShape::Bytes(layout.length),
+                    element_types: None,
+                }));
+            }
+            Some(
+                CollectionRole::Buffer | CollectionRole::MapBuffer | CollectionRole::BytesBuffer,
+            ) => {
                 return Err(VmError::TypeError);
             }
             None => {}
@@ -136,6 +148,7 @@ impl Vm {
             }
             AggregateShape::List => String::from("["),
             AggregateShape::Map(_) => String::from("{"),
+            AggregateShape::Bytes(len) => format!("Bytes(len={len})"),
             AggregateShape::Tuple => String::from("("),
             AggregateShape::Enum(name) if layout.length == 0 => name.clone(),
             AggregateShape::Enum(name) => format!("{name}("),
@@ -195,7 +208,7 @@ impl Vm {
             AggregateShape::Map(_) => output.push('}'),
             AggregateShape::Tuple => output.push(')'),
             AggregateShape::Enum(_) if layout.length != 0 => output.push(')'),
-            AggregateShape::Enum(_) | AggregateShape::Error(_) => {}
+            AggregateShape::Enum(_) | AggregateShape::Error(_) | AggregateShape::Bytes(_) => {}
         }
         visiting.remove(&value.raw());
         Ok(output)

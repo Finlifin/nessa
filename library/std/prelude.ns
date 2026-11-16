@@ -7,3 +7,6 @@ pub use .math.*
 pub use .string.*
 pub use .process.*
 pub use .scalar.*
+pub use .fmt.{format, printf, eprintf}
+pub use .collections.{HashMap, Set, Deque}
+pub use .json.JsonError

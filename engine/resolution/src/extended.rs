@@ -72,6 +72,7 @@ pub(crate) fn resolve(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Optio
                             value,
                         })
                         .collect(),
+                    spread_pack: None,
                 },
             );
             let signature = r

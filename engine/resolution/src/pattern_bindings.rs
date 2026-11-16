@@ -84,11 +84,35 @@ fn collect(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> Bindings {
         }
         NodeKind::PatternTyped => {
             let binder = children[0];
-            if ast.node(binder).kind == NodeKind::Id {
+            if !binder.is_null() && ast.node(binder).kind == NodeKind::Id {
                 HashMap::from([(ast.node(binder).str_id, vec![binder])])
             } else {
-                Bindings::new()
+                collect(r, ast, binder)
             }
+        }
+        NodeKind::PatternExtendedCall => {
+            let mut bindings = Bindings::new();
+            for &entry in ast.multi_children(node) {
+                if entry.is_null() {
+                    continue;
+                }
+                match ast.node(entry).kind {
+                    NodeKind::Id => merge(
+                        r,
+                        ast,
+                        &mut bindings,
+                        HashMap::from([(ast.node(entry).str_id, vec![entry])]),
+                    ),
+                    NodeKind::Property | NodeKind::PropertyPattern => merge(
+                        r,
+                        ast,
+                        &mut bindings,
+                        collect(r, ast, ast.fixed_children(entry)[1]),
+                    ),
+                    _ => {}
+                }
+            }
+            bindings
         }
         NodeKind::PatternIfGuard
         | NodeKind::PatternOptionSome
@@ -121,13 +145,18 @@ fn collect(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> Bindings {
     }
 }
 
-pub(crate) fn prepare(r: &mut Resolver<'_>, ast: &Ast, pattern: NodeIndex) {
+pub(crate) fn prepare_with_kind(
+    r: &mut Resolver<'_>,
+    ast: &Ast,
+    pattern: NodeIndex,
+    kind: SymbolKind,
+) {
     // Allocate before resolving either guard so both paths and nested captures
     // use the same SymbolId; no AST references or closure facts need remapping.
     let mut bindings: Vec<_> = collect(r, ast, pattern).into_iter().collect();
     bindings.sort_by_key(|(name, _)| name.as_u32());
     for (name, nodes) in bindings {
-        let symbol = r.alloc_unbound_symbol(name, SymbolKind::Variable, nodes[0]);
+        let symbol = r.alloc_unbound_symbol(name, kind, nodes[0]);
         for node in nodes {
             r.node_symbols.insert(node, symbol);
         }

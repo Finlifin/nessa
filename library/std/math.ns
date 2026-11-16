@@ -1,6 +1,7 @@
 -- std.math — mathematical builtins
 
 use .builtin.*
+use .traits.*
 
 pub const abs: fn(Any) -> Any = .abs'builtin
 const native_abs: fn(Any) -> Any = .abs'builtin
@@ -184,6 +185,123 @@ const native_from_bits: fn(u64) -> f64 = .from_bits'builtin
 -- Interpret the IEEE-754 bits of an unsigned 64-bit integer.
 pub fn f64_from_bits(bits: u64) -> f64 { native_from_bits(bits) }
 
+const native_f64_to_fixed: fn(f64, i64) -> String = .f64_to_fixed'builtin
+const native_f64_to_exp: fn(f64, i64) -> String = .f64_to_exp'builtin
+const native_f64_to_precision: fn(f64, i64) -> String = .f64_to_precision'builtin
+pub const frexp: fn(f64) -> (f64, i64) = .f64_frexp'builtin
+const native_frexp: fn(f64) -> (f64, i64) = .f64_frexp'builtin
+pub const ldexp: fn(f64, i64) -> f64 = .f64_ldexp'builtin
+const native_ldexp: fn(f64, i64) -> f64 = .f64_ldexp'builtin
+const native_type_of: fn(Any) -> Type = .type_of'builtin
+const native_cast_unsigned: fn(Any) -> Any = .cast_unsigned'builtin
+const native_parse_int_radix: fn(String, i64) -> ?i64 = .__str_parse_int_radix'builtin
+
+-- Lua-style math bounds and IEEE positive infinity.
+-- Defined as zero-arg functions matching `pi`/`infinity`/`f64_max` in `std.math` so prelude
+-- modules remain free of runtime global initializers (`entry_func_id == None` for libraries).
+pub const huge: fn() -> f64 = .infinity'builtin
+pub const HUGE: fn() -> f64 = .infinity'builtin
+pub fn max_integer() -> i64 = 9223372036854775807
+pub fn MAX_INTEGER() -> i64 = 9223372036854775807
+pub fn min_integer() -> i64 = -9223372036854775807 - 1
+pub fn MIN_INTEGER() -> i64 = -9223372036854775807 - 1
+
+-- IEEE-754 floating-point remainder truncated toward zero (Lua `math.fmod`).
+pub fn fmod(x: f64, y: f64) -> f64 = x % y
+
+-- Split `x` into `(integral, fractional)` parts with matching sign (Lua `math.modf`).
+pub fn modf(x: f64) -> (f64, f64) {
+    if native_is_nan(x) {
+        return (x, x)
+    }
+    if native_is_infinite(x) {
+        return (x, native_copysign(0.0, x))
+    }
+    let int_part = native_trunc(x)
+    (int_part, native_copysign(x - int_part, x))
+}
+
+-- Unsigned 64-bit comparison of two `i64` values (Lua `math.ult`).
+pub fn ult(a: i64, b: i64) -> bool {
+    native_cast_unsigned(a).as(u64) < native_cast_unsigned(b).as(u64)
+}
+
+-- Classify numeric values into `"integer"` or `"float"`, returning `null` for non-numbers (Lua `math.type`).
+pub fn math_type(value: Any) -> ?String {
+    if value == null {
+        return null
+    }
+    let ty = native_type_of(value)
+    if ty == i8
+        or ty == i16
+        or ty == i32
+        or ty == i64
+        or ty == i128
+        or ty == isize
+        or ty == u8
+        or ty == u16
+        or ty == u32
+        or ty == u64
+        or ty == u128
+        or ty == usize {
+        return "integer"
+    }
+    if ty == f32 or ty == f64 {
+        return "float"
+    }
+    null
+}
+
+-- Convert `value` to an exact `i64` without rounding or wrapping, or return `null` (Lua `math.tointeger`).
+pub fn to_exact_i64(value: Any) -> ?i64 {
+    if value == null {
+        return null
+    }
+    let ty = native_type_of(value)
+    if ty == i8 or ty == i16 or ty == i32 or ty == i64 or ty == isize {
+        return value.as(i64)
+    }
+    if ty == u8 or ty == u16 or ty == u32 {
+        return value.as(i64)
+    }
+    if ty == u64 or ty == usize {
+        let u = value.as(u64)
+        let max_u: u64 = 9223372036854775807
+        if u <= max_u {
+            return u.as(i64)
+        }
+        return null
+    }
+    if ty == i128 {
+        let v = value.as(i128)
+        let min_v: i128 = -9223372036854775808
+        let max_v: i128 = 9223372036854775807
+        if v >= min_v and v <= max_v {
+            return v.as(i64)
+        }
+        return null
+    }
+    if ty == u128 {
+        let v = value.as(u128)
+        let max_v: u128 = 9223372036854775807
+        if v <= max_v {
+            return v.as(i64)
+        }
+        return null
+    }
+    if ty == f32 or ty == f64 {
+        let f = value.as(f64)
+        if native_is_finite(f) and native_trunc(f) == f {
+            return trunc_i64(f)
+        }
+        return null
+    }
+    if ty == String {
+        return native_parse_int_radix(value.as(String), 0)
+    }
+    null
+}
+
 impl f64 {
     -- Call the private bindings. The public functions share these names, and a
     -- direct call would resolve to the method itself.
@@ -252,4 +370,9 @@ impl f64 {
     pub fn abs_diff(self, other: f64) -> f64 { native_f64_abs_diff(self, other) }
     -- True for both +0.0 and -0.0.
     pub fn is_zero(self) -> bool { native_f64_is_zero(self) }
+    pub fn frexp(self) -> (f64, i64) { native_frexp(self) }
+    pub fn ldexp(self, exponent: i64) -> f64 { native_ldexp(self, exponent) }
+    pub fn to_fixed(self, digits: i64) -> String { native_f64_to_fixed(self, digits) }
+    pub fn to_exp(self, .digits: i64 = -1) -> String { native_f64_to_exp(self, digits) }
+    pub fn to_precision(self, digits: i64) -> String { native_f64_to_precision(self, digits) }
 }

@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn unsupported_module_value_destructuring_is_rejected() {
-        let (_, errors) = resolve("let (first, second) = (1, 2)", None);
+        let (_, errors) = resolve("let [first, second] = [1, 2]", None);
         assert!(
             errors
                 .iter()

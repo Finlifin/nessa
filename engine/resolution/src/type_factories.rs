@@ -8,6 +8,16 @@ use crate::{SymbolKind, resolver::Resolver, typing};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeFactory {
     IterationStep,
+    Future,
+}
+
+impl TypeFactory {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::IterationStep => "IterationStep",
+            Self::Future => "Future",
+        }
+    }
 }
 
 pub(crate) fn identity(r: &Resolver<'_>, node: NodeIndex) -> Option<TypeFactory> {
@@ -27,15 +37,23 @@ pub(crate) fn application(
         return None;
     }
     let factory = identity(r, ast.fixed_children(node)[0])?;
+    let name = factory.name();
     Some((|| {
         let [item] = ast.multi_children(node) else {
-            return Err("IterationStep requires exactly one positional type argument".into());
+            return Err(format!(
+                "{name} requires exactly one positional type argument"
+            ));
         };
         if ast.node(*item).kind == NodeKind::NamedArg {
-            return Err("IterationStep requires exactly one positional type argument".into());
+            return Err(format!(
+                "{name} requires exactly one positional type argument"
+            ));
         }
-        let item = typing::resolve_type_expr_inner(r, ast, *item).ok_or_else(|| {
-            "IterationStep requires a statically known concrete Item type".to_string()
+        let item = typing::resolve_type_expr_inner(r, ast, *item).ok_or_else(|| match factory {
+            TypeFactory::IterationStep => {
+                "IterationStep requires a statically known concrete Item type".to_string()
+            }
+            TypeFactory::Future => "Future requires a statically known inner type".to_string(),
         })?;
         match factory {
             TypeFactory::IterationStep => {
@@ -67,6 +85,7 @@ pub(crate) fn application(
                 }
                 .map_err(|error| error.to_string())
             }
+            TypeFactory::Future => Ok(r.type_pool.intern_future(item)),
         }
     })())
 }
@@ -87,7 +106,7 @@ pub(crate) fn deferred_variant(
     }
     for _ in 0..r.symbols.len() {
         if matches!(ast.node(owner).kind, NodeKind::Call | NodeKind::PatternCall) {
-            return identity(r, ast.fixed_children(owner)[0]).is_some();
+            return identity(r, ast.fixed_children(owner)[0]) == Some(TypeFactory::IterationStep);
         }
         let Some(symbol) = r
             .node_symbols
@@ -104,8 +123,19 @@ pub(crate) fn deferred_variant(
     false
 }
 
+/// Bare `Future` denotes `Future(Any)`, allowing both `Future(T)` and `Future`.
+pub(crate) fn bare_type(r: &mut Resolver<'_>, node: NodeIndex) -> Option<TypeIndex> {
+    match identity(r, node)? {
+        TypeFactory::Future => Some(
+            r.type_pool
+                .intern_future(type_pool::Intrinsic::Any.type_index()),
+        ),
+        TypeFactory::IterationStep => None,
+    }
+}
+
 pub(crate) fn bare_value(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> bool {
-    if identity(r, node).is_none() {
+    if identity(r, node) != Some(TypeFactory::IterationStep) {
         return false;
     }
     r.diag_ctx

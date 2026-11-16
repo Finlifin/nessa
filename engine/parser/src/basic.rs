@@ -167,6 +167,26 @@ pub fn try_required_block(
 // Atomic parsers
 // ---------------------------------------------------------------------------
 
+/// Whether `kind` is an ordinary or backtick-quoted identifier token.
+#[inline]
+pub fn is_ident_token(kind: TokenKind) -> bool {
+    matches!(kind, TokenKind::Id | TokenKind::ArbitraryId)
+}
+
+/// Strip surrounding backticks from a `TokenKind::ArbitraryId` slice.
+#[inline]
+pub fn unquote_ident_text(kind: TokenKind, raw: &str) -> &str {
+    if kind == TokenKind::ArbitraryId
+        && raw.len() >= 2
+        && raw.starts_with('`')
+        && raw.ends_with('`')
+    {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    }
+}
+
 /// Parse atomic expressions (literals, identifiers, keywords).
 pub fn try_atomic(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
@@ -179,7 +199,7 @@ pub fn try_atomic(p: &mut Parser) -> ParseResult {
         TokenKind::Real | TokenKind::RealSci => Some(NodeKind::Real),
         TokenKind::String => Some(NodeKind::Str),
         TokenKind::Char => Some(NodeKind::Char),
-        TokenKind::Id => Some(NodeKind::Id),
+        TokenKind::Id | TokenKind::ArbitraryId => Some(NodeKind::Id),
         TokenKind::KwFalse | TokenKind::KwTrue => Some(NodeKind::Bool),
         TokenKind::KwSelfCap => Some(NodeKind::SelfUpper),
         TokenKind::KwSelfLower => Some(NodeKind::SelfLower),
@@ -189,7 +209,7 @@ pub fn try_atomic(p: &mut Parser) -> ParseResult {
     };
 
     if let Some(kind) = node_kind {
-        let text = p.next_token_text();
+        let text = unquote_ident_text(token.kind, p.next_token_text());
         let str_id = str_interner::intern(text);
         let span = p.next_token_span();
         p.next_token(); // consume the token
@@ -200,15 +220,16 @@ pub fn try_atomic(p: &mut Parser) -> ParseResult {
     Ok(NULL)
 }
 
-/// Parse an identifier.
+/// Parse an identifier (ordinary or backtick-quoted arbitrary identifier).
 pub fn try_id(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    if p.peek_token().kind != TokenKind::Id {
+    let kind = p.peek_token().kind;
+    if !is_ident_token(kind) {
         return Ok(NULL);
     }
 
-    let text = p.next_token_text();
+    let text = unquote_ident_text(kind, p.next_token_text());
     let str_id = str_interner::intern(text);
     let span = p.next_token_span();
     p.next_token();
@@ -254,7 +275,7 @@ pub fn try_symbol(p: &mut Parser) -> ParseResult {
 pub fn try_property(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    if !p.peek(&[TokenKind::Id, TokenKind::Colon]) {
+    if !is_ident_token(p.peek_nth(0).kind) || p.peek_nth(1).kind != TokenKind::Colon {
         return Ok(NULL);
     }
 
@@ -287,8 +308,8 @@ pub fn try_property(p: &mut Parser) -> ParseResult {
 pub fn try_named_arg(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    // Look ahead: must be Id followed by `=`.
-    if !p.peek(&[TokenKind::Id, TokenKind::Eq]) {
+    // Look ahead: must be Id/ArbitraryId followed by `=`.
+    if !is_ident_token(p.peek_nth(0).kind) || p.peek_nth(1).kind != TokenKind::Eq {
         return Ok(NULL);
     }
 
@@ -317,7 +338,10 @@ pub fn try_named_arg(p: &mut Parser) -> ParseResult {
 pub fn try_property_assign(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    if p.peek_token().kind != TokenKind::Dot {
+    if p.peek_nth(0).kind != TokenKind::Dot
+        || !is_ident_token(p.peek_nth(1).kind)
+        || p.peek_nth(2).kind != TokenKind::Eq
+    {
         return Ok(NULL);
     }
     p.next_token(); // consume dot
@@ -504,7 +528,7 @@ pub fn try_parameter(p: &mut Parser) -> ParseResult {
     }
 
     // Case: .id (: type)? = expr  (optional parameter)
-    if p.peek(&[TokenKind::Dot, TokenKind::Id]) {
+    if p.peek_nth(0).kind == TokenKind::Dot && is_ident_token(p.peek_nth(1).kind) {
         p.eat_tokens(1); // consume dot
         let id = try_id(p)?;
         let mut ty = NULL;

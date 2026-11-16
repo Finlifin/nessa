@@ -24,13 +24,14 @@ newtype Email = String
 
 `Meters` 和 `Seconds` 虽然底层都是 `f64`，但它们是不同的类型，不能直接互换，从而在编译期防止单位混淆等错误。
 
-## newtype 与 trait 继承
+## newtype 构造、转换、模式匹配与 trait 继承
 
-> TODO: newtype 是否应该自动继承原类型的 trait 实现？这是一个待决定的设计问题。
->
-> - 自动继承：方便，减少样板代码，但可能引入不期望的行为
-> - 不继承：安全，但需要手动 impl 或 derive 所需的 trait
-> - 选择性继承：通过某种语法声明要继承哪些 trait
+`newtype` 采用**显式不自动继承**策略：
+
+- **名义类型身份**：每个 `newtype` 拥有独立的名义 `TypeId` 与关联作用域，运行时值包装并保留名义身份，`type_of(Meters(1.0)) == Meters` 且不等于 `f64` 或 `Seconds`。禁止直接或间接自引用循环（如 `newtype A = A`），编译期报告循环诊断。
+- **构造与显式转换**：使用 `Meters(3.5)` 构造实例；通过 `m.as(f64)` 解包为底层类型，或通过 `(3.5).as(Meters)` 显式包装，不允许隐式退化为底层类型。
+- **模式匹配**：支持构造器模式解构，如 `m match { Meters(v) => v }`。
+- **Trait 实现与派生**：不自动继承底层类型的 trait 实现，防止意外暴露底层运算；支持显式 `impl` / `extend`，以及通过 `derive Eq, PartialEq, Ord, PartialOrd, Display, Hash` 或自定义无必填方法 trait 的 `derive` 按需派生（`Display` 输出 `Name(inner)` 格式）。
 
 ## 何时用 typealias，何时用 newtype
 

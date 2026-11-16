@@ -261,6 +261,7 @@ fn managed_capture_is_reclaimed_only_after_all_ordinary_register_and_frame_roots
         handler_func: FuncId(0),
         closure_env: owner,
         continuation_param: None,
+        scope_id: 0,
     });
     context.registers.regs.fill(TaggedValue::UNIT);
     fixture.collect();

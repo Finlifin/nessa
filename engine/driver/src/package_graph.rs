@@ -1,6 +1,6 @@
 //! Compile a selected manifest DAG from caller-owned package source trees.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ast::{NodeIndex, NodeKind};
 use pkg_manager::{PackageResolver, PackageSources, PackageType, SourceLoadLimits};
@@ -21,6 +21,44 @@ impl Driver {
         root: &PackageSources,
         catalog: &[PackageSources],
     ) -> CompileResult {
+        self.compile_package_sources_with_privileged(root, catalog, &BTreeSet::new())
+    }
+
+    /// Resolve and compile a root and an in-memory source catalog, reusing or populating
+    /// the content-addressed `.nsbc` compilation cache when compilation succeeds.
+    pub fn compile_package_sources_with_privileged_cached(
+        &self,
+        root: &PackageSources,
+        catalog: &[PackageSources],
+        privileged_packages: &BTreeSet<String>,
+    ) -> Result<nsbc::CompiledArtifact, Vec<diagnostic::Diagnostic>> {
+        let cache_dir = self.resolved_cache_dir();
+        let key = crate::artifact_cache::package_graph_key(root, catalog, privileged_packages);
+        if let Some(cached) =
+            crate::artifact_cache::load_cached_artifact(cache_dir.as_deref(), &key)
+        {
+            return Ok(cached);
+        }
+        let compiled =
+            self.compile_package_sources_with_privileged(root, catalog, privileged_packages);
+        if compiled.has_errors {
+            return Err(compiled.diagnostics);
+        }
+        let artifact = compiled
+            .into_artifact()
+            .map_err(|error| self.package_errors(error.to_string()))?;
+        crate::artifact_cache::store_cached_artifact(cache_dir.as_deref(), &key, &artifact);
+        Ok(artifact)
+    }
+
+    /// Resolve and compile a root and an in-memory source catalog, granting `'builtin`
+    /// view access to explicitly listed host-bridge qualified package names (`domain/name`).
+    pub fn compile_package_sources_with_privileged(
+        &self,
+        root: &PackageSources,
+        catalog: &[PackageSources],
+        privileged_packages: &BTreeSet<String>,
+    ) -> CompileResult {
         let selected = match select_sources(root, catalog) {
             Ok(selected) => selected,
             Err(error) => return self.package_failure(error),
@@ -37,6 +75,15 @@ impl Driver {
             }
         };
         let mut options = ResolveOptions::default();
+        if privileged_packages.contains(&root.manifest.manifest().qualified_name()) {
+            crate::standard_library::mark_trusted(&ast, ast.root, &mut options.privileged_nodes);
+        }
+        crate::standard_library::mark_ffi_permissions(
+            &ast,
+            ast.root,
+            root.manifest.ffi(),
+            &mut options,
+        );
         let mut nodes = BTreeMap::from([(root.manifest.manifest().qualified_name(), ast.root)]);
         let mut dependencies = Vec::new();
         for source in &sources {
@@ -101,6 +148,15 @@ impl Driver {
             nodes.insert(manifest.qualified_name(), node);
             options.package_roots.insert(node);
             options.detached_package_roots.insert(node);
+            if privileged_packages.contains(&manifest.qualified_name()) {
+                crate::standard_library::mark_trusted(&ast, node, &mut options.privileged_nodes);
+            }
+            crate::standard_library::mark_ffi_permissions(
+                &ast,
+                node,
+                source.manifest.ffi(),
+                &mut options,
+            );
             let context =
                 match CompilationIdentityContext::for_package(&graph, &manifest.qualified_name()) {
                     Ok(context) => context,
@@ -191,6 +247,15 @@ fn select_sources<'a>(
             }
         } else {
             registered.insert(key, source);
+        }
+    }
+    for bundled in pkg_manager::bundled_packages() {
+        let bkey = key(bundled);
+        if let std::collections::btree_map::Entry::Vacant(entry) = registered.entry(bkey) {
+            resolver
+                .register_document(bundled.manifest.clone())
+                .map_err(|error| error.to_string())?;
+            entry.insert(bundled);
         }
     }
     let graph = resolver

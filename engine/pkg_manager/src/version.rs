@@ -60,6 +60,10 @@ pub enum VersionConstraint {
 }
 
 impl VersionConstraint {
+    pub fn any() -> Self {
+        Self::Range(semver::VersionReq::STAR)
+    }
+
     pub fn parse(source: &str) -> Option<Self> {
         let source = source.trim();
         if let Some(version) = Version::parse(source.strip_prefix('=').unwrap_or(source).trim()) {

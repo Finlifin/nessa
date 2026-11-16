@@ -16,6 +16,7 @@ pub enum LexErrorKind {
     InvalidArbitraryId,
     UnmatchedIndentation,
     UnexpectedChar,
+    UnterminatedBlockComment,
 }
 
 impl fmt::Display for LexErrorKind {
@@ -27,6 +28,7 @@ impl fmt::Display for LexErrorKind {
             Self::InvalidArbitraryId => write!(f, "InvalidArbitraryId"),
             Self::UnmatchedIndentation => write!(f, "UnmatchedIndentation"),
             Self::UnexpectedChar => write!(f, "UnexpectedChar"),
+            Self::UnterminatedBlockComment => write!(f, "UnterminatedBlockComment"),
         }
     }
 }
@@ -80,6 +82,7 @@ impl NessaError for LexError {
                 LexErrorKind::InvalidArbitraryId => 4,
                 LexErrorKind::UnmatchedIndentation => 5,
                 LexErrorKind::UnexpectedChar => 6,
+                LexErrorKind::UnterminatedBlockComment => 7,
             }
     }
 
@@ -91,6 +94,7 @@ impl NessaError for LexError {
             LexErrorKind::InvalidArbitraryId => "InvalidArbitraryId",
             LexErrorKind::UnmatchedIndentation => "UnmatchedIndentation",
             LexErrorKind::UnexpectedChar => "UnexpectedChar",
+            LexErrorKind::UnterminatedBlockComment => "UnterminatedBlockComment",
         }
     }
 

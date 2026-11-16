@@ -575,6 +575,7 @@ fn engine_custom_config() {
             ..Default::default()
         },
         debug: true,
+        ..Default::default()
     };
     let engine = initialization::Engine::new(config);
     let _ = engine.type_pool();

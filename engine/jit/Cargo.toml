@@ -1,0 +1,11 @@
+[package]
+name = "jit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = { workspace = true }
+nsbc = { path = "../nsbc" }
+runtime = { path = "../runtime" }
+type_pool = { path = "../type_pool" }
+gc = { path = "../gc" }

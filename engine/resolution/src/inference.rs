@@ -44,6 +44,8 @@ fn static_scope(r: &Resolver<'_>, ast: &Ast, symbol: SymbolId) -> bool {
                 NodeKind::Block
                     | NodeKind::FunctionDef
                     | NodeKind::Lambda
+                    | NodeKind::CaseMap
+                    | NodeKind::CaseAlternative
                     | NodeKind::CaseArm
                     | NodeKind::ForLoop
             )
@@ -111,6 +113,17 @@ fn receiver_type(
                             };
                             r.type_pool.canonical_type(ret)
                         }),
+                        NodeKind::InfixFnCall => r
+                            .node_symbols
+                            .get(&node)
+                            .and_then(|symbol| {
+                                r.type_pool
+                                    .canonical_type(r.symbols[symbol.0 as usize].type_index)
+                            })
+                            .and_then(|ty| match r.type_pool.get(ty).kind {
+                                TypeKind::Function { ret, .. } => r.type_pool.canonical_type(ret),
+                                _ => None,
+                            }),
                         NodeKind::Projection => types.get(&children[0]).copied().and_then(|ty| {
                             let TypeKind::Struct { fields, .. } = &r.type_pool.get(ty).kind else {
                                 return None;
@@ -154,23 +167,51 @@ fn receiver_type(
 }
 
 pub(crate) fn resolve_static_dependencies(r: &mut Resolver<'_>, ast: &Ast) {
-    r.function_inference.value_initializers = ast
-        .nodes
-        .iter()
-        .enumerate()
-        .filter_map(|(index, node)| {
-            if !matches!(
-                node.kind,
-                NodeKind::LetDecl | NodeKind::ConstDecl | NodeKind::VarDecl
-            ) {
-                return None;
+    let mut initializers = HashMap::new();
+    for (index, node) in ast.nodes.iter().enumerate() {
+        let decl = NodeIndex(index as u32);
+        let (pattern_root, value_node) = match node.kind {
+            NodeKind::LetDecl | NodeKind::ConstDecl | NodeKind::VarDecl => {
+                let children = ast.fixed_children(decl);
+                (children[0], children[2])
             }
-            let children = ast.fixed_children(NodeIndex(index as u32));
-            r.node_symbols
-                .get(&children[0])
-                .map(|&symbol| (symbol, children[2]))
-        })
-        .collect();
+            NodeKind::LetHandler => {
+                let children = ast.fixed_children(decl);
+                (children[1], children[3])
+            }
+            _ => continue,
+        };
+        let mut pending = vec![pattern_root];
+        while let Some(pat) = pending.pop() {
+            if pat.is_null() {
+                continue;
+            }
+            if let Some(&symbol) = r.node_symbols.get(&pat)
+                && matches!(
+                    r.symbols[symbol.0 as usize].kind,
+                    SymbolKind::Variable | SymbolKind::Constant
+                )
+            {
+                initializers.insert(symbol, value_node);
+            }
+            match ast.node(pat).kind {
+                NodeKind::PatternExtendedCall => {
+                    pending.extend(ast.multi_children(pat));
+                }
+                NodeKind::PatternTyped => {
+                    pending.push(ast.fixed_children(pat)[0]);
+                }
+                NodeKind::Property | NodeKind::PropertyPattern => {
+                    pending.push(ast.fixed_children(pat)[1]);
+                }
+                _ => {
+                    pending.extend(ast.fixed_children(pat));
+                    pending.extend(ast.multi_children(pat));
+                }
+            }
+        }
+    }
+    r.function_inference.value_initializers = initializers;
     resolve_nodes(r, ast, static_nodes(r, ast), None);
 }
 
@@ -211,7 +252,10 @@ pub(crate) fn resolve_block_dependencies(r: &mut Resolver<'_>, ast: &Ast, block:
             function(ast, node)
                 || matches!(
                     ast.node(node).kind,
-                    NodeKind::LetDecl | NodeKind::ConstDecl | NodeKind::VarDecl
+                    NodeKind::LetDecl
+                        | NodeKind::ConstDecl
+                        | NodeKind::VarDecl
+                        | NodeKind::LetHandler
                 )
         })
         .collect();
@@ -236,6 +280,22 @@ pub(crate) fn resolve_block_dependencies(r: &mut Resolver<'_>, ast: &Ast, block:
     resolve_nodes(r, ast, nodes, None);
 }
 
+fn decl_binding_node(ast: &Ast, node: NodeIndex) -> NodeIndex {
+    if ast.node(node).kind == NodeKind::LetHandler {
+        ast.fixed_children(node)[1]
+    } else {
+        ast.fixed_children(node)[0]
+    }
+}
+
+fn decl_annotation_node(ast: &Ast, node: NodeIndex) -> NodeIndex {
+    if ast.node(node).kind == NodeKind::LetHandler {
+        ast.fixed_children(node)[2]
+    } else {
+        ast.fixed_children(node)[1]
+    }
+}
+
 fn resolve_nodes(
     r: &mut Resolver<'_>,
     ast: &Ast,
@@ -249,12 +309,17 @@ fn resolve_nodes(
     }
     let mut definitions = HashMap::new();
     for (index, &node) in nodes.iter().enumerate() {
-        let mut pending = vec![ast.fixed_children(node)[0]];
+        let mut pending = vec![decl_binding_node(ast, node)];
         while let Some(binding) = pending.pop() {
             if binding.is_null() {
                 continue;
             }
-            if let Some(&symbol) = r.node_symbols.get(&binding) {
+            if let Some(&symbol) = r.node_symbols.get(&binding)
+                && matches!(
+                    r.symbols[symbol.0 as usize].kind,
+                    SymbolKind::Function | SymbolKind::Variable | SymbolKind::Constant
+                )
+            {
                 definitions.insert(symbol, index);
             }
             pending.extend(ast.fixed_children(binding));
@@ -265,7 +330,11 @@ fn resolve_nodes(
     let mut methods = vec![Vec::new(); nodes.len()];
     for (index, &node) in nodes.iter().enumerate() {
         let children = ast.fixed_children(node);
-        let mut pending = vec![children[2]];
+        let mut pending = if ast.node(node).kind == NodeKind::LetHandler {
+            vec![children[0], children[3]]
+        } else {
+            vec![children[2]]
+        };
         if function(ast, node) {
             pending.extend(ast.multi_children(node));
             pending.push(children[3]);
@@ -304,7 +373,7 @@ fn resolve_nodes(
                     let definition = nodes[dependency];
                     // Explicit function results and value annotations are
                     // complete contracts, including within a dependency cycle.
-                    if ast.fixed_children(definition)[1].is_null() {
+                    if decl_annotation_node(ast, definition).is_null() {
                         edges[index].push(dependency);
                     }
                 }
@@ -369,7 +438,7 @@ fn resolve_nodes(
                     receiver_type(r, ast, receiver, &r.function_inference.value_initializers)
                     && let Ok(symbol) = crate::associated::member(r, ty, name)
                     && let Some(&dependency) = definitions.get(&symbol)
-                    && ast.fixed_children(nodes[dependency])[1].is_null()
+                    && decl_annotation_node(ast, nodes[dependency]).is_null()
                     && !edges[index].contains(&dependency)
                 {
                     edges[index].push(dependency);
@@ -382,6 +451,11 @@ fn resolve_nodes(
             let node = nodes[index];
             if function(ast, node) {
                 typing::resolve_function_def_types(r, ast, node);
+            } else if ast.node(node).kind == NodeKind::LetHandler {
+                if let Some(ti) = crate::capability::resolve_let_handler(r, ast, node) {
+                    r.node_types.insert(node, ti);
+                }
+                r.function_inference.values.insert(node);
             } else {
                 typing::resolve_decl(r, ast, node);
                 r.function_inference.values.insert(node);

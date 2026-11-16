@@ -201,6 +201,7 @@ pub(crate) fn decode_pool(bytes: &[u8]) -> io::Result<TypePool> {
         partial_ord: reader.index()?,
         iterator: reader.index()?,
         into_iterator: reader.index()?,
+        json: reader.index()?,
     };
     let null_type = reader.index()?;
     let scopes = reader.list(6, |reader| {
@@ -297,7 +298,7 @@ pub(crate) fn decode_pool(bytes: &[u8]) -> io::Result<TypePool> {
     Ok(pool)
 }
 
-fn known_traits(known: WellKnownTraits) -> [TypeIndex; 8] {
+fn known_traits(known: WellKnownTraits) -> [TypeIndex; 9] {
     [
         known.display,
         known.hash,
@@ -307,6 +308,7 @@ fn known_traits(known: WellKnownTraits) -> [TypeIndex; 8] {
         known.partial_ord,
         known.iterator,
         known.into_iterator,
+        known.json,
     ]
 }
 
@@ -412,6 +414,7 @@ impl Writer {
                 TraitTypeStep::EffectInner => (6, None),
                 TraitTypeStep::EffectMember(index) => (7, Some(*index)),
                 TraitTypeStep::IterationItem => (8, None),
+                TraitTypeStep::FutureInner => (9, None),
             };
             writer.u8(tag)?;
             if let Some(index) = index {
@@ -478,6 +481,10 @@ impl Writer {
             }
             AssociatedTypeExpr::Optional { inner } => {
                 self.u8(3)?;
+                self.associated_expr(inner, depth + 1)
+            }
+            AssociatedTypeExpr::Future { inner } => {
+                self.u8(8)?;
                 self.associated_expr(inner, depth + 1)
             }
             AssociatedTypeExpr::Tuple { elements } => {
@@ -553,6 +560,10 @@ impl Writer {
             }
             TypeKind::Optional { inner } => {
                 self.u8(8)?;
+                self.index(*inner)
+            }
+            TypeKind::Future { inner } => {
+                self.u8(15)?;
                 self.index(*inner)
             }
             TypeKind::ErrorQualified { errors, inner } => {
@@ -764,6 +775,7 @@ impl<'a> Reader<'a> {
                 6 => TraitTypeStep::EffectInner,
                 7 => TraitTypeStep::EffectMember(reader.u32()?),
                 8 => TraitTypeStep::IterationItem,
+                9 => TraitTypeStep::FutureInner,
                 _ => return Err(invalid("invalid trait Self path step tag")),
             })
         })
@@ -777,6 +789,9 @@ impl<'a> Reader<'a> {
         }
         Ok(match self.u8()? {
             7 => AssociatedTypeExpr::Required,
+            8 => AssociatedTypeExpr::Future {
+                inner: Box::new(self.associated_expr(depth + 1)?),
+            },
             6 => AssociatedTypeExpr::IterationStep {
                 item: Box::new(self.associated_expr(depth + 1)?),
             },
@@ -805,6 +820,9 @@ impl<'a> Reader<'a> {
         Ok(match self.u8()? {
             14 => TypeKind::IterationStepTemplate {
                 item: self.index()?,
+            },
+            15 => TypeKind::Future {
+                inner: self.index()?,
             },
             0 => TypeKind::Intrinsic(
                 *Intrinsic::ALL

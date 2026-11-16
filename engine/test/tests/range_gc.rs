@@ -35,6 +35,7 @@ fn range_and_dynamic_iterators_survive_collections_inside_loops() {
             gc_threads: 1,
         },
         debug: false,
+        ..Default::default()
     });
     let entry = driver::install_artifact(engine.vm_mut(), compiled.into_artifact().unwrap())
         .unwrap()

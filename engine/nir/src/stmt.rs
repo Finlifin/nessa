@@ -4,7 +4,7 @@
 use ast::{Ast, NodeIndex, NodeKind};
 use resolution::{ForLoopPlan, ResolvedAst};
 
-use crate::builder::{FunctionBuilder, LoopTargets};
+use crate::builder::{CleanupAction, FunctionBuilder, LoopTargets};
 use crate::expr::lower_expr;
 use crate::{BlockId, NirExpr, NirStmt, NirValue, Terminator};
 
@@ -32,30 +32,319 @@ pub(crate) fn lower_body_into(
             lower_stmt(resolved, node_idx, builder, block, true);
         }
         NodeKind::Block => {
-            let stmts = ast.multi_children(node_idx);
-            let last_idx = stmts.len().saturating_sub(1);
-            for (i, &stmt) in stmts.iter().enumerate() {
-                if !matches!(
-                    builder.blocks[block.0 as usize].terminator,
-                    Terminator::Unreachable
-                ) {
-                    break;
-                }
-                lower_stmt(resolved, stmt, builder, block, i == last_idx);
-            }
-            // If block is still unterminated, add return unit.
-            if matches!(
-                builder.blocks[block.0 as usize].terminator,
-                Terminator::Unreachable
-            ) {
-                builder.blocks[block.0 as usize].terminator = Terminator::Return(NirValue::Unit);
-            }
+            crate::capability::lower_block_statements(
+                resolved,
+                ast.multi_children(node_idx),
+                crate::capability::BlockExecMode::TailReturn,
+                builder,
+                block,
+            );
         }
         _ => {
             // Single expression body — return its value.
             let val = lower_expr(resolved, node_idx, builder, block);
-            builder.blocks[block.0 as usize].terminator = Terminator::Return(val);
+            if matches!(
+                builder.blocks[block.0 as usize].terminator,
+                Terminator::Unreachable
+            ) {
+                emit_normal_return(resolved, node_idx, val, builder, block);
+            }
         }
+    }
+}
+
+pub(crate) fn run_defer_node(
+    resolved: &ResolvedAst,
+    defer_body: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    let saved_scopes = std::mem::replace(&mut builder.defer_scopes, vec![Vec::new()]);
+    let saved_loops = std::mem::take(&mut builder.loop_targets);
+    lower_non_tail_body(resolved, defer_body, builder, block);
+    let inner_top = builder.defer_scopes.pop().unwrap_or_default();
+    if matches!(
+        builder.blocks[block.0 as usize].terminator,
+        Terminator::Unreachable
+    ) {
+        emit_scope_defers(resolved, &inner_top, builder, block);
+    }
+    builder.defer_scopes = saved_scopes;
+    builder.loop_targets = saved_loops;
+}
+
+pub(crate) fn emit_scope_defers_mode(
+    resolved: &ResolvedAst,
+    defers: &[CleanupAction],
+    await_handlers: bool,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    for &action in defers.iter().rev() {
+        if !matches!(
+            builder.blocks[block.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            break;
+        }
+        match action {
+            CleanupAction::Defer(defer_body) => {
+                run_defer_node(resolved, defer_body, builder, block)
+            }
+            CleanupAction::PopHandler => {
+                builder.blocks[block.0 as usize]
+                    .stmts
+                    .push(if await_handlers {
+                        NirStmt::AwaitPopHandler
+                    } else {
+                        NirStmt::PopHandler
+                    });
+            }
+        }
+    }
+}
+
+pub(crate) fn emit_scope_defers(
+    resolved: &ResolvedAst,
+    defers: &[CleanupAction],
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    emit_scope_defers_mode(resolved, defers, true, builder, block);
+}
+
+pub(crate) fn emit_scope_defers_for_value(
+    resolved: &ResolvedAst,
+    scope_node: NodeIndex,
+    value: NirValue,
+    value_type: Option<type_pool::TypeIndex>,
+    defers: &[CleanupAction],
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    if !matches!(
+        builder.blocks[block.0 as usize].terminator,
+        Terminator::Unreachable
+    ) || defers.is_empty()
+    {
+        return value;
+    }
+    let value = crate::arguments::snapshot(value, builder, *block);
+    let has_handlers = defers
+        .iter()
+        .any(|action| matches!(action, CleanupAction::PopHandler));
+    let is_error_qualified = value_type.is_some_and(|ty| {
+        resolved
+            .type_pool
+            .error_shape(ty)
+            .is_ok_and(|shape| shape.is_some())
+    });
+    if has_handlers && is_error_qualified {
+        let scope = resolved
+            .node_scopes
+            .get(&scope_node)
+            .map_or(builder.entry_scope.unwrap_or(0), |s| s.0);
+        let ok_block = builder.new_block();
+        let err_block = builder.new_block();
+        let merge_block = builder.new_block();
+        crate::patterns::test(
+            builder,
+            *block,
+            NirExpr::ErrorIsOk(value).in_scope(scope),
+            ok_block,
+            err_block,
+        );
+        let mut ok_cur = ok_block;
+        emit_scope_defers_mode(resolved, defers, true, builder, &mut ok_cur);
+        if matches!(
+            builder.blocks[ok_cur.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            builder.blocks[ok_cur.0 as usize].terminator = Terminator::Goto(merge_block);
+        }
+        let mut err_cur = err_block;
+        emit_scope_defers_mode(resolved, defers, false, builder, &mut err_cur);
+        if matches!(
+            builder.blocks[err_cur.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            builder.blocks[err_cur.0 as usize].terminator = Terminator::Goto(merge_block);
+        }
+        *block = merge_block;
+    } else {
+        emit_scope_defers_mode(resolved, defers, true, builder, block);
+    }
+    value
+}
+
+pub(crate) struct HandlerScopeSpec {
+    pub scope_node: NodeIndex,
+    pub expr_node: NodeIndex,
+    pub count: usize,
+    pub captures: bool,
+    pub answer_type: Option<type_pool::TypeIndex>,
+}
+
+pub(crate) fn finish_handler_scope_expr(
+    resolved: &ResolvedAst,
+    spec: HandlerScopeSpec,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    if spec.captures {
+        let (body, _) = crate::expr::lower_closure(
+            resolved,
+            spec.expr_node,
+            &[],
+            None,
+            spec.answer_type,
+            builder,
+            block,
+        );
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::DelimitedCall {
+                body,
+                handler_count: spec.count as u8,
+            },
+        ));
+        let pop_actions = vec![CleanupAction::PopHandler; spec.count];
+        emit_scope_defers_for_value(
+            resolved,
+            spec.scope_node,
+            NirValue::Local(local),
+            builder.node_type(resolved, spec.scope_node),
+            &pop_actions,
+            builder,
+            block,
+        )
+    } else {
+        builder
+            .defer_scopes
+            .push(vec![CleanupAction::PopHandler; spec.count]);
+        let result = lower_expr(resolved, spec.expr_node, builder, block);
+        let pop_actions = builder.defer_scopes.pop().unwrap_or_default();
+        emit_scope_defers_for_value(
+            resolved,
+            spec.scope_node,
+            result,
+            builder.node_type(resolved, spec.scope_node),
+            &pop_actions,
+            builder,
+            block,
+        )
+    }
+}
+
+pub(crate) fn emit_defers_from_mode(
+    resolved: &ResolvedAst,
+    from_depth: usize,
+    await_handlers: bool,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    if from_depth >= builder.defer_scopes.len() {
+        return;
+    }
+    let scopes: Vec<Vec<CleanupAction>> = builder.defer_scopes[from_depth..].to_vec();
+    for scope_defers in scopes.iter().rev() {
+        emit_scope_defers_mode(resolved, scope_defers, await_handlers, builder, block);
+    }
+}
+
+pub(crate) fn emit_defers_from(
+    resolved: &ResolvedAst,
+    from_depth: usize,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    emit_defers_from_mode(resolved, from_depth, false, builder, block);
+}
+
+pub(crate) fn emit_return(
+    resolved: &ResolvedAst,
+    val: NirValue,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    let has_defers = builder.defer_scopes.iter().any(|scope| !scope.is_empty());
+    let val = if has_defers {
+        crate::arguments::snapshot(val, builder, *block)
+    } else {
+        val
+    };
+    emit_defers_from(resolved, 0, builder, block);
+    if matches!(
+        builder.blocks[block.0 as usize].terminator,
+        Terminator::Unreachable
+    ) {
+        builder.blocks[block.0 as usize].terminator = Terminator::Return(val);
+    }
+}
+
+pub(crate) fn emit_normal_return(
+    resolved: &ResolvedAst,
+    scope_node: NodeIndex,
+    val: NirValue,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) {
+    let has_defers = builder.defer_scopes.iter().any(|scope| !scope.is_empty());
+    let val = if has_defers {
+        crate::arguments::snapshot(val, builder, *block)
+    } else {
+        val
+    };
+    let has_handlers = builder
+        .defer_scopes
+        .iter()
+        .flatten()
+        .any(|action| matches!(action, CleanupAction::PopHandler));
+    let is_error_qualified = resolved
+        .type_pool
+        .error_shape(builder.return_type)
+        .is_ok_and(|shape| shape.is_some());
+    if has_handlers && is_error_qualified {
+        let scope = resolved
+            .node_scopes
+            .get(&scope_node)
+            .map_or(builder.entry_scope.unwrap_or(0), |s| s.0);
+        let ok_block = builder.new_block();
+        let err_block = builder.new_block();
+        let merge_block = builder.new_block();
+        crate::patterns::test(
+            builder,
+            *block,
+            NirExpr::ErrorIsOk(val).in_scope(scope),
+            ok_block,
+            err_block,
+        );
+        let mut ok_cur = ok_block;
+        emit_defers_from_mode(resolved, 0, true, builder, &mut ok_cur);
+        if matches!(
+            builder.blocks[ok_cur.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            builder.blocks[ok_cur.0 as usize].terminator = Terminator::Goto(merge_block);
+        }
+        let mut err_cur = err_block;
+        emit_defers_from_mode(resolved, 0, false, builder, &mut err_cur);
+        if matches!(
+            builder.blocks[err_cur.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            builder.blocks[err_cur.0 as usize].terminator = Terminator::Goto(merge_block);
+        }
+        *block = merge_block;
+    } else {
+        emit_defers_from_mode(resolved, 0, true, builder, block);
+    }
+    if matches!(
+        builder.blocks[block.0 as usize].terminator,
+        Terminator::Unreachable
+    ) {
+        builder.blocks[block.0 as usize].terminator = Terminator::Return(val);
     }
 }
 
@@ -76,7 +365,7 @@ pub(crate) fn lower_stmt(
     let ast = &resolved.ast;
     let node = ast.node(node_idx);
     match node.kind {
-        NodeKind::PubDef | NodeKind::PrivateDef => {
+        NodeKind::PubDef | NodeKind::PrivateDef | NodeKind::GlobalDecl => {
             lower_stmt(
                 resolved,
                 ast.fixed_children(node_idx)[0],
@@ -102,7 +391,12 @@ pub(crate) fn lower_stmt(
                 } else {
                     lower_expr(resolved, children[0], builder, block)
                 };
-                builder.blocks[block.0 as usize].terminator = Terminator::Return(value);
+                if matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                ) {
+                    emit_return(resolved, value, builder, block);
+                }
                 *block = continue_block;
                 return;
             }
@@ -111,7 +405,12 @@ pub(crate) fn lower_stmt(
             } else {
                 NirValue::Unit
             };
-            builder.blocks[block.0 as usize].terminator = Terminator::Return(val);
+            if matches!(
+                builder.blocks[block.0 as usize].terminator,
+                Terminator::Unreachable
+            ) {
+                emit_return(resolved, val, builder, block);
+            }
         }
 
         NodeKind::BreakStatement | NodeKind::ContinueStatement => {
@@ -128,13 +427,28 @@ pub(crate) fn lower_stmt(
             } else {
                 targets.continue_to
             };
+            let defer_depth = targets.defer_depth;
             if children[1].is_null() {
-                builder.blocks[block.0 as usize].terminator = Terminator::Goto(target);
+                emit_defers_from(resolved, defer_depth, builder, block);
+                if matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                ) {
+                    builder.blocks[block.0 as usize].terminator = Terminator::Goto(target);
+                }
             } else {
                 let condition = lower_expr(resolved, children[1], builder, block);
+                let mut jump_block = builder.new_block();
                 let remainder = builder.new_block();
                 builder.blocks[block.0 as usize].terminator =
-                    Terminator::Branch(condition, target, remainder);
+                    Terminator::Branch(condition, jump_block, remainder);
+                emit_defers_from(resolved, defer_depth, builder, &mut jump_block);
+                if matches!(
+                    builder.blocks[jump_block.0 as usize].terminator,
+                    Terminator::Unreachable
+                ) {
+                    builder.blocks[jump_block.0 as usize].terminator = Terminator::Goto(target);
+                }
                 *block = remainder;
             }
         }
@@ -156,7 +470,7 @@ pub(crate) fn lower_stmt(
                     builder.blocks[block.0 as usize].terminator,
                     Terminator::Unreachable
                 ) {
-                    builder.blocks[block.0 as usize].terminator = Terminator::Return(val);
+                    emit_normal_return(resolved, children[0], val, builder, block);
                 }
             } else {
                 lower_expr(resolved, children[0], builder, block);
@@ -173,18 +487,179 @@ pub(crate) fn lower_stmt(
             lower_if(resolved, ast, node_idx, builder, block, is_last);
         }
 
+        // ── When statement ─────────────────────────────────────────
+        NodeKind::WhenStatement => {
+            lower_when_stmt(resolved, ast, node_idx, builder, block, is_last);
+        }
+
         // ── For loop ───────────────────────────────────────────────
         NodeKind::ForLoop => {
             lower_for_loop(resolved, ast, node_idx, builder, block);
+            if is_last
+                && matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                )
+            {
+                emit_normal_return(resolved, node_idx, NirValue::Unit, builder, block);
+            }
         }
 
         // ── While loop ─────────────────────────────────────────────
         NodeKind::WhileLoop => {
             lower_while_loop(resolved, ast, node_idx, builder, block);
+            if is_last
+                && matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                )
+            {
+                emit_normal_return(resolved, node_idx, NirValue::Unit, builder, block);
+            }
         }
 
-        // ── Default: treat as expression ───────────────────────────
-        _ => {
+        // ── Defer statement ────────────────────────────────────────
+        NodeKind::DeferStatement => {
+            let defer_body = ast.fixed_children(node_idx)[0];
+            if !defer_body.is_null()
+                && let Some(scope) = builder.defer_scopes.last_mut()
+            {
+                scope.push(CleanupAction::Defer(defer_body));
+            }
+            if is_last
+                && matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                )
+            {
+                emit_normal_return(resolved, node_idx, NirValue::Unit, builder, block);
+            }
+        }
+
+        NodeKind::HandlesStatement | NodeKind::LetHandler => {
+            crate::capability::lower_block_statements(
+                resolved,
+                &[node_idx],
+                if is_last {
+                    crate::capability::BlockExecMode::TailReturn
+                } else {
+                    crate::capability::BlockExecMode::NonTail
+                },
+                builder,
+                block,
+            );
+        }
+
+        // ── Non-runtime declarations in statement position ─────────
+        NodeKind::FunctionDef
+        | NodeKind::EffectDef
+        | NodeKind::AsyncEffectDef
+        | NodeKind::StructDef
+        | NodeKind::StructField
+        | NodeKind::EnumDef
+        | NodeKind::EnumVariant
+        | NodeKind::TraitDef
+        | NodeKind::TraitDefFn
+        | NodeKind::TraitDeriveFn
+        | NodeKind::ImplDef
+        | NodeKind::ImplTraitDef
+        | NodeKind::ExtendDef
+        | NodeKind::ExtendTraitDef
+        | NodeKind::DeriveDef
+        | NodeKind::Typealias
+        | NodeKind::Newtype
+        | NodeKind::ModuleDef
+        | NodeKind::UseStatement
+        | NodeKind::AssocDecl
+        | NodeKind::AssocBinding => {
+            if is_last
+                && matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                )
+            {
+                emit_normal_return(resolved, node_idx, NirValue::Unit, builder, block);
+            }
+        }
+
+        // ── Expressions in statement position ──────────────────────
+        NodeKind::Int
+        | NodeKind::Real
+        | NodeKind::Str
+        | NodeKind::FStringConcat
+        | NodeKind::Char
+        | NodeKind::Bool
+        | NodeKind::Id
+        | NodeKind::SelfUpper
+        | NodeKind::SelfLower
+        | NodeKind::Null
+        | NodeKind::Underscore
+        | NodeKind::Unit
+        | NodeKind::Symbol
+        | NodeKind::ListOf
+        | NodeKind::Tuple
+        | NodeKind::Object
+        | NodeKind::Lambda
+        | NodeKind::CaseMap
+        | NodeKind::CaseAlternative
+        | NodeKind::Negative
+        | NodeKind::BoolNot
+        | NodeKind::ErrorConstruction
+        | NodeKind::OptionalType
+        | NodeKind::EffectQualifiedType
+        | NodeKind::ErrorQualifiedType
+        | NodeKind::RangeFull
+        | NodeKind::RangeFrom
+        | NodeKind::RangeTo
+        | NodeKind::RangeFromTo
+        | NodeKind::RangeToInclusive
+        | NodeKind::RangeFromToInclusive
+        | NodeKind::Add
+        | NodeKind::Sub
+        | NodeKind::Mul
+        | NodeKind::Div
+        | NodeKind::Mod
+        | NodeKind::Concat
+        | NodeKind::BoolEq
+        | NodeKind::BoolNotEq
+        | NodeKind::BoolGt
+        | NodeKind::BoolGtEq
+        | NodeKind::BoolLt
+        | NodeKind::BoolLtEq
+        | NodeKind::BoolAnd
+        | NodeKind::BoolOr
+        | NodeKind::BoolMatches
+        | NodeKind::Projection
+        | NodeKind::View
+        | NodeKind::Arrow
+        | NodeKind::Pipeline
+        | NodeKind::InfixFnCall
+        | NodeKind::EffectPropagation
+        | NodeKind::EffectElimination
+        | NodeKind::ErrorPropagation
+        | NodeKind::ErrorElimination
+        | NodeKind::OptionPropagation
+        | NodeKind::HandlerApplication
+        | NodeKind::Call
+        | NodeKind::ExtendedCall
+        | NodeKind::PostDo
+        | NodeKind::TypeCast
+        | NodeKind::Await
+        | NodeKind::SpreadArg
+        | NodeKind::ResetExpr
+        | NodeKind::ShiftExpr
+        | NodeKind::FnType
+        | NodeKind::EffectType
+        | NodeKind::AsyncEffectType
+        | NodeKind::Assign
+        | NodeKind::AddAssign
+        | NodeKind::SubAssign
+        | NodeKind::MulAssign
+        | NodeKind::DivAssign
+        | NodeKind::ModAssign
+        | NodeKind::Block
+        | NodeKind::PropertyAssignment
+        | NodeKind::NamedArg => {
             let val = lower_expr(resolved, node_idx, builder, block);
             if is_last
                 && matches!(
@@ -192,7 +667,57 @@ pub(crate) fn lower_stmt(
                     Terminator::Unreachable
                 )
             {
-                builder.blocks[block.0 as usize].terminator = Terminator::Return(val);
+                emit_normal_return(resolved, node_idx, val, builder, block);
+            }
+        }
+
+        // ── Structural / pattern / invalid nodes ───────────────────
+        NodeKind::Invalid
+        | NodeKind::ConditionArm
+        | NodeKind::ElseConditionArm
+        | NodeKind::CaseArm
+        | NodeKind::CatchArm
+        | NodeKind::PatternOr
+        | NodeKind::PatternNot
+        | NodeKind::PatternError
+        | NodeKind::PatternEffect
+        | NodeKind::PatternTypeFamily
+        | NodeKind::PatternCall
+        | NodeKind::PatternExtendedCall
+        | NodeKind::PatternAsBind
+        | NodeKind::PatternTyped
+        | NodeKind::PatternIfGuard
+        | NodeKind::PatternAndIs
+        | NodeKind::PatternOptionSome
+        | NodeKind::PatternErrorOk
+        | NodeKind::PatternList
+        | NodeKind::PatternTuple
+        | NodeKind::PatternRecord
+        | NodeKind::PatternRestBind
+        | NodeKind::PatternAsync
+        | NodeKind::PatternFromExpr
+        | NodeKind::PropertyPattern
+        | NodeKind::SuperPath
+        | NodeKind::PackagePath
+        | NodeKind::PathProjection
+        | NodeKind::PathProjectionAll
+        | NodeKind::PathProjectionMulti
+        | NodeKind::PathAsBind
+        | NodeKind::ParamSelf
+        | NodeKind::ParamVarargs
+        | NodeKind::ParamOptional
+        | NodeKind::ParamLambda
+        | NodeKind::ParamTyped
+        | NodeKind::ParamCatch
+        | NodeKind::Property
+        | NodeKind::FileScope => {
+            if is_last
+                && matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                )
+            {
+                emit_normal_return(resolved, node_idx, NirValue::Unit, builder, block);
             }
         }
     }
@@ -212,7 +737,37 @@ fn lower_var_decl(
     let children = ast.fixed_children(node_idx);
     // [0] pattern  [1] type  [2] value  [3] else
     let pattern_node = children[0];
-    if ast.node(pattern_node).kind == NodeKind::PatternTuple {
+    if children.len() > 3 && !children[3].is_null() {
+        let value = lower_expr(resolved, children[2], builder, block);
+        let value = crate::arguments::snapshot(value, builder, *block);
+        let ok_block = builder.new_block();
+        let mut else_block = builder.new_block();
+        crate::patterns::branch(
+            resolved,
+            pattern_node,
+            value,
+            builder,
+            *block,
+            ok_block,
+            else_block,
+        );
+        lower_non_tail_body(resolved, children[3], builder, &mut else_block);
+        if matches!(
+            builder.blocks[else_block.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            builder.blocks[else_block.0 as usize].terminator = Terminator::Return(NirValue::Unit);
+        }
+        *block = ok_block;
+        return;
+    }
+    if matches!(
+        ast.node(pattern_node).kind,
+        NodeKind::PatternTuple
+            | NodeKind::PatternExtendedCall
+            | NodeKind::PatternTyped
+            | NodeKind::PatternCall
+    ) {
         let value = lower_expr(resolved, children[2], builder, block);
         crate::tuples::bind_pattern(resolved, pattern_node, value, builder, *block);
         return;
@@ -296,14 +851,95 @@ fn lower_if(
             }
         }
     } else {
-        builder.blocks[else_block.0 as usize].terminator = Terminator::Goto(merge_block);
+        if is_last {
+            emit_normal_return(resolved, node_idx, NirValue::Unit, builder, &mut else_block);
+        } else {
+            builder.blocks[else_block.0 as usize].terminator = Terminator::Goto(merge_block);
+        }
     }
 
     *block = merge_block;
 }
 
+fn lower_when_stmt(
+    resolved: &ResolvedAst,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+    is_last: bool,
+) {
+    let arms = ast.multi_children(node_idx);
+    let has_else = arms
+        .iter()
+        .any(|&arm| !arm.is_null() && ast.node(arm).kind == NodeKind::ElseConditionArm);
+    let merge_block = builder.new_block();
+
+    for &arm in arms {
+        if arm.is_null() {
+            continue;
+        }
+        match ast.node(arm).kind {
+            NodeKind::ConditionArm => {
+                let children = ast.fixed_children(arm);
+                let cond = lower_expr(resolved, children[0], builder, block);
+                let mut arm_block = builder.new_block();
+                let next_block = builder.new_block();
+                builder.blocks[block.0 as usize].terminator =
+                    Terminator::Branch(cond, arm_block, next_block);
+                if is_last && has_else {
+                    lower_body_into(resolved, children[1], builder, &mut arm_block);
+                } else {
+                    lower_non_tail_body(resolved, children[1], builder, &mut arm_block);
+                    if matches!(
+                        builder.blocks[arm_block.0 as usize].terminator,
+                        Terminator::Unreachable
+                    ) {
+                        builder.blocks[arm_block.0 as usize].terminator =
+                            Terminator::Goto(merge_block);
+                    }
+                }
+                *block = next_block;
+            }
+            NodeKind::ElseConditionArm => {
+                let body = ast.fixed_children(arm)[0];
+                if is_last {
+                    lower_body_into(resolved, body, builder, block);
+                } else {
+                    lower_non_tail_body(resolved, body, builder, block);
+                    if matches!(
+                        builder.blocks[block.0 as usize].terminator,
+                        Terminator::Unreachable
+                    ) {
+                        builder.blocks[block.0 as usize].terminator = Terminator::Goto(merge_block);
+                    }
+                }
+                *block = merge_block;
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    if matches!(
+        builder.blocks[block.0 as usize].terminator,
+        Terminator::Unreachable
+    ) {
+        builder.blocks[block.0 as usize].terminator = Terminator::Goto(merge_block);
+    }
+    *block = merge_block;
+    if is_last
+        && matches!(
+            builder.blocks[block.0 as usize].terminator,
+            Terminator::Unreachable
+        )
+    {
+        emit_normal_return(resolved, node_idx, NirValue::Unit, builder, block);
+    }
+}
+
 /// Discard ordinary expression values while preserving explicit control flow.
-fn lower_non_tail_body(
+pub(crate) fn lower_non_tail_body(
     resolved: &ResolvedAst,
     node: NodeIndex,
     builder: &mut FunctionBuilder,
@@ -313,17 +949,23 @@ fn lower_non_tail_body(
         return;
     }
     if resolved.ast.node(node).kind == NodeKind::Block {
-        for &statement in resolved.ast.multi_children(node) {
-            if !matches!(
-                builder.blocks[block.0 as usize].terminator,
-                Terminator::Unreachable
-            ) {
-                break;
-            }
-            lower_stmt(resolved, statement, builder, block, false);
-        }
+        crate::capability::lower_block_statements(
+            resolved,
+            resolved.ast.multi_children(node),
+            crate::capability::BlockExecMode::NonTail,
+            builder,
+            block,
+        );
     } else {
+        builder.defer_scopes.push(Vec::new());
         lower_stmt(resolved, node, builder, block, false);
+        let scope_defers = builder.defer_scopes.pop().unwrap_or_default();
+        if matches!(
+            builder.blocks[block.0 as usize].terminator,
+            Terminator::Unreachable
+        ) {
+            emit_scope_defers(resolved, &scope_defers, builder, block);
+        }
     }
 }
 
@@ -421,10 +1063,12 @@ fn lower_for_loop(
 
     // Lower body into body block.
     let mut body_block_cur = body_block;
+    let defer_depth = builder.defer_scopes.len();
     builder.loop_targets.push(LoopTargets {
         label: (!children[0].is_null()).then(|| ast.node(children[0]).str_id),
         break_to: exit_block,
         continue_to: header_block,
+        defer_depth,
     });
     lower_non_tail_body(resolved, children[3], builder, &mut body_block_cur);
     builder.loop_targets.pop();
@@ -468,10 +1112,12 @@ fn lower_while_loop(
 
     // Body.
     let mut body_block_cur = body_block;
+    let defer_depth = builder.defer_scopes.len();
     builder.loop_targets.push(LoopTargets {
         label: (!children[0].is_null()).then(|| ast.node(children[0]).str_id),
         break_to: exit_block,
         continue_to: header_block,
+        defer_depth,
     });
     lower_non_tail_body(resolved, children[2], builder, &mut body_block_cur);
     builder.loop_targets.pop();
@@ -505,7 +1151,7 @@ fn lower_post_match_stmt(
             Terminator::Unreachable
         )
     {
-        builder.blocks[block.0 as usize].terminator = Terminator::Return(value);
+        emit_normal_return(resolved, node_idx, value, builder, block);
     }
 }
 

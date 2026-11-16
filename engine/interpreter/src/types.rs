@@ -111,7 +111,28 @@ impl Vm {
             // SAFETY: the caller holds the operation and the source register
             // roots this live object. No collection occurs during inspection.
             let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
+            if !header.is_ordinary() {
+                return Err(VmError::TypeError);
+            }
             let heap_type = self.canonical_type(header.type_index)?;
+            match self
+                .state
+                .type_pool
+                .checked_collection_role(heap_type)
+                .map_err(|_| VmError::TypeError)?
+            {
+                Some(type_pool::CollectionRole::Bytes) => {
+                    self.bytes_layout(value)?;
+                }
+                Some(
+                    type_pool::CollectionRole::Buffer
+                    | type_pool::CollectionRole::MapBuffer
+                    | type_pool::CollectionRole::BytesBuffer,
+                ) => {
+                    return Err(VmError::TypeError);
+                }
+                _ => {}
+            }
             if let Some(kind) = self.state.type_pool.as_intrinsic(heap_type) {
                 if kind.is_numeric() {
                     // SAFETY: live ordinary object, retained in caller roots.
@@ -138,6 +159,13 @@ impl Vm {
                     .map_err(|_| VmError::TypeError)?
                     .is_none()
                 && header.payload_words() != fields.len()
+            {
+                return Err(VmError::TypeError);
+            }
+            if matches!(
+                self.state.type_pool.get(heap_type).kind,
+                TypeKind::Newtype { .. } | TypeKind::Future { .. }
+            ) && header.payload_words() != 1
             {
                 return Err(VmError::TypeError);
             }
@@ -245,6 +273,17 @@ impl Vm {
                         self.state.type_pool.is_gradually_consistent(actual, target)
                     }))
             }
+            TypeKind::Future { .. } => {
+                Ok(self
+                    .value_type_depth(value, depth + 1)?
+                    .is_some_and(|actual| {
+                        matches!(
+                            self.state.type_pool.get(actual).kind,
+                            TypeKind::Future { .. }
+                        ) && (self.state.type_pool.is_subtype(actual, target)
+                            || self.state.type_pool.is_gradually_consistent(actual, target))
+                    }))
+            }
             TypeKind::Tuple { elements } => {
                 let values = match self.tuple_values(value) {
                     Ok(values) => values,
@@ -345,12 +384,45 @@ impl Vm {
             }
             return self.cast_value(layout.payload, target, depth + 1);
         }
+        if target != Intrinsic::Any.type_index()
+            && let Some(actual) = self.value_type_depth(value, depth + 1)?
+            && actual != target
+            && let TypeKind::Newtype { inner, .. } = self.state.type_pool.get(actual).kind
+            && self.canonical_type(inner)? == target
+        {
+            return self.load_field_value(value, 0);
+        }
         match self.state.type_pool.get(target).kind.clone() {
             TypeKind::Intrinsic(kind) if kind.is_numeric() => {
                 // SAFETY: the source register keeps value rooted until this
                 // scalar snapshot has been read. Allocation follows the read.
                 let number = unsafe { Number::from_tagged(value) }.ok_or(VmError::TypeError)?;
                 self.typed_number_value(number.cast_to(kind)?, kind)
+            }
+            TypeKind::Newtype { inner, .. } => {
+                if self.value_matches_type(value, target, depth)? {
+                    return Ok(value);
+                }
+                if !self.value_matches_type(value, inner, depth + 1)? {
+                    return Err(VmError::TypeError);
+                }
+                let root = self.roots.temporary_values.borrow().len();
+                self.with_temporary_roots(&[value], |vm| {
+                    let value = vm.roots.temporary_values.borrow()[root];
+                    let inner_val = vm.assert_value_type_depth(value, inner, depth + 1)?;
+                    let inner_root = vm.roots.temporary_values.borrow().len();
+                    vm.with_temporary_roots(&[inner_val], |vm| {
+                        // SAFETY: execution operation is active and inner_val is rooted in
+                        // temporary_values across alloc_object. Payload is initialized before return.
+                        let ptr = unsafe { vm.state.heap.alloc_object(target, 1) }
+                            .ok_or(VmError::OutOfMemory)?;
+                        let rooted_inner = vm.roots.temporary_values.borrow()[inner_root];
+                        unsafe {
+                            ptr.as_ptr().cast::<u64>().write(rooted_inner.raw());
+                            Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+                        }
+                    })
+                })
             }
             TypeKind::Tuple { elements } => self.cast_tuple(value, target, &elements, depth + 1),
             TypeKind::Optional { inner } if !value.is_null() => {
@@ -364,7 +436,7 @@ impl Vm {
 
     /// Numeric casts preserve the concrete target type even for small values.
     /// Narrow types currently require a box because immediate subtags erase width.
-    fn typed_number_value(
+    pub(crate) fn typed_number_value(
         &mut self,
         number: Number,
         kind: Intrinsic,

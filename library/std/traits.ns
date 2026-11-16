@@ -4,6 +4,7 @@ use .builtin.*
 use .ordering.*
 
 const scalar_equal: fn(Any, Any) -> bool = .__scalar_eq'builtin
+const bytes_equal: fn(Bytes, Bytes) -> bool = .__bytes_eq'builtin
 const display_value: fn(Any) -> String = .to_string'builtin
 
 impl Eq for u8 {
@@ -325,4 +326,77 @@ impl PartialOrd for f32 {
 
 impl PartialOrd for f64 {
     pub fn partial_cmp(self, other: Self) -> ?Ordering { scalar_order(self, other) }
+}
+
+const scalar_hash: fn(Any) -> u64 = .__scalar_hash'builtin
+
+impl Hash for u8 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for u16 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for u32 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for u64 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for u128 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for usize {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for i8 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for i16 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for i32 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for i64 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for i128 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for isize {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for f32 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for f64 {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for bool {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for char {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for String {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for Unit {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+impl Hash for Type {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
+}
+
+impl Eq for Bytes {
+    pub fn eq(self, other: Self) -> bool { bytes_equal(self, other) }
+}
+impl PartialEq for Bytes {
+    pub fn eq(self, other: Self) -> bool { bytes_equal(self, other) }
+}
+impl Display for Bytes {
+    pub fn to_string(self) -> String { display_value(self) }
+}
+impl Hash for Bytes {
+    pub fn hash(self) -> u64 { scalar_hash(self) }
 }

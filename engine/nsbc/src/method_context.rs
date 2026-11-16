@@ -1,12 +1,12 @@
 //! Validate the complete lexical context table before dynamic code is loaded.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::HashSet;
 
 use crate::{ArtifactError, CompiledArtifact, Instruction, instruction_requires_scope};
 
 pub(crate) fn validate_method_contexts(artifact: &CompiledArtifact) -> Result<(), ArtifactError> {
     let output = &artifact.codegen_output;
-    let mut covered = BTreeSet::new();
+    let mut covered = HashSet::with_capacity(output.method_call_scopes.len());
     for function in &output.functions {
         for (pc, &word) in function.instructions.iter().enumerate() {
             // The main validator has already checked each instruction.
@@ -17,44 +17,56 @@ pub(crate) fn validate_method_contexts(artifact: &CompiledArtifact) -> Result<()
             }
         }
     }
-    let functions: BTreeMap<_, _> = output
-        .functions
-        .iter()
-        .map(|function| (function.func_id.0, function))
-        .collect();
-    let mut seen = BTreeSet::new();
+    let mut dense_functions = vec![None; output.functions.len()];
+    for function in &output.functions {
+        if let Some(slot) = dense_functions.get_mut(function.func_id.0 as usize) {
+            *slot = Some(function);
+        }
+    }
+    let mut seen = HashSet::with_capacity(output.method_call_scopes.len());
     for context in &output.method_call_scopes {
-        let location = format!(
-            "function {} PC {} method context",
-            context.func_id.0, context.pc
-        );
+        let location = || {
+            format!(
+                "function {} PC {} method context",
+                context.func_id.0, context.pc
+            )
+        };
         if artifact.type_pool.scope_context(context.scope).is_none() {
             return Err(ArtifactError::new(
-                &location,
+                location(),
                 "method scope is out of range",
             ));
         }
-        let function = functions.get(&context.func_id.0).ok_or_else(|| {
-            ArtifactError::new(&location, "method context function does not exist")
-        })?;
+        let Some(function) = dense_functions
+            .get(context.func_id.0 as usize)
+            .copied()
+            .flatten()
+        else {
+            return Err(ArtifactError::new(
+                location(),
+                "method context function does not exist",
+            ));
+        };
         if function.instructions.get(context.pc as usize).is_none() {
             return Err(ArtifactError::new(
-                &location,
+                location(),
                 "method context PC is out of range",
             ));
         }
         let key = (context.func_id.0, context.pc);
         if !covered.contains(&key) {
             return Err(ArtifactError::new(
-                &location,
+                location(),
                 "context PC is not covered by scope metadata",
             ));
         }
         if !seen.insert(key) {
-            return Err(ArtifactError::new(&location, "duplicate method context"));
+            return Err(ArtifactError::new(location(), "duplicate method context"));
         }
     }
-    if let Some((function, pc)) = covered.difference(&seen).next() {
+    if covered.len() != seen.len()
+        && let Some((function, pc)) = covered.difference(&seen).min()
+    {
         return Err(ArtifactError::new(
             format!("function {function} PC {pc} method context"),
             "missing dynamic call or type query scope",
@@ -65,7 +77,9 @@ pub(crate) fn validate_method_contexts(artifact: &CompiledArtifact) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use crate::{CodegenOutput, CompiledFunction, FuncId, FunctionAbi, MethodCallScope, Opcode, Reg};
+    use crate::{
+        CodegenOutput, CompiledFunction, FuncId, FunctionAbi, MethodCallScope, Opcode, Reg,
+    };
     use type_pool::{ScopeContext, TypeIndex, TypePool};
 
     use super::*;
@@ -134,11 +148,14 @@ mod tests {
                 .contains("missing dynamic call or type query scope")
         );
 
-        artifact.codegen_output.method_call_scopes.push(MethodCallScope {
-            func_id: FuncId(0),
-            pc: 2,
-            scope: 0,
-        });
+        artifact
+            .codegen_output
+            .method_call_scopes
+            .push(MethodCallScope {
+                func_id: FuncId(0),
+                pc: 2,
+                scope: 0,
+            });
         assert!(
             crate::validate_artifact(&artifact)
                 .unwrap_err()

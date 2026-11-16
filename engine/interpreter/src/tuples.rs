@@ -15,25 +15,41 @@ impl Vm {
         if elements.len() != values.len() {
             return Err(VmError::TypeError);
         }
-        let ty = (0..self.state.type_pool.len())
+        let words = u16::try_from(values.len()).map_err(|_| VmError::ObjectTooLarge)?;
+        let existing = (0..self.state.type_pool.len())
             .map(|index| TypeIndex::from_raw(index as u32))
             .find(|&index| {
                 matches!(
                     &self.state.type_pool.get(index).kind,
                     TypeKind::Tuple { elements: found } if found.as_slice() == elements
                 )
-            })
-            .unwrap_or_else(|| {
-                self.state.type_pool.intern_structural(TypeKind::Tuple {
-                    elements: elements.to_vec(),
-                })
             });
-        let words = u16::try_from(values.len()).map_err(|_| VmError::ObjectTooLarge)?;
-        let info = self.state.type_pool.get_mut(ty);
-        if info.type_id == TypeId::ZERO && info.size == 0 {
-            info.size = u32::from(words).saturating_mul(8);
-            info.align = 8;
-        }
+        let ty = match existing {
+            Some(index) => {
+                let info = self.state.type_pool.get(index);
+                if info.type_id == TypeId::ZERO && info.size == 0 {
+                    let info_mut = self.state.type_pool.get_mut(index);
+                    info_mut.size = u32::from(words).saturating_mul(8);
+                    info_mut.align = 8;
+                }
+                index
+            }
+            None => {
+                let index = self.state.type_pool.intern_structural(TypeKind::Tuple {
+                    elements: elements.to_vec(),
+                });
+                let info_mut = self.state.type_pool.get_mut(index);
+                info_mut.size = u32::from(words).saturating_mul(8);
+                info_mut.align = 8;
+                if let Some(input) = self.state.type_pool.identity_input().cloned() {
+                    self.state
+                        .type_pool
+                        .finalize_type_identities(input)
+                        .map_err(|_| VmError::InvalidType(index))?;
+                }
+                index
+            }
+        };
         let root = self.roots.temporary_values.borrow().len();
         self.with_temporary_roots(values, |vm| {
             // SAFETY: payload length fits u16; every element is rooted for the
@@ -269,6 +285,49 @@ mod tests {
                 vm.cast_value(outer, pair, 0),
                 Err(VmError::TypeError)
             ));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn alloc_tuple_preserves_finalized_type_identities_for_error_checks() {
+        let mut vm = make_vm();
+        let err_ty = vm
+            .state
+            .type_pool
+            .intern_structural(TypeKind::ErrorQualified {
+                errors: vec![Intrinsic::Str.type_index()],
+                inner: Intrinsic::I64.type_index(),
+            });
+        {
+            let info = vm.state.type_pool.get_mut(err_ty);
+            info.size = 24;
+            info.align = 8;
+        }
+        vm.state
+            .type_pool
+            .finalize_type_identities(type_pool::TypeIdentityInput {
+                schema: 1,
+                packages: Vec::new(),
+                declarations: Vec::new(),
+            })
+            .unwrap();
+
+        let msg = vm.alloc_string("unseen tuple shape").unwrap();
+        let tup = vm
+            .alloc_tuple(
+                &[Intrinsic::Bool.type_index(), Intrinsic::Str.type_index()],
+                &[TaggedValue::FALSE, msg],
+            )
+            .unwrap();
+        vm.with_temporary_roots(&[tup], |vm| {
+            let id = vm
+                .state
+                .type_pool
+                .stable_type_id(err_ty)
+                .expect("stable_type_id must remain valid after dynamic alloc_tuple");
+            assert_ne!(id, TypeId::ZERO);
             Ok(())
         })
         .unwrap();

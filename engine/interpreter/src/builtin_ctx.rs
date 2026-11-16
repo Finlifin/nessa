@@ -9,7 +9,7 @@ use std::rc::{Rc, Weak};
 use gc::ObjectHeader;
 use nsbc::Reg;
 use runtime::{BuiltinFnId, Number, TaggedValue, TaskId};
-use type_pool::{Intrinsic, TypeIndex, TypePool};
+use type_pool::{Intrinsic, TypeIndex, TypeKind, TypePool};
 
 use crate::{Vm, VmError};
 
@@ -45,6 +45,10 @@ impl BuiltinFnTable {
 pub enum BuiltinOutcome {
     /// Continue with return value already written to r0.
     Continue,
+    /// Cooperatively yield the current task's execution slice.
+    Yield,
+    /// Suspend the current task and rewind PC by 1 to retry when awakened.
+    SuspendRetry,
     /// Terminate the process with the given exit code.
     Exit(i32),
     /// Abort with a panic message.
@@ -57,6 +61,44 @@ pub enum BuiltinOutcome {
 pub struct BuiltinRoot {
     context: Weak<()>,
     index: usize,
+}
+
+/// Host-owned value specification converted into GC-managed values with every
+/// intermediate heap reference rooted across moving Immix allocations.
+#[derive(Debug, Clone)]
+pub enum NativeValue {
+    Null,
+    Unit,
+    Bool(bool),
+    Char(char),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Str(String),
+    OptI64(Option<i64>),
+    OptF64(Option<f64>),
+    OptStr(Option<String>),
+    List(Vec<NativeValue>),
+    StringMap(Vec<(String, NativeValue)>),
+    Tuple(Vec<NativeValue>),
+}
+
+/// Control-flow and value outcome returned by an embedder [`HostHandler`].
+#[derive(Debug, Clone)]
+pub enum HostCallOutcome {
+    /// Return `(true, value)` to the Nessa caller.
+    Return(NativeValue),
+    /// Return `(false, error_message)` to the Nessa caller.
+    Error(String),
+    /// Suspend `task_id` and retry the `__host_call` instruction when awakened via [`Vm::wake_task`].
+    SuspendRetry,
+    /// Cooperatively yield the active task's slice.
+    Yield,
+}
+
+/// Host-provided callback interface invoked by the privileged `__host_call` builtin.
+pub trait HostHandler {
+    fn call(&mut self, op: &str, args: &[NativeValue], task_id: TaskId) -> HostCallOutcome;
 }
 
 /// Context passed to every builtin invocation.
@@ -574,7 +616,7 @@ impl<'vm> BuiltinCtx<'vm> {
         }
     }
 
-    fn argument_snapshot(&self, i: u8) -> Result<TaggedValue, VmError> {
+    pub(crate) fn argument_snapshot(&self, i: u8) -> Result<TaggedValue, VmError> {
         if i >= self.arg_count {
             return Err(VmError::ArityError {
                 expected: i.saturating_add(1),
@@ -599,6 +641,16 @@ impl<'vm> BuiltinCtx<'vm> {
     /// Retain an argument in an updateable slot without pinning its object.
     pub fn arg_rooted(&self, i: u8) -> Result<BuiltinRoot, VmError> {
         let value = self.argument_snapshot(i)?;
+        self.push_movable_root(value)
+    }
+
+    /// Retain a live VM value in an updateable movable root slot.
+    pub fn root_value(&self, value: TaggedValue) -> Result<BuiltinRoot, VmError> {
+        self.require_rooted_value(value)?;
+        self.push_movable_root(value)
+    }
+
+    fn push_movable_root(&self, value: TaggedValue) -> Result<BuiltinRoot, VmError> {
         let mut roots = self.vm.roots.temporary_values.borrow_mut();
         let index = roots.len();
         roots.push(value);
@@ -622,6 +674,23 @@ impl<'vm> BuiltinCtx<'vm> {
             .get(root.index)
             .copied()
             .ok_or(VmError::TypeError)
+    }
+
+    /// Alias for [`Self::load_rooted`] emphasizing reload after heap allocation.
+    pub fn reload_root(&self, root: &BuiltinRoot) -> Result<TaggedValue, VmError> {
+        self.load_rooted(root)
+    }
+
+    /// Read element `index` of a rooted `List` into a movable `BuiltinRoot` without pinning.
+    pub fn list_get_rooted(
+        &self,
+        list: &BuiltinRoot,
+        index: usize,
+    ) -> Result<BuiltinRoot, VmError> {
+        let list_val = self.reload_root(list)?;
+        let idx_val = TaggedValue::try_from_u64(index as u64).ok_or(VmError::InvalidIndex)?;
+        let elem = self.vm.list_get(list_val, idx_val)?;
+        self.push_movable_root(elem)
     }
 
     pub fn arg_i64(&self, i: u8) -> Result<i64, VmError> {
@@ -681,8 +750,17 @@ impl<'vm> BuiltinCtx<'vm> {
 
     /// Read a heap string argument as owned UTF-8.
     pub fn arg_string(&self, i: u8) -> Result<String, VmError> {
-        let v = self.arg(i)?;
+        let v = self.argument_snapshot(i)?;
         heap_string_to_owned(v).ok_or(VmError::TypeError)
+    }
+
+    /// Read an optional heap string argument (`?String`) as owned UTF-8.
+    pub fn arg_optional_string(&self, i: u8) -> Result<Option<String>, VmError> {
+        let v = self.argument_snapshot(i)?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        heap_string_to_owned(v).map(Some).ok_or(VmError::TypeError)
     }
 
     pub fn set_return(&mut self, val: TaggedValue) -> Result<(), VmError> {
@@ -693,7 +771,7 @@ impl<'vm> BuiltinCtx<'vm> {
         Ok(())
     }
 
-    fn write_return(&mut self, val: TaggedValue) {
+    pub(crate) fn write_return(&mut self, val: TaggedValue) {
         if let Some(t) = self.vm.roots.scheduler.get_task_mut(self.task_id) {
             t.registers.set(Reg(0), val);
         }
@@ -709,6 +787,249 @@ impl<'vm> BuiltinCtx<'vm> {
 
     pub fn return_i64(&mut self, v: i64) -> Result<(), VmError> {
         self.return_number(Number::I64(v))
+    }
+
+    pub fn return_u64(&mut self, v: u64) -> Result<(), VmError> {
+        self.return_number(Number::U64(v))
+    }
+
+    pub fn return_u8(&mut self, v: u8) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::U64(u64::from(v)), Intrinsic::U8)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn return_usize(&mut self, v: usize) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::U64(v as u64), Intrinsic::Usize)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn arg_usize(&self, i: u8) -> Result<usize, VmError> {
+        crate::bytes_obj::checked_usize_arg(self.arg(i)?)
+    }
+
+    pub fn arg_byte(&self, i: u8) -> Result<u8, VmError> {
+        crate::bytes_obj::checked_byte_arg(self.arg(i)?)
+    }
+
+    /// Borrow a validated UTF-8 `String` argument's bytes without copying.
+    /// The closure receives no mutable VM handle, preventing GC safepoints during the borrow.
+    pub fn with_str_bytes<R>(
+        &self,
+        val: TaggedValue,
+        f: impl FnOnce(&[u8]) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        self.require_rooted_value(val)?;
+        let slice = crate::bytes_obj::heap_str_slice(val).ok_or(VmError::TypeError)?;
+        f(slice)
+    }
+
+    /// Borrow a `Bytes` object's active `[offset .. offset + len]` byte slice without copying.
+    pub fn with_bytes_slice<R>(
+        &self,
+        val: TaggedValue,
+        f: impl FnOnce(&[u8]) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        self.require_rooted_value(val)?;
+        let layout = self.vm.bytes_layout(val)?;
+        f(layout.as_slice())
+    }
+
+    /// Detach any shared COW view on `root`, reserve at least `min_cap` bytes if requested,
+    /// and pass `(writable_slice, &mut logical_len)` to `f` with no GC safepoints possible.
+    pub fn with_bytes_mut<R>(
+        &mut self,
+        root: &BuiltinRoot,
+        min_cap: Option<usize>,
+        f: impl FnOnce(&mut [u8], &mut usize) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        let val = self.load_rooted(root)?;
+        let cur_len = self.vm.bytes_len(val)?;
+        let req = min_cap.unwrap_or(cur_len).max(cur_len);
+        let unique = self.vm.ensure_bytes_unique(val, req)?;
+        let layout = self.vm.bytes_layout(unique)?;
+        let avail = layout.capacity.saturating_sub(layout.offset);
+        let mut logical_len = layout.length;
+        // SAFETY: `ensure_bytes_unique` guaranteed `share_count == 1` and `offset + avail <= capacity`.
+        // `f` cannot access `self` or allocate on the managed heap while `buf` is alive.
+        let buf = if avail == 0 {
+            &mut [][..]
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(layout.data_ptr.add(layout.offset), avail) }
+        };
+        let out = f(buf, &mut logical_len)?;
+        if logical_len > avail {
+            return Err(VmError::InvalidIndex);
+        }
+        // SAFETY: `layout.wrapper` remained unmoved during `f` because no managed allocation occurred.
+        unsafe {
+            layout
+                .wrapper
+                .write(TaggedValue::from_u64(logical_len as u64).raw());
+        }
+        Ok(out)
+    }
+
+    pub fn alloc_bytes(&mut self, data: &[u8]) -> Result<TaggedValue, VmError> {
+        let value = self.vm.alloc_bytes_from_slice(data)?;
+        Ok(self.retain_collection_result(value))
+    }
+
+    pub fn return_new_bytes(&mut self, capacity: usize, initial_len: usize) -> Result<(), VmError> {
+        let value = self.vm.new_bytes_with_len(capacity, initial_len)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn bytes_len(&self, bytes: TaggedValue) -> Result<usize, VmError> {
+        self.require_rooted_value(bytes)?;
+        self.vm.bytes_len(bytes)
+    }
+
+    pub fn bytes_cap(&self, bytes: TaggedValue) -> Result<usize, VmError> {
+        self.require_rooted_value(bytes)?;
+        self.vm.bytes_cap(bytes)
+    }
+
+    pub fn bytes_get(&self, bytes: TaggedValue, index: usize) -> Result<u8, VmError> {
+        self.require_rooted_value(bytes)?;
+        self.vm.bytes_get(bytes, index)
+    }
+
+    pub fn bytes_set(&mut self, bytes: TaggedValue, index: usize, byte: u8) -> Result<(), VmError> {
+        self.require_rooted_value(bytes)?;
+        self.vm.bytes_set(bytes, index, byte)
+    }
+
+    pub fn bytes_push(&mut self, bytes: TaggedValue, byte: u8) -> Result<(), VmError> {
+        self.require_rooted_value(bytes)?;
+        self.vm.bytes_push(bytes, byte)
+    }
+
+    pub fn bytes_clear(&mut self, bytes: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(bytes)?;
+        self.vm.bytes_clear(bytes)
+    }
+
+    pub fn return_bytes_slice(
+        &mut self,
+        bytes: TaggedValue,
+        start: usize,
+        end: usize,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(bytes)?;
+        let value = self.vm.bytes_slice(bytes, start, end)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn return_bytes_copy(&mut self, bytes: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(bytes)?;
+        let value = self.vm.bytes_copy(bytes)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn bytes_extend(&mut self, dst: TaggedValue, src: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(dst)?;
+        self.require_rooted_value(src)?;
+        self.vm.bytes_extend(dst, src)
+    }
+
+    pub fn return_bytes_from_str(&mut self, s: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(s)?;
+        let value = self.vm.bytes_from_str(s)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn return_bytes_to_str(&mut self, bytes: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(bytes)?;
+        let value = self.vm.bytes_to_str(bytes)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn return_bytes_from_list(&mut self, list: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(list)?;
+        let value = self.vm.bytes_from_list(list)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn return_bytes_to_list(&mut self, bytes: TaggedValue) -> Result<(), VmError> {
+        self.require_rooted_value(bytes)?;
+        let value = self.vm.bytes_to_list(bytes)?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    pub fn bytes_find(
+        &self,
+        haystack: TaggedValue,
+        needle: TaggedValue,
+        start: usize,
+    ) -> Result<Option<usize>, VmError> {
+        self.require_rooted_value(haystack)?;
+        self.require_rooted_value(needle)?;
+        self.vm.bytes_find(haystack, needle, start)
+    }
+
+    pub fn bytes_eq(&self, left: TaggedValue, right: TaggedValue) -> Result<bool, VmError> {
+        self.require_rooted_value(left)?;
+        self.require_rooted_value(right)?;
+        self.vm.bytes_eq(left, right)
+    }
+
+    pub fn bytes_read_u64_le(&self, bytes: TaggedValue, offset: usize) -> Result<u64, VmError> {
+        self.require_rooted_value(bytes)?;
+        self.vm.bytes_read_u64_le(bytes, offset)
+    }
+
+    pub fn resources(&self) -> &crate::resources::VmResourceTable {
+        self.vm.resources()
+    }
+
+    pub fn resources_mut(&mut self) -> &mut crate::resources::VmResourceTable {
+        self.vm.resources_mut()
+    }
+
+    pub fn is_ffi_library_allowed(&self, name: &str) -> bool {
+        self.vm.is_ffi_library_allowed(name)
+    }
+
+    /// Attach a weak-reference cleanup callback that executes when `target` is swept by GC
+    /// or when the `Vm` drops.
+    pub fn attach_weak_finalizer(
+        &mut self,
+        target: TaggedValue,
+        cleanup: impl FnOnce() + Send + 'static,
+    ) -> Result<(), VmError> {
+        self.require_rooted_value(target)?;
+        self.vm.register_weak_finalizer(target, cleanup)
+    }
+
+    /// Detach any shared COW backing storage on a rooted `Bytes` value prior to a native FFI call.
+    pub fn prepare_ffi_bytes_mut(&mut self, root: &BuiltinRoot) -> Result<(), VmError> {
+        let val = self.load_rooted(root)?;
+        let len = self.vm.bytes_len(val)?;
+        let _ = self.vm.ensure_bytes_unique(val, len)?;
+        Ok(())
+    }
+
+    /// Execute a non-allocating native FFI call under the VM's `native_frame_depth` guard.
+    /// Borrowing `&Vm` immutably inside `f` statically prevents managed heap allocations
+    /// and GC safepoints while raw pointers are live on the C stack.
+    pub fn with_native_ffi_frame<R>(
+        &mut self,
+        f: impl FnOnce(&Vm) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        self.vm.with_native_frame(|vm| f(&*vm))
     }
 
     pub fn return_f64(&mut self, v: f64) -> Result<(), VmError> {
@@ -732,10 +1053,22 @@ impl<'vm> BuiltinCtx<'vm> {
         };
         self.check_string_size(left.len())?;
         self.check_string_size(right.len())?;
-        let left = self.vm.alloc_string(left)?;
-        let right = self.vm.alloc_string(right)?;
+        let left_val = self.vm.alloc_string(left)?;
+        let left_root = self.push_movable_root(left_val)?;
+        let right_val = self.vm.alloc_string(right)?;
+        let left_reloaded = self.reload_root(&left_root)?;
         let str_ty = Intrinsic::Str.type_index();
-        let value = self.vm.alloc_tuple(&[str_ty, str_ty], &[left, right])?;
+        let value = self
+            .vm
+            .alloc_tuple(&[str_ty, str_ty], &[left_reloaded, right_val])?;
+        self.write_return(value);
+        Ok(())
+    }
+
+    /// Build a complex return value (`Tuple`, `List`, `Map`, `?String`, numbers)
+    /// while rooting every intermediate allocation across moving GC cycles.
+    pub fn return_native(&mut self, spec: NativeValue) -> Result<(), VmError> {
+        let (value, _) = self.vm.alloc_native(self.task_id, spec)?;
         self.write_return(value);
         Ok(())
     }
@@ -860,6 +1193,104 @@ impl<'vm> BuiltinCtx<'vm> {
         self.vm.collect_garbage()
     }
 
+    pub fn completed_collections(&self) -> u64 {
+        self.vm.completed_collections()
+    }
+
+    pub fn jit_enabled(&self) -> bool {
+        self.vm.jit_enabled()
+    }
+
+    pub fn jit_stats(&self) -> crate::JitStats {
+        self.vm.jit_stats()
+    }
+
+    pub fn scalar_hash(&self, value: TaggedValue) -> Result<u64, VmError> {
+        self.require_rooted_value(value)?;
+        self.vm.scalar_hash(value)
+    }
+
+    pub fn script_args(&self) -> &[String] {
+        self.vm.script_args()
+    }
+
+    pub fn rng_next_u64(&mut self) -> u64 {
+        self.vm.state.rng.next_u64()
+    }
+
+    pub fn rng_seed(&mut self, mode: i64, s1: i64, s2: i64) -> Result<(i64, i64), VmError> {
+        self.vm.state.rng.seed(mode, s1, s2)
+    }
+
+    pub fn format_backtrace(
+        &self,
+        msg: Option<&str>,
+        skip_frames: usize,
+    ) -> Result<String, VmError> {
+        self.vm.format_backtrace(self.task_id, msg, skip_frames)
+    }
+
+    pub fn file_open(&mut self, path: &str, mode: &str) -> (i64, i64, String) {
+        self.vm.state.files.open(path, mode)
+    }
+
+    pub fn file_temp(&mut self) -> (i64, i64, String) {
+        let state = &mut *self.vm.state;
+        state.files.create_temp(&mut state.rng)
+    }
+
+    pub fn file_close(&mut self, id: i64) -> (i64, String) {
+        self.vm.state.files.close(id)
+    }
+
+    pub fn file_is_open(&self, id: i64) -> bool {
+        self.vm.state.files.is_open(id)
+    }
+
+    pub fn file_flush(&mut self, id: i64) -> (i64, String) {
+        self.vm.state.files.flush(id)
+    }
+
+    pub fn file_read_all(&mut self, id: i64) -> Result<(i64, String), VmError> {
+        self.vm.state.files.read_all(id)
+    }
+
+    pub fn file_read_line(
+        &mut self,
+        id: i64,
+        keep_newline: bool,
+    ) -> Result<(i64, Option<String>, String), VmError> {
+        self.vm.state.files.read_line(id, keep_newline)
+    }
+
+    pub fn file_read_chars(
+        &mut self,
+        id: i64,
+        count: i64,
+    ) -> Result<(i64, Option<String>, String), VmError> {
+        self.vm.state.files.read_chars(id, count)
+    }
+
+    pub fn file_read_bytes(
+        &mut self,
+        id: i64,
+        max_bytes: i64,
+    ) -> Result<(i64, Vec<u8>, String), VmError> {
+        self.vm.state.files.read_bytes(id, max_bytes)
+    }
+
+    pub fn file_read_number(&mut self, id: i64) -> (i64, Option<f64>, String) {
+        self.vm.state.files.read_number(id)
+    }
+
+    pub fn file_write_bytes(&mut self, id: i64, bytes: &[u8]) -> (i64, String) {
+        self.vm.state.files.write_bytes(id, bytes)
+    }
+
+    pub fn file_seek(&mut self, id: i64, whence: i64, offset: i64) -> (i64, i64, String) {
+        self.vm.state.files.seek(id, whence, offset)
+    }
+
     pub fn type_pool(&self) -> &TypePool {
         self.vm.type_pool()
     }
@@ -891,15 +1322,441 @@ impl<'vm> BuiltinCtx<'vm> {
         self.outcome = BuiltinOutcome::Panic(msg.into());
     }
 
+    pub fn task_yield(&mut self) {
+        self.write_return(TaggedValue::UNIT);
+        self.outcome = BuiltinOutcome::Yield;
+    }
+
+    pub fn task_is_ready(&self, future_val: TaggedValue) -> Result<bool, VmError> {
+        self.require_rooted_value(future_val)?;
+        let fid = self.vm.decode_future_id(future_val)?;
+        let entry = self.vm.roots.promises.get(&fid).ok_or(VmError::TypeError)?;
+        Ok(!matches!(
+            entry.state,
+            crate::futures::PromiseState::Pending
+        ))
+    }
+
+    pub fn task_await_all(&mut self, list_handle: &BuiltinRoot) -> Result<(), VmError> {
+        let list_val = self.load_rooted(list_handle)?;
+        let len = self.vm.list_len(list_val)?;
+        let mut fids = Vec::with_capacity(len);
+        for i in 0..len {
+            let elem = self
+                .vm
+                .list_get(list_val, TaggedValue::from_i64(i as i64))?;
+            fids.push(self.vm.decode_future_id(elem)?);
+        }
+        for &fid in &fids {
+            let entry = self
+                .vm
+                .roots
+                .promises
+                .get_mut(&fid)
+                .ok_or(VmError::TypeError)?;
+            match &entry.state {
+                crate::futures::PromiseState::Failed(err) => {
+                    let err = err.clone();
+                    entry.observed_failure = true;
+                    return Err(err);
+                }
+                crate::futures::PromiseState::Cancelled => return Err(VmError::TaskCancelled),
+                _ => {}
+            }
+        }
+        for &fid in &fids {
+            if self
+                .vm
+                .roots
+                .promises
+                .get(&fid)
+                .is_some_and(|e| matches!(e.state, crate::futures::PromiseState::Pending))
+            {
+                self.vm.register_promise_waiter(fid, self.task_id);
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                return Ok(());
+            }
+        }
+        let out_list = self.vm.new_list(len)?;
+        let out_list = self.retain_collection_result(out_list);
+        for (i, fid) in fids.into_iter().enumerate() {
+            let val = match &self.vm.roots.promises[&fid].state {
+                crate::futures::PromiseState::Completed(v) => *v,
+                _ => unreachable!("all promises verified Completed above"),
+            };
+            self.vm
+                .list_set(out_list, TaggedValue::from_i64(i as i64), val)?;
+        }
+        self.write_return(out_list);
+        Ok(())
+    }
+
+    fn resolve_await_any(
+        &mut self,
+        list_handle: &BuiltinRoot,
+    ) -> Result<Option<(usize, TaggedValue)>, VmError> {
+        let list_val = self.load_rooted(list_handle)?;
+        let len = self.vm.list_len(list_val)?;
+        if len == 0 {
+            return Err(VmError::InvalidArgument(
+                "await_any requires a non-empty list of Futures",
+            ));
+        }
+        let mut fids = Vec::with_capacity(len);
+        for i in 0..len {
+            let elem = self
+                .vm
+                .list_get(list_val, TaggedValue::from_i64(i as i64))?;
+            fids.push(self.vm.decode_future_id(elem)?);
+        }
+        let mut winner: Option<(usize, Result<TaggedValue, VmError>)> = None;
+        for (idx, &fid) in fids.iter().enumerate() {
+            let entry = self
+                .vm
+                .roots
+                .promises
+                .get_mut(&fid)
+                .ok_or(VmError::TypeError)?;
+            match &entry.state {
+                crate::futures::PromiseState::Completed(val) => {
+                    winner = Some((idx, Ok(*val)));
+                    break;
+                }
+                crate::futures::PromiseState::Failed(err) => {
+                    let err = err.clone();
+                    entry.observed_failure = true;
+                    winner = Some((idx, Err(err)));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some((winner_idx, outcome)) = winner {
+            let winner_fid = fids[winner_idx];
+            for (idx, &other_fid) in fids.iter().enumerate() {
+                if idx != winner_idx && other_fid != winner_fid {
+                    self.vm.cancel_future(other_fid);
+                }
+            }
+            return outcome.map(|val| Some((winner_idx, val)));
+        }
+        let mut any_pending = false;
+        for &fid in &fids {
+            if self
+                .vm
+                .roots
+                .promises
+                .get(&fid)
+                .is_some_and(|e| matches!(e.state, crate::futures::PromiseState::Pending))
+            {
+                any_pending = true;
+                self.vm.register_promise_waiter(fid, self.task_id);
+            }
+        }
+        if any_pending {
+            self.outcome = BuiltinOutcome::SuspendRetry;
+            Ok(None)
+        } else {
+            Err(VmError::TaskCancelled)
+        }
+    }
+
+    pub fn task_await_any(&mut self, list_handle: &BuiltinRoot) -> Result<(), VmError> {
+        if let Some((_, val)) = self.resolve_await_any(list_handle)? {
+            self.write_return(val);
+        }
+        Ok(())
+    }
+
+    pub fn task_await_indexed(&mut self, list_handle: &BuiltinRoot) -> Result<(), VmError> {
+        let Some((winner_idx, val)) = self.resolve_await_any(list_handle)? else {
+            return Ok(());
+        };
+        let base = self.vm.roots.temporary_values.borrow().len();
+        let tuple = self
+            .vm
+            .with_temporary_roots(&[val, TaggedValue::UNIT], |vm| {
+                let idx_val = vm.number_value(Number::I64(winner_idx as i64))?;
+                vm.roots.temporary_values.borrow_mut()[base + 1] = idx_val;
+                let (cur_val, cur_idx) = {
+                    let roots = vm.roots.temporary_values.borrow();
+                    (roots[base], roots[base + 1])
+                };
+                vm.alloc_tuple(
+                    &[Intrinsic::I64.type_index(), Intrinsic::Any.type_index()],
+                    &[cur_idx, cur_val],
+                )
+            })?;
+        self.write_return(tuple);
+        Ok(())
+    }
+
     pub fn take_outcome(&mut self) -> BuiltinOutcome {
         std::mem::replace(&mut self.outcome, BuiltinOutcome::Continue)
     }
 }
 
+impl Vm {
+    fn intern_optional_type(&mut self, inner: TypeIndex) -> TypeIndex {
+        (0..self.state.type_pool.len())
+            .map(|index| TypeIndex::from_raw(index as u32))
+            .find(|&index| {
+                matches!(
+                    &self.state.type_pool.get(index).kind,
+                    TypeKind::Optional { inner: found } if *found == inner
+                )
+            })
+            .unwrap_or_else(|| {
+                self.state
+                    .type_pool
+                    .intern_structural(TypeKind::Optional { inner })
+            })
+    }
+
+    pub(crate) fn alloc_native(
+        &mut self,
+        task_id: TaskId,
+        spec: NativeValue,
+    ) -> Result<(TaggedValue, TypeIndex), VmError> {
+        match spec {
+            NativeValue::Null => Ok((
+                TaggedValue::NULL,
+                self.intern_optional_type(Intrinsic::Any.type_index()),
+            )),
+            NativeValue::Unit => Ok((TaggedValue::UNIT, Intrinsic::Unit.type_index())),
+            NativeValue::Bool(v) => Ok((TaggedValue::from_bool(v), Intrinsic::Bool.type_index())),
+            NativeValue::Char(c) => Ok((TaggedValue::from_char(c), Intrinsic::Char.type_index())),
+            NativeValue::I64(v) => Ok((
+                self.number_value(Number::I64(v))?,
+                Intrinsic::I64.type_index(),
+            )),
+            NativeValue::U64(v) => Ok((
+                self.number_value(Number::U64(v))?,
+                Intrinsic::U64.type_index(),
+            )),
+            NativeValue::F64(v) => Ok((
+                self.number_value(Number::F64(v))?,
+                Intrinsic::F64.type_index(),
+            )),
+            NativeValue::Str(s) => {
+                self.check_display_bytes(task_id, s.len())?;
+                Self::string_payload_words(s.len())?;
+                let v = self.alloc_string(&s)?;
+                Ok((v, Intrinsic::Str.type_index()))
+            }
+            NativeValue::OptI64(opt) => {
+                let ty = self.intern_optional_type(Intrinsic::I64.type_index());
+                let v = match opt {
+                    Some(n) => self.number_value(Number::I64(n))?,
+                    None => TaggedValue::NULL,
+                };
+                Ok((v, ty))
+            }
+            NativeValue::OptF64(opt) => {
+                let ty = self.intern_optional_type(Intrinsic::F64.type_index());
+                let v = match opt {
+                    Some(n) => self.number_value(Number::F64(n))?,
+                    None => TaggedValue::NULL,
+                };
+                Ok((v, ty))
+            }
+            NativeValue::OptStr(opt) => {
+                let ty = self.intern_optional_type(Intrinsic::Str.type_index());
+                let v = match opt {
+                    Some(s) => {
+                        self.check_display_bytes(task_id, s.len())?;
+                        Self::string_payload_words(s.len())?;
+                        self.alloc_string(&s)?
+                    }
+                    None => TaggedValue::NULL,
+                };
+                Ok((v, ty))
+            }
+            NativeValue::List(items) => {
+                let list_ty = self.state.type_pool.list_type().ok_or(VmError::TypeError)?;
+                let list = self.new_list(items.len())?;
+                let base = self.roots.temporary_values.borrow().len();
+                self.with_temporary_roots(&[list, TaggedValue::UNIT], |vm| {
+                    for (idx, item) in items.into_iter().enumerate() {
+                        let (elem, _) = vm.alloc_native(task_id, item)?;
+                        vm.roots.temporary_values.borrow_mut()[base + 1] = elem;
+                        let (cur_list, cur_elem) = {
+                            let roots = vm.roots.temporary_values.borrow();
+                            (roots[base], roots[base + 1])
+                        };
+                        vm.list_set(cur_list, TaggedValue::from_u64(idx as u64), cur_elem)?;
+                        vm.roots.temporary_values.borrow_mut()[base + 1] = TaggedValue::UNIT;
+                    }
+                    let final_list = vm.roots.temporary_values.borrow()[base];
+                    Ok((final_list, list_ty))
+                })
+            }
+            NativeValue::StringMap(entries) => {
+                let map_ty = self.state.type_pool.map_type().ok_or(VmError::TypeError)?;
+                let cap = if entries.is_empty() {
+                    0
+                } else {
+                    entries.len().saturating_mul(2).min(8192)
+                };
+                let map = self.new_map(cap)?;
+                let base = self.roots.temporary_values.borrow().len();
+                self.with_temporary_roots(&[map, TaggedValue::UNIT, TaggedValue::UNIT], |vm| {
+                    for (key_str, val_spec) in entries {
+                        vm.check_display_bytes(task_id, key_str.len())?;
+                        Self::string_payload_words(key_str.len())?;
+                        let k = vm.alloc_string(&key_str)?;
+                        vm.roots.temporary_values.borrow_mut()[base + 1] = k;
+                        let (v, _) = vm.alloc_native(task_id, val_spec)?;
+                        vm.roots.temporary_values.borrow_mut()[base + 2] = v;
+                        let (cur_map, cur_key, cur_val) = {
+                            let roots = vm.roots.temporary_values.borrow();
+                            (roots[base], roots[base + 1], roots[base + 2])
+                        };
+                        vm.map_set(cur_map, cur_key, cur_val)?;
+                        let mut roots = vm.roots.temporary_values.borrow_mut();
+                        roots[base + 1] = TaggedValue::UNIT;
+                        roots[base + 2] = TaggedValue::UNIT;
+                    }
+                    let final_map = vm.roots.temporary_values.borrow()[base];
+                    Ok((final_map, map_ty))
+                })
+            }
+            NativeValue::Tuple(items) => {
+                let len = items.len();
+                let init_slots = vec![TaggedValue::UNIT; len];
+                let base = self.roots.temporary_values.borrow().len();
+                self.with_temporary_roots(&init_slots, |vm| {
+                    let mut elem_types = Vec::with_capacity(len);
+                    for (idx, item) in items.into_iter().enumerate() {
+                        let (val, ty) = vm.alloc_native(task_id, item)?;
+                        vm.roots.temporary_values.borrow_mut()[base + idx] = val;
+                        elem_types.push(ty);
+                    }
+                    let values: Vec<TaggedValue> =
+                        vm.roots.temporary_values.borrow()[base..base + len].to_vec();
+                    let tuple = vm.alloc_tuple(&elem_types, &values)?;
+                    let tuple_ty = vm.reflected_type(tuple)?;
+                    Ok((tuple, tuple_ty))
+                })
+            }
+        }
+    }
+
+    /// Snapshot a live rooted VM value into a host-owned [`NativeValue`] without allocating on the GC heap.
+    pub fn value_to_native(&self, val: TaggedValue, depth: usize) -> Result<NativeValue, VmError> {
+        if depth > 64 {
+            return Err(VmError::TypeError);
+        }
+        if val.is_null() {
+            return Ok(NativeValue::Null);
+        }
+        if val.is_unit() {
+            return Ok(NativeValue::Unit);
+        }
+        if let Some(b) = val.as_bool() {
+            return Ok(NativeValue::Bool(b));
+        }
+        if let Some(c) = val.as_char() {
+            return Ok(NativeValue::Char(c));
+        }
+        // SAFETY: `val` is a live rooted VM value in the active mutator operation;
+        // `value_to_native` performs only host allocations with no GC safepoints.
+        if let Some(num) = unsafe { Number::from_tagged(val) } {
+            return match num {
+                Number::I64(n) => Ok(NativeValue::I64(n)),
+                Number::U64(n) => Ok(NativeValue::U64(n)),
+                Number::F64(n) => Ok(NativeValue::F64(n)),
+                Number::I128(n) => i64::try_from(n)
+                    .map(NativeValue::I64)
+                    .map_err(|_| VmError::NumericOverflow),
+                Number::U128(n) => u64::try_from(n)
+                    .map(NativeValue::U64)
+                    .map_err(|_| VmError::NumericOverflow),
+            };
+        }
+        if let Some(s) = heap_string_to_owned(val) {
+            return Ok(NativeValue::Str(s));
+        }
+        if let Ok(len) = self.list_len(val) {
+            let mut items = Vec::with_capacity(len);
+            for i in 0..len {
+                let elem = self.list_get(val, TaggedValue::from_u64(i as u64))?;
+                items.push(self.value_to_native(elem, depth + 1)?);
+            }
+            return Ok(NativeValue::List(items));
+        }
+        if let Ok(layout) = self.map_layout(val) {
+            let raw_entries = layout.snapshot_entries()?;
+            let mut entries = Vec::with_capacity(raw_entries.len());
+            for (k, v) in raw_entries {
+                entries.push((k, self.value_to_native(v, depth + 1)?));
+            }
+            return Ok(NativeValue::StringMap(entries));
+        }
+        if let Ok(elems) = self.tuple_values(val) {
+            let mut items = Vec::with_capacity(elems.len());
+            for elem in elems {
+                items.push(self.value_to_native(elem, depth + 1)?);
+            }
+            return Ok(NativeValue::Tuple(items));
+        }
+        Err(VmError::TypeError)
+    }
+}
+
+impl BuiltinCtx<'_> {
+    fn return_host_call_pair(&mut self, ok: bool, payload: NativeValue) -> Result<(), VmError> {
+        let flag = if ok {
+            TaggedValue::TRUE
+        } else {
+            TaggedValue::FALSE
+        };
+        let (payload_val, _) = self.vm.alloc_native(self.task_id, payload)?;
+        let elem_types = [Intrinsic::Bool.type_index(), Intrinsic::Any.type_index()];
+        let tuple = self.vm.alloc_tuple(&elem_types, &[flag, payload_val])?;
+        self.write_return(tuple);
+        Ok(())
+    }
+
+    /// Dispatch `(op, args)` to the embedder's [`HostHandler`] and encode `(ok: bool, payload: Any)`.
+    pub fn invoke_host_call(&mut self, op: &str, args_root: &BuiltinRoot) -> Result<(), VmError> {
+        let list_val = self.load_rooted(args_root)?;
+        let len = self.vm.list_len(list_val)?;
+        let mut native_args = Vec::with_capacity(len);
+        for i in 0..len {
+            let elem = self
+                .vm
+                .list_get(list_val, TaggedValue::from_u64(i as u64))?;
+            native_args.push(self.vm.value_to_native(elem, 0)?);
+        }
+        let Some(mut handler) = self.vm.state.host_handler.take() else {
+            return self.return_host_call_pair(
+                false,
+                NativeValue::Str("no host handler installed".to_string()),
+            );
+        };
+        let outcome = handler.call(op, &native_args, self.task_id);
+        self.vm.state.host_handler = Some(handler);
+        match outcome {
+            HostCallOutcome::Return(val) => self.return_host_call_pair(true, val),
+            HostCallOutcome::Error(msg) => self.return_host_call_pair(false, NativeValue::Str(msg)),
+            HostCallOutcome::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            HostCallOutcome::Yield => {
+                self.outcome = BuiltinOutcome::Yield;
+                self.return_host_call_pair(true, NativeValue::Unit)
+            }
+        }
+    }
+}
+
 /// Extract UTF-8 contents from a heap string TaggedValue.
-pub(crate) fn heap_string_to_owned(val: TaggedValue) -> Option<String> {
+pub(crate) fn with_heap_string_str<R>(val: TaggedValue, f: impl FnOnce(&str) -> R) -> Option<R> {
     let ptr = val.as_heap_ptr()?;
-    // SAFETY: callers run within a mutator operation and supply live VM values.
+    // SAFETY: callers run within a mutator operation and supply live VM values;
+    // `f` does not allocate managed objects, so `ptr` cannot move during `f`.
     let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
     if !header.is_ordinary()
         || header.type_index != Intrinsic::Str.type_index()
@@ -912,7 +1769,12 @@ pub(crate) fn heap_string_to_owned(val: TaggedValue) -> Option<String> {
         return None;
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
-    std::str::from_utf8(bytes).ok().map(|s| s.to_owned())
+    let s = std::str::from_utf8(bytes).ok()?;
+    Some(f(s))
+}
+
+pub(crate) fn heap_string_to_owned(val: TaggedValue) -> Option<String> {
+    with_heap_string_str(val, str::to_owned)
 }
 
 /// Format a TaggedValue for display.

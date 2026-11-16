@@ -164,6 +164,9 @@ impl ComparisonEmitter<'_> {
             TypeKind::Tuple { elements } => {
                 self.fields(&elements, (left, right), false, block, yes, no)
             }
+            TypeKind::Newtype { inner, .. } => {
+                self.fields(&[inner], (left, right), false, block, yes, no)
+            }
             TypeKind::Enum { variants, .. } => {
                 for variant in variants {
                     let matched = self.builder.new_block();
@@ -249,7 +252,7 @@ impl ComparisonEmitter<'_> {
                     self.fields(&elements, (left, right), false, block, yes, no);
                 }
             }
-            TypeKind::Struct { .. } | TypeKind::Enum { .. } => {
+            TypeKind::Struct { .. } | TypeKind::Enum { .. } | TypeKind::Newtype { .. } => {
                 let function = self
                     .field_function(ty)
                     .expect("resolution validated field comparison implementation");

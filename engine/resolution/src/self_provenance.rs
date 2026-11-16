@@ -126,6 +126,25 @@ impl SelfProvenance {
                     self.contextualize(ast, branch, paths, depth + 1)?;
                 }
             }
+            NodeKind::WhenStatement => {
+                let arms = ast.multi_children(node);
+                let has_else = arms
+                    .iter()
+                    .any(|&arm| !arm.is_null() && ast.node(arm).kind == NodeKind::ElseConditionArm);
+                if has_else {
+                    for &arm in arms {
+                        if arm.is_null() {
+                            continue;
+                        }
+                        let body = match ast.node(arm).kind {
+                            NodeKind::ConditionArm => ast.fixed_children(arm)[1],
+                            NodeKind::ElseConditionArm => ast.fixed_children(arm)[0],
+                            _ => continue,
+                        };
+                        self.contextualize(ast, body, paths, depth + 1)?;
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -229,6 +248,50 @@ impl SelfProvenance {
                 intersect(&mut paths, &recurse(children[2])?);
                 paths
             }
+            NodeKind::WhenStatement => {
+                let arms = ast.multi_children(node);
+                let has_else = arms
+                    .iter()
+                    .any(|&arm| !arm.is_null() && ast.node(arm).kind == NodeKind::ElseConditionArm);
+                if !has_else {
+                    Vec::new()
+                } else {
+                    let mut bodies = arms.iter().filter_map(|&arm| {
+                        if arm.is_null() {
+                            return None;
+                        }
+                        match ast.node(arm).kind {
+                            NodeKind::ConditionArm => Some(ast.fixed_children(arm)[1]),
+                            NodeKind::ElseConditionArm => Some(ast.fixed_children(arm)[0]),
+                            _ => None,
+                        }
+                    });
+                    let Some(first) = bodies.next() else {
+                        visiting.remove(&node);
+                        return Ok(Vec::new());
+                    };
+                    let mut paths = recurse(first)?;
+                    for body in bodies {
+                        intersect(&mut paths, &recurse(body)?);
+                    }
+                    paths
+                }
+            }
+            NodeKind::InfixFnCall => {
+                if let Some(symbol) = r.node_symbols.get(&node)
+                    && let Some(binding) = self.bindings.get(symbol)
+                {
+                    recurse(*binding)?
+                        .into_iter()
+                        .filter_map(|path| {
+                            (path.first() == Some(&TraitTypeStep::Return))
+                                .then(|| path[1..].to_vec())
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
             NodeKind::Tuple => {
                 let mut paths = Vec::new();
                 for (index, &element) in ast.multi_children(node).iter().enumerate() {
@@ -281,14 +344,18 @@ impl SelfProvenance {
             }
             NodeKind::Call => {
                 let callee = children[0];
-                if crate::type_factories::identity(r, callee).is_some() {
+                if let Some(factory) = crate::type_factories::identity(r, callee) {
                     let [item] = ast.multi_children(node) else {
-                        return Err("invalid IterationStep type argument count".into());
+                        return Err(format!("invalid {} type argument count", factory.name()));
+                    };
+                    let step = match factory {
+                        crate::TypeFactory::IterationStep => TraitTypeStep::IterationItem,
+                        crate::TypeFactory::Future => TraitTypeStep::FutureInner,
                     };
                     let paths = recurse(*item)?
                         .into_iter()
                         .map(|mut path| {
-                            path.insert(0, TraitTypeStep::IterationItem);
+                            path.insert(0, step);
                             path
                         })
                         .collect();
@@ -344,7 +411,10 @@ fn collect_returns(ast: &Ast, node: NodeIndex, result: &mut Vec<NodeIndex>) {
         return;
     }
     match ast.node(node).kind {
-        NodeKind::Lambda | NodeKind::FunctionDef => return,
+        NodeKind::Lambda
+        | NodeKind::CaseMap
+        | NodeKind::CaseAlternative
+        | NodeKind::FunctionDef => return,
         NodeKind::ReturnStatement => {
             result.push(node);
             return;

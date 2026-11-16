@@ -140,6 +140,7 @@ fn build_input(r: &Resolver<'_>, ast: &Ast) -> Result<TypeIdentityInput, String>
                 ast.node(symbol.def_node).kind,
                 NodeKind::StructDef
                     | NodeKind::EnumDef
+                    | NodeKind::Newtype
                     | NodeKind::TraitDef
                     | NodeKind::ModuleDef
                     | NodeKind::EffectDef
@@ -334,6 +335,9 @@ fn scope_paths(r: &Resolver<'_>, ast: &Ast) -> Result<Vec<Vec<IdentityPathSegmen
     children.sort_by_key(|scope| ranks.get(&scope.node).copied().unwrap_or(usize::MAX));
     let mut ordinals = HashMap::<(Option<ScopeId>, u8), u32>::new();
     for scope in children {
+        if scope.node.is_null() {
+            continue;
+        }
         let kind = ast.node(scope.node).kind;
         if kind == NodeKind::FileScope || r.options.detached_package_roots.contains(&scope.node) {
             continue;
@@ -343,6 +347,7 @@ fn scope_paths(r: &Resolver<'_>, ast: &Ast) -> Result<Vec<Vec<IdentityPathSegmen
             NodeKind::ModuleDef
                 | NodeKind::StructDef
                 | NodeKind::EnumDef
+                | NodeKind::Newtype
                 | NodeKind::TraitDef
                 | NodeKind::FunctionDef
                 | NodeKind::TraitDefFn
@@ -423,6 +428,16 @@ fn lexical_kind(kind: NodeKind) -> Result<u8, String> {
         NodeKind::PatternIfGuard => Ok(12),
         NodeKind::PatternNot => Ok(13),
         NodeKind::CatchArm => Ok(14),
+        NodeKind::ConditionArm => Ok(15),
+        NodeKind::ElseConditionArm => Ok(16),
+        NodeKind::CaseMap => Ok(17),
+        NodeKind::CaseAlternative => Ok(18),
+        NodeKind::DeferStatement => Ok(19),
+        NodeKind::LetDecl => Ok(20),
+        NodeKind::ConstDecl => Ok(21),
+        NodeKind::VarDecl => Ok(22),
+        NodeKind::ShiftExpr => Ok(23),
+        NodeKind::LetHandler => Ok(24),
         _ => Err("unsupported source lexical scope in type identity path".into()),
     }
 }

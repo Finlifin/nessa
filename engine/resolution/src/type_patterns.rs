@@ -35,7 +35,7 @@ pub(crate) fn resolve(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex, input: T
         return;
     };
     r.node_types.insert(type_expr, target);
-    if !is_dynamic(r, input) {
+    if !r.annotation_typed_patterns.contains(&node) && !is_dynamic(r, input) {
         let input_name = r
             .type_pool
             .display_name(input)
@@ -57,10 +57,12 @@ pub(crate) fn resolve(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex, input: T
             "dynamic trait views with associated types are not supported; use a concrete implementation".into(),
         );
     }
-    if ast.node(binder).kind == NodeKind::Id {
+    if ast.node(binder).kind == NodeKind::Id && crate::enums::descriptor(r, ast, binder).is_none() {
         r.node_types.insert(binder, target);
         if let Some(&symbol) = r.node_symbols.get(&binder) {
             r.symbols[symbol.0 as usize].type_index = target;
         }
+    } else {
+        crate::enums::pattern(r, ast, binder, Some(target));
     }
 }

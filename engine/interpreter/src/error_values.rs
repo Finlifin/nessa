@@ -59,7 +59,8 @@ impl Vm {
                         return Err(VmError::UnsupportedFunctionAbi);
                     }
                     type_pool::TypeKind::Optional { inner }
-                    | type_pool::TypeKind::EffectQualified { inner, .. } => pending.push(*inner),
+                    | type_pool::TypeKind::EffectQualified { inner, .. }
+                    | type_pool::TypeKind::Future { inner } => pending.push(*inner),
                     type_pool::TypeKind::Tuple { elements } => pending.extend(elements),
                     _ => {}
                 }

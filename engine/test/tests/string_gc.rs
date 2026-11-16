@@ -29,6 +29,7 @@ fn split_strings_survive_collections_triggered_while_the_list_is_built() {
             gc_threads: 1,
         },
         debug: false,
+        ..Default::default()
     });
     let entry = driver::install_artifact(engine.vm_mut(), compiled.into_artifact().unwrap())
         .unwrap()

@@ -124,10 +124,17 @@ impl Planner<'_> {
     }
 
     fn callback_symbol(&self, target: Target<'_>) -> Option<SymbolId> {
-        self.body_facts(target.context, target.expression)
+        let facts = self.body_facts(target.context, target.expression);
+        facts
             .map(|facts| &facts.node_symbols)
             .unwrap_or(&self.resolved.node_symbols)
             .get(&target.expression)
+            .or_else(|| {
+                facts
+                    .map(|facts| &facts.instance_methods)
+                    .unwrap_or(&self.resolved.instance_methods)
+                    .get(&target.expression)
+            })
             .copied()
     }
 
@@ -307,6 +314,25 @@ impl Planner<'_> {
                 bindings,
                 flow,
             );
+        } else if matches!(
+            ast.node(target.expression).kind,
+            NodeKind::CaseMap | NodeKind::CaseAlternative
+        ) {
+            let mut arms = Vec::new();
+            resolution::flatten_case_arms(ast, target.expression, &mut arms);
+            for arm in arms {
+                for &child in ast.fixed_children(arm) {
+                    self.scan_initializer_in(child, dependencies, visited, target.context);
+                    self.follow_callback_body(
+                        child,
+                        dependencies,
+                        visited,
+                        target.context,
+                        bindings,
+                        flow,
+                    );
+                }
+            }
         } else if let Some(symbol) = self.callback_symbol(target) {
             self.scan_called_symbol_in(symbol, dependencies, visited, target.context);
         }
@@ -343,7 +369,10 @@ impl Planner<'_> {
                     (resolution::argument_value_node(ast, argument), None)
                 }
                 CallArgumentValue::Default { expression, .. } => (expression, None),
-                CallArgumentValue::Variadic { .. } => (call, Some(Pack::List)),
+                CallArgumentValue::Variadic { .. } | CallArgumentValue::UnpackedTail => {
+                    (call, Some(Pack::List))
+                }
+                CallArgumentValue::Unpacked { .. } => continue,
                 CallArgumentValue::MapVariadic { .. } => (call, Some(Pack::Map)),
             };
             let target = self.callback_target(
@@ -395,7 +424,10 @@ impl Planner<'_> {
             }
             let children = ast.fixed_children(node);
             match ast.node(node).kind {
-                NodeKind::Lambda | NodeKind::FunctionDef => continue,
+                NodeKind::Lambda
+                | NodeKind::CaseMap
+                | NodeKind::CaseAlternative
+                | NodeKind::FunctionDef => continue,
                 NodeKind::ErrorElimination => {
                     if let Some(arms) = self.selected_error_arms(node, context) {
                         pending.push(children[0]);

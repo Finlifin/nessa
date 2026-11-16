@@ -14,6 +14,49 @@ pub(crate) use crate::default_body::{
     specialize_body_annotation,
 };
 
+fn search_derived_owner(
+    r: &Resolver<'_>,
+    ast: &Ast,
+    owner: TypeIndex,
+    name: str_interner::StrId,
+    from: crate::ScopeId,
+    selected: &mut Option<SymbolId>,
+) -> Result<(), String> {
+    let mut pending = vec![owner];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(owner) = pending.pop() {
+        if !visited.insert(owner) {
+            continue;
+        }
+        let declared = r
+            .scopes
+            .iter()
+            .find(|scope| scope.assoc_type == Some(owner) && scope.bindings.contains_key(&name));
+        if declared.is_some_and(|scope| {
+            let symbol = scope.bindings[&name];
+            let definition = r.symbols[symbol.0 as usize].def_node;
+            !definition.is_null()
+                && (ast.node(definition).kind == NodeKind::TraitDeriveFn
+                    || crate::ordering::default_template(r, name) == Some(symbol)
+                    || crate::json_derivation::default_template(r, name) == Some(symbol))
+        }) {
+            let symbol = crate::associated::member_from(r, owner, name, from)?;
+            if selected.is_some_and(|previous| previous != symbol) {
+                return Err(format!(
+                    "ambiguous associated member `{}`",
+                    str_interner::get(name)
+                ));
+            }
+            *selected = Some(symbol);
+            break;
+        }
+        if let type_pool::TypeKind::Trait { parents, .. } = &r.type_pool.get(owner).kind {
+            pending.extend(parents.iter().rev().copied());
+        }
+    }
+    Ok(())
+}
+
 /// Resolve declared defaults before executable adapters are published. This
 /// lets concrete callers infer the specialized result during the typing pass.
 pub(crate) fn source_member(
@@ -58,35 +101,50 @@ pub(crate) fn source_member(
         }) else {
             continue;
         };
-        let mut pending = vec![owner];
-        let mut visited = std::collections::HashSet::new();
-        while let Some(owner) = pending.pop() {
-            if !visited.insert(owner) {
+        search_derived_owner(r, ast, owner, name, from, &mut selected)?;
+    }
+    let denotes = |node: NodeIndex| {
+        r.node_type_values
+            .get(&node)
+            .copied()
+            .or_else(|| {
+                r.node_symbols
+                    .get(&node)
+                    .map(|symbol| r.symbols[symbol.0 as usize].type_index)
+            })
+            .and_then(|ty| r.type_pool.canonical_type(ty))
+    };
+    for index in 1..ast.nodes.len() {
+        let node = NodeIndex(index as u32);
+        if ast.node(node).kind != NodeKind::DeriveDef
+            || denotes(ast.fixed_children(node)[0]) != Some(receiver)
+        {
+            continue;
+        }
+        for &trait_node in ast.multi_children(node) {
+            let Some(owner) = denotes(trait_node) else {
+                continue;
+            };
+            if owner == r.type_pool.well_known.ord || owner == r.type_pool.well_known.json {
+                search_derived_owner(r, ast, owner, name, from, &mut selected)?;
                 continue;
             }
-            let declared = r.scopes.iter().find(|scope| {
-                scope.assoc_type == Some(owner) && scope.bindings.contains_key(&name)
-            });
-            if declared.is_some_and(|scope| {
-                let symbol = scope.bindings[&name];
-                let definition = r.symbols[symbol.0 as usize].def_node;
-                !definition.is_null()
-                    && (ast.node(definition).kind == NodeKind::TraitDeriveFn
-                        || crate::ordering::default_template(r, name) == Some(symbol))
-            }) {
-                let symbol = crate::associated::member_from(r, owner, name, from)?;
-                if selected.is_some_and(|previous| previous != symbol) {
-                    return Err(format!(
-                        "ambiguous associated member `{}`",
-                        str_interner::get(name)
-                    ));
-                }
-                selected = Some(symbol);
-                break;
+            let Some(trait_def) = r.symbols.iter().find_map(|sym| {
+                (sym.kind == crate::SymbolKind::Trait
+                    && !sym.def_node.is_null()
+                    && r.type_pool.canonical_type(sym.type_index) == Some(owner))
+                .then_some(sym.def_node)
+            }) else {
+                continue;
+            };
+            if ast
+                .multi_children(trait_def)
+                .iter()
+                .any(|&m| ast.node(m).kind == NodeKind::TraitDefFn)
+            {
+                continue;
             }
-            if let type_pool::TypeKind::Trait { parents, .. } = &r.type_pool.get(owner).kind {
-                pending.extend(parents.iter().rev().copied());
-            }
+            search_derived_owner(r, ast, owner, name, from, &mut selected)?;
         }
     }
     Ok(selected)

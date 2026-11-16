@@ -266,7 +266,13 @@ mod tests {
             Instruction::ret(Reg(2)),
         ];
         for (id, code, is_closure, param_count, abi) in [
-            (0, main.as_slice(), false, 0, nsbc::FunctionAbi::value_only(0)),
+            (
+                0,
+                main.as_slice(),
+                false,
+                0,
+                nsbc::FunctionAbi::value_only(0),
+            ),
             (
                 1,
                 closure.as_slice(),

@@ -155,7 +155,11 @@ pub(crate) fn pattern(
     for (&child, ty) in children.iter().zip(shape) {
         if !matches!(
             ast.node(child).kind,
-            NodeKind::Id | NodeKind::Underscore | NodeKind::PatternTuple
+            NodeKind::Id
+                | NodeKind::Underscore
+                | NodeKind::PatternTuple
+                | NodeKind::PatternExtendedCall
+                | NodeKind::PatternTyped
         ) {
             report(
                 r,
@@ -280,7 +284,7 @@ mod tests {
                 "tuple element 2",
             ),
             (
-                "let (a, b) = (1, 2)\nfn main() {}",
+                "let [a, b] = [1, 2]\nfn main() {}",
                 "module value destructuring",
             ),
             (

@@ -261,7 +261,9 @@ fn term_children(kind: &TypeKind) -> Vec<TypeIndex> {
         TypeKind::Function { params, ret } | TypeKind::Effect { params, ret, .. } => {
             params.iter().copied().chain([*ret]).collect()
         }
-        TypeKind::Optional { inner } | TypeKind::IterationStepTemplate { item: inner } => {
+        TypeKind::Optional { inner }
+        | TypeKind::Future { inner }
+        | TypeKind::IterationStepTemplate { item: inner } => {
             vec![*inner]
         }
         TypeKind::AssociatedType { trait_owner, .. } => vec![*trait_owner],
@@ -314,6 +316,7 @@ fn structural_term(
         },
         TypeKind::IterationStepTemplate { .. } => layout(pool, ty, 9, 5),
         TypeKind::Enum { .. } if structural => layout(pool, ty, 10, 6),
+        TypeKind::Future { .. } => layout(pool, ty, 11, 7),
         _ => return Err(fail("nominal type lacks an identity anchor")),
     };
     match kind {
@@ -332,9 +335,9 @@ fn structural_term(
             term.bytes.push(u8::from(*is_async));
             parameters(&mut term, params, *ret, terms)?;
         }
-        TypeKind::Optional { inner } | TypeKind::IterationStepTemplate { item: inner } => {
-            term.child(get(terms, *inner)?)?
-        }
+        TypeKind::Optional { inner }
+        | TypeKind::Future { inner }
+        | TypeKind::IterationStepTemplate { item: inner } => term.child(get(terms, *inner)?)?,
         TypeKind::AssociatedType { trait_owner, name } => {
             term.child(get(terms, *trait_owner)?)?;
             term.name(*name)?;
@@ -567,6 +570,7 @@ fn type_path(
             (TypeKind::IterationStepTemplate { item }, TraitTypeStep::IterationItem) => {
                 (8, None, Some(*item))
             }
+            (TypeKind::Future { inner }, TraitTypeStep::FutureInner) => (9, None, Some(*inner)),
             _ => return Err(fail("trait identity path does not match its declaration")),
         };
         bytes.push(tag);
@@ -592,6 +596,7 @@ fn default_expression(
         }
         let children: Vec<_> = match expression {
             AssociatedTypeExpr::Optional { inner }
+            | AssociatedTypeExpr::Future { inner }
             | AssociatedTypeExpr::IterationStep { item: inner } => vec![inner.as_ref()],
             AssociatedTypeExpr::Tuple { elements } => elements.iter().collect(),
             AssociatedTypeExpr::Function {
@@ -614,6 +619,7 @@ fn default_expression(
             AssociatedTypeExpr::IterationStep { .. } => 5,
             AssociatedTypeExpr::Tuple { .. } => 6,
             AssociatedTypeExpr::Function { .. } => 7,
+            AssociatedTypeExpr::Future { .. } => 8,
         };
         let mut result = Term {
             bytes: vec![tag],

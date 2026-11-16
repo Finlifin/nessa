@@ -242,18 +242,56 @@ impl Scheduler {
 
     /// Cancel a task and all its children.
     pub fn cancel(&mut self, id: TaskId) {
-        let children = if let Some(task) = self.find_task(id) {
-            task.children.clone()
-        } else {
-            return;
-        };
-        for child_id in children {
-            self.cancel(child_id);
+        let _ = self.cancel_subtree(id);
+    }
+
+    /// Cascade-cancel `root_id` and all its descendants in the task tree.
+    /// Returns every task ID visited in the cancelled subtree.
+    pub fn cancel_subtree(&mut self, root_id: TaskId) -> Vec<TaskId> {
+        let mut visited = Vec::new();
+        let mut stack = vec![root_id];
+        while let Some(id) = stack.pop() {
+            let Some(task) = self.find_task(id) else {
+                continue;
+            };
+            visited.push(id);
+            for &child_id in task.children.iter().rev() {
+                stack.push(child_id);
+            }
+            if let Some(task) = self.find_task_mut(id) {
+                task.cancelled = true;
+                if task.status != TaskStatus::Running {
+                    task.status = TaskStatus::Finished;
+                    task.stacks.finish();
+                }
+            }
         }
-        if let Some(task) = self.find_task_mut(id) {
-            task.status = TaskStatus::Finished;
-            task.stacks.finish();
+        visited
+    }
+
+    /// Whether another ready task is waiting in the ready queue.
+    pub fn has_other_ready_tasks(&self) -> bool {
+        self.ready_queue.iter().any(|&id| {
+            self.find_task(id)
+                .is_some_and(|t| t.status == TaskStatus::Ready)
+        })
+    }
+
+    /// Walk up the parent links of `task_id` to find the nearest installed handler for `effect`.
+    pub fn find_ancestor_handler(
+        &self,
+        task_id: TaskId,
+        effect: runtime::TypeIndex,
+    ) -> Option<runtime::EffectHandler> {
+        let mut current = self.find_task(task_id)?.parent;
+        while let Some(pid) = current {
+            let parent_task = self.find_task(pid)?;
+            if let Some(handler) = parent_task.stacks.find_handler(effect) {
+                return Some(handler.clone());
+            }
+            current = parent_task.parent;
         }
+        None
     }
 
     // -- Queries -------------------------------------------------------------

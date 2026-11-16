@@ -18,6 +18,9 @@ pub enum AssociatedTypeExpr {
     Optional {
         inner: Box<Self>,
     },
+    Future {
+        inner: Box<Self>,
+    },
     IterationStep {
         item: Box<Self>,
     },
@@ -56,9 +59,11 @@ fn contains_symbolic_inner(types: &[TypeInfo], root: TypeIndex, templates: bool)
             }
             None | Some(TypeKind::AssociatedType { .. }) => return true,
             Some(TypeKind::Typealias { target, .. }) => pending.push(*target),
-            Some(TypeKind::Newtype { inner, .. } | TypeKind::Optional { inner }) => {
-                pending.push(*inner)
-            }
+            Some(
+                TypeKind::Newtype { inner, .. }
+                | TypeKind::Optional { inner }
+                | TypeKind::Future { inner },
+            ) => pending.push(*inner),
             Some(TypeKind::Struct { fields, .. }) => pending.extend(fields.iter().map(|f| f.ty)),
             Some(TypeKind::Enum { variants, .. }) => {
                 pending.extend(variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)))
@@ -94,9 +99,9 @@ pub(crate) fn symbolic_types(types: &[TypeInfo]) -> HashSet<TypeIndex> {
                 pending.push(source)
             }
             TypeKind::Typealias { target, .. } => dependencies.push(*target),
-            TypeKind::Newtype { inner, .. } | TypeKind::Optional { inner } => {
-                dependencies.push(*inner)
-            }
+            TypeKind::Newtype { inner, .. }
+            | TypeKind::Optional { inner }
+            | TypeKind::Future { inner } => dependencies.push(*inner),
             TypeKind::Struct { fields, .. } => {
                 dependencies.extend(fields.iter().map(|field| field.ty))
             }
@@ -183,7 +188,8 @@ fn validate_expr(
             }
         }
         AssociatedTypeExpr::IterationStep { item: inner }
-        | AssociatedTypeExpr::Optional { inner } => {
+        | AssociatedTypeExpr::Optional { inner }
+        | AssociatedTypeExpr::Future { inner } => {
             validate_expr(types, root, inner, depth + 1, items)?
         }
         AssociatedTypeExpr::Tuple { elements } => {
@@ -521,6 +527,10 @@ impl DefaultResolver<'_> {
                 let inner = self.expression(inner, depth + 1)?;
                 self.pool.intern_structural(TypeKind::Optional { inner })
             }
+            AssociatedTypeExpr::Future { inner } => {
+                let inner = self.expression(inner, depth + 1)?;
+                self.pool.intern_future(inner)
+            }
             AssociatedTypeExpr::Tuple { elements } => {
                 let elements = elements
                     .iter()
@@ -627,6 +637,10 @@ impl TypePool {
             TypeKind::Optional { inner } => {
                 let inner = self.specialize_associated_inner(inner, values, cache, depth + 1)?;
                 self.intern_structural(TypeKind::Optional { inner })
+            }
+            TypeKind::Future { inner } => {
+                let inner = self.specialize_associated_inner(inner, values, cache, depth + 1)?;
+                self.intern_future(inner)
             }
             TypeKind::Tuple { elements } => {
                 let elements = elements

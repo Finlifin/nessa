@@ -16,24 +16,24 @@ impl Vm {
     ) -> DispatchResult {
         let payload = e_payload(instruction);
         let register = Reg((payload >> 17) as u8);
-        let (effect_type, continuation_param) =
-            if instruction.opcode == Opcode::PushCapturingHandler {
-                let const_index = payload & 0x1FFFF;
-                let Some(&metadata) = self.roots.constants.values().get(const_index as usize)
-                else {
-                    return DispatchResult::Error(VmError::InvalidConstant(const_index));
-                };
-                let Some(packed) = metadata.as_u64() else {
-                    return DispatchResult::Error(VmError::TypeError);
-                };
-                let position = packed >> 32;
-                if position >= 32 {
-                    return DispatchResult::Error(VmError::TypeError);
-                }
-                (TypeIndex::from_raw(packed as u32), Some(position as u8))
-            } else {
-                (TypeIndex::from_raw(payload & 0x1FFFF), None)
+        let (effect_type, continuation_param) = if instruction.opcode
+            == Opcode::PushCapturingHandler
+        {
+            let const_index = payload & 0x1FFFF;
+            let Some(&metadata) = self.roots.constants.values().get(const_index as usize) else {
+                return DispatchResult::Error(VmError::InvalidConstant(const_index));
             };
+            let Some(packed) = metadata.as_u64() else {
+                return DispatchResult::Error(VmError::TypeError);
+            };
+            let position = packed >> 32;
+            if position >= 32 {
+                return DispatchResult::Error(VmError::TypeError);
+            }
+            (TypeIndex::from_raw(packed as u32), Some(position as u8))
+        } else {
+            (TypeIndex::from_raw(payload & 0x1FFFF), None)
+        };
         let task = self
             .roots
             .scheduler
@@ -48,6 +48,8 @@ impl Vm {
         if let Err(error) = self.check_entry_environment(handler_func, Some(closure)) {
             return DispatchResult::Error(error);
         }
+        let scope_id = self.state.next_handler_scope_id;
+        self.state.next_handler_scope_id = scope_id.wrapping_add(1);
         let task = self
             .roots
             .scheduler
@@ -58,6 +60,7 @@ impl Vm {
             handler_func,
             closure_env: closure,
             continuation_param,
+            scope_id,
         });
         DispatchResult::Continue
     }
@@ -67,6 +70,9 @@ impl Vm {
         task_id: TaskId,
         instruction: &Instruction,
     ) -> DispatchResult {
+        if self.state.native_frame_depth > 0 {
+            return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
+        }
         let payload = e_payload(instruction);
         let arg_count = (payload >> 17) as u8;
         let effect = TypeIndex::from_raw(payload & 0x1FFFF);
@@ -78,7 +84,12 @@ impl Vm {
             .scheduler
             .get_task(task_id)
             .expect("dispatched task exists");
-        let Some(handler) = task.stacks.find_handler(effect).cloned() else {
+        let Some(handler) = task
+            .stacks
+            .find_handler(effect)
+            .cloned()
+            .or_else(|| self.roots.scheduler.find_ancestor_handler(task_id, effect))
+        else {
             return DispatchResult::Error(VmError::UnhandledEffect(effect));
         };
         let code = match self.checked_function(handler.handler_func) {
@@ -100,12 +111,25 @@ impl Vm {
             return DispatchResult::Error(VmError::InvalidType(effect));
         };
         let TypeKind::Effect {
-            ret: input_type, ..
+            ret: input_type,
+            is_async,
+            ..
         } = self.state.type_pool.get(effect_type).kind
         else {
             return DispatchResult::Error(VmError::InvalidType(effect));
         };
+        let task = self
+            .roots
+            .scheduler
+            .get_task(task_id)
+            .expect("dispatched task exists");
         let args: Vec<TaggedValue> = task.registers.regs[..arg_count as usize].to_vec();
+        if is_async {
+            if handler.continuation_param.is_some() {
+                return DispatchResult::Error(VmError::TypeError);
+            }
+            return self.spawn_async_effect(task_id, &handler, input_type, &args);
+        }
         let argument_count = args.len();
         let mut values = args;
         values.push(handler.closure_env);
@@ -214,6 +238,9 @@ impl Vm {
         task_id: TaskId,
         instruction: &Instruction,
     ) -> DispatchResult {
+        if self.state.native_frame_depth > 0 {
+            return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
+        }
         let payload = e_payload(instruction);
         if payload & 0xFFF != 0 {
             return DispatchResult::Error(VmError::InvalidInstruction(instruction.encode()));
@@ -337,6 +364,9 @@ impl Vm {
         value: TaggedValue,
         once: bool,
     ) -> DispatchResult {
+        if self.state.native_frame_depth > 0 {
+            return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
+        }
         let result = self.with_temporary_roots(&[continuation, value], |vm| {
             let handle = Self::language_continuation_handle(continuation)?;
             let contract = vm.continuation_input_contract(task_id, handle)?;
@@ -378,6 +408,9 @@ impl Vm {
         task_id: TaskId,
         continuation: TaggedValue,
     ) -> DispatchResult {
+        if self.state.native_frame_depth > 0 {
+            return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
+        }
         let handle = match Self::language_continuation_handle(continuation) {
             Ok(handle) => handle,
             Err(error) => return DispatchResult::Error(error),

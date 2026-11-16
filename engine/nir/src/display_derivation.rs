@@ -234,7 +234,7 @@ impl DisplayEmitter<'_> {
                     .iter()
                     .map(|field| (field.ty, Some(field.name)))
                     .collect::<Vec<_>>();
-                let output = self.fields(&fields, receiver, false, false, output, block);
+                let output = self.fields(&fields, receiver, false, true, output, block);
                 self.append(*block, output, self.text(" }"))
             }
             TypeKind::Tuple { elements } => {
@@ -245,6 +245,11 @@ impl DisplayEmitter<'_> {
                     output,
                     self.text(if elements.len() == 1 { ",)" } else { ")" }),
                 )
+            }
+            TypeKind::Newtype { name, inner } => {
+                let prefix = self.text(&format!("{}(", str_interner::get(name)));
+                let output = self.fields(&[(inner, None)], receiver, false, true, prefix, block);
+                self.append(*block, output, self.text(")"))
             }
             TypeKind::Enum { name, variants } => {
                 let result = self.builder.alloc_local();

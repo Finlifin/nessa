@@ -287,6 +287,7 @@ impl TokenKind {
             self,
             Self::Hash
                 | Self::Bang
+                | Self::Question
                 | Self::RBrace
                 | Self::RBracket
                 | Self::RParen
@@ -332,6 +333,7 @@ impl TokenKind {
                 | Self::Newline
                 | Self::Indent
                 | Self::String
+                | Self::FStringStart
                 | Self::Integer
                 | Self::IntBin
                 | Self::IntOct
@@ -346,6 +348,7 @@ impl TokenKind {
                 | Self::KwReturn
                 | Self::KwContinue
                 | Self::KwBreak
+                | Self::KwCase
                 | Self::KwConst
                 | Self::KwDef
                 | Self::KwDerive

@@ -30,19 +30,27 @@ fn default_expression(
             NodeKind::Call
                 if crate::type_factories::identity(r, ast.fixed_children(node)[0]).is_some() =>
             {
+                let factory = crate::type_factories::identity(r, ast.fixed_children(node)[0])
+                    .expect("checked factory identity");
+                let fname = factory.name();
                 let [item] = ast.multi_children(node) else {
-                    return Err(
-                        "IterationStep requires exactly one positional type argument".into(),
-                    );
+                    return Err(format!(
+                        "{fname} requires exactly one positional type argument"
+                    ));
                 };
                 if ast.node(*item).kind == NodeKind::NamedArg {
-                    return Err("IterationStep requires a positional type argument".into());
+                    return Err(format!("{fname} requires a positional type argument"));
                 }
                 let Some(item) = default_expression(r, ast, *item, active, depth + 1)? else {
                     return Ok(None);
                 };
-                Expr::IterationStep {
-                    item: Box::new(item),
+                match factory {
+                    crate::TypeFactory::IterationStep => Expr::IterationStep {
+                        item: Box::new(item),
+                    },
+                    crate::TypeFactory::Future => Expr::Future {
+                        inner: Box::new(item),
+                    },
                 }
             }
             NodeKind::SelfUpper => {
@@ -413,6 +421,7 @@ pub(crate) fn contains_dynamic_view(r: &Resolver<'_>, ty: TypeIndex, depth: usiz
         TypeKind::Trait { .. } => has_declarations(r, ty),
         TypeKind::IterationStepTemplate { item: inner }
         | TypeKind::Optional { inner }
+        | TypeKind::Future { inner }
         | TypeKind::ErrorQualified { inner, .. }
         | TypeKind::EffectQualified { inner, .. } => contains_dynamic_view(r, *inner, depth + 1),
         TypeKind::Tuple { elements } => elements

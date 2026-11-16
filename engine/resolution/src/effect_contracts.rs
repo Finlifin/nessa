@@ -51,6 +51,73 @@ pub(crate) fn prepare_inputs(r: &mut Resolver<'_>, ast: &Ast) {
             }
         }
     }
+    r.assigned_symbols = assigned.clone();
+    for (index, node) in ast.nodes.iter().enumerate() {
+        let idx = NodeIndex(index as u32);
+        let (eff_node, skip_self) = match node.kind {
+            NodeKind::HandlesStatement => (ast.fixed_children(idx)[0], 0usize),
+            NodeKind::TraitDefFn => {
+                let ch = ast.fixed_children(idx);
+                if ch.len() < 3 || ch[2].is_null() {
+                    continue;
+                }
+                (ch[2], 1usize)
+            }
+            NodeKind::FunctionDef | NodeKind::TraitDeriveFn => {
+                let ch = ast.fixed_children(idx);
+                if ch.len() < 4 || ch[3].is_null() {
+                    continue;
+                }
+                (ch[3], 1usize)
+            }
+            _ => continue,
+        };
+        let eff_sym = r.node_symbols.get(&eff_node).copied().or_else(|| {
+            if ast.node(eff_node).kind == NodeKind::Projection {
+                let ch = ast.fixed_children(eff_node);
+                r.node_symbols
+                    .get(&ch[0])
+                    .and_then(|&base| crate::imports::member(r, base, ast.node(ch[1]).str_id).ok())
+            } else {
+                None
+            }
+        });
+        let Some(eff_sym) = eff_sym else {
+            continue;
+        };
+        let effect = r.symbols[eff_sym.0 as usize].type_index;
+        let Some(operation) = r
+            .effects
+            .iter()
+            .find(|info| info.type_index == effect)
+            .and_then(|info| info.operations.first())
+        else {
+            continue;
+        };
+        let Some(position) = operation.continuation_param else {
+            continue;
+        };
+        let Some(&param_node) = ast.multi_children(idx).get(skip_self + position) else {
+            continue;
+        };
+        let binding = match ast.node(param_node).kind {
+            NodeKind::ParamCatch | NodeKind::ParamTyped | NodeKind::ParamLambda => {
+                let ch = ast.fixed_children(param_node);
+                if !ch[0].is_null() && ast.node(ch[0]).kind == NodeKind::PatternTyped {
+                    ast.fixed_children(ch[0])[0]
+                } else {
+                    ch[0]
+                }
+            }
+            _ => param_node,
+        };
+        if !binding.is_null()
+            && let Some(&symbol) = r.node_symbols.get(&binding)
+            && !assigned.contains(&symbol)
+        {
+            r.continuation_inputs.insert(symbol, operation.return_type);
+        }
+    }
     for &arm in &r.handler_arms {
         let pattern = ast.fixed_children(arm)[0];
         if ast.node(pattern).kind != NodeKind::PatternCall {

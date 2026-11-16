@@ -98,6 +98,38 @@ impl NirLowering {
                 function,
             );
         }
+        for plan in &resolved.hash_derivations {
+            let function = FuncId(self.next_func_id);
+            self.next_func_id += 1;
+            self.derived_functions.insert(
+                (plan.implementor, plan.trait_type, plan.method_name),
+                function,
+            );
+        }
+        let mut json_write_helpers = HashMap::new();
+        let mut json_read_helpers = HashMap::new();
+        for plan in &resolved.json_derivations {
+            let to_json_fn = FuncId(self.next_func_id);
+            self.next_func_id += 1;
+            self.derived_functions.insert(
+                (plan.implementor, plan.trait_type, plan.method_name),
+                to_json_fn,
+            );
+
+            let write_fn = FuncId(self.next_func_id);
+            self.next_func_id += 1;
+            json_write_helpers.insert(plan.implementor, write_fn);
+
+            let read_fn = FuncId(self.next_func_id);
+            self.next_func_id += 1;
+            json_read_helpers.insert(plan.implementor, read_fn);
+
+            if let Some(sym) = plan.from_json_symbol {
+                let from_json_fn = FuncId(self.next_func_id);
+                self.next_func_id += 1;
+                self.func_map.insert(sym, from_json_fn);
+            }
+        }
 
         // Pass 2: lower function bodies with the complete func_map.
         let pending = std::mem::take(&mut self.pending);
@@ -168,6 +200,34 @@ impl NirLowering {
                 func_id,
             });
         }
+        for plan in &resolved.hash_derivations {
+            let func_id =
+                self.derived_functions[&(plan.implementor, plan.trait_type, plan.method_name)];
+            self.functions.push(crate::hash_derivation::lower(
+                resolved,
+                plan,
+                func_id,
+                &self.func_map,
+                &self.derived_functions,
+            ));
+            derived_methods.push(crate::DerivedMethod {
+                implementor: plan.implementor,
+                trait_type: plan.trait_type,
+                method_name: plan.method_name,
+                func_id,
+            });
+        }
+        crate::json_derivation::lower_all(
+            resolved,
+            &mut self.next_func_id,
+            &self.func_map,
+            &self.derived_functions,
+            &self.global_map,
+            &json_write_helpers,
+            &json_read_helpers,
+            &mut self.functions,
+            &mut derived_methods,
+        );
         self.functions.sort_by_key(|function| function.func_id.0);
         NirModule {
             derived_methods,
@@ -212,7 +272,7 @@ impl NirLowering {
                     NirExpr::Call(self.func_map[&hook], Vec::new()),
                 ));
             }
-            builder.blocks[block.0 as usize].terminator = Terminator::Return(NirValue::Unit);
+            crate::stmt::emit_return(resolved, NirValue::Unit, &mut builder, &mut block);
             self.next_func_id = builder.next_func_id;
             self.functions.append(&mut builder.lambda_functions);
             self.functions.push(builder.build());
@@ -382,7 +442,13 @@ impl NirLowering {
                             .unwrap_or(type_pool::TypeIndex::INVALID),
                         role: crate::NirParamRole::User,
                     });
-                    if pat_node.kind == NodeKind::PatternTuple {
+                    if matches!(
+                        pat_node.kind,
+                        NodeKind::PatternTuple
+                            | NodeKind::PatternExtendedCall
+                            | NodeKind::PatternTyped
+                            | NodeKind::PatternCall
+                    ) {
                         tuple_parameters.push((pat_node_idx, local));
                     }
                 }
@@ -463,6 +529,38 @@ impl NirLowering {
                         type_index: TypeIndex::INVALID,
                         role: crate::NirParamRole::User,
                     });
+                    if matches!(
+                        pat_node.kind,
+                        NodeKind::PatternTuple
+                            | NodeKind::PatternExtendedCall
+                            | NodeKind::PatternTyped
+                            | NodeKind::PatternCall
+                    ) {
+                        tuple_parameters.push((pat_node_idx, local));
+                    }
+                }
+                NodeKind::ParamCatch => {
+                    let param_children = ast.fixed_children(param);
+                    let id_node_idx = param_children[0];
+                    let id_node = ast.node(id_node_idx);
+                    let sym_opt = resolved.node_symbols.get(&id_node_idx).copied();
+                    let local = sym_opt
+                        .map(|sym_id| builder.local_for_symbol(sym_id))
+                        .unwrap_or_else(|| builder.alloc_local());
+                    builder.params.push(NirParam {
+                        local,
+                        name: id_node.str_id,
+                        type_index: type_pool::Intrinsic::Continuation.type_index(),
+                        role: crate::NirParamRole::User,
+                    });
+                    if children.len() > 2 && !children[2].is_null() {
+                        builder.consume_continuation_at =
+                            crate::continuation::single_use_handler_call(
+                                resolved,
+                                children[2],
+                                sym_opt,
+                            );
+                    }
                 }
                 _ => {}
             }

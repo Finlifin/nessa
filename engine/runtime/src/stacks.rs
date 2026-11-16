@@ -211,6 +211,18 @@ impl TaskStacks {
         &mut self.segment_mut(self.active).context
     }
 
+    /// Active contexts ordered from innermost delimiter segment to outermost root segment.
+    pub fn active_chain(&self) -> Vec<&StackContext> {
+        let mut chain = Vec::new();
+        let mut current = Some(self.active);
+        while let Some(index) = current {
+            let segment = self.segment(index);
+            chain.push(&segment.context);
+            current = segment.parent;
+        }
+        chain
+    }
+
     /// Nearest handler across active delimiter segments and their parents.
     pub fn find_handler(&self, effect: type_pool::TypeIndex) -> Option<&EffectHandler> {
         let mut index = self.active;
@@ -494,6 +506,12 @@ impl TaskStacks {
             },
         );
         Ok(new_id)
+    }
+
+    /// Whether the active segment is at the task root with no caller frames or parent delimiter.
+    pub fn is_at_task_root(&self) -> bool {
+        let segment = self.segment(self.active);
+        segment.context.call_stack.is_empty() && segment.parent.is_none()
     }
 
     /// Return from a delimiter after its local call frames have been unwound.
@@ -976,6 +994,7 @@ mod tests {
             handler_func: FuncId(1),
             closure_env: TaggedValue::UNIT,
             continuation_param: None,
+            scope_id: 0,
         });
         for depth in 2..20 {
             let handlers = stacks.effective_handlers();
@@ -989,6 +1008,7 @@ mod tests {
                 handler_func: FuncId(depth),
                 closure_env: TaggedValue::UNIT,
                 continuation_param: None,
+                scope_id: 0,
             });
             let retained = stacks.effective_handlers();
             assert_eq!(retained.len(), 1);
@@ -1025,6 +1045,7 @@ mod tests {
             handler_func: FuncId(0),
             closure_env: TaggedValue::from_i64(7),
             continuation_param: None,
+            scope_id: 0,
         });
         let mut seen = Vec::new();
         context.visit_slots_mut(|slot| {

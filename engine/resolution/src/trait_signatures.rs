@@ -17,7 +17,9 @@ pub(crate) fn parameter_kinds(
         .map(|&parameter| {
             Some(match ast.node(parameter).kind {
                 NodeKind::ParamSelf => TraitParameterKind::Receiver,
-                NodeKind::ParamTyped | NodeKind::ParamLambda => TraitParameterKind::Required,
+                NodeKind::ParamTyped | NodeKind::ParamLambda | NodeKind::ParamCatch => {
+                    TraitParameterKind::Required
+                }
                 NodeKind::ParamOptional => TraitParameterKind::Optional,
                 NodeKind::ParamVarargs => {
                     let layout =
@@ -70,6 +72,7 @@ pub(crate) fn type_at_path(
                 *elements.get(*index as usize)?
             }
             (TraitTypeStep::OptionalInner, TypeKind::Optional { inner })
+            | (TraitTypeStep::FutureInner, TypeKind::Future { inner })
             | (TraitTypeStep::ErrorInner, TypeKind::ErrorQualified { inner, .. })
             | (TraitTypeStep::EffectInner, TypeKind::EffectQualified { inner, .. }) => *inner,
             (TraitTypeStep::ErrorMember(index), TypeKind::ErrorQualified { errors, .. }) => {
@@ -252,10 +255,16 @@ fn self_paths(
         NodeKind::Call | NodeKind::PatternCall
             if crate::type_factories::identity(r, ast.fixed_children(node)[0]).is_some() =>
         {
+            let factory = crate::type_factories::identity(r, ast.fixed_children(node)[0])
+                .expect("checked factory identity");
             let [item] = ast.multi_children(node) else {
-                return Err("invalid IterationStep type argument count".into());
+                return Err(format!("invalid {} type argument count", factory.name()));
             };
-            child!(*item, TraitTypeStep::IterationItem);
+            let step = match factory {
+                crate::TypeFactory::IterationStep => TraitTypeStep::IterationItem,
+                crate::TypeFactory::Future => TraitTypeStep::FutureInner,
+            };
+            child!(*item, step);
         }
         NodeKind::SelfUpper => {
             let actual = r

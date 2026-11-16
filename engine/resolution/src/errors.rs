@@ -206,6 +206,32 @@ pub(crate) fn construction(
     );
     Some(result)
 }
+pub(crate) fn unwrap_signature(
+    r: &mut Resolver<'_>,
+    ast: &Ast,
+    node: NodeIndex,
+    receiver: TypeIndex,
+) -> Option<TypeIndex> {
+    let shape = r.type_pool.error_shape(receiver).ok()??;
+    let member = ast.fixed_children(node)[1];
+    if str_interner::get(ast.node(member).str_id) != "unwrap" {
+        return None;
+    }
+    if r.current_call_callee != Some(node) {
+        report(
+            r,
+            ast,
+            node,
+            "bound Error unwrap values are not implemented; call unwrap directly",
+        );
+        return None;
+    }
+    Some(r.register_type(TypeKind::Function {
+        params: Vec::new(),
+        ret: shape.inner,
+    }))
+}
+
 pub(crate) fn conversion(
     r: &Resolver<'_>,
     source: TypeIndex,
@@ -253,35 +279,56 @@ pub(crate) fn record_conversion(
     true
 }
 pub(crate) fn join(r: &mut Resolver<'_>, left: TypeIndex, right: TypeIndex) -> TypeIndex {
+    let mut effects = Vec::new();
+    let peel_effects = |pool: &type_pool::TypePool, mut ty: TypeIndex, out: &mut Vec<TypeIndex>| {
+        while let Some(canon) = pool.canonical_type(ty) {
+            if let TypeKind::EffectQualified {
+                effects: effs,
+                inner,
+            } = &pool.get(canon).kind
+            {
+                out.extend(effs.iter().copied());
+                ty = *inner;
+            } else {
+                break;
+            }
+        }
+        ty
+    };
+    let left = peel_effects(&r.type_pool, left, &mut effects);
+    let right = peel_effects(&r.type_pool, right, &mut effects);
+
     let a = r.type_pool.error_shape(left).ok().flatten();
     let b = r.type_pool.error_shape(right).ok().flatten();
-    if a.is_none() && b.is_none() {
-        return crate::optional::join(r, left, right);
-    }
-    let mut errors = Vec::new();
-    let a_inner = a
-        .as_ref()
-        .map(|shape| {
-            errors.extend(domain_members(r, &shape.domain));
-            shape.inner
-        })
-        .unwrap_or(left);
-    let b_inner = b
-        .as_ref()
-        .map(|shape| {
-            errors.extend(domain_members(r, &shape.domain));
-            shape.inner
-        })
-        .unwrap_or(right);
-    let inner = crate::optional::join(r, a_inner, b_inner);
-    // Shapes originate from checked source types; errors cannot contain invalid indices.
-    match r.type_pool.normalize_error_type(errors, inner) {
-        Ok(ty) => ty,
-        Err(error) => {
-            r.diag_ctx.error(error.to_string()).emit(r.diag_ctx);
-            Intrinsic::NoReturn.type_index()
+    let joined = if a.is_none() && b.is_none() {
+        crate::optional::join(r, left, right)
+    } else {
+        let mut errors = Vec::new();
+        let a_inner = a
+            .as_ref()
+            .map(|shape| {
+                errors.extend(domain_members(r, &shape.domain));
+                shape.inner
+            })
+            .unwrap_or(left);
+        let b_inner = b
+            .as_ref()
+            .map(|shape| {
+                errors.extend(domain_members(r, &shape.domain));
+                shape.inner
+            })
+            .unwrap_or(right);
+        let inner = crate::optional::join(r, a_inner, b_inner);
+        // Shapes originate from checked source types; errors cannot contain invalid indices.
+        match r.type_pool.normalize_error_type(errors, inner) {
+            Ok(ty) => ty,
+            Err(error) => {
+                r.diag_ctx.error(error.to_string()).emit(r.diag_ctx);
+                Intrinsic::NoReturn.type_index()
+            }
         }
-    }
+    };
+    crate::effect::normalize(r, effects, joined)
 }
 pub(crate) fn callable(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option<NodeIndex> {
     let mut scope = r.node_scopes.get(&node).copied();
@@ -290,7 +337,11 @@ pub(crate) fn callable(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option<N
         if !entry.node.is_null()
             && (matches!(
                 ast.node(entry.node).kind,
-                NodeKind::FunctionDef | NodeKind::TraitDeriveFn | NodeKind::Lambda
+                NodeKind::FunctionDef
+                    | NodeKind::TraitDeriveFn
+                    | NodeKind::Lambda
+                    | NodeKind::CaseMap
+                    | NodeKind::CaseAlternative
             ) || r.handler_arms.contains(&entry.node))
         {
             return Some(entry.node);

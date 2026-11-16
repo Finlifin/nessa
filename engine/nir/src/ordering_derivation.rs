@@ -144,6 +144,9 @@ impl OrderingEmitter<'_> {
             TypeKind::Tuple { elements } => {
                 self.fields(&elements, left, right, false, block, equal)
             }
+            TypeKind::Newtype { inner, .. } => {
+                self.fields(&[inner], left, right, false, block, equal)
+            }
             TypeKind::Enum { variants, .. } => {
                 for (left_index, variant) in variants.iter().enumerate() {
                     let matched = self.builder.new_block();

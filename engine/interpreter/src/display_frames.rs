@@ -78,7 +78,10 @@ impl Vm {
         }
         let aggregate = matches!(
             self.state.type_pool.get(owner).kind,
-            TypeKind::Struct { .. } | TypeKind::Tuple { .. } | TypeKind::Enum { .. }
+            TypeKind::Struct { .. }
+                | TypeKind::Tuple { .. }
+                | TypeKind::Enum { .. }
+                | TypeKind::Newtype { .. }
         );
         if aggregate && receiver.is_heap() && state.ancestors.contains(&receiver) {
             state.current_target = true;

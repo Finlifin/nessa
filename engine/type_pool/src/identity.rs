@@ -49,7 +49,7 @@ pub(crate) fn fail(message: impl Into<String>) -> TypeIdentityError {
 pub(crate) const fn bootstrap_id(ordinal: u64) -> TypeId {
     TypeId(BOOTSTRAP_NAMESPACE, (1 << 32) | ordinal)
 }
-pub(crate) fn known_traits(pool: &TypePool) -> [TypeIndex; 8] {
+pub(crate) fn known_traits(pool: &TypePool) -> [TypeIndex; 9] {
     let k = pool.well_known;
     [
         k.display,
@@ -60,6 +60,7 @@ pub(crate) fn known_traits(pool: &TypePool) -> [TypeIndex; 8] {
         k.partial_ord,
         k.iterator,
         k.into_iterator,
+        k.json,
     ]
 }
 

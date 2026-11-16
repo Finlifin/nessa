@@ -1,5 +1,5 @@
 //! Compile checked filesystem source trees through the ordinary source backend.
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use ast::{Ast, Node, NodeIndex, NodeKind};
@@ -17,8 +17,24 @@ pub(crate) struct SourceUnit<'a> {
 
 impl Driver {
     pub fn compile_package(&self, root: &Path) -> CompileResult {
-        match pkg_manager::load_package_sources(root) {
-            Ok(sources) => self.compile_package_sources(&sources),
+        self.compile_package_with_lock_mode(root, false)
+    }
+
+    pub fn compile_package_locked(&self, root: &Path) -> CompileResult {
+        self.compile_package_with_lock_mode(root, true)
+    }
+
+    fn compile_package_with_lock_mode(&self, root: &Path, require_lockfile: bool) -> CompileResult {
+        match pkg_manager::load_package_workspace(root) {
+            Ok(workspace) => {
+                if let Err(message) = verify_workspace_lockfile(&workspace, require_lockfile) {
+                    return self.package_failure(message);
+                }
+                self.compile_package_sources_with_dependencies(
+                    &workspace.root,
+                    &workspace.dependencies,
+                )
+            }
             Err(error) => self.package_failure(error.to_string()),
         }
     }
@@ -28,8 +44,61 @@ impl Driver {
         self.compile_package_sources_with_dependencies(sources, &[])
     }
 
+    pub fn compile_package_cached_artifact(
+        &self,
+        root: &Path,
+    ) -> Result<nsbc::CompiledArtifact, Vec<Diagnostic>> {
+        self.compile_package_cached_with_lock_mode(root, false)
+    }
+
+    pub fn compile_package_locked_cached_artifact(
+        &self,
+        root: &Path,
+    ) -> Result<nsbc::CompiledArtifact, Vec<Diagnostic>> {
+        self.compile_package_cached_with_lock_mode(root, true)
+    }
+
+    fn compile_package_cached_with_lock_mode(
+        &self,
+        root: &Path,
+        require_lockfile: bool,
+    ) -> Result<nsbc::CompiledArtifact, Vec<Diagnostic>> {
+        let workspace = pkg_manager::load_package_workspace(root)
+            .map_err(|error| self.package_errors(error.to_string()))?;
+        if let Err(message) = verify_workspace_lockfile(&workspace, require_lockfile) {
+            return Err(self.package_errors(message));
+        }
+        self.compile_package_sources_with_privileged_cached(
+            &workspace.root,
+            &workspace.dependencies,
+            &BTreeSet::new(),
+        )
+    }
+
     pub fn run_package(&self, root: &Path) -> RunResult {
-        let compiled = self.compile_package(root);
+        self.run_package_with_lock_mode(root, false)
+    }
+
+    pub fn run_package_locked(&self, root: &Path) -> RunResult {
+        self.run_package_with_lock_mode(root, true)
+    }
+
+    pub fn run_package_cached(&self, root: &Path) -> RunResult {
+        match self.compile_package_cached_with_lock_mode(root, false) {
+            Ok(artifact) => self.run_artifact(artifact),
+            Err(diagnostics) => RunResult::CompileError(diagnostics),
+        }
+    }
+
+    pub fn run_package_locked_cached(&self, root: &Path) -> RunResult {
+        match self.compile_package_cached_with_lock_mode(root, true) {
+            Ok(artifact) => self.run_artifact(artifact),
+            Err(diagnostics) => RunResult::CompileError(diagnostics),
+        }
+    }
+
+    fn run_package_with_lock_mode(&self, root: &Path, require_lockfile: bool) -> RunResult {
+        let compiled = self.compile_package_with_lock_mode(root, require_lockfile);
         if compiled.has_errors {
             return RunResult::CompileError(compiled.diagnostics);
         }
@@ -40,15 +109,179 @@ impl Driver {
     }
 
     pub fn compile_package_to_archive(&self, root: &Path, output: &Path) -> std::io::Result<()> {
-        let artifact = self.compile_package(root).into_artifact()?;
-        std::fs::write(output, nsbc_io::write_artifact(&artifact)?)
+        let workspace = pkg_manager::load_package_workspace(root).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let artifact = self
+            .compile_package_sources_with_privileged_cached(
+                &workspace.root,
+                &workspace.dependencies,
+                &BTreeSet::new(),
+            )
+            .map_err(|diagnostics| compilation_error(&diagnostics))?;
+        let bytes = nsbc_io::write_artifact(&artifact)?;
+        let has_local_deps = workspace
+            .dependencies
+            .iter()
+            .any(|dep| !pkg_manager::is_bundled_package_root(&dep.root));
+        if has_local_deps || workspace.existing_lockfile.is_some() {
+            let lockfile = pkg_manager::Lockfile::from_workspace(&workspace);
+            if workspace.existing_lockfile.as_ref() != Some(&lockfile) {
+                lockfile.write(&workspace.root.root.join("package.lock"))?;
+            }
+        }
+        std::fs::write(output, bytes)
+    }
+
+    /// Compile a disk package to an `.nsbc` archive while strictly enforcing `package.lock`
+    /// without modifying or creating `package.lock`.
+    pub fn compile_package_to_archive_locked(
+        &self,
+        root: &Path,
+        output: &Path,
+    ) -> std::io::Result<()> {
+        let workspace = pkg_manager::load_package_workspace(root).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        verify_workspace_lockfile(&workspace, true)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+        let artifact = self
+            .compile_package_sources_with_privileged_cached(
+                &workspace.root,
+                &workspace.dependencies,
+                &BTreeSet::new(),
+            )
+            .map_err(|diagnostics| compilation_error(&diagnostics))?;
+        let bytes = nsbc_io::write_artifact(&artifact)?;
+        std::fs::write(output, bytes)
+    }
+
+    /// Deterministically compute and write/update `package.lock` for a disk package.
+    pub fn sync_package_lockfile(&self, root: &Path) -> std::io::Result<pkg_manager::Lockfile> {
+        let workspace = pkg_manager::load_package_workspace(root).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let lockfile = pkg_manager::Lockfile::from_workspace(&workspace);
+        if workspace.existing_lockfile.as_ref() != Some(&lockfile) {
+            lockfile.write(&workspace.root.root.join("package.lock"))?;
+        }
+        Ok(lockfile)
+    }
+
+    /// Verify an existing `package.lock` on disk against all resolved local dependencies.
+    pub fn verify_package_lockfile(&self, root: &Path) -> std::io::Result<()> {
+        let workspace = pkg_manager::load_package_workspace(root).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let lockfile = workspace.existing_lockfile.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing lockfile in {}", workspace.root.root.display()),
+            )
+        })?;
+        lockfile.verify(&workspace).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })
+    }
+
+    /// Compile a disk package and render its human-readable NSBC disassembly.
+    pub fn disassemble_package(&self, root: &Path) -> std::io::Result<String> {
+        let compiled = self.compile_package(root);
+        if compiled.has_errors {
+            return Err(compilation_error(&compiled.diagnostics));
+        }
+        let artifact = compiled.into_artifact()?;
+        Ok(nsbc_io::disassemble_artifact(&artifact))
+    }
+
+    /// Compile a disk package with `--locked` verification and render its NSBC disassembly.
+    pub fn disassemble_package_locked(&self, root: &Path) -> std::io::Result<String> {
+        let compiled = self.compile_package_locked(root);
+        if compiled.has_errors {
+            return Err(compilation_error(&compiled.diagnostics));
+        }
+        let artifact = compiled.into_artifact()?;
+        Ok(nsbc_io::disassemble_artifact(&artifact))
+    }
+
+    /// Compile a disk package and write its human-readable NSBC disassembly to `output`.
+    pub fn emit_package_bc_dump(&self, root: &Path, output: &Path) -> std::io::Result<()> {
+        let dump = self.disassemble_package(root)?;
+        std::fs::write(output, dump)
     }
 
     pub fn emit_package_ast_dump(&self, root: &Path, output: &Path) -> std::io::Result<()> {
-        let sources = pkg_manager::load_package_sources(root).map_err(std::io::Error::other)?;
-        let (ast, _) = self
-            .package_ast(&sources)
+        self.emit_package_ast_dump_with_lock_mode(root, output, false)
+    }
+
+    pub fn emit_package_ast_dump_locked(&self, root: &Path, output: &Path) -> std::io::Result<()> {
+        self.emit_package_ast_dump_with_lock_mode(root, output, true)
+    }
+
+    fn emit_package_ast_dump_with_lock_mode(
+        &self,
+        root: &Path,
+        output: &Path,
+        require_lockfile: bool,
+    ) -> std::io::Result<()> {
+        let workspace = pkg_manager::load_package_workspace(root).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        verify_workspace_lockfile(&workspace, require_lockfile)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+        let (mut ast, _) = self
+            .package_ast(&workspace.root)
             .map_err(|errors| compilation_error(&errors))?;
+        if !workspace.dependencies.is_empty() {
+            let mut dep_asts = Vec::with_capacity(workspace.dependencies.len());
+            for dep in &workspace.dependencies {
+                let (dep_ast, _) = self
+                    .package_ast(dep)
+                    .map_err(|errors| compilation_error(&errors))?;
+                dep_asts.push(dep_ast);
+            }
+            let bodies = self
+                .append_source_units(&mut ast, dep_asts)
+                .map_err(|errors| compilation_error(&errors))?;
+            let mut members = ast.multi_children(ast.root).to_vec();
+            for (dep, body) in workspace.dependencies.iter().zip(bodies) {
+                let dep_name = &dep.manifest.manifest().name;
+                let name_node = self
+                    .package_node(
+                        &mut ast,
+                        NodeKind::Id,
+                        DUMMY_SP,
+                        str_interner::intern(dep_name),
+                        NodeIndex::NULL,
+                        &[],
+                    )
+                    .map_err(|errors| compilation_error(&errors))?;
+                let items = ast.multi_children(body).to_vec();
+                let span = ast.node(body).span;
+                let mod_node = self
+                    .package_node(
+                        &mut ast,
+                        NodeKind::ModuleDef,
+                        span,
+                        str_interner::StrId::from_raw(0),
+                        name_node,
+                        &items,
+                    )
+                    .map_err(|errors| compilation_error(&errors))?;
+                members.push(mod_node);
+            }
+            let root_span = ast.node(ast.root).span;
+            ast.root = self
+                .package_node(
+                    &mut ast,
+                    NodeKind::FileScope,
+                    root_span,
+                    str_interner::StrId::from_raw(0),
+                    NodeIndex::NULL,
+                    &members,
+                )
+                .map_err(|errors| compilation_error(&errors))?;
+        }
         std::fs::write(output, ast::dump::dump_ast_to_string_pretty(&ast, ast.root))
     }
 
@@ -201,6 +434,24 @@ impl Driver {
     }
 }
 
+fn verify_workspace_lockfile(
+    workspace: &pkg_manager::PackageWorkspace,
+    require_lockfile: bool,
+) -> Result<(), String> {
+    let has_local_deps = workspace
+        .dependencies
+        .iter()
+        .any(|dep| !pkg_manager::is_bundled_package_root(&dep.root));
+    match &workspace.existing_lockfile {
+        Some(lockfile) => lockfile.verify(workspace).map_err(|err| err.to_string()),
+        None if require_lockfile && has_local_deps => Err(format!(
+            "missing package.lock in {} (--locked requires an up-to-date lockfile)",
+            workspace.root.root.display()
+        )),
+        None => Ok(()),
+    }
+}
+
 fn unwrap_visibility(ast: &Ast, item: NodeIndex) -> NodeIndex {
     match ast.node(item).kind {
         NodeKind::PubDef | NodeKind::PrivateDef => ast.fixed_children(item)[0],
@@ -226,6 +477,7 @@ fn binding_name(ast: &Ast, item: NodeIndex) -> Option<str_interner::StrId> {
             | NodeKind::EffectDef
             | NodeKind::AsyncEffectDef
             | NodeKind::Typealias
+            | NodeKind::Newtype
             | NodeKind::ConstDecl
             | NodeKind::LetDecl
             | NodeKind::VarDecl

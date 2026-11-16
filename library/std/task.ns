@@ -1,0 +1,94 @@
+-- std.task — cooperative task control and structured Future combinators.
+
+use .builtin.*
+use .collections.*
+use .traits.*
+
+private const _panic: fn(Any) -> NoReturn = .panic'builtin
+private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+private const _task_yield: fn() -> Unit = .__task_yield'builtin
+private const _task_await_all: fn(List) -> List = .__task_await_all'builtin
+private const _task_await_any: fn(List) -> Any = .__task_await_any'builtin
+private const _task_is_ready: fn(Future) -> bool = .__task_is_ready'builtin
+private const _task_await_indexed: fn(List) -> (i64, Any) = .__task_await_indexed'builtin
+
+pub enum Either {
+    pub Left(value: Any),
+    pub Right(value: Any),
+
+    pub fn is_left(self) -> bool {
+        self matches Either.Left(_)
+    }
+
+    pub fn is_right(self) -> bool {
+        self matches Either.Right(_)
+    }
+
+    pub fn unwrap_left(self) -> Any {
+        self match {
+            Either.Left(v) => v,
+            Either.Right(_) => _panic("Either.unwrap_left called on Right"),
+        }
+    }
+
+    pub fn unwrap_right(self) -> Any {
+        self match {
+            Either.Right(v) => v,
+            Either.Left(_) => _panic("Either.unwrap_right called on Left"),
+        }
+    }
+}
+
+impl PartialEq for Either {
+    pub fn eq(self, other: Self) -> bool {
+        self match {
+            Either.Left(a) => other match {
+                Either.Left(b) => a == b,
+                Either.Right(_) => false,
+            },
+            Either.Right(a) => other match {
+                Either.Right(b) => a == b,
+                Either.Left(_) => false,
+            },
+        }
+    }
+}
+
+impl Display for Either {
+    pub fn to_string(self) -> String {
+        self match {
+            Either.Left(v) => "Left(" ++ _to_string_raw(v) ++ ")",
+            Either.Right(v) => "Right(" ++ _to_string_raw(v) ++ ")",
+        }
+    }
+}
+
+pub use Either.{Left, Right}
+
+pub fn yield_now() -> Unit {
+    _task_yield()
+}
+
+pub fn is_ready(f: Future) -> bool {
+    _task_is_ready(f)
+}
+
+pub fn await_all(futures: List) -> List {
+    _task_await_all(futures)
+}
+
+pub fn await_any(futures: List) -> Any {
+    _task_await_any(futures)
+}
+
+pub fn await_first(first: Future, second: Future) -> Either {
+    let pair = List()
+    pair.push(first)
+    pair.push(second)
+    let (idx, value) = _task_await_indexed(pair)
+    if idx == 0 {
+        Either.Left(value)
+    } else {
+        Either.Right(value)
+    }
+}

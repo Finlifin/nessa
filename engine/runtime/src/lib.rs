@@ -1,5 +1,5 @@
 use nsbc::{FuncId, GlobalInfo, Reg};
-use type_pool::TypeIndex;
+pub use type_pool::TypeIndex;
 
 pub mod stacks;
 pub use stacks::{ContinuationId, PromptId, StackContext, StackError, TaskStacks};
@@ -385,6 +385,12 @@ pub struct TaskState {
     pub parent: Option<TaskId>,
     /// Child tasks spawned by this task.
     pub children: Vec<TaskId>,
+    /// Future IDs spawned directly by this task.
+    pub promise_set: Vec<u64>,
+    /// If this task was spawned for an async effect handler, the promise it fulfills.
+    pub spawned_promise: Option<u64>,
+    /// Cooperative/safepoint cancellation flag propagated down the task tree.
+    pub cancelled: bool,
 }
 
 impl TaskState {
@@ -395,6 +401,9 @@ impl TaskState {
             stacks: TaskStacks::new(func_id),
             parent: None,
             children: Vec::new(),
+            promise_set: Vec::new(),
+            spawned_promise: None,
+            cancelled: false,
         }
     }
 }
@@ -428,6 +437,8 @@ pub struct EffectHandler {
     pub closure_env: TaggedValue,
     /// Runtime-provided continuation argument position for capturing handlers.
     pub continuation_param: Option<u8>,
+    /// Unique identifier for this handler's lexical installation scope.
+    pub scope_id: u64,
 }
 
 // ---------------------------------------------------------------------------

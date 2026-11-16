@@ -1,13 +1,23 @@
 //! Builtin function implementations registered at engine init.
 
+mod bytes;
 mod convert;
+mod ffi;
+mod fmt;
+mod fs_io;
 mod int;
 mod io;
+mod json;
 mod list;
 mod map;
 mod math;
+mod pattern;
 mod process;
 mod string;
+mod sys;
+mod task;
+#[cfg(test)]
+mod tests;
 
 use interpreter::Vm;
 use runtime::ids;
@@ -563,4 +573,148 @@ pub fn register_all(vm: &mut Vm) {
     vm.register_builtin(ids::STR_RFIND_CHAR, string::str_rfind_char);
     vm.register_builtin(ids::STR_COUNT_CHAR, string::str_count_char);
     vm.register_builtin(ids::MAP_COPY, map::map_copy);
+
+    // ── Formatting, hashing, pattern, binary pack, I/O, FS & OS (573..=637) ─
+    vm.register_builtin(ids::SCALAR_HASH, fmt::scalar_hash);
+    vm.register_builtin(ids::FMT_SPRINTF, fmt::fmt_sprintf);
+    vm.register_builtin(ids::F64_TO_FIXED, fmt::f64_to_fixed);
+    vm.register_builtin(ids::F64_TO_EXP, fmt::f64_to_exp);
+    vm.register_builtin(ids::F64_TO_PRECISION, fmt::f64_to_precision);
+    vm.register_builtin(ids::F64_FREXP, fmt::f64_frexp);
+    vm.register_builtin(ids::F64_LDEXP, fmt::f64_ldexp);
+
+    vm.register_builtin(ids::PAT_FIND, pattern::pat_find);
+    vm.register_builtin(ids::PAT_GSUB, pattern::pat_gsub);
+    vm.register_builtin(ids::BYTES_PACK, bytes::bytes_pack);
+    vm.register_builtin(ids::BYTES_PACKSIZE, bytes::bytes_packsize);
+    vm.register_builtin(ids::BYTES_UNPACK, bytes::bytes_unpack);
+    vm.register_builtin(ids::STR_PARSE_INT_RADIX, pattern::str_parse_int_radix);
+    vm.register_builtin(ids::STR_FROM_CODES, pattern::str_from_codes);
+    vm.register_builtin(ids::STR_UTF8_OFFSET, pattern::str_utf8_offset);
+
+    vm.register_builtin(ids::IO_EPRINT, fs_io::io_eprint);
+    vm.register_builtin(ids::IO_EPRINTLN, fs_io::io_eprintln);
+    vm.register_builtin(ids::IO_FLUSH_STDOUT, fs_io::io_flush_stdout);
+    vm.register_builtin(ids::IO_FLUSH_STDERR, fs_io::io_flush_stderr);
+
+    vm.register_builtin(ids::FILE_OPEN, fs_io::file_open);
+    vm.register_builtin(ids::FILE_TEMP, fs_io::file_temp);
+    vm.register_builtin(ids::FILE_CLOSE, fs_io::file_close);
+    vm.register_builtin(ids::FILE_IS_OPEN, fs_io::file_is_open);
+    vm.register_builtin(ids::FILE_FLUSH, fs_io::file_flush);
+    vm.register_builtin(ids::FILE_READ_ALL, fs_io::file_read_all);
+    vm.register_builtin(ids::FILE_READ_LINE, fs_io::file_read_line);
+    vm.register_builtin(ids::FILE_READ_CHARS, fs_io::file_read_chars);
+    vm.register_builtin(ids::FILE_READ_BYTES, fs_io::file_read_bytes);
+    vm.register_builtin(ids::FILE_READ_NUMBER, fs_io::file_read_number);
+    vm.register_builtin(ids::FILE_WRITE_STR, fs_io::file_write_str);
+    vm.register_builtin(ids::FILE_WRITE_BYTES, fs_io::file_write_bytes);
+    vm.register_builtin(ids::FILE_SEEK, fs_io::file_seek);
+
+    vm.register_builtin(ids::FS_EXISTS, fs_io::fs_exists);
+    vm.register_builtin(ids::FS_IS_FILE, fs_io::fs_is_file);
+    vm.register_builtin(ids::FS_IS_DIR, fs_io::fs_is_dir);
+    vm.register_builtin(ids::FS_METADATA, fs_io::fs_metadata);
+    vm.register_builtin(ids::FS_CREATE_DIR, fs_io::fs_create_dir);
+    vm.register_builtin(ids::FS_REMOVE, fs_io::fs_remove);
+    vm.register_builtin(ids::FS_RENAME, fs_io::fs_rename);
+    vm.register_builtin(ids::FS_COPY, fs_io::fs_copy);
+    vm.register_builtin(ids::FS_READ_DIR, fs_io::fs_read_dir);
+    vm.register_builtin(ids::FS_CANONICALIZE, fs_io::fs_canonicalize);
+    vm.register_builtin(ids::FS_TEMP_PATH, fs_io::fs_temp_path);
+
+    vm.register_builtin(ids::ENV_ARGS, sys::env_args);
+    vm.register_builtin(ids::ENV_GET, sys::env_get);
+    vm.register_builtin(ids::ENV_VARS, sys::env_vars);
+    vm.register_builtin(ids::ENV_CURRENT_DIR, sys::env_current_dir);
+    vm.register_builtin(ids::ENV_SET_CURRENT_DIR, sys::env_set_current_dir);
+    vm.register_builtin(ids::ENV_OS, sys::env_os);
+    vm.register_builtin(ids::ENV_ARCH, sys::env_arch);
+
+    vm.register_builtin(ids::TIME_UNIX_SECS, sys::time_unix_secs);
+    vm.register_builtin(ids::TIME_UNIX_MILLIS, sys::time_unix_millis);
+    vm.register_builtin(ids::TIME_MONOTONIC_NANOS, sys::time_monotonic_nanos);
+    vm.register_builtin(ids::TIME_CPU_SECS, sys::time_cpu_secs);
+    vm.register_builtin(ids::TIME_SLEEP_MS, sys::time_sleep_ms);
+    vm.register_builtin(ids::TIME_BREAKDOWN, sys::time_breakdown);
+    vm.register_builtin(ids::TIME_MAKE_UNIX, sys::time_make_unix);
+    vm.register_builtin(ids::TIME_STRFTIME, sys::time_strftime);
+
+    vm.register_builtin(ids::PROC_EXEC, sys::proc_exec);
+    vm.register_builtin(ids::PROC_SHELL, sys::proc_shell);
+    vm.register_builtin(ids::PROC_PID, sys::proc_pid);
+
+    vm.register_builtin(ids::RNG_NEXT_U64, sys::rng_next_u64);
+    vm.register_builtin(ids::RNG_SEED, sys::rng_seed);
+    vm.register_builtin(ids::RT_GC_COLLECT, sys::rt_gc_collect);
+    vm.register_builtin(ids::RT_BACKTRACE, sys::rt_backtrace);
+
+    vm.register_builtin(ids::TASK_YIELD, task::task_yield);
+    vm.register_builtin(ids::TASK_AWAIT_ALL, task::task_await_all);
+    vm.register_builtin(ids::TASK_AWAIT_ANY, task::task_await_any);
+    vm.register_builtin(ids::TASK_IS_READY, task::task_is_ready);
+    vm.register_builtin(ids::TASK_AWAIT_INDEXED, task::task_await_indexed);
+    vm.register_builtin(ids::HOST_CALL, task::host_call);
+    vm.register_builtin(ids::FS_READ_DIR_ENTRIES, fs_io::fs_read_dir_entries);
+    vm.register_builtin(ids::FS_WALK_DIR, fs_io::fs_walk_dir);
+    vm.register_builtin(ids::PROC_EXEC_CWD, sys::proc_exec_cwd);
+    vm.register_builtin(ids::PROC_SHELL_CWD, sys::proc_shell_cwd);
+
+    vm.register_builtin(ids::BYTES_NEW, bytes::bytes_new);
+    vm.register_builtin(ids::BYTES_LEN, bytes::bytes_len);
+    vm.register_builtin(ids::BYTES_CAP, bytes::bytes_cap);
+    vm.register_builtin(ids::BYTES_GET, bytes::bytes_get);
+    vm.register_builtin(ids::BYTES_SET, bytes::bytes_set);
+    vm.register_builtin(ids::BYTES_PUSH, bytes::bytes_push);
+    vm.register_builtin(ids::BYTES_CLEAR, bytes::bytes_clear);
+    vm.register_builtin(ids::BYTES_SLICE, bytes::bytes_slice);
+    vm.register_builtin(ids::BYTES_COPY, bytes::bytes_copy);
+    vm.register_builtin(ids::BYTES_EXTEND, bytes::bytes_extend);
+    vm.register_builtin(ids::BYTES_FROM_STR, bytes::bytes_from_str);
+    vm.register_builtin(ids::BYTES_TO_STR, bytes::bytes_to_str);
+    vm.register_builtin(ids::BYTES_FROM_LIST, bytes::bytes_from_list);
+    vm.register_builtin(ids::BYTES_TO_LIST, bytes::bytes_to_list);
+    vm.register_builtin(ids::BYTES_FIND, bytes::bytes_find);
+    vm.register_builtin(ids::BYTES_EQ, bytes::bytes_eq);
+    vm.register_builtin(ids::BYTES_READ_U64_LE, bytes::bytes_read_u64_le);
+
+    static HOST_FFI_INIT: std::sync::Once = std::sync::Once::new();
+    HOST_FFI_INIT.call_once(|| {
+        ::ffi::register_host_library("nessa_regex_ffi", &nessa_regex_ffi::host_symbols());
+    });
+
+    vm.register_builtin(ids::FFI_DLOPEN, ffi::ffi_dlopen);
+    vm.register_builtin(ids::FFI_DLSYM, ffi::ffi_dlsym);
+    vm.register_builtin(ids::FFI_CALL, ffi::ffi_call);
+    vm.register_builtin(ids::FFI_CALL4, ffi::ffi_call4);
+    vm.register_builtin(ids::FFI_CALL6, ffi::ffi_call6);
+
+    // ── High-performance JSON kernel (670..=687) ───────────────────
+    vm.register_builtin(ids::JSON_PARSE_DYNAMIC, json::json_parse_dynamic);
+    vm.register_builtin(ids::JSON_STRINGIFY_DYNAMIC, json::json_stringify_dynamic);
+    vm.register_builtin(ids::JSON_TAPE_OPEN, json::json_tape_open);
+    vm.register_builtin(ids::JSON_TAPE_CLOSE, json::json_tape_close);
+    vm.register_builtin(ids::JSON_TAPE_KIND, json::json_tape_kind);
+    vm.register_builtin(ids::JSON_TAPE_OBJ_GET, json::json_tape_obj_get);
+    vm.register_builtin(ids::JSON_TAPE_OBJ_UNKNOWN, json::json_tape_obj_unknown);
+    vm.register_builtin(
+        ids::JSON_TAPE_OBJ_SINGLE_VARIANT,
+        json::json_tape_obj_single_variant,
+    );
+    vm.register_builtin(ids::JSON_TAPE_ARR_LEN, json::json_tape_arr_len);
+    vm.register_builtin(ids::JSON_TAPE_ARR_AT, json::json_tape_arr_at);
+    vm.register_builtin(ids::JSON_TAPE_READ_BOOL, json::json_tape_read_bool);
+    vm.register_builtin(ids::JSON_TAPE_READ_INT, json::json_tape_read_int);
+    vm.register_builtin(ids::JSON_TAPE_READ_FLOAT, json::json_tape_read_float);
+    vm.register_builtin(ids::JSON_TAPE_READ_STR, json::json_tape_read_str);
+    vm.register_builtin(ids::JSON_WRITER_NEW, json::json_writer_new);
+    vm.register_builtin(ids::JSON_WRITER_OP, json::json_writer_op);
+    vm.register_builtin(ids::JSON_WRITER_FINISH, json::json_writer_finish);
+    vm.register_builtin(ids::JSON_WRITER_CLOSE, json::json_writer_close);
+
+    // ── JIT telemetry (688..=691) ──────────────────────────────────
+    vm.register_builtin(ids::RT_JIT_ENABLED, sys::rt_jit_enabled);
+    vm.register_builtin(ids::RT_JIT_COMPILED_FNS, sys::rt_jit_compiled_fns);
+    vm.register_builtin(ids::RT_JIT_CODE_BYTES, sys::rt_jit_code_bytes);
+    vm.register_builtin(ids::RT_JIT_DEOPT_COUNT, sys::rt_jit_deopt_count);
 }

@@ -51,6 +51,25 @@ pub const fn builtin_requires_list_roles(id: runtime::BuiltinFnId) -> bool {
             | runtime::ids::LIST_APPEND..=runtime::ids::STR_LINES
             | runtime::ids::MAP_ENTRIES
             | runtime::ids::LIST_CHUNKS..=runtime::ids::LIST_ZIP
+            | runtime::ids::FMT_SPRINTF
+            | runtime::ids::PAT_FIND
+            | runtime::ids::BYTES_PACK
+            | runtime::ids::BYTES_UNPACK
+            | runtime::ids::STR_FROM_CODES
+            | runtime::ids::FILE_READ_BYTES
+            | runtime::ids::FILE_WRITE_BYTES
+            | runtime::ids::FS_READ_DIR
+            | runtime::ids::FS_READ_DIR_ENTRIES
+            | runtime::ids::FS_WALK_DIR
+            | runtime::ids::ENV_ARGS
+            | runtime::ids::PROC_EXEC
+            | runtime::ids::PROC_EXEC_CWD
+            | runtime::ids::TASK_AWAIT_ALL..=runtime::ids::TASK_AWAIT_ANY
+            | runtime::ids::TASK_AWAIT_INDEXED
+            | runtime::ids::HOST_CALL
+            | runtime::ids::BYTES_FROM_LIST
+            | runtime::ids::BYTES_TO_LIST
+            | runtime::ids::FFI_CALL
     )
 }
 
@@ -63,6 +82,16 @@ pub const fn builtin_requires_map_roles(id: runtime::BuiltinFnId) -> bool {
             | runtime::ids::MAP_VALUES..=runtime::ids::MAP_INSERT_ABSENT
             | runtime::ids::MAP_ENTRIES..=runtime::ids::MAP_IS_EMPTY
             | runtime::ids::MAP_COPY
+            | runtime::ids::ENV_VARS
+            | runtime::ids::HOST_CALL
+    )
+}
+
+/// True when a native builtin accepts or constructs a runtime `Bytes`.
+pub const fn builtin_requires_bytes_roles(id: runtime::BuiltinFnId) -> bool {
+    matches!(
+        id,
+        runtime::ids::BYTES_NEW..=runtime::ids::BYTES_EQ | runtime::ids::BYTES_READ_U64_LE
     )
 }
 
@@ -120,6 +149,21 @@ pub fn install_artifact(
             nsbc::ArtifactError::new(
                 "native imports",
                 "Map imports require Map and MapBuffer roles",
+            ),
+        ));
+    }
+
+    if artifact
+        .builtins
+        .iter()
+        .any(|import| builtin_requires_bytes_roles(import.id))
+        && (artifact.type_pool.bytes_type().is_none()
+            || artifact.type_pool.bytes_buffer_type().is_none())
+    {
+        return Err(ArtifactLoadError::InvalidMetadata(
+            nsbc::ArtifactError::new(
+                "native imports",
+                "Bytes imports require Bytes and BytesBuffer roles",
             ),
         ));
     }
@@ -213,13 +257,17 @@ mod tests {
         let error = install_artifact(engine.vm_mut(), make(legacy_pool)).unwrap_err();
         assert!(error.to_string().contains("require List and Buffer roles"));
         assert!(
-            install_artifact(engine.vm_mut(), make(type_pool::TypePool::with_intrinsics())).is_ok()
+            install_artifact(
+                engine.vm_mut(),
+                make(type_pool::TypePool::with_intrinsics())
+            )
+            .is_ok()
         );
     }
 
     #[test]
     fn non_current_builtin_abi_revisions_and_retired_derived_display_id_are_rejected() {
-        for revision in [0, 1, 2, 3, 4, 5, 6, 7, 8, 10] {
+        for revision in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
             let artifact = artifact_with_import(
                 revision,
                 type_pool::TypePool::with_intrinsics(),
@@ -299,7 +347,7 @@ mod tests {
 
     #[test]
     fn abi_nine_imports_enforce_exact_revision_and_complete_list_and_map_role_contracts() {
-        let abi_nine_ids = runtime::ids::STR_CONTAINS..=runtime::ids::MAP_COPY;
+        let abi_nine_ids = runtime::ids::STR_CONTAINS..=runtime::ids::HOST_CALL;
         for id in abi_nine_ids {
             let name = runtime::lookup_builtin_fn_meta(id).unwrap().name;
             let valid = artifact_with_import(

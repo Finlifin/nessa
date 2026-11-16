@@ -445,10 +445,22 @@ fn alias_and_manual_newtype_have_transparent_and_distinct_identities() {
     .unwrap();
     assert_eq!(id(&pool, base), id(&pool, alias));
     assert_ne!(id(&pool, base), id(&pool, newtype));
-    let rejected = Driver::new().compile("newtype Distance=i64;fn main(){42}");
-    assert!(rejected.has_errors, "source newtype remains unsupported");
-    assert!(rejected.codegen_output.functions.is_empty());
-    assert!(rejected.into_artifact().is_err());
+    let compiled = Driver::new().compile("newtype Distance=i64;fn main(){42}");
+    assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
+    let distance_idx = (0..compiled.type_pool.len())
+        .map(|i| type_pool::TypeIndex::from_raw(i as u32))
+        .find(|&idx| {
+            matches!(
+                compiled.type_pool.get(idx).kind,
+                TypeKind::Newtype { name, .. } if str_interner::get(name) == "Distance"
+            )
+        })
+        .expect("Distance newtype registered");
+    assert_ne!(
+        id(&compiled.type_pool, distance_idx),
+        id(&compiled.type_pool, Intrinsic::I64.type_index())
+    );
+    assert!(compiled.into_artifact().is_ok());
 }
 
 #[test]

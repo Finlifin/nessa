@@ -2,7 +2,7 @@
 use .builtin.*
 
 pub enum Ordering { pub less, pub equal, pub greater }
-derive Eq, PartialEq, Ord, PartialOrd for Ordering
+derive Eq, PartialEq, Ord, PartialOrd, Hash for Ordering
 
 const display_value: fn(Any) -> String = .to_string'builtin
 impl Display for Ordering {

@@ -3,20 +3,27 @@
 
 use std::path::PathBuf;
 
+mod bundled;
 mod error;
 mod identity;
 mod lock;
+mod lockfile;
 mod manifest;
 mod resolver;
 mod source;
 mod version;
+mod workspace;
 
 #[cfg(test)]
 mod foundation_tests;
 
+pub use bundled::{bundled_packages, bundled_packages_sha256, is_bundled_package_root};
 pub use error::PackageError;
 pub use identity::PackageIdentity;
-pub use manifest::ManifestDocument;
+pub use lockfile::{
+    LOCKFILE_VERSION, LockedPackage, Lockfile, compute_package_sha256, relative_normalized_path,
+};
+pub use manifest::{FfiConfig, ManifestDocument, PathDependency};
 pub use resolver::{PackageResolver, ResolvedPackageGraph};
 pub use source::{
     ModuleSources, PackageSourceError, PackageSources, SourceFile, SourceLoadLimits,
@@ -24,6 +31,9 @@ pub use source::{
     load_package_sources_with_limits,
 };
 pub use version::{Version, VersionConstraint};
+pub use workspace::{
+    PackageLoadError, PackageWorkspace, load_package_workspace, load_package_workspace_with_limits,
+};
 
 // ---------------------------------------------------------------------------
 // PackageType

@@ -5,6 +5,13 @@ resolver = "2"
 [workspace.dependencies]
 rustc_span = "0.1.2"
 ariadne = { version = "0.5.1", features = ["auto-color"] }
+libc = "0.2"
+libloading = "0.8.9"
+memchr = "2.8.0"
+itoa = "1.0.17"
+regex = "1.12.3"
+regex-automata = "0.4.14"
+regex-syntax = "0.8.10"
 
 # Independent verification trees share one target directory. Full debug data
 # and per-tree incremental caches otherwise consume tens of GiB between runs.
@@ -15,3 +22,8 @@ incremental = false
 [profile.test]
 debug = 0
 incremental = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,5 +1,8 @@
--- std.collections — checked List values and String-keyed Map values.
+-- std.collections — checked List, String-keyed Map, generic HashMap, Set, and Deque.
 use .builtin.*
+use .ordering.*
+use .scalar.*
+use .traits.*
 
 private const _init: fn() -> List = .__list_init'builtin
 private const _length: fn(List) -> i64 = .__list_len'builtin
@@ -42,9 +45,116 @@ private const _swap_remove: fn(List, usize) -> Any = .list_swap_remove'builtin
 private const _split_off: fn(List, usize) -> List = .list_split_off'builtin
 private const _resize: fn(List, usize, Any) -> Unit = .list_resize'builtin
 private const _panic: fn(Any) -> NoReturn = .panic'builtin
+private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+private const _display_quote: fn(String) -> String = .__display_quote'builtin
+private const _scalar_hash: fn(Any) -> u64 = .__scalar_hash'builtin
+
+private const _native_equal: fn(Any, Any) -> ?bool = .__native_equal'builtin
+private const _tuple_len: fn(Any) -> ?i64 = .__tuple_len'builtin
+private const _tuple_get: fn(Any, i64) -> Any = .__tuple_get'builtin
+private const _runtime_type: fn(Any) -> Type = .type_of'builtin
+
+private fn _any_lt(left: Any, right: Any) -> bool {
+    left match {
+        ord_left: Ord => {
+            if _runtime_type(left) == _runtime_type(right) {
+                return ord_left.lt(right.as(Ord))
+            }
+            left < right
+        },
+        _ => left < right,
+    }
+}
+
+private fn _merge_sort_by_lt(list: List, less: fn(Any, Any) -> bool) -> Unit {
+    let n = list.len()
+    if n <= 1 { return () }
+    let buf = List()
+    buf.resize(n.as(usize), null)
+    var width: i64 = 1
+    while width < n {
+        var left: i64 = 0
+        while left < n {
+            let mid = if left + width < n { left + width } else { n }
+            let right = if left + width * 2 < n { left + width * 2 } else { n }
+            var i = left
+            var j = mid
+            var k = left
+            while i < mid and j < right {
+                let a = list.get(i.as(usize))
+                let b = list.get(j.as(usize))
+                if less(b, a) {
+                    buf.set(k.as(usize), b)
+                    j += 1
+                } else {
+                    buf.set(k.as(usize), a)
+                    i += 1
+                }
+                k += 1
+            }
+            while i < mid {
+                buf.set(k.as(usize), list.get(i.as(usize)))
+                i += 1
+                k += 1
+            }
+            while j < right {
+                buf.set(k.as(usize), list.get(j.as(usize)))
+                j += 1
+                k += 1
+            }
+            var c = left
+            while c < right {
+                list.set(c.as(usize), buf.get(c.as(usize)))
+                c += 1
+            }
+            left += width * 2
+        }
+        width *= 2
+    }
+}
+
+private fn _format_nested(value: Any, depth: i64) -> String {
+    if depth > 32 {
+        return "..."
+    }
+    value match {
+        s: String => _display_quote(s),
+        lst: List => _format_list_depth(lst, depth + 1),
+        mp: Map => _format_map_depth(mp, depth + 1),
+        shown: Display => shown.to_string(),
+        _ => _to_string_raw(value),
+    }
+}
+
+private fn _format_list_depth(list: List, depth: i64) -> String {
+    if depth > 32 { return "[...]" }
+    let parts = List()
+    var i: usize = 0
+    while i < list.len() {
+        parts.push(_format_nested(list.get(i), depth))
+        i += 1
+    }
+    "[" ++ parts.join(", ") ++ "]"
+}
+
+private fn _format_map_depth(mp: Map, depth: i64) -> String {
+    if depth > 32 { return "\x7b...\x7d" }
+    let keys = mp.keys()
+    keys.sort()
+    let parts = List()
+    var i: usize = 0
+    while i < keys.len() {
+        let k = keys.get(i).as(String)
+        let v = mp.get(k)
+        parts.push(_display_quote(k) ++ ": " ++ _format_nested(v, depth))
+        i += 1
+    }
+    "\x7b" ++ parts.join(", ") ++ "\x7d"
+}
 
 impl List {
     pub fn new() -> List { _init() }
+    pub fn pack(...items: List) -> List { items.copy() }
     pub fn len(self) -> i64 { _length(self) }
     pub fn get(self, index: usize) -> Any { _get(self, index) }
     pub fn apply(self, index: usize) -> Any { _get(self, index) }
@@ -212,6 +322,309 @@ impl List {
     pub fn append(self, other: List) { _append(self, other) }
     -- Elements must be String values. An empty list returns an empty string.
     pub fn join(self, separator: String) -> String { _join(self, separator) }
+
+    -- In-place stable merge sort using `<` / `Ord`.
+    pub fn sort(self) -> Unit {
+        _merge_sort_by_lt(self, _any_lt)
+    }
+
+    -- In-place stable merge sort using an `Ordering` comparator.
+    pub fn sort_by(self, cmp: fn(Any, Any) -> Ordering) -> Unit {
+        _merge_sort_by_lt(self, |a: Any, b: Any| -> bool { cmp(a, b) == Ordering.less })
+    }
+
+    -- In-place stable merge sort using a strict `<` predicate (Lua `table.sort`).
+    pub fn sort_by_lt(self, less: fn(Any, Any) -> bool) -> Unit {
+        _merge_sort_by_lt(self, less)
+    }
+
+    -- In-place stable sort caching one `key_fn(elem)` call per element.
+    pub fn sort_by_key(self, key_fn: fn(Any) -> Any) -> Unit {
+        let n = self.len()
+        if n <= 1 { return () }
+        let decorated = List()
+        var i: usize = 0
+        while i < n {
+            let elem = self.get(i)
+            decorated.push((key_fn(elem), elem))
+            i += 1
+        }
+        _merge_sort_by_lt(decorated, |a: Any, b: Any| -> bool {
+            let pa = a.as((Any, Any))
+            let pb = b.as((Any, Any))
+            _any_lt(pa.0, pb.0)
+        })
+        var j: usize = 0
+        while j < n {
+            let pair = decorated.get(j).as((Any, Any))
+            self.set(j, pair.1)
+            j += 1
+        }
+    }
+
+    pub fn is_sorted(self) -> bool {
+        var i: usize = 1
+        while i < self.len() {
+            if _any_lt(self.get(i), self.get(i - 1)) { return false }
+            i += 1
+        }
+        true
+    }
+
+    pub fn is_sorted_by_lt(self, less: fn(Any, Any) -> bool) -> bool {
+        var i: usize = 1
+        while i < self.len() {
+            if less(self.get(i), self.get(i - 1)) { return false }
+            i += 1
+        }
+        true
+    }
+
+    -- Returns `(true, index)` when found, or `(false, insertion_index)` when absent.
+    pub fn binary_search(self, target: Any) -> (bool, i64) {
+        var lo: i64 = 0
+        var hi: i64 = self.len()
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            let elem = self.get(mid.as(usize))
+            if _any_lt(elem, target) {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo < self.len() {
+            let candidate = self.get(lo.as(usize))
+            if (not _any_lt(target, candidate)) and (not _any_lt(candidate, target)) {
+                return (true, lo)
+            }
+        }
+        (false, lo)
+    }
+
+    pub fn binary_search_by(self, cmp: fn(Any) -> Ordering) -> (bool, i64) {
+        var lo: i64 = 0
+        var hi: i64 = self.len()
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            let order = cmp(self.get(mid.as(usize)))
+            if order == Ordering.less {
+                lo = mid + 1
+            } else if order == Ordering.greater {
+                hi = mid
+            } else {
+                return (true, mid)
+            }
+        }
+        (false, lo)
+    }
+
+    -- Half-open `[start, end)`.
+    pub fn slice(self, start: usize, end: usize) -> List {
+        let len_u = self.len().as(usize)
+        if start > end or end > len_u {
+            _panic("List.slice: range out of bounds")
+        }
+        let out = List()
+        var i = start
+        while i < end {
+            out.push(self.get(i))
+            i += 1
+        }
+        out
+    }
+
+    -- Overlap-safe in-place copy of `[src_start, src_end)` to `dst_start`.
+    -- Grows `self` with `null` if `dst_start + count > self.len()`.
+    pub fn copy_within(self, src_start: usize, src_end: usize, dst_start: usize) -> List {
+        let len_u = self.len().as(usize)
+        if src_start > src_end or src_end > len_u {
+            _panic("List.copy_within: source range out of bounds")
+        }
+        let count = src_end - src_start
+        if count == 0 or src_start == dst_start {
+            return self
+        }
+        let needed = dst_start + count
+        if needed > len_u {
+            self.resize(needed, null)
+        }
+        if dst_start < src_start {
+            var i: usize = 0
+            while i < count {
+                self.set(dst_start + i, self.get(src_start + i))
+                i += 1
+            }
+        } else {
+            var rem = count
+            while rem > 0 {
+                rem -= 1
+                self.set(dst_start + rem, self.get(src_start + rem))
+            }
+        }
+        self
+    }
+
+    -- Copies `[src_start, src_end)` into `dst` starting at `dst_start`, growing `dst` if needed.
+    pub fn copy_to(self, src_start: usize, src_end: usize, dst: List, dst_start: usize) -> List {
+        let len_u = self.len().as(usize)
+        if src_start > src_end or src_end > len_u {
+            _panic("List.copy_to: source range out of bounds")
+        }
+        let snap = self.slice(src_start, src_end)
+        let count = snap.len().as(usize)
+        if count == 0 {
+            return dst
+        }
+        let needed = dst_start + count
+        if needed > dst.len().as(usize) {
+            dst.resize(needed, null)
+        }
+        var i: usize = 0
+        while i < count {
+            dst.set(dst_start + i, snap.get(i))
+            i += 1
+        }
+        dst
+    }
+
+    -- Joins `String` elements in `[start, end)` separated by `sep`.
+    pub fn join_range(self, sep: String, start: usize, end: usize) -> String {
+        self.slice(start, end).join(sep)
+    }
+
+    pub fn flat_map(self, callback: fn(Any) -> List) -> List {
+        let out = List()
+        let snap = self.concat(List())
+        var i: usize = 0
+        while i < snap.len() {
+            out.append(callback(snap.get(i)))
+            i += 1
+        }
+        out
+    }
+
+    pub fn find(self, predicate: fn(Any) -> bool) -> Any {
+        let snap = self.concat(List())
+        var i: usize = 0
+        while i < snap.len() {
+            let elem = snap.get(i)
+            if predicate(elem) { return elem }
+            i += 1
+        }
+        null
+    }
+
+    pub fn position(self, predicate: fn(Any) -> bool) -> ?i64 {
+        let snap = self.concat(List())
+        var i: usize = 0
+        while i < snap.len() {
+            if predicate(snap.get(i)) { return i.as(i64) }
+            i += 1
+        }
+        null
+    }
+
+    pub fn rposition(self, predicate: fn(Any) -> bool) -> ?i64 {
+        let snap = self.concat(List())
+        var i = snap.len()
+        while i > 0 {
+            i -= 1
+            if predicate(snap.get(i.as(usize))) { return i }
+        }
+        null
+    }
+
+    pub fn reduce(self, callback: fn(Any, Any) -> Any) -> Any {
+        let snap = self.concat(List())
+        if snap.is_empty() { return null }
+        var acc = snap.get(0)
+        var i: usize = 1
+        while i < snap.len() {
+            acc = callback(acc, snap.get(i))
+            i += 1
+        }
+        acc
+    }
+
+    pub fn partition(self, predicate: fn(Any) -> bool) -> (List, List) {
+        let matched = List()
+        let unmatched = List()
+        let snap = self.concat(List())
+        var i: usize = 0
+        while i < snap.len() {
+            let elem = snap.get(i)
+            if predicate(elem) {
+                matched.push(elem)
+            } else {
+                unmatched.push(elem)
+            }
+            i += 1
+        }
+        (matched, unmatched)
+    }
+
+    pub fn retain(self, predicate: fn(Any) -> bool) -> Unit {
+        var write_idx: usize = 0
+        var read_idx: usize = 0
+        let total = self.len().as(usize)
+        while read_idx < total {
+            let elem = self.get(read_idx)
+            if predicate(elem) {
+                if write_idx != read_idx {
+                    self.set(write_idx, elem)
+                }
+                write_idx += 1
+            }
+            read_idx += 1
+        }
+        self.truncate(write_idx)
+    }
+
+    pub fn dedup(self) -> Unit {
+        let total = self.len().as(usize)
+        if total <= 1 { return () }
+        var write_idx: usize = 1
+        var read_idx: usize = 1
+        while read_idx < total {
+            let elem = self.get(read_idx)
+            if elem != self.get(write_idx - 1) {
+                if write_idx != read_idx {
+                    self.set(write_idx, elem)
+                }
+                write_idx += 1
+            }
+            read_idx += 1
+        }
+        self.truncate(write_idx)
+    }
+
+    pub fn reverse_in_place(self) -> Unit {
+        let total = self.len().as(usize)
+        if total <= 1 { return () }
+        var lo: usize = 0
+        var hi: usize = total - 1
+        while lo < hi {
+            self.swap(lo, hi)
+            lo += 1
+            hi -= 1
+        }
+    }
+
+    -- Formats elements as `"[a, b, c]"` without implementing `Display` on `List`.
+    pub fn format_list(self) -> String {
+        _format_list_depth(self, 0)
+    }
+
+    -- Waits for all `Future` elements in `self` to complete and returns their results in order.
+    pub fn await_all(self) -> List {
+        .__task_await_all'builtin(self)
+    }
+
+    -- Waits for the first completing `Future` in `self`, cancelling remaining sibling futures.
+    pub fn await_any(self) -> Any {
+        .__task_await_any'builtin(self)
+    }
 }
 
 -- Lists are equal when they have the same length and pairwise equal elements.
@@ -226,11 +639,6 @@ impl PartialEq for List {
         true
     }
 }
-
-private const _native_equal: fn(Any, Any) -> ?bool = .__native_equal'builtin
-private const _tuple_len: fn(Any) -> ?i64 = .__tuple_len'builtin
-private const _tuple_get: fn(Any, i64) -> Any = .__tuple_get'builtin
-private const _runtime_type: fn(Any) -> Type = .type_of'builtin
 
 -- `==` on operands typed Any or tuple calls this function. Native kernels
 -- decide scalars and payload-free enums; tuples compare element-wise; values
@@ -303,6 +711,61 @@ impl Map {
     pub fn get_or_insert(self, key: String, value: Any) -> Any { _map_get_or_insert(self, key, value) }
     -- Inserts only when the key is absent. A stored null counts as present.
     pub fn insert_absent(self, key: String, value: Any) -> bool { _map_insert_absent(self, key, value) }
+
+    pub fn get_or(self, key: String, default: Any) -> Any {
+        if self.contains(key) { self.get(key) } else { default }
+    }
+
+    pub fn insert(self, key: String, value: Any) -> Unit {
+        self.set(key, value)
+    }
+
+    pub fn contains_key(self, key: String) -> bool {
+        self.contains(key)
+    }
+
+    pub fn filter(self, predicate: fn(String, Any) -> bool) -> Map {
+        let out = Map()
+        let snap = self.entries()
+        var i: usize = 0
+        while i < snap.len() {
+            let pair = snap.get(i).as((String, Any))
+            if predicate(pair.0, pair.1) {
+                out.set(pair.0, pair.1)
+            }
+            i += 1
+        }
+        out
+    }
+
+    pub fn map_values(self, callback: fn(String, Any) -> Any) -> Map {
+        let out = Map()
+        let snap = self.entries()
+        var i: usize = 0
+        while i < snap.len() {
+            let pair = snap.get(i).as((String, Any))
+            out.set(pair.0, callback(pair.0, pair.1))
+            i += 1
+        }
+        out
+    }
+
+    pub fn retain(self, predicate: fn(String, Any) -> bool) -> Unit {
+        let snap = self.entries()
+        var i: usize = 0
+        while i < snap.len() {
+            let pair = snap.get(i).as((String, Any))
+            if not predicate(pair.0, pair.1) {
+                let _ = self.remove(pair.0)
+            }
+            i += 1
+        }
+    }
+
+    -- Formats entries deterministically without implementing `Display` on `Map`.
+    pub fn format_map(self) -> String {
+        _format_map_depth(self, 0)
+    }
 }
 
 -- Maps are equal when they hold the same keys with pairwise equal values.
@@ -368,5 +831,624 @@ impl IntoIterator for Map {
     assoc Iter: Type = MapIterator
     pub fn into_iter(self) -> MapIterator {
         MapIterator { entries: self.entries(), index: 0 }
+    }
+}
+
+-- ============================================================================
+-- Generic HashMap (O(1) average lookup/insert/remove + insertion-order entries)
+-- ============================================================================
+
+private fn _hash_any(value: Any) -> u64 {
+    value match {
+        hashed: Hash => hashed.hash(),
+        _ => _tuple_len(value) match {
+            length? => {
+                let mul: u64 = (5871781006564002453).as(u64)
+                let inc: u64 = (2862933555777941757).as(u64)
+                var acc: u64 = inc
+                var idx = 0
+                while idx < length {
+                    let elem_hash = _hash_any(_tuple_get(value, idx))
+                    acc = acc.wrapping_mul(mul).wrapping_add(elem_hash).wrapping_add(inc)
+                    idx += 1
+                }
+                acc
+            },
+            _ => _scalar_hash(value),
+        },
+    }
+}
+
+private fn _make_buckets(cap: usize) -> List {
+    let buckets = List()
+    var i: usize = 0
+    while i < cap {
+        buckets.push(List())
+        i += 1
+    }
+    buckets
+}
+
+pub struct HashMap {
+    buckets: List,
+    entries_log: List,
+    live_count: i64,
+    cap: u64,
+}
+
+impl HashMap {
+    pub fn new() -> HashMap {
+        let initial_cap: usize = 16
+        HashMap {
+            buckets: _make_buckets(initial_cap),
+            entries_log: List(),
+            live_count: 0,
+            cap: initial_cap.as(u64),
+        }
+    }
+
+    pub fn len(self) -> i64 = self.live_count
+    pub fn is_empty(self) -> bool = self.live_count == 0
+
+    private fn _rehash(self, new_cap: usize) -> Unit {
+        let new_buckets = _make_buckets(new_cap)
+        let new_log = List()
+        let cap_u64 = new_cap.as(u64)
+        var i: usize = 0
+        while i < self.entries_log.len() {
+            let slot = self.entries_log.get(i)
+            if slot != null {
+                let rec = slot.as((u64, Any, Any))
+                let new_idx = new_log.len().as(usize)
+                new_log.push(rec)
+                let b_idx = rec.0.wrapping_rem(cap_u64).as(usize)
+                let chain = new_buckets.get(b_idx).as(List)
+                chain.push(new_idx)
+            }
+            i += 1
+        }
+        self.buckets = new_buckets
+        self.entries_log = new_log
+        self.cap = cap_u64
+    }
+
+    private fn _find_entry_index(self, key: Any, h: u64) -> ?(List, usize, usize) {
+        let b_idx = h.wrapping_rem(self.cap).as(usize)
+        let chain = self.buckets.get(b_idx).as(List)
+        var c_pos: usize = 0
+        while c_pos < chain.len() {
+            let log_idx = chain.get(c_pos).as(usize)
+            let rec = self.entries_log.get(log_idx).as((u64, Any, Any))
+            if rec.0 == h and rec.1 == key {
+                return (chain, c_pos, log_idx)
+            }
+            c_pos += 1
+        }
+        null
+    }
+
+    pub fn contains(self, key: Any) -> bool {
+        let h = _hash_any(key)
+        self._find_entry_index(key, h) != null
+    }
+
+    pub fn get(self, key: Any) -> Any {
+        let h = _hash_any(key)
+        self._find_entry_index(key, h) match {
+            found? => {
+                let rec = self.entries_log.get(found.2).as((u64, Any, Any))
+                rec.2
+            },
+            _ => null,
+        }
+    }
+
+    pub fn apply(self, key: Any) -> Any = self.get(key)
+
+    pub fn get_or(self, key: Any, default: Any) -> Any {
+        let h = _hash_any(key)
+        self._find_entry_index(key, h) match {
+            found? => {
+                let rec = self.entries_log.get(found.2).as((u64, Any, Any))
+                rec.2
+            },
+            _ => default,
+        }
+    }
+
+    pub fn set(self, key: Any, value: Any) -> Unit {
+        let h = _hash_any(key)
+        self._find_entry_index(key, h) match {
+            found? => {
+                let rec = self.entries_log.get(found.2).as((u64, Any, Any))
+                self.entries_log.set(found.2, (h, rec.1, value))
+            },
+            _ => {
+                if (self.entries_log.len() + 1) * 4 > self.cap.as(i64) * 3 {
+                    let two_u: usize = 2
+                    let next_cap = if (self.live_count + 1) * 4 > self.cap.as(i64) * 3 {
+                        (self.cap.as(usize)) * two_u
+                    } else {
+                        self.cap.as(usize)
+                    }
+                    self._rehash(next_cap)
+                }
+                let log_idx = self.entries_log.len().as(usize)
+                self.entries_log.push((h, key, value))
+                let b_idx = h.wrapping_rem(self.cap).as(usize)
+                let chain = self.buckets.get(b_idx).as(List)
+                chain.push(log_idx)
+                self.live_count += 1
+            },
+        }
+    }
+
+    pub fn update(self, key: Any, value: Any) -> Unit {
+        self.set(key, value)
+    }
+
+    pub fn insert(self, key: Any, value: Any) -> Unit {
+        self.set(key, value)
+    }
+
+    pub fn contains_key(self, key: Any) -> bool {
+        self.contains(key)
+    }
+
+    pub fn remove(self, key: Any) -> Any {
+        let h = _hash_any(key)
+        self._find_entry_index(key, h) match {
+            found? => {
+                let (chain, c_pos, log_idx) = found
+                let rec = self.entries_log.get(log_idx).as((u64, Any, Any))
+                let _ = chain.swap_remove(c_pos)
+                self.entries_log.set(log_idx, null)
+                self.live_count -= 1
+                if self.live_count == 0 {
+                    self.entries_log.clear()
+                }
+                rec.2
+            },
+            _ => null,
+        }
+    }
+
+    pub fn clear(self) -> Unit {
+        let initial_cap: usize = 16
+        self.buckets = _make_buckets(initial_cap)
+        self.entries_log = List()
+        self.live_count = 0
+        self.cap = initial_cap.as(u64)
+    }
+
+    pub fn keys(self) -> List {
+        let out = List()
+        var i: usize = 0
+        while i < self.entries_log.len() {
+            let slot = self.entries_log.get(i)
+            if slot != null {
+                let rec = slot.as((u64, Any, Any))
+                out.push(rec.1)
+            }
+            i += 1
+        }
+        out
+    }
+
+    pub fn values(self) -> List {
+        let out = List()
+        var i: usize = 0
+        while i < self.entries_log.len() {
+            let slot = self.entries_log.get(i)
+            if slot != null {
+                let rec = slot.as((u64, Any, Any))
+                out.push(rec.2)
+            }
+            i += 1
+        }
+        out
+    }
+
+    pub fn entries(self) -> List {
+        let out = List()
+        var i: usize = 0
+        while i < self.entries_log.len() {
+            let slot = self.entries_log.get(i)
+            if slot != null {
+                let rec = slot.as((u64, Any, Any))
+                out.push((rec.1, rec.2))
+            }
+            i += 1
+        }
+        out
+    }
+
+    pub fn copy(self) -> HashMap {
+        let dup = HashMap.new()
+        var i: usize = 0
+        while i < self.entries_log.len() {
+            let slot = self.entries_log.get(i)
+            if slot != null {
+                let rec = slot.as((u64, Any, Any))
+                dup.set(rec.1, rec.2)
+            }
+            i += 1
+        }
+        dup
+    }
+}
+
+impl PartialEq for HashMap {
+    pub fn eq(self, other: Self) -> bool {
+        if self.len() != other.len() { return false }
+        let snap = self.entries()
+        var i: usize = 0
+        while i < snap.len() {
+            let pair = snap.get(i).as((Any, Any))
+            if not other.contains(pair.0) { return false }
+            if other.get(pair.0) != pair.1 { return false }
+            i += 1
+        }
+        true
+    }
+}
+
+pub struct HashMapIter {
+    entries: List,
+    index: usize,
+}
+
+impl Iterator for HashMapIter {
+    assoc Item: Type = (Any, Any)
+    pub fn next(self) -> IterationStep((Any, Any)) {
+        if self.index < self.entries.len() {
+            let pair = self.entries.get(self.index).as((Any, Any))
+            self.index += 1
+            IterationStep((Any, Any)).yielded(pair)
+        } else {
+            IterationStep((Any, Any)).done
+        }
+    }
+}
+
+impl IntoIterator for HashMap {
+    assoc Iter: Type = HashMapIter
+    pub fn into_iter(self) -> HashMapIter {
+        HashMapIter { entries: self.entries(), index: 0 }
+    }
+}
+
+-- ============================================================================
+-- Generic Set (backed by HashMap, preserving insertion order)
+-- ============================================================================
+
+pub struct Set {
+    table: HashMap,
+}
+
+impl Set {
+    pub fn new() -> Set = Set { table: HashMap.new() }
+
+    pub fn from_list(items: List) -> Set {
+        let s = Set.new()
+        var i: usize = 0
+        while i < items.len() {
+            let _ = s.insert(items.get(i))
+            i += 1
+        }
+        s
+    }
+
+    pub fn len(self) -> i64 = self.table.len()
+    pub fn is_empty(self) -> bool = self.table.is_empty()
+
+    -- Returns `true` when newly inserted, `false` when already present.
+    pub fn insert(self, item: Any) -> bool {
+        if self.table.contains(item) {
+            false
+        } else {
+            self.table.set(item, true)
+            true
+        }
+    }
+
+    -- Returns `true` when the element was present and removed.
+    pub fn remove(self, item: Any) -> bool {
+        if self.table.contains(item) {
+            let _ = self.table.remove(item)
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn contains(self, item: Any) -> bool = self.table.contains(item)
+
+    pub fn clear(self) -> Unit {
+        self.table.clear()
+    }
+
+    pub fn copy(self) -> Set = Set { table: self.table.copy() }
+
+    pub fn to_list(self) -> List = self.table.keys()
+
+    pub fn union(self, other: Set) -> Set {
+        let out = self.copy()
+        let other_items = other.to_list()
+        var i: usize = 0
+        while i < other_items.len() {
+            let _ = out.insert(other_items.get(i))
+            i += 1
+        }
+        out
+    }
+
+    pub fn intersection(self, other: Set) -> Set {
+        let out = Set.new()
+        let items = self.to_list()
+        var i: usize = 0
+        while i < items.len() {
+            let elem = items.get(i)
+            if other.contains(elem) {
+                let _ = out.insert(elem)
+            }
+            i += 1
+        }
+        out
+    }
+
+    pub fn difference(self, other: Set) -> Set {
+        let out = Set.new()
+        let items = self.to_list()
+        var i: usize = 0
+        while i < items.len() {
+            let elem = items.get(i)
+            if not other.contains(elem) {
+                let _ = out.insert(elem)
+            }
+            i += 1
+        }
+        out
+    }
+
+    pub fn symmetric_difference(self, other: Set) -> Set {
+        let out = self.difference(other)
+        let rhs_only = other.difference(self).to_list()
+        var i: usize = 0
+        while i < rhs_only.len() {
+            let _ = out.insert(rhs_only.get(i))
+            i += 1
+        }
+        out
+    }
+
+    pub fn is_subset(self, other: Set) -> bool {
+        if self.len() > other.len() { return false }
+        let items = self.to_list()
+        var i: usize = 0
+        while i < items.len() {
+            if not other.contains(items.get(i)) { return false }
+            i += 1
+        }
+        true
+    }
+
+    pub fn is_superset(self, other: Set) -> bool = other.is_subset(self)
+}
+
+impl PartialEq for Set {
+    pub fn eq(self, other: Self) -> bool {
+        self.len() == other.len() and self.is_subset(other)
+    }
+}
+
+pub struct SetIter {
+    items: List,
+    index: usize,
+}
+
+impl Iterator for SetIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.index < self.items.len() {
+            let item = self.items.get(self.index)
+            self.index += 1
+            IterationStep(Any).yielded(item)
+        } else {
+            IterationStep(Any).done
+        }
+    }
+}
+
+impl IntoIterator for Set {
+    assoc Iter: Type = SetIter
+    pub fn into_iter(self) -> SetIter {
+        SetIter { items: self.to_list(), index: 0 }
+    }
+}
+
+-- ============================================================================
+-- Deque (O(1) amortized double-ended ring buffer backed by List)
+-- ============================================================================
+
+pub struct Deque {
+    buf: List,
+    head: usize,
+    count: usize,
+}
+
+impl Deque {
+    pub fn new() -> Deque {
+        let buf = List()
+        buf.resize(8, null)
+        Deque { buf: buf, head: 0, count: 0 }
+    }
+
+    pub fn from_list(items: List) -> Deque {
+        let n = items.len().as(usize)
+        let two_u: usize = 2
+        var cap: usize = 8
+        while cap < n {
+            cap = cap * two_u
+        }
+        let buf = List()
+        buf.resize(cap, null)
+        var i: usize = 0
+        while i < n {
+            buf.set(i, items.get(i))
+            i += 1
+        }
+        Deque { buf: buf, head: 0, count: n }
+    }
+
+    pub fn len(self) -> i64 = self.count.as(i64)
+    pub fn is_empty(self) -> bool = self.count == 0
+
+    private fn _grow(self) -> Unit {
+        let old_cap = self.buf.len().as(usize)
+        let eight_u: usize = 8
+        let two_u: usize = 2
+        let new_cap = if old_cap == 0 { eight_u } else { old_cap * two_u }
+        let new_buf = List()
+        new_buf.resize(new_cap, null)
+        var i: usize = 0
+        while i < self.count {
+            let phys = (self.head + i) % old_cap
+            new_buf.set(i, self.buf.get(phys))
+            i += 1
+        }
+        self.buf = new_buf
+        self.head = 0
+    }
+
+    pub fn push_back(self, value: Any) -> Unit {
+        if self.count == self.buf.len().as(usize) {
+            self._grow()
+        }
+        let cap = self.buf.len().as(usize)
+        let tail = (self.head + self.count) % cap
+        self.buf.set(tail, value)
+        self.count += 1
+    }
+
+    pub fn push_front(self, value: Any) -> Unit {
+        if self.count == self.buf.len().as(usize) {
+            self._grow()
+        }
+        let cap = self.buf.len().as(usize)
+        self.head = if self.head == 0 { cap - 1 } else { self.head - 1 }
+        self.buf.set(self.head, value)
+        self.count += 1
+    }
+
+    pub fn pop_front(self) -> Any {
+        if self.count == 0 { return null }
+        let cap = self.buf.len().as(usize)
+        let val = self.buf.get(self.head)
+        self.buf.set(self.head, null)
+        self.head = (self.head + 1) % cap
+        self.count -= 1
+        if self.count == 0 {
+            self.head = 0
+        }
+        val
+    }
+
+    pub fn pop_back(self) -> Any {
+        if self.count == 0 { return null }
+        let cap = self.buf.len().as(usize)
+        self.count -= 1
+        let tail = (self.head + self.count) % cap
+        let val = self.buf.get(tail)
+        self.buf.set(tail, null)
+        if self.count == 0 {
+            self.head = 0
+        }
+        val
+    }
+
+    pub fn front(self) -> Any {
+        if self.count == 0 { null } else { self.buf.get(self.head) }
+    }
+
+    pub fn back(self) -> Any {
+        if self.count == 0 {
+            null
+        } else {
+            let cap = self.buf.len().as(usize)
+            self.buf.get((self.head + self.count - 1) % cap)
+        }
+    }
+
+    pub fn get(self, index: usize) -> Any {
+        if index >= self.count {
+            _panic("Deque.get: index out of bounds")
+        }
+        let cap = self.buf.len().as(usize)
+        self.buf.get((self.head + index) % cap)
+    }
+
+    pub fn set(self, index: usize, value: Any) -> Unit {
+        if index >= self.count {
+            _panic("Deque.set: index out of bounds")
+        }
+        let cap = self.buf.len().as(usize)
+        self.buf.set((self.head + index) % cap, value)
+    }
+
+    pub fn clear(self) -> Unit {
+        let buf = List()
+        buf.resize(8, null)
+        self.buf = buf
+        self.head = 0
+        self.count = 0
+    }
+
+    pub fn to_list(self) -> List {
+        let out = List()
+        let cap = self.buf.len().as(usize)
+        var i: usize = 0
+        while i < self.count {
+            out.push(self.buf.get((self.head + i) % cap))
+            i += 1
+        }
+        out
+    }
+}
+
+impl PartialEq for Deque {
+    pub fn eq(self, other: Self) -> bool {
+        if self.count != other.count { return false }
+        var i: usize = 0
+        while i < self.count {
+            if self.get(i) != other.get(i) { return false }
+            i += 1
+        }
+        true
+    }
+}
+
+pub struct DequeIter {
+    items: List,
+    index: usize,
+}
+
+impl Iterator for DequeIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.index < self.items.len() {
+            let item = self.items.get(self.index)
+            self.index += 1
+            IterationStep(Any).yielded(item)
+        } else {
+            IterationStep(Any).done
+        }
+    }
+}
+
+impl IntoIterator for Deque {
+    assoc Iter: Type = DequeIter
+    pub fn into_iter(self) -> DequeIter {
+        DequeIter { items: self.to_list(), index: 0 }
     }
 }

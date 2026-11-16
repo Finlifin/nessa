@@ -627,7 +627,15 @@ impl<'src> Lexer<'src> {
             let mut depth: u32 = 1;
             while depth > 0 {
                 match self.peek_byte() {
-                    None => break,
+                    None => {
+                        self.push_error(
+                            LexErrorKind::UnterminatedBlockComment,
+                            start,
+                            self.pos(),
+                            "unterminated block comment",
+                        );
+                        return self.token(TokenKind::Invalid, start, self.pos());
+                    }
                     Some(b'{') => {
                         self.cursor += 1;
                         if self.peek_byte() == Some(b'-') {
@@ -1346,7 +1354,17 @@ impl<'src> Lexer<'src> {
         loop {
             match self.peek_byte() {
                 Some(b'`') => {
+                    let is_empty = self.pos() == start + 1;
                     self.cursor += 1;
+                    if is_empty {
+                        self.push_error(
+                            LexErrorKind::InvalidArbitraryId,
+                            start,
+                            self.pos(),
+                            "empty arbitrary identifier",
+                        );
+                        return self.token(TokenKind::Invalid, start, self.pos());
+                    }
                     return self.token(TokenKind::ArbitraryId, start, self.pos());
                 }
                 Some(b'\n') => {

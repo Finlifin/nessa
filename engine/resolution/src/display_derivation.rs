@@ -76,6 +76,7 @@ fn components(r: &Resolver<'_>, ty: TypeIndex) -> Vec<TypeIndex> {
             .flat_map(|variant| variant.fields.iter().map(|field| field.ty))
             .collect(),
         TypeKind::Tuple { elements } => elements.clone(),
+        TypeKind::Newtype { inner, .. } => vec![*inner],
         _ => vec![],
     }
 }
@@ -84,7 +85,9 @@ fn displayable(r: &Resolver<'_>, ty: TypeIndex, seen: &mut HashSet<TypeIndex>, s
     let Some(ty) = r.type_pool.canonical_type(ty) else {
         return false;
     };
-    if r.type_pool.is_reserved_collection_role(ty) {
+    if r.type_pool.is_reserved_collection_role(ty)
+        && r.type_pool.collection_role(ty) != Some(type_pool::CollectionRole::Bytes)
+    {
         return false;
     }
     if !seen.insert(ty) {

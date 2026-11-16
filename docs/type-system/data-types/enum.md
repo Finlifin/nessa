@@ -156,10 +156,10 @@ Enum/tag的携带值在静态类型已实现Eq或PartialEq时调用其比较方�
 `derive Eq for E`和`derive PartialEq for E`，按variant及声明字段顺序短路比较，
 字段调用对应trait的用户实现或派生函数。未实现trait的携值比较仍明确返回
 UnsupportedEnumEquality，不以地址代替字段语义。Any动态比较尚未接入trait分派；
-Enum支持Ord/PartialOrd派生：先按variant声明顺序比较，再逐字段比较，
-PartialOrd遇到不可比较字段返回null。Hash派生仍明确不支持。
-List/struct等其余模式、泛型variant、完整穷尽性分析和trait规则
-也未因本轮构造/匹配通过而完成；设计示例不代表这些路径已经支持。
+Enum支持Ord/PartialOrd及Hash派生：Ord/PartialOrd先按variant声明顺序比较，再逐字段比较，
+PartialOrd遇到不可比较字段返回null；`derive Hash for E` 组合variant序号与各字段 `Hash.hash()`。
+List切片模式（`[head, ...tail]`）、Struct解构模式（`Point { x, ... }`）、组合模式（`p1 or p2`、`pat as x`、`not pat`）
+以及未覆盖构造器/布尔值的非穷尽性编译告警均已接通；区间模式与泛型enum variant仍待后续扩展。
 字符值使用独立Char表示并可持久化到NSBC。字符字面量模式支持Unicode标量与
 词法支持的转义，适用于match/matches及嵌套Enum/Tuple字段；Any中的String或
 整数不会当作同字符匹配，静态不兼容字段会产生类型诊断。

@@ -1,24 +1,30 @@
 //! Compilation driver — orchestrates the full pipeline:
 //!   Source → Lexer → Parser → Resolution → NIR → Codegen → Archive / Run
 
+mod artifact_cache;
 mod execution;
 mod identity;
 pub use identity::CompilationIdentityContext;
+pub use nsbc_io::{disassemble_artifact, disassemble_bytes};
 pub use pkg_manager::ManifestDocument;
-pub use pkg_manager::{ModuleSources, PackageSources, SourceFile, load_package_sources};
+pub use pkg_manager::{
+    LockedPackage, Lockfile, ModuleSources, PackageLoadError, PackageSources, PackageWorkspace,
+    SourceFile, load_package_sources, load_package_workspace,
+};
 mod package;
 mod package_graph;
 mod source_units;
 mod standard_library;
 
 pub use execution::{ArtifactLoadError, install_artifact};
+pub use initialization::{EngineConfig, JitConfig, JitMode, JitStats};
 
 use ast::dump::dump_ast_to_string_pretty;
 use diagnostic::{Diagnostic, DiagnosticContext, Level, NessaError};
 use initialization::Engine;
 use nsbc::CodegenOutput;
 use rustc_span::{FileName, SourceMap, source_map::FilePathMapping};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -102,6 +108,9 @@ fn compilation_error(diagnostics: &[Diagnostic]) -> std::io::Error {
 pub struct Driver {
     source_map: SourceMap,
     next_source: AtomicU64,
+    script_args: Vec<String>,
+    cache_override: Option<Option<PathBuf>>,
+    jit_config: Option<JitConfig>,
 }
 
 impl Driver {
@@ -109,7 +118,68 @@ impl Driver {
         Self {
             source_map: SourceMap::new(FilePathMapping::empty()),
             next_source: AtomicU64::new(0),
+            script_args: Vec::new(),
+            cache_override: None,
+            jit_config: None,
         }
+    }
+
+    /// Override the JIT mode used when executing artifacts on this driver.
+    pub fn with_jit_mode(mut self, mode: JitMode) -> Self {
+        self.jit_config = Some(JitConfig::with_mode(mode));
+        self
+    }
+
+    /// Override the full [`JitConfig`] (mode + code-cache budget) used on this driver.
+    pub fn with_jit_config(mut self, config: JitConfig) -> Self {
+        self.jit_config = Some(config);
+        self
+    }
+
+    /// Set or clear the explicit [`JitMode`] override (`None` falls back to `NESSA_JIT` / `Auto`).
+    pub fn set_jit_mode(&mut self, mode: Option<JitMode>) {
+        self.jit_config = mode.map(JitConfig::with_mode);
+    }
+
+    /// Return the explicit [`JitMode`] configured on this driver, if any.
+    pub fn jit_mode(&self) -> Option<JitMode> {
+        self.jit_config.map(|cfg| cfg.mode)
+    }
+
+    /// Override the content-addressed `.nsbc` compilation cache directory for this driver.
+    pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
+        self.cache_override = Some(Some(dir));
+        self
+    }
+
+    /// Disable content-addressed `.nsbc` compilation caching on this driver.
+    pub fn without_cache(mut self) -> Self {
+        self.cache_override = Some(None);
+        self
+    }
+
+    pub(crate) fn resolved_cache_dir(&self) -> Option<PathBuf> {
+        artifact_cache::active_cache_dir(self.cache_override.as_ref())
+    }
+
+    /// Configure command-line arguments visible to the executed Nessa program.
+    ///
+    /// When invoked from the `nessa` CLI (`nessa run <target> [-- <args...>]`),
+    /// index `0` is the target path display string followed by trailing arguments.
+    /// Defaults to an empty `Vec` in [`Driver::new`].
+    pub fn with_script_args(mut self, args: Vec<String>) -> Self {
+        self.script_args = args;
+        self
+    }
+
+    /// Replace the command-line arguments visible to subsequent runs on this driver.
+    pub fn set_script_args(&mut self, args: Vec<String>) {
+        self.script_args = args;
+    }
+
+    /// Return the configured command-line arguments for script execution.
+    pub fn script_args(&self) -> &[String] {
+        &self.script_args
     }
 
     /// Parse only valid token streams, retaining lexical and syntax diagnostics.
@@ -196,19 +266,40 @@ impl Driver {
         package_options: Option<resolution::ResolveOptions>,
     ) -> CompileResult {
         let original_root = ast.root;
-        let (ast, mut options) = match self.load_standard_library(ast, &mut diagnostics) {
+        let needs_bundled_script_packages = package_options.is_none() && {
+            let bundled_names: std::collections::HashSet<str_interner::StrId> =
+                pkg_manager::bundled_packages()
+                    .iter()
+                    .map(|pkg| str_interner::intern(&pkg.manifest.manifest().name))
+                    .collect();
+            ast.nodes
+                .iter()
+                .any(|node| node.kind == ast::NodeKind::Id && bundled_names.contains(&node.str_id))
+        };
+        let (mut ast, mut options) = match self.load_standard_library(ast, &mut diagnostics) {
             Ok(loaded) => loaded,
             Err(errors) => {
                 diagnostics.extend(errors);
                 return CompileResult::failed(diagnostics, type_pool::TypePool::with_intrinsics());
             }
         };
+        let standard = options.package_roots.iter().copied().next();
+        if needs_bundled_script_packages
+            && let Err(errors) = self.attach_bundled_script_packages(
+                &mut ast,
+                &mut options,
+                standard,
+                &mut diagnostics,
+            )
+        {
+            diagnostics.extend(errors);
+            return CompileResult::failed(diagnostics, type_pool::TypePool::with_intrinsics());
+        }
         if let Some(mut packages) = package_options {
             if let Some(dependencies) = packages.package_dependencies.remove(&original_root) {
                 packages.package_dependencies.insert(ast.root, dependencies);
             }
             // std is provided by the engine, independently of manifest edges.
-            let standard = options.package_roots.iter().copied().next();
             if let Some(standard) = standard {
                 for dependencies in packages.package_dependencies.values_mut() {
                     dependencies
@@ -224,6 +315,11 @@ impl Driver {
                 .package_identities
                 .extend(packages.package_identities);
             options.implicit_imports.extend(packages.implicit_imports);
+            options.privileged_nodes.extend(packages.privileged_nodes);
+            options.ffi_nodes.extend(packages.ffi_nodes);
+            options
+                .ffi_library_allowlists
+                .extend(packages.ffi_library_allowlists);
         }
         if let Some(identity) = identity {
             options
@@ -350,9 +446,32 @@ impl Driver {
         }
     }
 
-    /// Compile and write an `.nsbc` archive to a file.
+    /// Compile source or load a validated content-addressed `.nsbc` artifact from cache.
+    pub fn compile_cached_artifact(
+        &self,
+        source: &str,
+    ) -> Result<nsbc::CompiledArtifact, Vec<Diagnostic>> {
+        let cache_dir = self.resolved_cache_dir();
+        let key = artifact_cache::single_source_key(source, None);
+        if let Some(cached) = artifact_cache::load_cached_artifact(cache_dir.as_deref(), &key) {
+            return Ok(cached);
+        }
+        let compiled = self.compile(source);
+        if compiled.has_errors {
+            return Err(compiled.diagnostics);
+        }
+        let artifact = compiled
+            .into_artifact()
+            .map_err(|error| self.package_errors(error.to_string()))?;
+        artifact_cache::store_cached_artifact(cache_dir.as_deref(), &key, &artifact);
+        Ok(artifact)
+    }
+
+    /// Compile and write an `.nsbc` archive to a file, reusing/populating the `.nsbc` cache.
     pub fn compile_to_archive(&self, source: &str, output_path: &Path) -> std::io::Result<()> {
-        let artifact = self.compile(source).into_artifact()?;
+        let artifact = self
+            .compile_cached_artifact(source)
+            .map_err(|diagnostics| compilation_error(&diagnostics))?;
         let bytes = nsbc_io::write_artifact(&artifact)?;
         std::fs::write(output_path, bytes)
     }
@@ -366,6 +485,42 @@ impl Driver {
         std::fs::write(output_path, dump)
     }
 
+    /// Compile source and render its human-readable NSBC disassembly.
+    pub fn disassemble_source(&self, source: &str) -> std::io::Result<String> {
+        let compiled = self.compile(source);
+        if compiled.has_errors {
+            return Err(compilation_error(&compiled.diagnostics));
+        }
+        let artifact = compiled.into_artifact()?;
+        Ok(nsbc_io::disassemble_artifact(&artifact))
+    }
+
+    /// Read an `.nsbc` archive file with a bounded allocation and render its disassembly.
+    pub fn disassemble_archive_file(&self, path: &Path) -> std::io::Result<String> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(nsbc_io::MAX_ARCHIVE_SIZE as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        nsbc_io::disassemble_bytes(&bytes)
+    }
+
+    /// Compile source and write its human-readable NSBC disassembly to a file.
+    pub fn emit_bc_dump(&self, source: &str, output_path: &Path) -> std::io::Result<()> {
+        let dump = self.disassemble_source(source)?;
+        std::fs::write(output_path, dump)
+    }
+
+    /// Read an `.nsbc` archive file and write its human-readable NSBC disassembly to a file.
+    pub fn emit_archive_bc_dump(
+        &self,
+        archive_path: &Path,
+        output_path: &Path,
+    ) -> std::io::Result<()> {
+        let dump = self.disassemble_archive_file(archive_path)?;
+        std::fs::write(output_path, dump)
+    }
+
     /// Compile source and run it immediately.
     pub fn run(&self, source: &str) -> RunResult {
         let result = self.compile(source);
@@ -376,6 +531,14 @@ impl Driver {
         match result.into_artifact() {
             Ok(artifact) => self.run_artifact(artifact),
             Err(error) => RunResult::RuntimeError(error.to_string()),
+        }
+    }
+
+    /// Compile source (reusing the content-addressed `.nsbc` cache) and run it immediately.
+    pub fn run_cached(&self, source: &str) -> RunResult {
+        match self.compile_cached_artifact(source) {
+            Ok(artifact) => self.run_artifact(artifact),
+            Err(diagnostics) => RunResult::CompileError(diagnostics),
         }
     }
 
@@ -407,7 +570,12 @@ impl Driver {
 
     /// Execute an artifact through the same installation path as source runs.
     pub fn run_artifact(&self, artifact: nsbc::CompiledArtifact) -> RunResult {
-        let mut engine = Engine::with_defaults();
+        let mut engine_cfg = EngineConfig::default();
+        if let Some(jit_cfg) = self.jit_config {
+            engine_cfg.jit = jit_cfg;
+        }
+        let mut engine = Engine::new(engine_cfg);
+        engine.vm_mut().set_script_args(self.script_args.clone());
         let entry = match install_artifact(engine.vm_mut(), artifact) {
             Ok(entry) => entry,
             Err(error) => return RunResult::RuntimeError(error.to_string()),
@@ -604,5 +772,236 @@ mod tests {
             );
             assert!(!missing.exists());
         }
+    }
+
+    #[test]
+    fn driver_script_args_hooks_default_empty_and_preserve_arguments() {
+        let default_driver = Driver::new();
+        assert!(default_driver.script_args().is_empty());
+
+        let mut configured = Driver::new().with_script_args(vec![
+            "script.ns".to_owned(),
+            "--some-flag".to_owned(),
+            "value".to_owned(),
+        ]);
+        assert_eq!(
+            configured.script_args(),
+            &["script.ns", "--some-flag", "value"]
+        );
+
+        configured.set_script_args(vec!["pkg_dir".to_owned(), "pos1".to_owned()]);
+        assert_eq!(configured.script_args(), &["pkg_dir", "pos1"]);
+    }
+
+    #[test]
+    fn driver_disassembles_compiled_source_and_saved_nsbc_archives() {
+        let directory = TestDirectory::new();
+        let driver = Driver::new();
+        let source = r#"
+fn add_bias(x: i64) -> i64 {
+    let f = |n: i64| n + 7
+    f(x)
+}
+
+fn main() {
+    let total = add_bias(35)
+    if total == 42 {
+        println("ok")
+    }
+}
+"#;
+        let source_dump = driver.disassemble_source(source).unwrap();
+        assert!(
+            source_dump.contains("; NSBC Disassembly\n"),
+            "{source_dump}"
+        );
+        assert!(
+            source_dump.contains("builtin_abi_version:"),
+            "{source_dump}"
+        );
+        assert!(source_dump.contains("add_bias"), "{source_dump}");
+        assert!(source_dump.contains("NewClosure"), "{source_dump}");
+        assert!(source_dump.contains("CallIndirect"), "{source_dump}");
+        assert!(source_dump.contains("Str(\"ok\")"), "{source_dump}");
+
+        let archive_path = directory.0.join("sample.nsbc");
+        driver.compile_to_archive(source, &archive_path).unwrap();
+        let archive_dump = driver.disassemble_archive_file(&archive_path).unwrap();
+        assert!(archive_dump.contains("entry: fn #"), "{archive_dump}");
+        assert!(archive_dump.contains("add_bias"), "{archive_dump}");
+
+        let bad_archive = directory.0.join("corrupt.nsbc");
+        std::fs::write(&bad_archive, b"corrupt-bytes").unwrap();
+        assert!(driver.disassemble_archive_file(&bad_archive).is_err());
+    }
+
+    #[test]
+    fn driver_compiles_multi_package_local_workspace_and_verifies_lockfile() {
+        let directory = TestDirectory::new();
+        let math_dir = directory.0.join("math");
+        std::fs::create_dir_all(math_dir.join("src")).unwrap();
+        std::fs::write(
+            math_dir.join("package.toml"),
+            "[package]\nname = \"math\"\ndomain = \"org.test\"\nversion = \"0.2.0\"\ntype = \"lib\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            math_dir.join("src/lib.ns"),
+            "pub fn double(x: i64) -> i64 { x * 2 }\n",
+        )
+        .unwrap();
+
+        let app_dir = directory.0.join("app");
+        std::fs::create_dir_all(app_dir.join("src")).unwrap();
+        std::fs::write(
+            app_dir.join("package.toml"),
+            "[package]\nname = \"app\"\ndomain = \"org.test\"\nversion = \"0.1.0\"\ntype = \"exe\"\n\n[dependencies]\nmath = { path = \"../math\", version = \"^0.2.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app_dir.join("src/main.ns"),
+            "use @math.double\nfn main() { let _ = double(21) }\n",
+        )
+        .unwrap();
+
+        let driver = Driver::new();
+        let compiled = driver.compile_package(&app_dir);
+        assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
+        assert!(!app_dir.join("package.lock").exists());
+
+        let lock = driver.sync_package_lockfile(&app_dir).unwrap();
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages[0].name, "math");
+        assert_eq!(lock.packages[0].path, "../math");
+        driver.verify_package_lockfile(&app_dir).unwrap();
+    }
+
+    #[test]
+    fn cached_single_source_hits_invalidates_recovers_from_corruption_and_honors_disable() {
+        let directory = TestDirectory::new();
+        let cache_dir = directory.0.join("nsbc-cache");
+        let marker = directory.0.join("out.txt");
+        let source_v1 = format!(
+            "use std.fs\nfn main() {{ let _ = fs.write_string({:?}, \"v1\") }}\n",
+            marker.to_string_lossy()
+        );
+        let source_v2 = format!(
+            "use std.fs\nfn main() {{ let _ = fs.write_string({:?}, \"v2\") }}\n",
+            marker.to_string_lossy()
+        );
+
+        let no_cache_driver = Driver::new().without_cache();
+        assert!(matches!(
+            no_cache_driver.run_cached(&source_v1),
+            RunResult::Ok
+        ));
+        assert!(!cache_dir.exists());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "v1");
+
+        let cached_driver = Driver::new().with_cache_dir(cache_dir.clone());
+        assert!(matches!(
+            cached_driver.run_cached(&source_v1),
+            RunResult::Ok
+        ));
+        let entries_v1: Vec<_> = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries_v1.len(), 1);
+
+        // Corrupt the cached .nsbc file: driver must evict it, recompile cleanly, and succeed.
+        std::fs::write(&entries_v1[0], b"corrupted-nsbc-cache-entry").unwrap();
+        std::fs::write(&marker, "stale").unwrap();
+        assert!(matches!(
+            cached_driver.run_cached(&source_v1),
+            RunResult::Ok
+        ));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "v1");
+        let valid_bytes = std::fs::read(&entries_v1[0]).unwrap();
+        assert!(nsbc_io::read_artifact(&valid_bytes).is_ok());
+
+        // Editing source must produce a distinct cache entry and run the updated program.
+        assert!(matches!(
+            cached_driver.run_cached(&source_v2),
+            RunResult::Ok
+        ));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "v2");
+        let count_after_v2 = std::fs::read_dir(&cache_dir).unwrap().count();
+        assert_eq!(count_after_v2, 2);
+    }
+
+    #[test]
+    fn cached_package_compilation_tracks_dependency_edits_and_preserves_locked_checks() {
+        let directory = TestDirectory::new();
+        let cache_dir = directory.0.join("pkg-cache");
+        let marker = directory.0.join("pkg-out.txt");
+
+        let dep_dir = directory.0.join("util");
+        std::fs::create_dir_all(dep_dir.join("src")).unwrap();
+        std::fs::write(
+            dep_dir.join("package.toml"),
+            "[package]\nname = \"util\"\ndomain = \"org.test\"\nversion = \"0.1.0\"\ntype = \"lib\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dep_dir.join("src/lib.ns"),
+            "pub fn greeting() -> String { \"hello-v1\" }\n",
+        )
+        .unwrap();
+
+        let app_dir = directory.0.join("app");
+        std::fs::create_dir_all(app_dir.join("src")).unwrap();
+        std::fs::write(
+            app_dir.join("package.toml"),
+            "[package]\nname = \"app\"\ndomain = \"org.test\"\nversion = \"0.1.0\"\ntype = \"exe\"\n\n[dependencies]\nutil = { path = \"../util\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app_dir.join("src/main.ns"),
+            format!(
+                "use std.fs\nuse @util.greeting\nfn main() {{ let _ = fs.write_string({:?}, greeting()) }}\n",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let driver = Driver::new().with_cache_dir(cache_dir.clone());
+        assert!(matches!(driver.run_package_cached(&app_dir), RunResult::Ok));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "hello-v1");
+        assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 1);
+
+        // Even with a warm bytecode cache, `--locked` must reject missing `package.lock`.
+        assert!(matches!(
+            driver.run_package_locked_cached(&app_dir),
+            RunResult::CompileError(_)
+        ));
+
+        // Sync lockfile, then `--locked` succeeds using the warm cache entry.
+        driver.sync_package_lockfile(&app_dir).unwrap();
+        std::fs::write(&marker, "cleared").unwrap();
+        assert!(matches!(
+            driver.run_package_locked_cached(&app_dir),
+            RunResult::Ok
+        ));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "hello-v1");
+        assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 1);
+
+        // Editing dependency invalidates both `--locked` and the bytecode cache key.
+        std::fs::write(
+            dep_dir.join("src/lib.ns"),
+            "pub fn greeting() -> String { \"hello-v2\" }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            driver.run_package_locked_cached(&app_dir),
+            RunResult::CompileError(_)
+        ));
+        driver.sync_package_lockfile(&app_dir).unwrap();
+        assert!(matches!(
+            driver.run_package_locked_cached(&app_dir),
+            RunResult::Ok
+        ));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "hello-v2");
+        assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 2);
     }
 }

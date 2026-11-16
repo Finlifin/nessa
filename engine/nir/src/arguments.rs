@@ -27,11 +27,30 @@ pub(crate) fn lower_arguments(
     builder: &mut FunctionBuilder,
     block: &mut BlockId,
 ) -> Vec<NirValue> {
-    let explicit: Vec<_> = resolved
-        .ast
-        .multi_children(call)
+    lower_arguments_with_first(resolved, call, None, builder, block)
+}
+
+pub(crate) fn lower_arguments_with_first(
+    resolved: &ResolvedAst,
+    call: NodeIndex,
+    pre_first: Option<NirValue>,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> Vec<NirValue> {
+    let raw_args = if resolved.ast.node(call).kind == ast::NodeKind::InfixFnCall {
+        resolved.ast.fixed_children(call)
+    } else {
+        resolved.ast.multi_children(call)
+    };
+    let explicit: Vec<_> = raw_args
         .iter()
-        .map(|&argument| {
+        .enumerate()
+        .map(|(idx, &argument)| {
+            if idx == 0
+                && let Some(first) = pre_first
+            {
+                return first;
+            }
             let value = lower_expr(
                 resolved,
                 resolution::argument_value_node(&resolved.ast, argument),
@@ -41,7 +60,7 @@ pub(crate) fn lower_arguments(
             snapshot(value, builder, *block)
         })
         .collect();
-    bind_arguments(resolved, call, explicit, None, builder, block)
+    bind_arguments(resolved, call, raw_args, explicit, None, builder, block)
 }
 
 pub(crate) fn lower_method_arguments(
@@ -51,17 +70,37 @@ pub(crate) fn lower_method_arguments(
     builder: &mut FunctionBuilder,
     block: &mut BlockId,
 ) -> Vec<NirValue> {
+    lower_method_arguments_with_first(resolved, node, receiver, None, builder, block)
+}
+
+pub(crate) fn lower_method_arguments_with_first(
+    resolved: &ResolvedAst,
+    node: NodeIndex,
+    receiver: NirValue,
+    pre_first: Option<NirValue>,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> Vec<NirValue> {
     let assignment = resolved.ast.node(node).kind == ast::NodeKind::Assign;
     let call = if assignment {
         resolved.ast.fixed_children(node)[0]
     } else {
         node
     };
-    let mut explicit: Vec<_> = resolved
-        .ast
-        .multi_children(call)
+    let raw_args = if resolved.ast.node(call).kind == ast::NodeKind::InfixFnCall {
+        resolved.ast.fixed_children(call)
+    } else {
+        resolved.ast.multi_children(call)
+    };
+    let mut explicit: Vec<_> = raw_args
         .iter()
-        .map(|&argument| {
+        .enumerate()
+        .map(|(idx, &argument)| {
+            if idx == 0
+                && let Some(first) = pre_first
+            {
+                return first;
+            }
             let value = lower_expr(
                 resolved,
                 resolution::argument_value_node(&resolved.ast, argument),
@@ -80,12 +119,21 @@ pub(crate) fn lower_method_arguments(
         );
         explicit.push(snapshot(value, builder, *block));
     }
-    bind_arguments(resolved, node, explicit, Some(receiver), builder, block)
+    bind_arguments(
+        resolved,
+        node,
+        raw_args,
+        explicit,
+        Some(receiver),
+        builder,
+        block,
+    )
 }
 
 fn bind_arguments(
     resolved: &ResolvedAst,
     call: NodeIndex,
+    raw_args: &[NodeIndex],
     explicit: Vec<NirValue>,
     receiver: Option<NirValue>,
     builder: &mut FunctionBuilder,
@@ -96,7 +144,9 @@ fn bind_arguments(
     };
     let mut arguments = Vec::with_capacity(plan.parameters.len());
     let mut previous = Vec::new();
-    if let Some(receiver) = receiver {
+    if let Some(receiver) = receiver
+        && !plan.declaration.is_null()
+    {
         let parameter = resolved.ast.multi_children(plan.declaration)[0];
         let symbol = builder
             .node_symbol(resolved, parameter)
@@ -113,15 +163,129 @@ fn bind_arguments(
         };
         previous.push((symbol, builder.symbol_to_local.insert(symbol, local)));
     }
+    let packed_list = plan.spread_pack.as_ref().map(|pack| {
+        let list_local = builder.alloc_local();
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(list_local, NirExpr::NewList(0)));
+        let list_val = NirValue::Local(list_local);
+        for &src_idx in &pack.source_indices {
+            emit_spread_or_push(
+                resolved,
+                raw_args.get(src_idx).copied(),
+                explicit[src_idx],
+                list_val,
+                builder,
+                *block,
+            );
+        }
+        let len_local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            len_local,
+            NirExpr::CallBuiltin(runtime::ids::LIST_LEN, vec![list_val]),
+        ));
+        let cmp_op = if pack.has_variadic_tail {
+            crate::BinOp::Ge
+        } else {
+            crate::BinOp::Eq
+        };
+        let ok_block = builder.new_block();
+        let err_block = builder.new_block();
+        crate::patterns::test(
+            builder,
+            *block,
+            NirExpr::BinOp(
+                cmp_op,
+                NirValue::Local(len_local),
+                NirValue::ConstInt(pack.fixed_count as i64),
+            ),
+            ok_block,
+            err_block,
+        );
+        let panic_res = builder.alloc_local();
+        let msg = if pack.has_variadic_tail {
+            "too few arguments in spread call"
+        } else {
+            "spread call arity mismatch"
+        };
+        builder.blocks[err_block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(
+                panic_res,
+                NirExpr::CallBuiltin(
+                    runtime::ids::PANIC,
+                    vec![NirValue::ConstStr(str_interner::intern(msg))],
+                ),
+            ));
+        builder.blocks[err_block.0 as usize].terminator = crate::Terminator::Return(NirValue::Unit);
+        *block = ok_block;
+        (list_val, pack.fixed_count)
+    });
     for binding in &plan.parameters {
         let value = match &binding.value {
             CallArgumentValue::Explicit { source_index } => explicit[*source_index],
             CallArgumentValue::Variadic { source_indices } => {
-                let elements: Vec<_> = source_indices
-                    .iter()
-                    .map(|&index| explicit[index])
-                    .collect();
-                crate::lists::build_list(&elements, builder, *block)
+                let has_spread_item = source_indices.iter().any(|&index| {
+                    raw_args
+                        .get(index)
+                        .is_some_and(|&arg| resolved.ast.node(arg).kind == ast::NodeKind::SpreadArg)
+                });
+                if has_spread_item {
+                    let list_local = builder.alloc_local();
+                    builder.blocks[block.0 as usize]
+                        .stmts
+                        .push(NirStmt::Assign(list_local, NirExpr::NewList(0)));
+                    let list_val = NirValue::Local(list_local);
+                    for &index in source_indices {
+                        emit_spread_or_push(
+                            resolved,
+                            raw_args.get(index).copied(),
+                            explicit[index],
+                            list_val,
+                            builder,
+                            *block,
+                        );
+                    }
+                    list_val
+                } else {
+                    let elements: Vec<_> = source_indices
+                        .iter()
+                        .map(|&index| explicit[index])
+                        .collect();
+                    crate::lists::build_list(&elements, builder, *block)
+                }
+            }
+            CallArgumentValue::Unpacked {
+                unpack_index,
+                target_type,
+            } => {
+                let (list_val, _) = packed_list.expect("checked spread_pack");
+                let elem_local = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    elem_local,
+                    NirExpr::IndexAccess(list_val, NirValue::ConstInt(*unpack_index as i64)),
+                ));
+                let mut elem = NirValue::Local(elem_local);
+                if let Some(ty) = target_type
+                    && resolved.type_pool.as_intrinsic(*ty) != Some(type_pool::Intrinsic::Any)
+                {
+                    elem = NirValue::Local(crate::expr::lower_cast(
+                        resolved, call, elem, *ty, builder, *block,
+                    ));
+                }
+                elem
+            }
+            CallArgumentValue::UnpackedTail => {
+                let (list_val, fixed_count) = packed_list.expect("checked spread_pack");
+                let tail_local = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    tail_local,
+                    NirExpr::CallBuiltin(
+                        runtime::ids::LIST_DROP,
+                        vec![list_val, NirValue::ConstInt(fixed_count as i64)],
+                    ),
+                ));
+                NirValue::Local(tail_local)
             }
             CallArgumentValue::MapVariadic { source_properties } => {
                 let map = builder.alloc_local();
@@ -200,16 +364,24 @@ fn bind_arguments(
                 local
             }
         };
-        let pattern = resolved.ast.fixed_children(binding.parameter)[0];
-        if resolved.ast.node(pattern).kind == ast::NodeKind::PatternTuple {
-            for &symbol in &binding.symbols {
-                let old = builder.symbol_to_local.remove(&symbol);
-                previous.push((symbol, old));
-            }
-            crate::tuples::bind_pattern(resolved, pattern, NirValue::Local(local), builder, *block);
-        } else {
-            for &symbol in &binding.symbols {
-                previous.push((symbol, builder.symbol_to_local.insert(symbol, local)));
+        if !binding.parameter.is_null() {
+            let pattern = resolved.ast.fixed_children(binding.parameter)[0];
+            if resolved.ast.node(pattern).kind == ast::NodeKind::PatternTuple {
+                for &symbol in &binding.symbols {
+                    let old = builder.symbol_to_local.remove(&symbol);
+                    previous.push((symbol, old));
+                }
+                crate::tuples::bind_pattern(
+                    resolved,
+                    pattern,
+                    NirValue::Local(local),
+                    builder,
+                    *block,
+                );
+            } else {
+                for &symbol in &binding.symbols {
+                    previous.push((symbol, builder.symbol_to_local.insert(symbol, local)));
+                }
             }
         }
         arguments.push(value);
@@ -225,6 +397,26 @@ fn bind_arguments(
         }
     }
     arguments
+}
+
+fn emit_spread_or_push(
+    resolved: &ResolvedAst,
+    raw_arg: Option<NodeIndex>,
+    value: NirValue,
+    list_val: NirValue,
+    builder: &mut FunctionBuilder,
+    block: BlockId,
+) {
+    let op = if raw_arg.is_some_and(|arg| resolved.ast.node(arg).kind == ast::NodeKind::SpreadArg) {
+        runtime::ids::LIST_APPEND
+    } else {
+        runtime::ids::LIST_PUSH
+    };
+    let tmp = builder.alloc_local();
+    builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+        tmp,
+        NirExpr::CallBuiltin(op, vec![list_val, value]),
+    ));
 }
 
 #[cfg(test)]
@@ -310,6 +502,7 @@ mod tests {
                         },
                     },
                 ],
+                spread_pack: None,
             },
         );
         let mut builder = FunctionBuilder::new(FuncId(0), str_interner::intern("main"));

@@ -307,6 +307,39 @@ fn matrix(
                 .collect();
             matrix(r, ast, specialized, &fields, budget, depth + 1)
         }
+        TypeKind::Newtype { inner, .. } => {
+            let inner = *inner;
+            let mut specialized = Vec::new();
+            for row in rows {
+                let Some(&pattern) = row.first() else {
+                    continue;
+                };
+                let child = if wildcard(r, ast, pattern, head) {
+                    Some(NodeIndex::NULL)
+                } else if ast.node(pattern).kind == NodeKind::PatternCall
+                    && r.newtype_patterns
+                        .get(&pattern)
+                        .is_some_and(|&nt| r.type_pool.canonical_type(nt) == Some(head))
+                    && ast.multi_children(pattern).len() == 1
+                {
+                    Some(ast.multi_children(pattern)[0])
+                } else {
+                    None
+                };
+                if let Some(child) = child {
+                    if !budget.spend(row.len() + 1) {
+                        return false;
+                    }
+                    let mut fields = vec![child];
+                    fields.extend_from_slice(&row[1..]);
+                    specialized.push(fields);
+                }
+            }
+            let fields: Vec<_> = std::iter::once(inner)
+                .chain(types[1..].iter().copied())
+                .collect();
+            matrix(r, ast, specialized, &fields, budget, depth + 1)
+        }
         _ => false,
     }
 }

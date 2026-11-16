@@ -47,11 +47,21 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
             // availability covers this block and its descendants. Prepare only
             // extensions here; ordinary local values remain source-ordered.
             for &child in ast.multi_children(node_idx) {
+                let inner = if matches!(
+                    ast.node(child).kind,
+                    NodeKind::PubDef | NodeKind::PrivateDef
+                ) {
+                    ast.fixed_children(child)[0]
+                } else {
+                    child
+                };
                 if matches!(
                     ast.node(child).kind,
                     NodeKind::ExtendDef | NodeKind::ExtendTraitDef
                 ) {
                     prepare_scope_tree(r, ast, child, None);
+                } else if !inner.is_null() && ast.node(inner).kind == NodeKind::DeriveDef {
+                    r.pending_derives.push((r.current_scope, inner));
                 }
             }
             crate::associated::attach(r, ast);
@@ -142,20 +152,72 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         NodeKind::ImplDef | NodeKind::ImplTraitDef => resolve_impl(r, ast, node_idx),
         NodeKind::ExtendDef | NodeKind::ExtendTraitDef => resolve_extend(r, ast, node_idx),
 
-        // ── Typealias ──────────────────────────────────────────────
+        // ── Typealias & Newtype ────────────────────────────────────
         NodeKind::Typealias => resolve_typealias(r, ast, node_idx),
-        NodeKind::Newtype => {
-            r.diag_ctx
-                .error("source newtype semantics are not implemented".into())
-                .with_primary_span(ast.node(node_idx).span)
-                .emit(r.diag_ctx);
-        }
+        NodeKind::Newtype => resolve_newtype(r, ast, node_idx),
 
         // ── View (e.g. `.print'builtin`) ───────────────────────────
         NodeKind::View => resolve_view(r, ast, node_idx),
 
-        // ── Symbol literal `.id` — name is not a scope lookup ──────
-        NodeKind::Symbol => {}
+        // ── Standalone symbol literal `.id` ────────────────────────
+        NodeKind::Symbol => {
+            r.diag_ctx
+                .error(
+                    "standalone symbol literals `.name` are not supported as runtime values".into(),
+                )
+                .with_primary_span(ast.node(node_idx).span)
+                .emit(r.diag_ctx);
+        }
+
+        // ── Unsupported surface constructs ─────────────────────────
+        NodeKind::ResetExpr => {
+            r.diag_ctx
+                .error(
+                    "`reset` expressions are not supported; declare an `effect` with `catch k` instead"
+                        .into(),
+                )
+                .with_primary_span(ast.node(node_idx).span)
+                .emit(r.diag_ctx);
+            let children = ast.fixed_children(node_idx);
+            resolve_names(r, ast, children[0]);
+            resolve_names(r, ast, children[1]);
+        }
+        NodeKind::ShiftExpr => {
+            r.diag_ctx
+                .error(
+                    "`shift` expressions are not supported; declare an `effect` with `catch k` instead"
+                        .into(),
+                )
+                .with_primary_span(ast.node(node_idx).span)
+                .emit(r.diag_ctx);
+            let children = ast.fixed_children(node_idx);
+            resolve_names(r, ast, children[0]);
+            r.push_scope(node_idx, None);
+            if !children[1].is_null() && ast.node(children[1]).kind == NodeKind::Id {
+                bind_pattern_identifier(r, ast, children[1], NodeKind::LetDecl);
+            }
+            resolve_names(r, ast, children[2]);
+            r.pop_scope();
+        }
+        NodeKind::Object => {
+            r.diag_ctx
+                .error(
+                    "anonymous Object literals `{ ... }` are not supported; define a `struct` or use `Map`"
+                        .into(),
+                )
+                .with_primary_span(ast.node(node_idx).span)
+                .emit(r.diag_ctx);
+            for &item in ast.multi_children(node_idx) {
+                if ast.node(item).kind == NodeKind::Property {
+                    resolve_names(r, ast, ast.fixed_children(item)[1]);
+                } else {
+                    resolve_names(r, ast, item);
+                }
+            }
+        }
+        NodeKind::Await => {
+            resolve_names(r, ast, ast.fixed_children(node_idx)[0]);
+        }
 
         // ── Derive ─────────────────────────────────────────────────
         NodeKind::DeriveDef => resolve_derive(r, ast, node_idx),
@@ -168,15 +230,20 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
             crate::imports::resolve_local_use(r, ast, node_idx, Visibility::Package);
         }
 
-        // ── Lambda ─────────────────────────────────────────────────
+        // ── Lambda & case closure ──────────────────────────────────
         NodeKind::Lambda => resolve_lambda(r, ast, node_idx),
+        NodeKind::CaseMap | NodeKind::CaseAlternative => resolve_case_closure(r, ast, node_idx),
+        NodeKind::DeferStatement => resolve_defer(r, ast, node_idx),
 
-        // ── Named argument ─────────────────────────────────────────
-        NodeKind::NamedArg => {
+        // ── Named argument / property assignment / spread ──────────
+        NodeKind::NamedArg | NodeKind::PropertyAssignment => {
             // children[0] = parameter name (Id) — do NOT resolve as variable
             // children[1] = value expression — resolve normally
             let children = ast.fixed_children(node_idx);
             resolve_names(r, ast, children[1]);
+        }
+        NodeKind::SpreadArg => {
+            resolve_names(r, ast, ast.fixed_children(node_idx)[0]);
         }
 
         // ── Control flow ───────────────────────────────────────────
@@ -194,9 +261,12 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         NodeKind::ForLoop => resolve_for_loop(r, ast, node_idx),
         NodeKind::WhileLoop => resolve_while_loop(r, ast, node_idx),
         NodeKind::IfStatement => resolve_if(r, ast, node_idx),
+        NodeKind::WhenStatement => resolve_when(r, ast, node_idx),
+        NodeKind::InfixFnCall => resolve_infix_fn_call(r, ast, node_idx),
 
         // ── Effect handler ─────────────────────────────────────────
         NodeKind::HandlesStatement => resolve_handles(r, ast, node_idx),
+        NodeKind::LetHandler => resolve_let_handler_names(r, ast, node_idx),
 
         // ── Qualified access ───────────────────────────────────────
         NodeKind::Projection => resolve_projection(r, ast, node_idx),
@@ -242,9 +312,10 @@ fn resolve_handler_names(r: &mut Resolver, ast: &Ast, node: NodeIndex) {
     let mut seen = std::collections::HashSet::new();
     for &arm in ast.multi_children(node) {
         let children = ast.fixed_children(arm);
-        let pattern = children[0];
-        let span = ast.node(pattern).span;
-        if ast.node(pattern).kind != NodeKind::PatternCall {
+        let raw_pattern = children[0];
+        let (pattern, arm_is_async) = crate::effect::unwrap_handler_pattern(ast, raw_pattern);
+        let span = ast.node(raw_pattern).span;
+        if pattern.is_null() || ast.node(pattern).kind != NodeKind::PatternCall {
             r.diag_ctx
                 .error("an effect handler arm must name an effect and its parameters".into())
                 .with_primary_span(span)
@@ -264,13 +335,32 @@ fn resolve_handler_names(r: &mut Resolver, ast: &Ast, node: NodeIndex) {
                 .emit(r.diag_ctx);
             continue;
         }
+        let effect_name = str_interner::get(effect.name);
+        let def_is_async = !effect.def_node.is_null()
+            && ast.node(effect.def_node).kind == NodeKind::AsyncEffectDef;
+        if def_is_async && !arm_is_async {
+            r.diag_ctx
+                .error(format!(
+                    "handler for `async effect {effect_name}` must be marked `async`"
+                ))
+                .with_primary_span(span)
+                .emit(r.diag_ctx);
+        } else if !def_is_async && arm_is_async {
+            r.diag_ctx
+                .error(format!(
+                    "`async` handler arm cannot handle synchronous effect `{effect_name}`"
+                ))
+                .with_primary_span(span)
+                .emit(r.diag_ctx);
+        }
         if !seen.insert(symbol) {
             r.diag_ctx
                 .error("duplicate handler for the same effect".into())
                 .with_primary_span(span)
                 .emit(r.diag_ctx);
         }
-        let expected = ast.multi_children(effect.def_node).len();
+        let def_params = ast.multi_children(effect.def_node);
+        let expected = def_params.len();
         let params = ast.multi_children(pattern);
         if params.len() != expected {
             r.diag_ctx
@@ -283,14 +373,21 @@ fn resolve_handler_names(r: &mut Resolver, ast: &Ast, node: NodeIndex) {
         }
         r.handler_arms.insert(arm);
         r.push_scope(arm, None);
-        for &param in params {
-            if !matches!(ast.node(param).kind, NodeKind::Id | NodeKind::Underscore) {
-                r.diag_ctx
-                    .error("handler parameter destructuring is not yet implemented".into())
-                    .with_primary_span(ast.node(param).span)
-                    .emit(r.diag_ctx);
+        for (idx, &param) in params.iter().enumerate() {
+            let is_catch = def_params
+                .get(idx)
+                .is_some_and(|&def_p| ast.node(def_p).kind == NodeKind::ParamCatch);
+            if is_catch {
+                if !matches!(ast.node(param).kind, NodeKind::Id | NodeKind::Underscore) {
+                    r.diag_ctx
+                        .error("continuation parameter cannot be destructured".into())
+                        .with_primary_span(ast.node(param).span)
+                        .emit(r.diag_ctx);
+                }
+                resolve_pattern_with_mode(r, ast, param, NodeKind::LetDecl, false);
+            } else {
+                resolve_pattern_with_mode(r, ast, param, NodeKind::LetDecl, true);
             }
-            resolve_pattern(r, ast, param, NodeKind::LetDecl);
         }
         resolve_names(r, ast, children[1]);
         r.pop_scope();
@@ -371,6 +468,7 @@ fn prepare_scope_tree(
             | NodeKind::ExtendDef
             | NodeKind::ExtendTraitDef => prepare_scope_tree(r, ast, inner, None),
             NodeKind::UseStatement => r.imports.uses.push((scope, inner, visibility)),
+            NodeKind::DeriveDef => r.pending_derives.push((scope, inner)),
             _ => {}
         }
     }
@@ -387,6 +485,7 @@ fn forward_declare_one(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         NodeKind::FunctionDef
             | NodeKind::StructDef
             | NodeKind::EnumDef
+            | NodeKind::Newtype
             | NodeKind::TraitDef
             | NodeKind::EffectDef
             | NodeKind::AsyncEffectDef
@@ -458,6 +557,18 @@ fn forward_declare_one(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
             let sym_id = r.define_symbol(name_str, SymbolKind::Type, node_idx, Visibility::Package);
             r.symbol_mut(sym_id).type_index = type_idx;
         }
+        NodeKind::Newtype => {
+            let children = ast.fixed_children(node_idx);
+            let name_str = ast.node(children[0]).str_id;
+            let type_idx = r.register_type(TypeKind::Newtype {
+                name: name_str,
+                inner: type_pool::Intrinsic::Unit.type_index(),
+            });
+            r.type_pool.get_mut(type_idx).size = 8;
+            r.type_pool.get_mut(type_idx).align = 8;
+            let sym_id = r.define_symbol(name_str, SymbolKind::Type, node_idx, Visibility::Package);
+            r.symbol_mut(sym_id).type_index = type_idx;
+        }
         NodeKind::TraitDef => {
             let children = ast.fixed_children(node_idx);
             let name_str = ast.node(children[0]).str_id;
@@ -503,23 +614,62 @@ fn forward_declare_one(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
             let _ = r.define_symbol(name_str, SymbolKind::Type, node_idx, Visibility::Package);
         }
         NodeKind::ConstDecl | NodeKind::LetDecl | NodeKind::VarDecl => {
-            let name = ast.fixed_children(node_idx)[0];
-            if ast.node(name).kind == NodeKind::Id {
+            let children = ast.fixed_children(node_idx);
+            let name = children[0];
+            let has_else = children.len() > 3 && !children[3].is_null();
+            let sym_kind = if kind == NodeKind::ConstDecl {
+                SymbolKind::Constant
+            } else {
+                SymbolKind::Variable
+            };
+            if ast.node(name).kind == NodeKind::Id && !has_else {
                 r.define_symbol(
                     ast.node(name).str_id,
-                    if kind == NodeKind::ConstDecl {
-                        SymbolKind::Constant
-                    } else {
-                        SymbolKind::Variable
-                    },
+                    sym_kind,
                     node_idx,
                     Visibility::Package,
                 );
             } else {
-                r.diag_ctx
-                    .error("module value destructuring is not implemented".into())
-                    .with_primary_span(ast.node(name).span)
-                    .emit(r.diag_ctx);
+                let mut leaves = Vec::new();
+                if !has_else && collect_module_binding_leaves(ast, name, &mut leaves) {
+                    let mut seen_in_decl = std::collections::HashSet::new();
+                    for leaf in leaves {
+                        let leaf_name = ast.node(leaf).str_id;
+                        if !seen_in_decl.insert(leaf_name) {
+                            r.diag_ctx
+                                .error("pattern binds the same name more than once".into())
+                                .with_primary_span(ast.node(leaf).span)
+                                .emit(r.diag_ctx);
+                            continue;
+                        }
+                        if !r.options.detached_package_roots.contains(&node_idx)
+                            && let Some(existing) = r.lookup_current_scope(leaf_name)
+                        {
+                            if r.symbols[existing.0 as usize].def_node == node_idx {
+                                r.node_symbols.insert(leaf, existing);
+                            } else {
+                                r.diag_ctx
+                                    .error(format!(
+                                        "duplicate definition `{}`",
+                                        str_interner::get(leaf_name)
+                                    ))
+                                    .with_primary_span(ast.node(leaf).span)
+                                    .emit(r.diag_ctx);
+                            }
+                            continue;
+                        }
+                        let sym =
+                            r.define_symbol(leaf_name, sym_kind, node_idx, Visibility::Package);
+                        if !r.options.detached_package_roots.contains(&node_idx) {
+                            r.node_symbols.insert(leaf, sym);
+                        }
+                    }
+                } else {
+                    r.diag_ctx
+                        .error("module value destructuring is not implemented".into())
+                        .with_primary_span(ast.node(name).span)
+                        .emit(r.diag_ctx);
+                }
             }
         }
         NodeKind::StructField | NodeKind::EnumVariant => {
@@ -540,12 +690,30 @@ fn forward_declare_one(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
             let children = ast.fixed_children(node_idx);
             if !children.is_empty() {
                 forward_declare_one(r, ast, children[0]);
+                let visibility = if kind == NodeKind::PrivateDef {
+                    Visibility::Private
+                } else {
+                    Visibility::Public
+                };
                 if let Some(&symbol) = r.node_symbols.get(&children[0]) {
-                    r.symbol_mut(symbol).visibility = if kind == NodeKind::PrivateDef {
-                        Visibility::Private
-                    } else {
-                        Visibility::Public
-                    };
+                    r.symbol_mut(symbol).visibility = visibility;
+                }
+                let mut target_decl = children[0];
+                while !target_decl.is_null()
+                    && matches!(
+                        ast.node(target_decl).kind,
+                        NodeKind::PubDef | NodeKind::PrivateDef | NodeKind::GlobalDecl
+                    )
+                {
+                    target_decl = ast.fixed_children(target_decl)[0];
+                }
+                if !target_decl.is_null() {
+                    let current = r.current_scope;
+                    for sym in &mut r.symbols {
+                        if sym.scope == current && sym.def_node == target_decl {
+                            sym.visibility = visibility;
+                        }
+                    }
                 }
             }
         }
@@ -563,6 +731,7 @@ fn forward_declare_one(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         NodeKind::FunctionDef
             | NodeKind::StructDef
             | NodeKind::EnumDef
+            | NodeKind::Newtype
             | NodeKind::TraitDef
             | NodeKind::EffectDef
             | NodeKind::AsyncEffectDef
@@ -628,21 +797,31 @@ fn resolve_id(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex, str_id: str_inte
 fn resolve_let_or_const(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex, kind: NodeKind) {
     let children = ast.fixed_children(node_idx);
     // [0] pattern  [1] type  [2] value  [3] else
-    // Resolve value first (before binding the pattern).
+    // Resolve value, type, and else branch BEFORE binding the pattern.
     if children.len() > 2 {
         resolve_names(r, ast, children[2]);
     }
     if children.len() > 1 {
         resolve_names(r, ast, children[1]);
     }
-    resolve_pattern(r, ast, children[0], kind);
+    let has_else = children.len() > 3 && !children[3].is_null();
+    if has_else {
+        if ast.node(children[3]).kind == NodeKind::Block {
+            resolve_names(r, ast, children[3]);
+        } else {
+            r.push_scope(node_idx, None);
+            resolve_names(r, ast, children[3]);
+            r.pop_scope();
+        }
+    }
+    resolve_pattern_with_mode(r, ast, children[0], kind, has_else);
     if let Some(&symbol) = r.node_symbols.get(&children[0]) {
         r.node_symbols.insert(node_idx, symbol);
     }
 
     // If `const name = .foo'builtin`, promote the binding to BuiltinFunction
     // so calls lower to CallBuiltin.
-    if kind == NodeKind::ConstDecl && children.len() > 2 {
+    if !has_else && kind == NodeKind::ConstDecl && children.len() > 2 {
         let pat = children[0];
         let rhs = children[2];
         if !pat.is_null()
@@ -656,23 +835,29 @@ fn resolve_let_or_const(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex, kind: 
             r.builtin_fns.insert(pat_sym, builtin_id);
         }
     }
-
-    if children.len() > 3 {
-        resolve_names(r, ast, children[3]);
-    }
 }
 
-/// `var pat: Type = value`
+/// `var pat: Type = value else { ... }`
 fn resolve_var_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     let children = ast.fixed_children(node_idx);
-    // [0] pattern  [1] type  [2] value
+    // [0] pattern  [1] type  [2] value  [3] else
     if children.len() > 2 {
         resolve_names(r, ast, children[2]);
     }
     if children.len() > 1 {
         resolve_names(r, ast, children[1]);
     }
-    resolve_pattern(r, ast, children[0], NodeKind::VarDecl);
+    let has_else = children.len() > 3 && !children[3].is_null();
+    if has_else {
+        if ast.node(children[3]).kind == NodeKind::Block {
+            resolve_names(r, ast, children[3]);
+        } else {
+            r.push_scope(node_idx, None);
+            resolve_names(r, ast, children[3]);
+            r.pop_scope();
+        }
+    }
+    resolve_pattern_with_mode(r, ast, children[0], NodeKind::VarDecl, has_else);
     if let Some(&symbol) = r.node_symbols.get(&children[0]) {
         r.node_symbols.insert(node_idx, symbol);
     }
@@ -688,6 +873,9 @@ fn resolve_global_decl(r: &mut Resolver, ast: &Ast, node: NodeIndex) {
                 | NodeKind::StructDef
                 | NodeKind::EnumDef
                 | NodeKind::ImplDef
+                | NodeKind::ImplTraitDef
+                | NodeKind::ExtendDef
+                | NodeKind::ExtendTraitDef
         )
     {
         r.diag_ctx
@@ -1169,6 +1357,34 @@ fn resolve_typealias(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     }
 }
 
+/// `newtype Name = type_expr`
+fn resolve_newtype(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    let children = ast.fixed_children(node_idx);
+    if children.len() < 2 {
+        return;
+    }
+    let name_node = children[0];
+    let type_expr = children[1];
+    resolve_names(r, ast, type_expr);
+
+    let name_str = ast.node(name_node).str_id;
+    let sym_id = if let Some(existing) = r.lookup_current_scope(name_str) {
+        existing
+    } else {
+        let type_idx = r.register_type(TypeKind::Newtype {
+            name: name_str,
+            inner: type_pool::Intrinsic::Unit.type_index(),
+        });
+        r.type_pool.get_mut(type_idx).size = 8;
+        r.type_pool.get_mut(type_idx).align = 8;
+        let sym_id = r.define_symbol(name_str, SymbolKind::Type, node_idx, Visibility::Package);
+        r.symbol_mut(sym_id).type_index = type_idx;
+        sym_id
+    };
+    r.node_symbols.insert(name_node, sym_id);
+    r.node_symbols.insert(node_idx, sym_id);
+}
+
 fn resolve_typealias_target(
     r: &mut Resolver,
     ast: &Ast,
@@ -1208,15 +1424,42 @@ fn resolve_view(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     }
     let object = children[0];
     let view_id_node = children[1];
-    resolve_names(r, ast, object);
-
     let view_name = str_interner::get(ast.node(view_id_node).str_id);
+    if view_name == "builtin" && !object.is_null() && ast.node(object).kind == NodeKind::Symbol {
+        r.node_scopes.insert(object, r.current_scope);
+        if let Some(&id_node) = ast.fixed_children(object).first()
+            && !id_node.is_null()
+        {
+            r.node_scopes.insert(id_node, r.current_scope);
+        }
+    } else {
+        resolve_names(r, ast, object);
+    }
+
     if view_name != "builtin" {
         // Other views (`'type`, …) are not resolved here yet.
         return;
     }
 
-    if !r.options.builtin_access && !r.options.privileged_nodes.contains(&node_idx) {
+    let is_privileged = r.options.builtin_access || r.options.privileged_nodes.contains(&node_idx);
+    let has_ffi_node = r.options.ffi_nodes.contains(&node_idx);
+
+    if !is_privileged && !has_ffi_node {
+        if !object.is_null()
+            && ast.node(object).kind == NodeKind::Symbol
+            && let Some(&sym_id_node) = ast.fixed_children(object).first()
+            && !sym_id_node.is_null()
+        {
+            let symbol_name = str_interner::get(ast.node(sym_id_node).str_id);
+            if is_ffi_builtin_name(&symbol_name) {
+                let span = ast.node(node_idx).span;
+                r.diag_ctx
+                    .error("FFI builtin requires `[ffi] allow = true` in package.toml".to_string())
+                    .with_primary_span(span)
+                    .emit(r.diag_ctx);
+                return;
+            }
+        }
         let span = ast.node(node_idx).span;
         r.diag_ctx
             .error(
@@ -1246,6 +1489,25 @@ fn resolve_view(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         return;
     }
     let symbol_name = str_interner::get(ast.node(sym_children[0]).str_id);
+    if !is_privileged {
+        if !is_ffi_builtin_name(&symbol_name) {
+            let span = ast.node(node_idx).span;
+            r.diag_ctx
+                .error(
+                    "`\'builtin` view is only allowed in privileged packages (std/core/alloc)"
+                        .to_string(),
+                )
+                .with_primary_span(span)
+                .emit(r.diag_ctx);
+            return;
+        }
+        if symbol_name == "__ffi_dlopen"
+            && let Some(allowlist) = r.options.ffi_library_allowlists.get(&node_idx)
+        {
+            r.restricted_dlopen_views
+                .insert(node_idx, allowlist.clone());
+        }
+    }
     match r.resolve_builtin_view(node_idx, &symbol_name) {
         Some(sym_id) => {
             r.node_symbols.insert(node_idx, sym_id);
@@ -1258,6 +1520,13 @@ fn resolve_view(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                 .emit(r.diag_ctx);
         }
     }
+}
+
+fn is_ffi_builtin_name(symbol_name: &str) -> bool {
+    matches!(
+        symbol_name,
+        "__ffi_dlopen" | "__ffi_dlsym" | "__ffi_call" | "__ffi_call4" | "__ffi_call6"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,12 +1583,42 @@ fn resolve_lambda(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     r.pop_scope();
 }
 
+fn resolve_case_closure(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    r.push_scope(node_idx, None);
+    let mut arms = Vec::new();
+    crate::flatten_case_arms(ast, node_idx, &mut arms);
+    for arm in arms {
+        let previous = r.current_scope;
+        r.push_scope(arm, None);
+        r.node_scopes.insert(arm, r.current_scope);
+        let children = ast.fixed_children(arm);
+        resolve_pattern(r, ast, children[0], NodeKind::CaseArm);
+        resolve_names(r, ast, children[1]);
+        r.current_scope = previous;
+    }
+    r.pop_scope();
+}
+
+fn resolve_defer(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    r.push_scope(node_idx, None);
+    resolve_names(r, ast, ast.fixed_children(node_idx)[0]);
+    r.pop_scope();
+}
+
 // ---------------------------------------------------------------------------
 // Control flow
 // ---------------------------------------------------------------------------
 
 fn validate_control_placement(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) {
     let kind = ast.node(node).kind;
+    let keyword = match kind {
+        NodeKind::OptionPropagation => "?",
+        NodeKind::ErrorPropagation => "!",
+        NodeKind::ReturnStatement => "return",
+        NodeKind::ResumeStatement => "resume",
+        NodeKind::BreakStatement => "break",
+        _ => "continue",
+    };
     let is_loop_control = matches!(kind, NodeKind::BreakStatement | NodeKind::ContinueStatement);
     let label = is_loop_control
         .then(|| ast.fixed_children(node)[0])
@@ -1331,9 +1630,21 @@ fn validate_control_placement(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) {
         let entry = &r.scopes[id.0 as usize];
         if !entry.node.is_null() {
             let owner = ast.node(entry.node).kind;
+            if owner == NodeKind::DeferStatement {
+                r.diag_ctx
+                    .error(format!("`{keyword}` cannot exit a `defer` block"))
+                    .with_primary_span(ast.node(node).span)
+                    .emit(r.diag_ctx);
+                return;
+            }
             if matches!(
                 owner,
-                NodeKind::FunctionDef | NodeKind::TraitDeriveFn | NodeKind::Lambda
+                NodeKind::FunctionDef
+                    | NodeKind::TraitDeriveFn
+                    | NodeKind::Lambda
+                    | NodeKind::CaseMap
+                    | NodeKind::CaseAlternative
+                    | NodeKind::HandlesStatement
             ) || (owner == NodeKind::CaseArm && r.handler_arms.contains(&entry.node))
             {
                 allowed = !is_loop_control;
@@ -1358,14 +1669,6 @@ fn validate_control_placement(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) {
         scope = entry.parent;
     }
     if !allowed {
-        let keyword = match kind {
-            NodeKind::OptionPropagation => "?",
-            NodeKind::ErrorPropagation => "!",
-            NodeKind::ReturnStatement => "return",
-            NodeKind::ResumeStatement => "resume",
-            NodeKind::BreakStatement => "break",
-            _ => "continue",
-        };
         let context = if is_loop_control {
             "a loop body"
         } else {
@@ -1427,6 +1730,119 @@ fn resolve_if(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     resolve_names(r, ast, children[2]);
 }
 
+fn resolve_when(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    let arms = ast.multi_children(node_idx);
+    let mut seen_else = false;
+    for (idx, &arm) in arms.iter().enumerate() {
+        if arm.is_null() {
+            continue;
+        }
+        r.node_scopes.insert(arm, r.current_scope);
+        match ast.node(arm).kind {
+            NodeKind::ConditionArm => {
+                let children = ast.fixed_children(arm);
+                resolve_names(r, ast, children[0]);
+                let body = children[1];
+                if !body.is_null() && ast.node(body).kind != NodeKind::Block {
+                    r.push_scope(arm, None);
+                    resolve_names(r, ast, body);
+                    r.pop_scope();
+                } else {
+                    resolve_names(r, ast, body);
+                }
+            }
+            NodeKind::ElseConditionArm => {
+                if seen_else {
+                    r.diag_ctx
+                        .error("at most one `else` arm is allowed in `when`".into())
+                        .with_primary_span(ast.node(arm).span)
+                        .emit(r.diag_ctx);
+                } else if idx + 1 != arms.len() {
+                    r.diag_ctx
+                        .error("the `else` arm in `when` must be the last arm".into())
+                        .with_primary_span(ast.node(arm).span)
+                        .emit(r.diag_ctx);
+                }
+                seen_else = true;
+                let body = ast.fixed_children(arm)[0];
+                if !body.is_null() && ast.node(body).kind != NodeKind::Block {
+                    r.push_scope(arm, None);
+                    resolve_names(r, ast, body);
+                    r.pop_scope();
+                } else {
+                    resolve_names(r, ast, body);
+                }
+            }
+            _ => resolve_names(r, ast, arm),
+        }
+    }
+}
+
+fn infix_fn_name(r: &Resolver<'_>, ast: &Ast, node_idx: NodeIndex) -> Option<str_interner::StrId> {
+    let direct = ast.node(node_idx).str_id;
+    if direct != str_interner::StrId::from_raw(0) {
+        return Some(direct);
+    }
+    let children = ast.fixed_children(node_idx);
+    if children.len() < 2 || children[0].is_null() || children[1].is_null() {
+        return None;
+    }
+    let lhs_span = ast.node(children[0]).span;
+    let rhs_span = ast.node(children[1]).span;
+    if lhs_span.hi() >= rhs_span.lo() {
+        return None;
+    }
+    let between = rustc_span::Span::new(lhs_span.hi(), rhs_span.lo());
+    let snippet = r.diag_ctx.source_map().span_to_snippet(between).ok()?;
+    let (tokens, _) = lexer::tokenize(&snippet);
+    let tok = tokens
+        .into_iter()
+        .find(|t| t.kind == lexer::TokenKind::Id)?;
+    let slice = snippet.get(tok.from as usize..tok.to as usize)?;
+    Some(str_interner::intern(slice))
+}
+
+fn resolve_infix_fn_call(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    let children = ast.fixed_children(node_idx);
+    resolve_names(r, ast, children[0]);
+    resolve_names(r, ast, children[1]);
+    let Some(fn_name) = infix_fn_name(r, ast, node_idx) else {
+        let span = ast.node(node_idx).span;
+        r.diag_ctx
+            .error("missing function identifier in infix call".into())
+            .with_primary_span(span)
+            .emit(r.diag_ctx);
+        return;
+    };
+    match r.lookup_with_visibility(fn_name) {
+        Ok(Some(sym_id)) => {
+            r.node_symbols.insert(node_idx, sym_id);
+        }
+        Err(_) => {
+            r.diag_ctx
+                .error(format!(
+                    "`{}` is not visible from this module",
+                    str_interner::get(fn_name)
+                ))
+                .with_primary_span(ast.node(node_idx).span)
+                .emit(r.diag_ctx);
+        }
+        Ok(None) => {
+            let name = str_interner::get(fn_name);
+            let span = ast.node(node_idx).span;
+            r.diag_ctx
+                .error(format!("undefined name `{name}`"))
+                .with_primary_span(span)
+                .with_label(
+                    span,
+                    format!("`{name}` is not defined in this scope"),
+                    Level::Error,
+                )
+                .emit(r.diag_ctx);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handles statement (effect handler)
 // ---------------------------------------------------------------------------
@@ -1434,14 +1850,33 @@ fn resolve_if(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
 fn resolve_handles(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     let children = ast.fixed_children(node_idx);
     // [0] effect  [1] ret_type  [2] body   multi: params
+    resolve_names(r, ast, children[0]); // effect expr in enclosing scope
+    r.handler_arms.insert(node_idx);
     r.push_scope(node_idx, None);
-    resolve_names(r, ast, children[0]); // effect expr
     for &param in ast.multi_children(node_idx) {
         resolve_param(r, ast, param);
     }
     resolve_names(r, ast, children[1]); // ret_type
     resolve_names(r, ast, children[2]); // body
     r.pop_scope();
+}
+
+fn resolve_let_handler_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
+    let children = ast.fixed_children(node_idx);
+    // [0] effect_node  [1] pat  [2] type_ann  [3] value
+    resolve_names(r, ast, children[0]);
+    if children.len() > 2 {
+        resolve_names(r, ast, children[2]);
+    }
+    if children.len() > 3 {
+        resolve_names(r, ast, children[3]);
+    }
+    if children.len() > 1 {
+        resolve_pattern(r, ast, children[1], NodeKind::LetDecl);
+        if let Some(&symbol) = r.node_symbols.get(&children[1]) {
+            r.node_symbols.insert(node_idx, symbol);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,23 +1983,90 @@ pub(crate) fn resolve_pattern(
     pattern: NodeIndex,
     declaration: NodeKind,
 ) {
-    if matches!(declaration, NodeKind::CaseArm | NodeKind::ForLoop) {
-        crate::pattern_bindings::prepare(r, ast, pattern);
-    }
-    resolve_pattern_names(r, ast, pattern, declaration);
+    let refutable = matches!(declaration, NodeKind::CaseArm | NodeKind::ForLoop);
+    resolve_pattern_with_mode(r, ast, pattern, declaration, refutable);
 }
 
-fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_kind: NodeKind) {
+pub(crate) fn resolve_pattern_with_mode(
+    r: &mut Resolver,
+    ast: &Ast,
+    pattern: NodeIndex,
+    declaration: NodeKind,
+    refutable: bool,
+) {
+    if refutable {
+        let sym_kind = if declaration == NodeKind::ConstDecl {
+            SymbolKind::Constant
+        } else {
+            SymbolKind::Variable
+        };
+        crate::pattern_bindings::prepare_with_kind(r, ast, pattern, sym_kind);
+    }
+    resolve_pattern_names(r, ast, pattern, declaration, refutable);
+}
+
+fn collect_module_binding_leaves(ast: &Ast, pat: NodeIndex, out: &mut Vec<NodeIndex>) -> bool {
+    if pat.is_null() {
+        return false;
+    }
+    match ast.node(pat).kind {
+        NodeKind::Id => {
+            out.push(pat);
+            true
+        }
+        NodeKind::Underscore => true,
+        NodeKind::PatternTuple | NodeKind::PatternCall => ast
+            .multi_children(pat)
+            .iter()
+            .all(|&child| collect_module_binding_leaves(ast, child, out)),
+        NodeKind::PatternTyped => {
+            collect_module_binding_leaves(ast, ast.fixed_children(pat)[0], out)
+        }
+        NodeKind::PatternExtendedCall => ast.multi_children(pat).iter().all(|&entry| {
+            if entry.is_null() {
+                return false;
+            }
+            match ast.node(entry).kind {
+                NodeKind::Id => {
+                    out.push(entry);
+                    true
+                }
+                NodeKind::Property | NodeKind::PropertyPattern => {
+                    collect_module_binding_leaves(ast, ast.fixed_children(entry)[1], out)
+                }
+                NodeKind::PatternRestBind => {
+                    let inner = ast.fixed_children(entry)[0];
+                    inner.is_null() || ast.node(inner).kind == NodeKind::Underscore
+                }
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn resolve_pattern_names(
+    r: &mut Resolver,
+    ast: &Ast,
+    pat_idx: NodeIndex,
+    _decl_kind: NodeKind,
+    refutable: bool,
+) {
     if pat_idx.is_null() {
         return;
     }
     r.node_scopes.insert(pat_idx, r.current_scope);
     let kind = ast.node(pat_idx).kind;
     let str_id = ast.node(pat_idx).str_id;
+    let sym_kind = if _decl_kind == NodeKind::ConstDecl {
+        SymbolKind::Constant
+    } else {
+        SymbolKind::Variable
+    };
 
     match kind {
         NodeKind::Id => {
-            if matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop)
+            if refutable
                 && let Some(symbol) = r.lookup(str_id)
                 && r.symbols[symbol.0 as usize].kind == SymbolKind::EnumVariant
             {
@@ -1574,7 +2076,12 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
             bind_pattern_identifier(r, ast, pat_idx, _decl_kind);
         }
         NodeKind::PatternTyped => {
-            if !matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop) {
+            if !refutable
+                && !matches!(
+                    _decl_kind,
+                    NodeKind::LetDecl | NodeKind::VarDecl | NodeKind::ConstDecl
+                )
+            {
                 r.diag_ctx
                     .error("typed patterns are supported in match, matches and for".into())
                     .with_primary_span(ast.node(pat_idx).span)
@@ -1582,9 +2089,13 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
             }
             let children = ast.fixed_children(pat_idx);
             resolve_names(r, ast, children[1]);
-            if ast.node(children[0]).kind == NodeKind::Id {
-                r.node_scopes.insert(children[0], r.current_scope);
-                bind_pattern_identifier(r, ast, children[0], _decl_kind);
+            if !children[0].is_null() {
+                if ast.node(children[0]).kind == NodeKind::Id {
+                    r.node_scopes.insert(children[0], r.current_scope);
+                    bind_pattern_identifier(r, ast, children[0], _decl_kind);
+                } else {
+                    resolve_pattern_names(r, ast, children[0], _decl_kind, refutable);
+                }
             }
         }
 
@@ -1599,29 +2110,24 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
         | NodeKind::Unit => {}
 
         NodeKind::PatternOr => {
-            check_composite_pattern_context(r, ast, pat_idx, _decl_kind);
+            check_composite_pattern_context(r, ast, pat_idx, refutable);
             let children = ast.fixed_children(pat_idx);
             let original = r.scopes[r.current_scope.0 as usize].bindings.clone();
-            resolve_pattern_names(r, ast, children[0], _decl_kind);
+            resolve_pattern_names(r, ast, children[0], _decl_kind, refutable);
             // Names introduced by the left path are not available before the
             // corresponding right-path binding has actually been encountered.
             r.scopes[r.current_scope.0 as usize].bindings = original;
-            resolve_pattern_names(r, ast, children[1], _decl_kind);
+            resolve_pattern_names(r, ast, children[1], _decl_kind, refutable);
         }
         NodeKind::PatternAsBind => {
-            check_composite_pattern_context(r, ast, pat_idx, _decl_kind);
+            check_composite_pattern_context(r, ast, pat_idx, refutable);
             let children = ast.fixed_children(pat_idx);
-            resolve_pattern_names(r, ast, children[0], _decl_kind);
+            resolve_pattern_names(r, ast, children[0], _decl_kind, refutable);
             let alias_node = children[1];
             r.node_scopes.insert(alias_node, r.current_scope);
             let alias_str = ast.node(alias_node).str_id;
             let sym_id = r.node_symbols.get(&alias_node).copied().unwrap_or_else(|| {
-                r.define_symbol(
-                    alias_str,
-                    SymbolKind::Variable,
-                    alias_node,
-                    Visibility::Private,
-                )
+                r.define_symbol(alias_str, sym_kind, alias_node, Visibility::Private)
             });
             r.scopes[r.current_scope.0 as usize]
                 .bindings
@@ -1630,35 +2136,61 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
         }
         NodeKind::PatternIfGuard => {
             let children = ast.fixed_children(pat_idx);
-            resolve_pattern_names(r, ast, children[0], _decl_kind);
+            resolve_pattern_names(r, ast, children[0], _decl_kind, refutable);
             resolve_names(r, ast, children[1]); // guard expression
         }
         NodeKind::PatternOptionSome => {
-            if !matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop) {
+            if !refutable {
                 r.diag_ctx
                     .error("some patterns are supported in match, matches and for".into())
                     .with_primary_span(ast.node(pat_idx).span)
                     .emit(r.diag_ctx);
             }
-            resolve_pattern_names(r, ast, ast.fixed_children(pat_idx)[0], _decl_kind);
+            resolve_pattern_names(
+                r,
+                ast,
+                ast.fixed_children(pat_idx)[0],
+                _decl_kind,
+                refutable,
+            );
         }
-        NodeKind::PatternList | NodeKind::PatternTuple | NodeKind::PatternRecord => {
-            if kind == NodeKind::PatternList
-                && !matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop)
-            {
+        NodeKind::PatternRecord => {
+            r.diag_ctx
+                .error(
+                    "anonymous record patterns `{ ... }` require a struct type name `TypeName { ... }`"
+                        .into(),
+                )
+                .with_primary_span(ast.node(pat_idx).span)
+                .emit(r.diag_ctx);
+            for &child in ast.multi_children(pat_idx) {
+                if matches!(
+                    ast.node(child).kind,
+                    NodeKind::Property | NodeKind::PropertyPattern
+                ) {
+                    resolve_pattern_names(
+                        r,
+                        ast,
+                        ast.fixed_children(child)[1],
+                        _decl_kind,
+                        refutable,
+                    );
+                } else {
+                    resolve_pattern_names(r, ast, child, _decl_kind, refutable);
+                }
+            }
+        }
+        NodeKind::PatternList | NodeKind::PatternTuple => {
+            if kind == NodeKind::PatternList && !refutable {
                 r.diag_ctx
                     .error("List patterns are supported in match, matches and for".into())
                     .with_primary_span(ast.node(pat_idx).span)
                     .emit(r.diag_ctx);
             }
             if ast.node(pat_idx).kind == NodeKind::PatternTuple
+                && !refutable
                 && !matches!(
                     _decl_kind,
-                    NodeKind::LetDecl
-                        | NodeKind::VarDecl
-                        | NodeKind::ConstDecl
-                        | NodeKind::CaseArm
-                        | NodeKind::ForLoop
+                    NodeKind::LetDecl | NodeKind::VarDecl | NodeKind::ConstDecl
                 )
             {
                 r.diag_ctx
@@ -1670,14 +2202,19 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
                     .emit(r.diag_ctx);
             }
             for &child in ast.multi_children(pat_idx) {
-                resolve_pattern_names(r, ast, child, _decl_kind);
+                resolve_pattern_names(r, ast, child, _decl_kind, refutable);
             }
         }
-        NodeKind::PatternCall | NodeKind::PatternExtendedCall => {
-            if !matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop) {
+        NodeKind::PatternCall => {
+            if !refutable
+                && !matches!(
+                    _decl_kind,
+                    NodeKind::LetDecl | NodeKind::VarDecl | NodeKind::ConstDecl
+                )
+            {
                 r.diag_ctx
                     .error(
-                        "constructor patterns are supported only in match and matches expressions"
+                        "constructor patterns are supported only in match, matches, and newtype bindings"
                             .into(),
                     )
                     .with_primary_span(ast.node(pat_idx).span)
@@ -1686,7 +2223,60 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
             let children = ast.fixed_children(pat_idx);
             resolve_names(r, ast, children[0]); // constructor
             for &arg in ast.multi_children(pat_idx) {
-                resolve_pattern_names(r, ast, arg, _decl_kind);
+                resolve_pattern_names(r, ast, arg, _decl_kind, refutable);
+            }
+        }
+        NodeKind::PatternExtendedCall => {
+            if !refutable
+                && !matches!(
+                    _decl_kind,
+                    NodeKind::LetDecl | NodeKind::VarDecl | NodeKind::ConstDecl
+                )
+            {
+                r.diag_ctx
+                    .error(
+                        "struct patterns are supported only in declarations, parameters, and match"
+                            .into(),
+                    )
+                    .with_primary_span(ast.node(pat_idx).span)
+                    .emit(r.diag_ctx);
+            }
+            let children = ast.fixed_children(pat_idx);
+            resolve_names(r, ast, children[0]); // struct type
+            for &entry in ast.multi_children(pat_idx) {
+                if entry.is_null() {
+                    continue;
+                }
+                match ast.node(entry).kind {
+                    NodeKind::Id => {
+                        r.node_scopes.insert(entry, r.current_scope);
+                        bind_pattern_identifier(r, ast, entry, _decl_kind);
+                    }
+                    NodeKind::Property | NodeKind::PropertyPattern => {
+                        r.node_scopes.insert(entry, r.current_scope);
+                        resolve_pattern_names(
+                            r,
+                            ast,
+                            ast.fixed_children(entry)[1],
+                            _decl_kind,
+                            refutable,
+                        );
+                    }
+                    NodeKind::PatternRestBind => {
+                        r.node_scopes.insert(entry, r.current_scope);
+                        let rest = ast.fixed_children(entry)[0];
+                        if !rest.is_null() && ast.node(rest).kind != NodeKind::Underscore {
+                            r.diag_ctx
+                                .error(
+                                    "struct rest pattern `...` cannot bind a variable; use `...` to ignore remaining fields"
+                                        .into(),
+                                )
+                                .with_primary_span(ast.node(entry).span)
+                                .emit(r.diag_ctx);
+                        }
+                    }
+                    _ => resolve_pattern_names(r, ast, entry, _decl_kind, refutable),
+                }
             }
         }
         NodeKind::PatternRestBind => {
@@ -1696,7 +2286,7 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
                 r.node_scopes.insert(name_node, r.current_scope);
                 let name = ast.node(name_node).str_id;
                 let symbol = r.node_symbols.get(&name_node).copied().unwrap_or_else(|| {
-                    r.define_symbol(name, SymbolKind::Variable, name_node, Visibility::Private)
+                    r.define_symbol(name, sym_kind, name_node, Visibility::Private)
                 });
                 r.scopes[r.current_scope.0 as usize]
                     .bindings
@@ -1705,7 +2295,7 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
             }
         }
         NodeKind::PatternNot => {
-            if !matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop) {
+            if !refutable {
                 r.diag_ctx
                     .error("not patterns are supported in match, matches and for".into())
                     .with_primary_span(ast.node(pat_idx).span)
@@ -1717,41 +2307,41 @@ fn resolve_pattern_names(r: &mut Resolver, ast: &Ast, pat_idx: NodeIndex, _decl_
             let previous = r.current_scope;
             r.push_scope(pat_idx, None);
             let inner = ast.fixed_children(pat_idx)[0];
-            crate::pattern_bindings::prepare(r, ast, inner);
-            resolve_pattern_names(r, ast, inner, _decl_kind);
+            crate::pattern_bindings::prepare_with_kind(r, ast, inner, sym_kind);
+            resolve_pattern_names(r, ast, inner, _decl_kind, refutable);
             r.current_scope = previous;
         }
         NodeKind::PatternErrorOk | NodeKind::PatternError | NodeKind::PatternAsync => {
             let children = ast.fixed_children(pat_idx);
-            resolve_pattern_names(r, ast, children[0], _decl_kind);
+            resolve_pattern_names(r, ast, children[0], _decl_kind, refutable);
         }
         NodeKind::PatternTypeFamily => {
             resolve_names(r, ast, ast.fixed_children(pat_idx)[0]);
         }
         NodeKind::PropertyPattern => {
-            if matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop) {
+            if refutable {
                 resolve_property_pattern(r, ast, pat_idx);
                 return;
             }
             let children = ast.fixed_children(pat_idx);
             // [0] property name (Id), [1] pattern
-            resolve_pattern_names(r, ast, children[1], _decl_kind);
+            resolve_pattern_names(r, ast, children[1], _decl_kind, refutable);
         }
         NodeKind::PatternFromExpr => {
             let children = ast.fixed_children(pat_idx);
             resolve_names(r, ast, children[0]);
         }
         NodeKind::PatternAndIs => {
-            if !matches!(_decl_kind, NodeKind::CaseArm | NodeKind::ForLoop) {
+            if !refutable {
                 r.diag_ctx
                     .error("and is patterns are supported in match, matches and for".into())
                     .with_primary_span(ast.node(pat_idx).span)
                     .emit(r.diag_ctx);
             }
             let children = ast.fixed_children(pat_idx);
-            resolve_pattern_names(r, ast, children[0], _decl_kind);
+            resolve_pattern_names(r, ast, children[0], _decl_kind, refutable);
             resolve_names(r, ast, children[1]);
-            resolve_pattern_names(r, ast, children[2], _decl_kind);
+            resolve_pattern_names(r, ast, children[2], _decl_kind, refutable);
         }
         _ => {
             // Treat unknown patterns as expressions.
@@ -1788,13 +2378,8 @@ fn bind_pattern_identifier(r: &mut Resolver, ast: &Ast, node: NodeIndex, declara
     r.node_symbols.insert(node, symbol);
 }
 
-fn check_composite_pattern_context(
-    r: &Resolver,
-    ast: &Ast,
-    node: NodeIndex,
-    declaration: NodeKind,
-) {
-    if !matches!(declaration, NodeKind::CaseArm | NodeKind::ForLoop) {
+fn check_composite_pattern_context(r: &Resolver, ast: &Ast, node: NodeIndex, refutable: bool) {
+    if !refutable {
         r.diag_ctx
             .error("or and as patterns are supported in match, matches and for".into())
             .with_primary_span(ast.node(node).span)
@@ -1903,4 +2488,5 @@ fn resolve_derive(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     for &trait_expr in ast.multi_children(node_idx) {
         resolve_names(r, ast, trait_expr);
     }
+    crate::json_derivation::attach_derive_associated(r, ast, r.current_scope, node_idx);
 }

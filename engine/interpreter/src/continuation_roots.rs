@@ -23,6 +23,20 @@ pub(super) struct ManagedContinuation {
     contract: ContinuationInputContract,
 }
 
+pub(crate) struct WeakFinalizer {
+    owner: WeakObject,
+    reachable: bool,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl WeakFinalizer {
+    pub(crate) fn run_cleanup(&mut self) {
+        if let Some(cb) = self.cleanup.take() {
+            cb();
+        }
+    }
+}
+
 pub(super) const CALLBACKS: ConditionalRootCallbacks = ConditionalRootCallbacks {
     prepare,
     trace,
@@ -79,6 +93,23 @@ impl Vm {
         );
         assert!(previous.is_none(), "capture has exactly one language owner");
     }
+
+    pub(crate) fn register_weak_finalizer(
+        &mut self,
+        target: TaggedValue,
+        cleanup: impl FnOnce() + Send + 'static,
+    ) -> Result<(), VmError> {
+        let ptr = target.as_heap_ptr().ok_or(VmError::TypeError)?;
+        // SAFETY: `target` is a live rooted heap object during the active mutator operation;
+        // `sweep` / `VmRoots::drop` removes unreachable entries before mutators resume.
+        let owner = unsafe { WeakObject::new(ptr) };
+        self.roots.weak_finalizers.push(WeakFinalizer {
+            owner,
+            reachable: false,
+            cleanup: Some(Box::new(cleanup)),
+        });
+        Ok(())
+    }
 }
 
 unsafe fn prepare(context: *const ()) {
@@ -87,6 +118,9 @@ unsafe fn prepare(context: *const ()) {
     let roots = unsafe { &mut *context.cast::<VmRoots>().cast_mut() };
     for continuation in roots.continuations.values_mut() {
         continuation.traced = false;
+    }
+    for finalizer in &mut roots.weak_finalizers {
+        finalizer.reachable = false;
     }
 }
 
@@ -104,7 +138,7 @@ unsafe fn trace(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) -> bool 
         // pointer that no longer owns any captured stack.
         if !task.stacks.has_capture(handle) {
             return false;
-        }
+        };
         if !continuation.traced {
             // SAFETY: the current closure is complete and unswept owners have
             // valid old addresses. Forward only owners already reached.
@@ -119,6 +153,15 @@ unsafe fn trace(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) -> bool 
         }
         true
     });
+    for finalizer in &mut roots.weak_finalizers {
+        if !finalizer.reachable {
+            // SAFETY: `owner` tracks an unswept heap object under STW after closure completion.
+            if unsafe { finalizer.owner.is_reachable() } {
+                unsafe { finalizer.owner.forward() };
+                finalizer.reachable = true;
+            }
+        }
+    }
     changed
 }
 
@@ -140,6 +183,14 @@ unsafe fn sweep(context: *const ()) {
         }
         false
     });
+    roots.weak_finalizers.retain_mut(|finalizer| {
+        if finalizer.reachable {
+            true
+        } else {
+            finalizer.run_cleanup();
+            false
+        }
+    });
 }
 
 unsafe fn forward(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) {
@@ -155,6 +206,10 @@ unsafe fn forward(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) {
                 .visit_captured_contexts_mut(handle, |stack| visit_stack_slots(stack, visitor))
                 .expect("retained owner has a capture");
         }
+    }
+    for finalizer in &mut roots.weak_finalizers {
+        // SAFETY: only reachable finalizers survived `sweep`.
+        unsafe { finalizer.owner.forward() };
     }
 }
 

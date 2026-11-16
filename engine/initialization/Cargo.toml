@@ -11,3 +11,5 @@ gc = { path = "../gc" }
 scheduler = { path = "../scheduler" }
 stack_pool = { path = "../stack_pool" }
 nsbc = { path = "../nsbc" }
+ffi = { path = "../ffi" }
+regex_ffi = { path = "../regex_ffi" }

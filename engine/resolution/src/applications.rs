@@ -29,33 +29,38 @@ fn bind(
     let declaration = r.symbols[method.function.0 as usize].def_node;
     let plan = crate::arguments::plan_method(r, ast, node, declaration, arguments, rhs);
     let mut expected = vec![None; arguments.len()];
-    if let Some(plan) = plan {
-        for (index, binding) in plan.parameters.iter().enumerate() {
-            match &binding.value {
+    if let Some(mut plan) = plan {
+        for (index, binding) in plan.parameters.iter_mut().enumerate() {
+            match &mut binding.value {
                 CallArgumentValue::Explicit { source_index } => {
                     expected[*source_index] = Some(method.parameters[index])
                 }
                 CallArgumentValue::Variadic { source_indices } => {
-                    for &index in source_indices {
+                    for &index in source_indices.iter() {
                         expected[index] = Some(Intrinsic::Any.type_index());
                     }
                 }
-                CallArgumentValue::Default { .. } | CallArgumentValue::MapVariadic { .. } => {}
+                CallArgumentValue::Unpacked { target_type, .. } => {
+                    if let Some(&param_ty) = method.parameters.get(index) {
+                        typing::validate_spread_target_type(r, ast, node, param_ty);
+                        *target_type = Some(param_ty);
+                    }
+                }
+                CallArgumentValue::UnpackedTail
+                | CallArgumentValue::Default { .. }
+                | CallArgumentValue::MapVariadic { .. } => {}
             }
         }
         r.call_arguments.insert(node, plan);
     }
     for (&argument, expected) in arguments.iter().zip(expected) {
-        typing::resolve_types_expected(r, ast, argument, expected);
-        if let Some(expected) = expected {
-            typing::check_expected_type(
-                r,
-                ast,
-                crate::argument_value_node(ast, argument),
-                expected,
-                "application argument",
-            );
-        }
+        typing::resolve_call_argument_or_spread(
+            r,
+            ast,
+            argument,
+            expected,
+            expected.map(|_| "application argument"),
+        );
     }
 }
 
@@ -66,7 +71,12 @@ pub(crate) fn apply(
     ty: TypeIndex,
 ) -> Option<TypeIndex> {
     let method = methods::checked_method(r, ast, call, ty, str_interner::intern("apply"))?;
-    bind(r, ast, call, &method, ast.multi_children(call), None);
+    let arguments = if ast.node(call).kind == NodeKind::InfixFnCall {
+        ast.fixed_children(call)
+    } else {
+        ast.multi_children(call)
+    };
+    bind(r, ast, call, &method, arguments, None);
     r.application_calls.insert(call, method.function);
     Some(method.result)
 }

@@ -25,3 +25,6 @@ rustc_span = { workspace = true }
 
 [dev-dependencies]
 driver = { path = "../driver" }
+pkg_manager = { path = "../pkg_manager" }
+ffi = { path = "../ffi" }
+regex_ffi = { path = "../regex_ffi" }

@@ -25,7 +25,11 @@ pub(crate) fn validate_default_control(r: &Resolver<'_>, ast: &Ast, expression: 
         // Nested callable and handler bodies have their own control context.
         if matches!(
             kind,
-            NodeKind::FunctionDef | NodeKind::TraitDeriveFn | NodeKind::Lambda
+            NodeKind::FunctionDef
+                | NodeKind::TraitDeriveFn
+                | NodeKind::Lambda
+                | NodeKind::CaseMap
+                | NodeKind::CaseAlternative
         ) || (kind == NodeKind::CaseArm && r.handler_arms.contains(&node))
         {
             continue;
@@ -83,6 +87,8 @@ pub(crate) fn validate_default_expansions(r: &Resolver<'_>, ast: &Ast) {
             CallArgumentValue::Default { expression, .. } => Some(expression),
             CallArgumentValue::Explicit { .. }
             | CallArgumentValue::Variadic { .. }
+            | CallArgumentValue::Unpacked { .. }
+            | CallArgumentValue::UnpackedTail
             | CallArgumentValue::MapVariadic { .. } => None,
         })
         .chain(

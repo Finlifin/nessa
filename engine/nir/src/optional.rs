@@ -36,7 +36,8 @@ pub(crate) fn propagate(
     );
     let value = snapshot(value, builder, *block);
     let (null, payload) = split(value, builder, *block);
-    builder.blocks[null.0 as usize].terminator = Terminator::Return(NirValue::Null);
+    let mut null_cur = null;
+    crate::stmt::emit_return(resolved, NirValue::Null, builder, &mut null_cur);
     *block = payload;
     value
 }

@@ -25,6 +25,12 @@ pub enum StructFieldValue {
     Default { expression: NodeIndex },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructPatternPlan {
+    pub type_index: TypeIndex,
+    pub fields: Vec<(u32, NodeIndex)>,
+}
+
 pub(crate) fn unwrap_member(ast: &Ast, mut node: NodeIndex) -> NodeIndex {
     while matches!(ast.node(node).kind, NodeKind::PubDef | NodeKind::PrivateDef) {
         node = ast.fixed_children(node)[0];
@@ -287,6 +293,241 @@ pub(crate) fn resolve_construction(
         );
     }
     Some(ty)
+}
+
+pub(crate) fn is_irrefutable_subpattern(ast: &Ast, node: NodeIndex) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    match ast.node(node).kind {
+        NodeKind::Id | NodeKind::Underscore => true,
+        NodeKind::PatternTuple => ast
+            .multi_children(node)
+            .iter()
+            .all(|&child| is_irrefutable_subpattern(ast, child)),
+        NodeKind::PatternTyped => is_irrefutable_subpattern(ast, ast.fixed_children(node)[0]),
+        NodeKind::PatternExtendedCall => {
+            ast.multi_children(node)
+                .iter()
+                .all(|&entry| match ast.node(entry).kind {
+                    NodeKind::Id => true,
+                    NodeKind::Property | NodeKind::PropertyPattern => {
+                        is_irrefutable_subpattern(ast, ast.fixed_children(entry)[1])
+                    }
+                    NodeKind::PatternRestBind => {
+                        let inner = ast.fixed_children(entry)[0];
+                        inner.is_null() || ast.node(inner).kind == NodeKind::Underscore
+                    }
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn resolve_pattern(
+    r: &mut Resolver<'_>,
+    ast: &Ast,
+    node: NodeIndex,
+    expected: Option<TypeIndex>,
+    irrefutable_only: bool,
+    resolve_child: fn(&mut Resolver<'_>, &Ast, NodeIndex, Option<TypeIndex>),
+) {
+    let callee = ast.fixed_children(node)[0];
+    crate::typing::resolve_types(r, ast, callee);
+    let ty = r
+        .node_symbols
+        .get(&callee)
+        .and_then(|symbol| {
+            let symbol = &r.symbols[symbol.0 as usize];
+            (symbol.kind == SymbolKind::Type).then_some(symbol.type_index)
+        })
+        .or_else(|| r.node_type_values.get(&callee).copied())
+        .and_then(|ty| r.type_pool.canonical_type(ty));
+    let declaration = ty.and_then(|ty| {
+        r.symbols
+            .iter()
+            .find(|symbol| {
+                symbol.type_index == ty
+                    && !symbol.def_node.is_null()
+                    && ast.node(symbol.def_node).kind == NodeKind::StructDef
+            })
+            .map(|symbol| symbol.def_node)
+    });
+    let (Some(ty), Some(declaration)) = (ty, declaration) else {
+        report(
+            r,
+            ast,
+            callee,
+            "struct pattern requires a statically known struct type",
+        );
+        for &entry in ast.multi_children(node) {
+            if matches!(
+                ast.node(entry).kind,
+                NodeKind::Property | NodeKind::PropertyPattern
+            ) {
+                resolve_child(r, ast, ast.fixed_children(entry)[1], None);
+            }
+        }
+        return;
+    };
+
+    let expected_canon = expected.and_then(|exp| r.type_pool.canonical_type(exp));
+    if irrefutable_only {
+        if expected_canon != Some(ty) {
+            let struct_name = crate::typing::type_display_name(&r.type_pool, ty);
+            report(
+                r,
+                ast,
+                node,
+                format!("struct destructuring requires a statically known `{struct_name}` value"),
+            );
+        }
+    } else if let Some(exp) = expected_canon {
+        let is_dynamic = r.type_pool.as_intrinsic(exp) == Some(type_pool::Intrinsic::Any)
+            || matches!(r.type_pool.get(exp).kind, TypeKind::Trait { .. });
+        if exp != ty && !is_dynamic {
+            let struct_name = crate::typing::type_display_name(&r.type_pool, ty);
+            let found_name = crate::typing::type_display_name(&r.type_pool, exp);
+            report(
+                r,
+                ast,
+                node,
+                format!(
+                    "struct pattern `{struct_name}` does not match expected type `{found_name}`"
+                ),
+            );
+        }
+    }
+    r.node_types.insert(node, ty);
+
+    let field_nodes = fields(ast, declaration);
+    let mut seen_slots = vec![false; field_nodes.len()];
+    let mut has_rest = false;
+    let mut valid = true;
+    let mut planned = Vec::new();
+    let saved_scope = r.current_scope;
+    r.current_scope = r.node_scopes.get(&node).copied().unwrap_or(ScopeId::ROOT);
+
+    for &entry in ast.multi_children(node) {
+        if entry.is_null() {
+            continue;
+        }
+        match ast.node(entry).kind {
+            NodeKind::PatternRestBind => {
+                let inner = ast.fixed_children(entry)[0];
+                if !inner.is_null() && ast.node(inner).kind != NodeKind::Underscore {
+                    valid = false;
+                }
+                if has_rest {
+                    report(r, ast, entry, "duplicate `...` in struct pattern");
+                    valid = false;
+                }
+                has_rest = true;
+                continue;
+            }
+            NodeKind::Property | NodeKind::PropertyPattern | NodeKind::Id => {}
+            _ => {
+                report(
+                    r,
+                    ast,
+                    entry,
+                    "struct pattern fields require named properties, identifier shorthand, or `...`",
+                );
+                valid = false;
+                continue;
+            }
+        }
+        let is_shorthand = ast.node(entry).kind == NodeKind::Id;
+        let (name, subpat) = if is_shorthand {
+            (ast.node(entry).str_id, entry)
+        } else {
+            let children = ast.fixed_children(entry);
+            (ast.node(children[0]).str_id, children[1])
+        };
+        let Some(slot) = field_nodes
+            .iter()
+            .position(|&field| ast.node(ast.fixed_children(field)[0]).str_id == name)
+        else {
+            report(
+                r,
+                ast,
+                entry,
+                format!("unknown struct field `{}`", str_interner::get(name)),
+            );
+            valid = false;
+            if !is_shorthand {
+                resolve_child(r, ast, subpat, None);
+            }
+            continue;
+        };
+        if seen_slots[slot] {
+            report(r, ast, entry, "duplicate struct field pattern");
+            valid = false;
+        }
+        seen_slots[slot] = true;
+
+        let field_ty = match crate::associated::member(r, ty, name) {
+            Ok(symbol) => r.symbols[symbol.0 as usize].type_index,
+            Err(error) => {
+                report(r, ast, entry, error);
+                valid = false;
+                TypeIndex::INVALID
+            }
+        };
+
+        if irrefutable_only && !is_irrefutable_subpattern(ast, subpat) {
+            report(
+                r,
+                ast,
+                subpat,
+                "struct declaration bindings require identifiers, underscores, or nested irrefutable patterns",
+            );
+            valid = false;
+            continue;
+        }
+
+        if field_ty != TypeIndex::INVALID {
+            if is_shorthand {
+                r.node_types.insert(subpat, field_ty);
+                if let Some(&sym_id) = r.node_symbols.get(&subpat) {
+                    r.symbols[sym_id.0 as usize].type_index = field_ty;
+                }
+            } else {
+                r.node_types.insert(subpat, field_ty);
+                resolve_child(r, ast, subpat, Some(field_ty));
+            }
+        } else if !is_shorthand {
+            resolve_child(r, ast, subpat, None);
+        }
+        planned.push((slot as u32, subpat));
+    }
+    r.current_scope = saved_scope;
+
+    if !has_rest {
+        for (slot, &field) in field_nodes.iter().enumerate() {
+            if !seen_slots[slot] {
+                let field_name = str_interner::get(ast.node(ast.fixed_children(field)[0]).str_id);
+                report(
+                    r,
+                    ast,
+                    node,
+                    format!("missing struct field `{field_name}` in pattern"),
+                );
+                valid = false;
+            }
+        }
+    }
+
+    if valid {
+        r.struct_patterns.insert(
+            node,
+            StructPatternPlan {
+                type_index: ty,
+                fields: planned,
+            },
+        );
+    }
 }
 
 #[cfg(test)]

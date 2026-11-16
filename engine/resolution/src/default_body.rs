@@ -295,9 +295,16 @@ pub struct DefaultBodyFacts {
     pub error_patterns: HashMap<NodeIndex, crate::ErrorPatternPlan>,
     pub call_arguments: HashMap<NodeIndex, crate::CallArgumentPlan>,
     pub struct_constructions: HashMap<NodeIndex, crate::StructConstructionPlan>,
+    pub struct_patterns: HashMap<NodeIndex, crate::StructPatternPlan>,
     pub enum_constructions: HashMap<NodeIndex, crate::EnumConstructionPlan>,
     pub enum_variants: HashMap<NodeIndex, crate::EnumVariantRef>,
+    pub newtype_constructions: HashMap<NodeIndex, TypeIndex>,
+    pub newtype_wraps: HashMap<NodeIndex, TypeIndex>,
+    pub newtype_patterns: HashMap<NodeIndex, TypeIndex>,
     pub for_loops: HashMap<NodeIndex, crate::ForLoopPlan>,
+    pub handler_applications: HashMap<NodeIndex, crate::HandlerApplicationPlan>,
+    pub handles_statements: HashMap<NodeIndex, crate::HandlesStmtPlan>,
+    pub let_handlers: HashMap<NodeIndex, crate::LetHandlerPlan>,
     pub instance_methods: HashMap<NodeIndex, SymbolId>,
     pub application_calls: HashMap<NodeIndex, SymbolId>,
     pub update_calls: HashMap<NodeIndex, SymbolId>,
@@ -322,9 +329,16 @@ impl DefaultBodyFacts {
             error_patterns: r.error_patterns.clone(),
             call_arguments: r.call_arguments.clone(),
             struct_constructions: r.struct_constructions.clone(),
+            struct_patterns: r.struct_patterns.clone(),
             enum_constructions: r.enum_constructions.clone(),
             enum_variants: r.enum_variants.clone(),
+            newtype_constructions: r.newtype_constructions.clone(),
+            newtype_wraps: r.newtype_wraps.clone(),
+            newtype_patterns: r.newtype_patterns.clone(),
             for_loops: r.for_loops.clone(),
+            handler_applications: r.handler_applications.clone(),
+            handles_statements: r.handles_statements.clone(),
+            let_handlers: r.let_handlers.clone(),
             instance_methods: r.instance_methods.clone(),
             application_calls: r.application_calls.clone(),
             update_calls: r.update_calls.clone(),
@@ -357,10 +371,31 @@ impl DefaultBodyFacts {
             .struct_constructions
             .retain(|node, _| facts.nodes.contains(node));
         facts
+            .struct_patterns
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
             .enum_constructions
             .retain(|node, _| facts.nodes.contains(node));
         facts
             .enum_variants
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
+            .newtype_constructions
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
+            .newtype_wraps
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
+            .newtype_patterns
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
+            .handler_applications
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
+            .handles_statements
+            .retain(|node, _| facts.nodes.contains(node));
+        facts
+            .let_handlers
             .retain(|node, _| facts.nodes.contains(node));
         facts
             .instance_methods
@@ -413,9 +448,16 @@ impl DefaultBodyFacts {
         r.error_patterns = self.error_patterns.clone();
         r.call_arguments = self.call_arguments.clone();
         r.struct_constructions = self.struct_constructions.clone();
+        r.struct_patterns = self.struct_patterns.clone();
         r.enum_constructions = self.enum_constructions.clone();
         r.enum_variants = self.enum_variants.clone();
+        r.newtype_constructions = self.newtype_constructions.clone();
+        r.newtype_wraps = self.newtype_wraps.clone();
+        r.newtype_patterns = self.newtype_patterns.clone();
         r.for_loops = self.for_loops.clone();
+        r.handler_applications = self.handler_applications.clone();
+        r.handles_statements = self.handles_statements.clone();
+        r.let_handlers = self.let_handlers.clone();
         r.instance_methods = self.instance_methods.clone();
         r.application_calls = self.application_calls.clone();
         r.update_calls = self.update_calls.clone();
@@ -499,9 +541,19 @@ pub(crate) fn check_body(
     r.call_arguments.retain(|node, _| !domain.contains(node));
     r.struct_constructions
         .retain(|node, _| !domain.contains(node));
+    r.struct_patterns.retain(|node, _| !domain.contains(node));
     r.enum_constructions
         .retain(|node, _| !domain.contains(node));
+    r.newtype_constructions
+        .retain(|node, _| !domain.contains(node));
+    r.newtype_wraps.retain(|node, _| !domain.contains(node));
+    r.newtype_patterns.retain(|node, _| !domain.contains(node));
     r.for_loops.retain(|node, _| !domain.contains(node));
+    r.handler_applications
+        .retain(|node, _| !domain.contains(node));
+    r.handles_statements
+        .retain(|node, _| !domain.contains(node));
+    r.let_handlers.retain(|node, _| !domain.contains(node));
     r.instance_methods.retain(|node, _| !domain.contains(node));
     r.application_calls.retain(|node, _| !domain.contains(node));
     r.update_calls.retain(|node, _| !domain.contains(node));

@@ -43,6 +43,15 @@ impl Vm {
             Err(error) => return Err(error),
             Ok(None) => {}
         }
+        let left_bytes = self.is_bytes_value(left)?;
+        let right_bytes = self.is_bytes_value(right)?;
+        if left_bytes || right_bytes {
+            return if left_bytes && right_bytes {
+                self.bytes_eq(left, right).map(Some)
+            } else {
+                Ok(Some(false))
+            };
+        }
         match (self.is_scalar_value(left), self.is_scalar_value(right)) {
             (true, true) => self.scalar_equal(left, right).map(Some),
             (true, false) | (false, true) => Ok(Some(false)),

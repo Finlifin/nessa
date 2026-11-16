@@ -69,7 +69,11 @@ impl<'a> Planner<'a> {
                             | NodeKind::ModuleDef
                             | NodeKind::StructDef
                             | NodeKind::EnumDef
+                            | NodeKind::Newtype
                             | NodeKind::ImplDef
+                            | NodeKind::ImplTraitDef
+                            | NodeKind::ExtendDef
+                            | NodeKind::ExtendTraitDef
                     )
             })
             .map(|scope| scope.id)
@@ -196,28 +200,47 @@ impl<'a> Planner<'a> {
                 let kind = self.resolved.ast.node(declaration).kind;
                 match kind {
                     NodeKind::ConstDecl | NodeKind::LetDecl | NodeKind::VarDecl => {
-                        let pattern = self.resolved.ast.fixed_children(declaration)[0];
-                        let Some(&symbol) = self.resolved.node_symbols.get(&pattern) else {
-                            continue;
-                        };
-                        let definition = &self.resolved.symbols[symbol.0 as usize];
-                        if definition.scope != scope.id {
-                            continue;
+                        let bound: Vec<_> = self
+                            .resolved
+                            .symbols
+                            .iter()
+                            .filter(|definition| {
+                                definition.scope == scope.id
+                                    && definition.def_node == declaration
+                                    && matches!(
+                                        definition.kind,
+                                        SymbolKind::Variable | SymbolKind::Constant
+                                    )
+                            })
+                            .map(|definition| (definition.id, definition.type_index))
+                            .collect();
+                        for (symbol, type_index) in &bound {
+                            let global = GlobalId(self.globals.len() as u32);
+                            self.slots.insert(*symbol, global);
+                            self.globals.push(GlobalInfo {
+                                type_index: if *type_index == TypeIndex::INVALID {
+                                    Intrinsic::Any.type_index()
+                                } else {
+                                    *type_index
+                                },
+                                is_mutable: kind != NodeKind::ConstDecl,
+                            });
                         }
-                        if !matches!(definition.kind, SymbolKind::Variable | SymbolKind::Constant) {
-                            continue;
+                        if !bound.is_empty()
+                            || matches!(
+                                self.resolved
+                                    .ast
+                                    .node(self.resolved.ast.fixed_children(declaration)[0])
+                                    .kind,
+                                NodeKind::Underscore
+                                    | NodeKind::PatternTuple
+                                    | NodeKind::PatternExtendedCall
+                                    | NodeKind::PatternTyped
+                                    | NodeKind::PatternCall
+                            )
+                        {
+                            self.statements[owner].push(declaration);
                         }
-                        let global = GlobalId(self.globals.len() as u32);
-                        self.slots.insert(symbol, global);
-                        self.globals.push(GlobalInfo {
-                            type_index: if definition.type_index == TypeIndex::INVALID {
-                                Intrinsic::Any.type_index()
-                            } else {
-                                definition.type_index
-                            },
-                            is_mutable: kind != NodeKind::ConstDecl,
-                        });
-                        self.statements[owner].push(declaration);
                     }
                     NodeKind::FunctionDef
                     | NodeKind::ModuleDef
@@ -414,6 +437,177 @@ impl<'a> Planner<'a> {
                 }
             }
         }
+        for plan in &self.resolved.hash_derivations {
+            let Some(&owner) = self.node_owners.get(&plan.node) else {
+                continue;
+            };
+            let mut functions = HashSet::new();
+            self.hash_component_functions(plan.implementor, &mut HashSet::new(), &mut functions);
+            for function in functions {
+                for target in self.owners_of_symbol(function) {
+                    if owner != target {
+                        self.references[owner].insert(target);
+                    }
+                }
+            }
+        }
+        for plan in &self.resolved.json_derivations {
+            let Some(&owner) = self.node_owners.get(&plan.node) else {
+                continue;
+            };
+            let mut functions = HashSet::new();
+            self.json_component_functions(plan.implementor, &mut HashSet::new(), &mut functions);
+            for &(_, sym, _) in &plan.custom_decoders {
+                functions.insert(sym);
+            }
+            for function in functions {
+                for target in self.owners_of_symbol(function) {
+                    if owner != target {
+                        self.references[owner].insert(target);
+                    }
+                }
+            }
+        }
+        for (&node, plan) in &self.resolved.handler_applications {
+            if let Some(&owner) = self.node_owners.get(&node) {
+                for binding in &plan.handlers {
+                    if let resolution::HandlerBindingKind::CapabilityMethod {
+                        concrete_method: Some(symbol),
+                        ..
+                    } = binding
+                    {
+                        for target in self.owners_of_symbol(*symbol) {
+                            if owner != target {
+                                self.references[owner].insert(target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (&node, plan) in &self.resolved.let_handlers {
+            if let Some(&owner) = self.node_owners.get(&node) {
+                for binding in &plan.handlers {
+                    if let resolution::HandlerBindingKind::CapabilityMethod {
+                        concrete_method: Some(symbol),
+                        ..
+                    } = binding
+                    {
+                        for target in self.owners_of_symbol(*symbol) {
+                            if owner != target {
+                                self.references[owner].insert(target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn hash_component_functions(
+        &self,
+        ty: TypeIndex,
+        visited: &mut HashSet<TypeIndex>,
+        functions: &mut HashSet<SymbolId>,
+    ) {
+        let Some(ty) = self.resolved.type_pool.canonical_type(ty) else {
+            return;
+        };
+        if !visited.insert(ty) {
+            return;
+        };
+        if let Some(method) = self.resolved.type_pool.find_trait_method(
+            ty,
+            self.resolved.type_pool.well_known.hash,
+            str_interner::intern("hash"),
+        ) {
+            if method.func_id != type_pool::DERIVE_FUNC_ID {
+                functions.insert(SymbolId(method.func_id));
+                return;
+            }
+            if !self
+                .resolved
+                .hash_derivations
+                .iter()
+                .any(|plan| plan.implementor == ty)
+            {
+                return;
+            }
+        }
+        match &self.resolved.type_pool.get(ty).kind {
+            TypeKind::Optional { inner } | TypeKind::Newtype { inner, .. } => {
+                self.hash_component_functions(*inner, visited, functions)
+            }
+            TypeKind::Struct { fields, .. } => {
+                for field in fields {
+                    self.hash_component_functions(field.ty, visited, functions);
+                }
+            }
+            TypeKind::Tuple { elements } => {
+                for &element in elements {
+                    self.hash_component_functions(element, visited, functions);
+                }
+            }
+            TypeKind::Enum { variants, .. } => {
+                for field in variants.iter().flat_map(|variant| &variant.fields) {
+                    self.hash_component_functions(field.ty, visited, functions);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn json_component_functions(
+        &self,
+        ty: TypeIndex,
+        visited: &mut HashSet<TypeIndex>,
+        functions: &mut HashSet<SymbolId>,
+    ) {
+        let Some(ty) = self.resolved.type_pool.canonical_type(ty) else {
+            return;
+        };
+        if !visited.insert(ty) {
+            return;
+        }
+        if let Some(method) = self.resolved.type_pool.find_trait_method(
+            ty,
+            self.resolved.type_pool.well_known.json,
+            str_interner::intern("to_json"),
+        ) {
+            if method.func_id != type_pool::DERIVE_FUNC_ID {
+                functions.insert(SymbolId(method.func_id));
+                return;
+            }
+            if !self
+                .resolved
+                .json_derivations
+                .iter()
+                .any(|plan| plan.implementor == ty)
+            {
+                return;
+            }
+        }
+        match &self.resolved.type_pool.get(ty).kind {
+            TypeKind::Optional { inner } | TypeKind::Newtype { inner, .. } => {
+                self.json_component_functions(*inner, visited, functions)
+            }
+            TypeKind::Struct { fields, .. } => {
+                for field in fields {
+                    self.json_component_functions(field.ty, visited, functions);
+                }
+            }
+            TypeKind::Tuple { elements } => {
+                for &element in elements {
+                    self.json_component_functions(element, visited, functions);
+                }
+            }
+            TypeKind::Enum { variants, .. } => {
+                for field in variants.iter().flat_map(|variant| &variant.fields) {
+                    self.json_component_functions(field.ty, visited, functions);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn display_component_functions(
@@ -447,7 +641,7 @@ impl<'a> Planner<'a> {
             }
         }
         match &self.resolved.type_pool.get(ty).kind {
-            TypeKind::Optional { inner } => {
+            TypeKind::Optional { inner } | TypeKind::Newtype { inner, .. } => {
                 self.display_component_functions(*inner, visited, functions)
             }
             TypeKind::Struct { fields, .. } => {
@@ -577,10 +771,12 @@ impl<'a> Planner<'a> {
         let Some(definition) = self.resolved.symbols.get(symbol.0 as usize) else {
             return symbol;
         };
-        if !matches!(
-            self.resolved.ast.node(definition.def_node).kind,
-            NodeKind::TraitDefFn | NodeKind::TraitDeriveFn
-        ) {
+        if definition.def_node.is_null()
+            || !matches!(
+                self.resolved.ast.node(definition.def_node).kind,
+                NodeKind::TraitDefFn | NodeKind::TraitDeriveFn
+            )
+        {
             return symbol;
         }
         let pool = &self.resolved.type_pool;
@@ -727,7 +923,11 @@ impl<'a> Planner<'a> {
         // Constructing a closure does not execute its body or capture globals.
         if matches!(
             ast.node(node).kind,
-            NodeKind::Lambda | NodeKind::FunctionDef | NodeKind::ModuleDef
+            NodeKind::Lambda
+                | NodeKind::CaseMap
+                | NodeKind::CaseAlternative
+                | NodeKind::FunctionDef
+                | NodeKind::ModuleDef
         ) {
             return;
         }
@@ -826,6 +1026,17 @@ impl<'a> Planner<'a> {
                     visited,
                     context,
                 );
+            } else if matches!(
+                ast.node(callee).kind,
+                NodeKind::CaseMap | NodeKind::CaseAlternative
+            ) {
+                let mut arms = Vec::new();
+                resolution::flatten_case_arms(ast, callee, &mut arms);
+                for arm in arms {
+                    for &child in ast.fixed_children(arm) {
+                        self.scan_initializer_in(child, dependencies, visited, context);
+                    }
+                }
             }
         }
         for &child in ast
@@ -875,10 +1086,12 @@ impl<'a> Planner<'a> {
         let Some(definition) = self.resolved.symbols.get(symbol.0 as usize) else {
             return false;
         };
-        if !matches!(
-            ast.node(definition.def_node).kind,
-            NodeKind::TraitDefFn | NodeKind::TraitDeriveFn
-        ) {
+        if definition.def_node.is_null()
+            || !matches!(
+                ast.node(definition.def_node).kind,
+                NodeKind::TraitDefFn | NodeKind::TraitDeriveFn
+            )
+        {
             return false;
         }
         let pool = &self.resolved.type_pool;
@@ -951,6 +1164,13 @@ impl<'a> Planner<'a> {
         {
             return Some(symbol);
         }
+        if self.resolved.ast.node(node).kind == NodeKind::InfixFnCall {
+            return facts
+                .map(|facts| &facts.node_symbols)
+                .unwrap_or(&self.resolved.node_symbols)
+                .get(&node)
+                .copied();
+        }
         if !matches!(
             self.resolved.ast.node(node).kind,
             NodeKind::Call | NodeKind::ExtendedCall
@@ -1015,12 +1235,30 @@ impl<'a> Planner<'a> {
             if let Some(owner) = self.owner_of_symbol(symbol) {
                 dependencies.insert(owner);
             }
-            self.scan_initializer_in(
-                ast.fixed_children(definition.def_node)[2],
-                dependencies,
-                visited,
-                context,
-            );
+            if definition.def_node.is_null() {
+                if let Some(plan) = self
+                    .resolved
+                    .json_derivations
+                    .iter()
+                    .find(|plan| plan.from_json_symbol == Some(symbol))
+                {
+                    let mut seen_types = HashSet::new();
+                    self.scan_json_read_plan(
+                        plan.implementor,
+                        &mut seen_types,
+                        dependencies,
+                        visited,
+                        context,
+                    );
+                }
+            } else {
+                self.scan_initializer_in(
+                    ast.fixed_children(definition.def_node)[2],
+                    dependencies,
+                    visited,
+                    context,
+                );
+            }
         } else if definition.kind == SymbolKind::Type {
             if let Some(owner) = self.owner_of_symbol(symbol) {
                 dependencies.insert(owner);
@@ -1038,6 +1276,15 @@ impl<'a> Planner<'a> {
                     visited,
                     context,
                 ),
+                NodeKind::CaseMap | NodeKind::CaseAlternative => {
+                    let mut arms = Vec::new();
+                    resolution::flatten_case_arms(ast, value, &mut arms);
+                    for arm in arms {
+                        for &child in ast.fixed_children(arm) {
+                            self.scan_initializer_in(child, dependencies, visited, context);
+                        }
+                    }
+                }
                 NodeKind::Id | NodeKind::Projection => {
                     if let Some(&target) = self.resolved.node_symbols.get(&value) {
                         self.scan_called_symbol_in(target, dependencies, visited, context);
@@ -1045,6 +1292,59 @@ impl<'a> Planner<'a> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn scan_json_read_plan(
+        &self,
+        ty: TypeIndex,
+        seen_types: &mut HashSet<TypeIndex>,
+        dependencies: &mut BTreeSet<usize>,
+        visited: &mut HashSet<(SymbolId, Option<SymbolId>)>,
+        context: Option<DefaultScan<'_>>,
+    ) {
+        let Some(canon) = self.resolved.type_pool.canonical_type(ty) else {
+            return;
+        };
+        if !seen_types.insert(canon) {
+            return;
+        }
+        if let Some(plan) = self
+            .resolved
+            .json_derivations
+            .iter()
+            .find(|plan| plan.implementor == canon)
+        {
+            if let Some(&owner) = self.node_owners.get(&plan.node) {
+                dependencies.insert(owner);
+            }
+            for &(_, default_expr) in &plan.struct_field_defaults {
+                self.scan_initializer_in(default_expr, dependencies, visited, context);
+            }
+            for &(_, decoder_sym, _) in &plan.custom_decoders {
+                self.scan_called_symbol_in(decoder_sym, dependencies, visited, context);
+            }
+        }
+        match &self.resolved.type_pool.get(canon).kind {
+            TypeKind::Optional { inner } | TypeKind::Newtype { inner, .. } => {
+                self.scan_json_read_plan(*inner, seen_types, dependencies, visited, context);
+            }
+            TypeKind::Struct { fields, .. } => {
+                for field in fields {
+                    self.scan_json_read_plan(field.ty, seen_types, dependencies, visited, context);
+                }
+            }
+            TypeKind::Tuple { elements } => {
+                for &elem in elements {
+                    self.scan_json_read_plan(elem, seen_types, dependencies, visited, context);
+                }
+            }
+            TypeKind::Enum { variants, .. } => {
+                for field in variants.iter().flat_map(|v| &v.fields) {
+                    self.scan_json_read_plan(field.ty, seen_types, dependencies, visited, context);
+                }
+            }
+            _ => {}
         }
     }
 

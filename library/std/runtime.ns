@@ -1,0 +1,39 @@
+-- std.runtime — garbage collection control, JIT telemetry, and call-stack introspection.
+
+use .builtin.*
+use .collections.List
+
+private const _rt_gc_collect: fn(i64) -> i64 = .__rt_gc_collect'builtin
+private const _rt_backtrace: fn(?String, i64) -> String = .__rt_backtrace'builtin
+private const _host_call: fn(String, List) -> (bool, Any) = .__host_call'builtin
+private const _rt_jit_enabled: fn() -> bool = .__rt_jit_enabled'builtin
+private const _rt_jit_compiled_fns: fn() -> usize = .__rt_jit_compiled_fns'builtin
+private const _rt_jit_code_bytes: fn() -> usize = .__rt_jit_code_bytes'builtin
+private const _rt_jit_deopt_count: fn() -> usize = .__rt_jit_deopt_count'builtin
+
+pub const VERSION: String = "Nessa 0.1.0"
+
+pub fn collect_garbage() -> i64 = _rt_gc_collect(0)
+
+pub fn gc_collections() -> i64 = _rt_gc_collect(1)
+
+pub fn jit_enabled() -> bool = _rt_jit_enabled()
+
+pub fn jit_compiled_functions() -> usize = _rt_jit_compiled_fns()
+
+pub fn jit_code_bytes() -> usize = _rt_jit_code_bytes()
+
+pub fn jit_deopt_count() -> usize = _rt_jit_deopt_count()
+
+pub fn backtrace(.message: ?String = null, .skip: i64 = 1) -> String {
+    _rt_backtrace(message, skip)
+}
+
+pub fn host_call(op: String, args: List) -> !String Any {
+    let (ok, payload) = _host_call(op, args)
+    if ok {
+        payload
+    } else {
+        error payload.as(String)
+    }
+}

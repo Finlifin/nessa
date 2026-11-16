@@ -103,6 +103,10 @@ pub struct Codegen {
     encoding_errors: Vec<EncodingError>,
     enum_descriptors: HashMap<(type_pool::TypeIndex, u32), u16>,
     error_descriptors: HashMap<type_pool::TypeIndex, u16>,
+    method_descriptors: HashMap<u32, u16>,
+    closure_descriptors: HashMap<u32, u16>,
+    call_descriptors: HashMap<u32, u16>,
+    handler_descriptors: HashMap<u64, u32>,
 }
 
 impl Codegen {
@@ -113,6 +117,10 @@ impl Codegen {
             encoding_errors: Vec::new(),
             enum_descriptors: HashMap::new(),
             error_descriptors: HashMap::new(),
+            method_descriptors: HashMap::new(),
+            closure_descriptors: HashMap::new(),
+            call_descriptors: HashMap::new(),
+            handler_descriptors: HashMap::new(),
         }
     }
 
@@ -127,49 +135,137 @@ impl Codegen {
     }
 
     fn compile_checked(mut self, module: &NirModule) -> Result<CodegenOutput, Vec<EncodingError>> {
-        // Reserve narrow enum metadata operands before ordinary value constants.
-        // The archive writer likewise preserves/reorders these checked operands.
+        // Reserve narrow metadata operands (12-bit, then 14-bit, then 17-bit)
+        // before ordinary value constants so large modules with >4096 string/int
+        // constants never truncate `CallMethodFar`, `NewClosureWide`, `CallFar`,
+        // or `PushCapturingHandler` constant pool indices.
         for function in &module.functions {
             for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
-                let NirStmt::Assign(_, expression) = statement else {
+                let NirStmt::Assign(_, expression) = statement.unscoped() else {
                     continue;
                 };
-                if let NirExpr::ErrorOk(_, ty) | NirExpr::ErrorErr(_, ty) = expression.unscoped() {
-                    if !self.error_descriptors.contains_key(ty) {
-                        if self.output_constants.len() >= 4096 {
+                match expression.unscoped() {
+                    NirExpr::ErrorOk(_, ty) | NirExpr::ErrorErr(_, ty) => {
+                        if !self.error_descriptors.contains_key(ty) {
+                            if self.output_constants.len() >= (1 << 12) {
+                                return Err(vec![EncodingError {
+                                    function: function.func_id,
+                                    message:
+                                        "narrow 12-bit metadata descriptors exceed 4096 constants"
+                                            .into(),
+                                }]);
+                            }
+                            self.error_descriptors
+                                .insert(*ty, self.output_constants.len() as u16);
+                            self.output_constants.push(Constant::Type(*ty));
+                        }
+                    }
+                    NirExpr::NewEnum(ty, tag, _) | NirExpr::EnumIs(_, ty, tag) => {
+                        let key = (*ty, *tag);
+                        if !self.enum_descriptors.contains_key(&key) {
+                            if self.output_constants.len() >= (1 << 12) {
+                                return Err(vec![EncodingError {
+                                    function: function.func_id,
+                                    message:
+                                        "enum instructions support at most 4096 distinct variant descriptors"
+                                            .into(),
+                                }]);
+                            }
+                            let index = self.output_constants.len() as u16;
+                            self.enum_descriptors.insert(key, index);
+                            self.output_constants.push(Constant::Enum {
+                                type_index: key.0,
+                                variant: key.1,
+                            });
+                        }
+                    }
+                    NirExpr::MethodCall(_, method, args)
+                        if method.as_u32() >= (1 << 12) || args.len() >= 32 =>
+                    {
+                        let method_id = method.as_u32();
+                        if !self.method_descriptors.contains_key(&method_id) {
+                            if self.output_constants.len() >= (1 << 12) {
+                                return Err(vec![EncodingError {
+                                    function: function.func_id,
+                                    message:
+                                        "CallMethodFar metadata descriptors exceed 4096 narrow constants"
+                                            .into(),
+                                }]);
+                            }
+                            let index = self.output_constants.len() as u16;
+                            self.method_descriptors.insert(method_id, index);
+                            self.output_constants.push(Constant::UInt(method_id as u64));
+                        }
+                    }
+                    NirExpr::NewClosure(func_id, _)
+                        if func_id.0 >= (1 << 12)
+                            && !self.closure_descriptors.contains_key(&func_id.0) =>
+                    {
+                        if self.output_constants.len() >= (1 << 12) {
                             return Err(vec![EncodingError {
                                 function: function.func_id,
-                                message: "Error and enum descriptor operands exceed 4096 constants"
-                                    .into(),
+                                message:
+                                    "NewClosureWide metadata descriptors exceed 4096 narrow constants"
+                                        .into(),
                             }]);
                         }
-                        self.error_descriptors
-                            .insert(*ty, self.output_constants.len() as u16);
-                        self.output_constants.push(Constant::Type(*ty));
+                        let index = self.output_constants.len() as u16;
+                        self.closure_descriptors.insert(func_id.0, index);
+                        self.output_constants.push(Constant::UInt(func_id.0 as u64));
                     }
-                    continue;
+                    _ => {}
                 }
-                let key = match expression.unscoped() {
-                    NirExpr::NewEnum(ty, tag, _) | NirExpr::EnumIs(_, ty, tag) => (*ty, *tag),
-                    _ => continue,
+            }
+        }
+        for function in &module.functions {
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                let NirStmt::Assign(_, expression) = statement.unscoped() else {
+                    continue;
                 };
-                if self.enum_descriptors.contains_key(&key) {
-                    continue;
+                if let NirExpr::Call(func_id, _) | NirExpr::CallWithProof(func_id, _) =
+                    expression.unscoped()
+                    && func_id.0 >= (1 << 14)
+                    && !self.call_descriptors.contains_key(&func_id.0)
+                {
+                    if let Some(&existing) = self.closure_descriptors.get(&func_id.0) {
+                        self.call_descriptors.insert(func_id.0, existing);
+                        continue;
+                    }
+                    if self.output_constants.len() >= (1 << 14) {
+                        return Err(vec![EncodingError {
+                            function: function.func_id,
+                            message: "CallFar metadata descriptors exceed 16384 constants".into(),
+                        }]);
+                    }
+                    let index = self.output_constants.len() as u16;
+                    self.call_descriptors.insert(func_id.0, index);
+                    self.output_constants.push(Constant::UInt(func_id.0 as u64));
                 }
-                if self.output_constants.len() >= 1 << 12 {
-                    return Err(vec![EncodingError {
-                        function: function.func_id,
-                        message:
-                            "enum instructions support at most 4096 distinct variant descriptors"
-                                .into(),
-                    }]);
+            }
+        }
+        for function in &module.functions {
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                if let NirStmt::PushHandler {
+                    effect,
+                    continuation_param: Some(position),
+                    ..
+                } = statement.unscoped()
+                {
+                    let packed = effect.as_u32() as u64 | ((*position as u64) << 32);
+                    if !self.handler_descriptors.contains_key(&packed) {
+                        if self.output_constants.len() >= (1 << 17) {
+                            return Err(vec![EncodingError {
+                                function: function.func_id,
+                                message:
+                                    "PushCapturingHandler metadata descriptors exceed 131072 constants"
+                                        .into(),
+                            }]);
+                        }
+                        let index = self.output_constants.len() as u32;
+                        self.handler_descriptors.insert(packed, index);
+                        self.output_constants.push(Constant::UInt(packed));
+                    }
                 }
-                let index = self.output_constants.len() as u16;
-                self.enum_descriptors.insert(key, index);
-                self.output_constants.push(Constant::Enum {
-                    type_index: key.0,
-                    variant: key.1,
-                });
             }
         }
         let mut functions = Vec::new();
@@ -394,15 +490,19 @@ impl Codegen {
             } => {
                 let register = self.value_to_reg(closure, emitter, layout);
                 if let Some(position) = continuation_param {
-                    let metadata = emitter.add_constant(Constant::UInt(
-                        effect.as_u32() as u64 | ((*position as u64) << 32),
-                    ));
+                    let packed = effect.as_u32() as u64 | ((*position as u64) << 32);
+                    let metadata = self
+                        .handler_descriptors
+                        .get(&packed)
+                        .copied()
+                        .unwrap_or_else(|| emitter.add_constant(Constant::UInt(packed)));
                     emitter.emit(Instruction::push_capturing_handler(register, metadata));
                 } else {
                     emitter.emit(Instruction::push_handler_closure(*effect, register));
                 }
             }
             NirStmt::PopHandler => emitter.emit(Instruction::e_type(Opcode::PopHandler, 0)),
+            NirStmt::AwaitPopHandler => emitter.emit(Instruction::await_pop_handler()),
             NirStmt::Nop => {
                 emitter.emit(Instruction::nop());
             }
@@ -540,6 +640,10 @@ impl Codegen {
                     Instruction::resume_continuation(continuation, value)
                 });
                 emitter.emit(Instruction::mov(dst, Reg(0)));
+            }
+            NirExpr::Await(future) => {
+                let src = self.value_to_reg(future, emitter, layout);
+                emitter.emit(Instruction::await_future(dst, src));
             }
             NirExpr::MethodCall(receiver, method, args) => {
                 // Place args in r0..rN-1.
@@ -733,9 +837,16 @@ impl Codegen {
         if func_id < (1 << 14) {
             emitter.emit(Instruction::call(func_id, arg_count));
         } else {
-            let idx = emitter.add_constant(Constant::UInt(func_id as u64));
-            debug_assert!(idx < (1 << 14));
-            emitter.emit(Instruction::call_far(idx as u16, arg_count));
+            let idx = self
+                .call_descriptors
+                .get(&func_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    let raw = emitter.add_constant(Constant::UInt(func_id as u64));
+                    debug_assert!(raw < (1 << 14));
+                    raw as u16
+                });
+            emitter.emit(Instruction::call_far(idx, arg_count));
         }
     }
 
@@ -749,9 +860,16 @@ impl Codegen {
         if method_str_id < (1 << 12) && arg_count < 32 {
             emitter.emit(Instruction::call_method(recv, method_str_id, arg_count));
         } else {
-            let idx = emitter.add_constant(Constant::UInt(method_str_id as u64));
-            debug_assert!(idx < (1 << 12));
-            emitter.emit(Instruction::call_method_far(recv, idx as u16, arg_count));
+            let idx = self
+                .method_descriptors
+                .get(&method_str_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    let raw = emitter.add_constant(Constant::UInt(method_str_id as u64));
+                    debug_assert!(raw < (1 << 12));
+                    raw as u16
+                });
+            emitter.emit(Instruction::call_method_far(recv, idx, arg_count));
         }
     }
 
@@ -759,13 +877,16 @@ impl Codegen {
         if func_id < (1 << 12) {
             emitter.emit(Instruction::new_closure(dst, func_id, capture_count));
         } else {
-            let idx = emitter.add_constant(Constant::UInt(func_id as u64));
-            debug_assert!(idx < (1 << 12));
-            emitter.emit(Instruction::new_closure_wide(
-                dst,
-                idx as u16,
-                capture_count,
-            ));
+            let idx = self
+                .closure_descriptors
+                .get(&func_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    let raw = emitter.add_constant(Constant::UInt(func_id as u64));
+                    debug_assert!(raw < (1 << 12));
+                    raw as u16
+                });
+            emitter.emit(Instruction::new_closure_wide(dst, idx, capture_count));
         }
     }
 
@@ -1914,5 +2035,50 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn narrow_method_metadata_survives_large_value_constant_pools() {
+        let mut module = make_simple_nir();
+        let function = &mut module.functions[0];
+        function.local_count = 2;
+        let mut far_method_id = str_interner::intern("far_method_probe");
+        while far_method_id.as_u32() < 4096 {
+            far_method_id = str_interner::intern(&format!("pad_sym_{}", far_method_id.as_u32()));
+        }
+        let mut stmts = Vec::with_capacity(4201);
+        for i in 0..4200i64 {
+            stmts.push(NirStmt::Assign(
+                NirLocal(0),
+                NirExpr::Use(NirValue::ConstInt(10_000 + i)),
+            ));
+        }
+        stmts.push(NirStmt::Assign(
+            NirLocal(1),
+            NirExpr::MethodCall(NirValue::Local(NirLocal(0)), far_method_id, vec![]).in_scope(1),
+        ));
+        function.blocks[0].stmts = stmts;
+        function.blocks[0].terminator = Terminator::Return(NirValue::Local(NirLocal(1)));
+
+        let output = try_codegen(&module).expect("codegen succeeds with >4096 value constants");
+        assert!(output.constants.len() > 4200);
+        let far_instr = output.functions[0]
+            .instructions
+            .iter()
+            .filter_map(|&word| Instruction::decode(word))
+            .find(|instr| instr.opcode == Opcode::CallMethodFar)
+            .expect("emitted CallMethodFar");
+        let nsbc::InstructionData::C { payload } = far_instr.data else {
+            panic!("expected C-format instruction");
+        };
+        let (_, _, const_idx) = Instruction::c_call_method(payload);
+        assert!(
+            (const_idx as usize) < 4096,
+            "narrow 12-bit constant index must remain < 4096"
+        );
+        assert!(matches!(
+            output.constants[const_idx as usize],
+            Constant::UInt(v) if v == far_method_id.as_u32() as u64
+        ));
     }
 }

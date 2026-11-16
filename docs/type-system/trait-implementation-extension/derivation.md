@@ -43,32 +43,10 @@ derive_def -> derive expr* for expr
 
 ## 当前实现边界
 
-Eq/PartialEq 支持 struct、enum 和 tuple typealias，生成普通受检函数。Enum 先
-比较 variant，再按声明顺序短路比较字段；嵌套 struct/enum 调用目标 trait 的
-`eq(self, other: T) -> bool` 实现，PartialEq 字段可回退 Eq。Tuple 和 Optional
-字段递归组合；数值、bool、字符串、Unit 与 Type 使用原生值比较。所有派生先
-登记，再检查字段先决条件，因此前向引用与递归 enum 不依赖声明次序。
-
-Any、List、闭包及缺少目标 trait 的字段不能派生比较；无效方法签名会诊断。
-生成函数保留正常调用帧、GC 根与效应处理路径，真实函数身份写入 NSBC，加载
-无需原源码。循环对象的递归比较预算尚未实现。
-
-Hash 派生目前明确诊断未支持，不返回占位 hash。Display及Ord/PartialOrd
-派生见后文，已有路径不代表完整trait设计完成。
-Any 的动态比较尚未选择用户 trait。
-
-
-新源码的 struct Display 派生也发布普通有类型函数 `fn(Self)->String`，
-可通过 `Display` 参数证明调用。其内部使用 builtin ABI4 的 ID120，保持
-原 `Name { field: value, ... }` 字段格式与 Unicode 文本，不以通用 Any
-to_string 替代。入口检查 receiver，返回前检查实际 String；native 验证
-执行函数与全局派生 Display 记录身份、真实签名和布局。删除源码后的归档
-及真实 GC/continuation 多次恢复已验证。旧 sentinel metadata 不自动升级
-为证明可执行目标。此旧字段 formatter 不调用字段的用户 Display 方法。
-
-用户选择暂时保留struct的旧派生行为：struct仍使用ID120，不新增字段Display
-前置要求，Any等已有字段仍沿旧formatter；不把struct内部字段迁移为用户方法调用。
-Enum/Tuple新增派生路径单独实现，调用嵌套struct的Display时仍尊重这个旧实现。
+- **比较派生（`Eq` / `PartialEq` / `Ord` / `PartialOrd`）**：支持 `struct`、`enum`、`newtype` 和 tuple `typealias`，生成普通受检函数并写入 `.nsbc` 归档，执行无需原源码。`Ord` 要求已具备 `Eq`，`PartialOrd` 要求已具备 `PartialEq`。`Any`、`List`、`Map`、闭包及缺少对应全局 trait 的字段在编译期诊断拒绝。
+- **哈希派生（`Hash`）**：支持 `struct`、`enum`、`newtype` 和 tuple `typealias`，组合各字段的全局 `Hash.hash(self) -> u64`（FNV-1a 64-bit 混合变体标签与字段哈希），与标量内建哈希（正规化 `-0.0` 与跨整数位宽数值一致性）保持一致，供 `std.collections.{HashMap, Set}` 使用。
+- **显示派生（`Display`）**：`struct`、`enum`、`newtype` 与 tuple `typealias` 统一采用组合式受检函数降级，逐字段调用全局 `Display.to_string(self) -> String`（字符串字段带引号与转义，自定义 `Display` 直接拼接；`struct` 格式为 `Name { field: value, ... }`，`enum` 为 `E.variant(...)`，`newtype` 为 `Name(inner)`），具备 128 层深度预算、`<cycle>` 环检测与 1 MiB 输出上限。
+- **自定义 Trait 派生（`derive UserTrait for T`）**：当目标 trait 的所有方法均由 `derive fn` 提供默认实现，且目标类型已满足该 trait 的全部父 trait（supertraits）时，可通过 `derive` 直接生成受检实现；若仍含未实现的 `def fn` 必填方法或缺少父 trait 实现，则在编译期明确报错。
 
 
 ## Enum与Tuple的Display派生

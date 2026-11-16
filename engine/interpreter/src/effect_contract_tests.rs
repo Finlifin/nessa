@@ -449,6 +449,7 @@ fn effect_dispatch_derives_resume_input_from_declared_effect_metadata() {
             handler_func: FuncId(0),
             closure_env: handler_closure,
             continuation_param: Some(0),
+            scope_id: 0,
         });
     vm.roots
         .scheduler

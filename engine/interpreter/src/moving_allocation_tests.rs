@@ -214,3 +214,168 @@ fn allocation_slow_paths_reload_moved_receivers_and_payloads() {
         vm.completed_collections() - before
     );
 }
+
+#[test]
+fn native_value_builder_survives_stress_moving_gc_and_scalar_hash_is_cross_type_coherent() {
+    const MARKER: &str = "NESSA_NATIVE_VALUE_MOVEMENT_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "moving_allocation_tests::native_value_builder_survives_stress_moving_gc_and_scalar_hash_is_cross_type_coherent",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("MMTK_STRESS_FACTOR", "1")
+            .env("MMTK_PRECISE_STRESS", "true")
+            .env("MMTK_IMMIX_ALWAYS_DEFRAG", "true")
+            .env("MMTK_IMMIX_DEFRAG_EVERY_BLOCK", "true")
+            .output()
+            .unwrap();
+        eprintln!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    let mut fixture = make_vm();
+    let vm: &mut Vm = &mut fixture;
+    let task = vm.spawn_root(nsbc::FuncId(0));
+    let before = vm.completed_collections();
+
+    let complex = crate::NativeValue::Tuple(vec![
+        crate::NativeValue::I64(0),
+        crate::NativeValue::OptStr(Some("alpha_payload".to_string())),
+        crate::NativeValue::OptStr(None),
+        crate::NativeValue::OptF64(Some(3.5)),
+        crate::NativeValue::List(vec![
+            crate::NativeValue::Str("first_item".to_string()),
+            crate::NativeValue::Str("second_item".to_string()),
+            crate::NativeValue::U64(u64::MAX),
+        ]),
+        crate::NativeValue::StringMap(vec![
+            ("k1".to_string(), crate::NativeValue::Str("v1".to_string())),
+            ("k2".to_string(), crate::NativeValue::Str("v2".to_string())),
+        ]),
+    ]);
+
+    let (built, _) = vm.alloc_native(task, complex).unwrap();
+    let built_root = root(vm, built);
+    assert!(
+        vm.completed_collections() > before + 5,
+        "expected multiple moving collections inside nested NativeValue build"
+    );
+
+    let elems = vm.tuple_values(load(vm, built_root)).unwrap();
+    assert_eq!(elems[0].as_i64(), Some(0));
+    assert_eq!(
+        heap_string_to_owned(elems[1]).as_deref(),
+        Some("alpha_payload")
+    );
+    assert!(elems[2].is_null());
+    assert_eq!(elems[3].as_f64(), Some(3.5));
+
+    let list_root = root(vm, elems[4]);
+    let map_root = root(vm, elems[5]);
+    assert_eq!(
+        heap_string_to_owned(
+            vm.list_get(load(vm, list_root), TaggedValue::from_u64(0))
+                .unwrap()
+        )
+        .as_deref(),
+        Some("first_item")
+    );
+    assert_eq!(
+        heap_string_to_owned(
+            vm.list_get(load(vm, list_root), TaggedValue::from_u64(1))
+                .unwrap()
+        )
+        .as_deref(),
+        Some("second_item")
+    );
+    let k2 = vm.alloc_string("k2").unwrap();
+    let k2_root = root(vm, k2);
+    assert_eq!(
+        heap_string_to_owned(vm.map_get(load(vm, map_root), load(vm, k2_root)).unwrap()).as_deref(),
+        Some("v2")
+    );
+
+    // Verify SCALAR_HASH cross-numeric coherence across ALL 14 numeric intrinsics!
+    let mut hashes_for_one = Vec::new();
+    for kind in [
+        Intrinsic::I8,
+        Intrinsic::I16,
+        Intrinsic::I32,
+        Intrinsic::I64,
+        Intrinsic::I128,
+        Intrinsic::Isize,
+        Intrinsic::U8,
+        Intrinsic::U16,
+        Intrinsic::U32,
+        Intrinsic::U64,
+        Intrinsic::U128,
+        Intrinsic::Usize,
+        Intrinsic::F32,
+        Intrinsic::F64,
+    ] {
+        let casted = vm
+            .cast_value(TaggedValue::from_i64(1), kind.type_index(), 0)
+            .unwrap();
+        let r = root(vm, casted);
+        hashes_for_one.push((kind, vm.scalar_hash(load(vm, r)).unwrap()));
+    }
+    let expected_one = hashes_for_one[0].1;
+    for (kind, h) in &hashes_for_one {
+        assert_eq!(
+            *h, expected_one,
+            "hash(1) mismatch for numeric kind {kind:?}"
+        );
+    }
+
+    // Zero coherence: -0.0f32 == -0.0f64 == +0.0f64 == 0i8 == 0u128
+    let neg_zero_f32 = vm
+        .cast_value(TaggedValue::from_f64(-0.0), Intrinsic::F32.type_index(), 0)
+        .unwrap();
+    let nz32_r = root(vm, neg_zero_f32);
+    let zero_u128 = vm
+        .cast_value(TaggedValue::from_i64(0), Intrinsic::U128.type_index(), 0)
+        .unwrap();
+    let z128_r = root(vm, zero_u128);
+    let h_zero = vm.scalar_hash(TaggedValue::from_i64(0)).unwrap();
+    assert_eq!(vm.scalar_hash(TaggedValue::from_f64(-0.0)).unwrap(), h_zero);
+    assert_eq!(vm.scalar_hash(TaggedValue::from_f64(0.0)).unwrap(), h_zero);
+    assert_eq!(vm.scalar_hash(load(vm, nz32_r)).unwrap(), h_zero);
+    assert_eq!(vm.scalar_hash(load(vm, z128_r)).unwrap(), h_zero);
+
+    // Fractional float coherence: 0.25f32 == 0.25f64
+    let q_f32 = vm
+        .cast_value(TaggedValue::from_f64(0.25), Intrinsic::F32.type_index(), 0)
+        .unwrap();
+    let q32_r = root(vm, q_f32);
+    assert_eq!(
+        vm.scalar_hash(load(vm, q32_r)).unwrap(),
+        vm.scalar_hash(TaggedValue::from_f64(0.25)).unwrap()
+    );
+
+    // Negative integer / float coherence: -5i32 == -5i128 == -5.0f32 == -5.0f64
+    let neg5_i32 = vm
+        .cast_value(TaggedValue::from_i64(-5), Intrinsic::I32.type_index(), 0)
+        .unwrap();
+    let n32_r = root(vm, neg5_i32);
+    let neg5_i128 = vm
+        .cast_value(TaggedValue::from_i64(-5), Intrinsic::I128.type_index(), 0)
+        .unwrap();
+    let n128_r = root(vm, neg5_i128);
+    let neg5_f32 = vm
+        .cast_value(TaggedValue::from_f64(-5.0), Intrinsic::F32.type_index(), 0)
+        .unwrap();
+    let nf32_r = root(vm, neg5_f32);
+    let h_neg5 = vm.scalar_hash(TaggedValue::from_f64(-5.0)).unwrap();
+    assert_eq!(vm.scalar_hash(load(vm, n32_r)).unwrap(), h_neg5);
+    assert_eq!(vm.scalar_hash(load(vm, n128_r)).unwrap(), h_neg5);
+    assert_eq!(vm.scalar_hash(load(vm, nf32_r)).unwrap(), h_neg5);
+}

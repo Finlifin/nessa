@@ -247,4 +247,129 @@ impl Vm {
             .set(destination, TaggedValue::from_bool(result));
         DispatchResult::Continue
     }
+
+    /// Coherent 64-bit hash across scalar values (`Unit`, `null`, `bool`, `char`,
+    /// `String`, `Type`, payload-free `Enum`, and all 14 numeric types).
+    ///
+    /// Equal numbers under `scalar_equal` always produce the exact same `u64`.
+    pub(crate) fn scalar_hash(&self, value: TaggedValue) -> Result<u64, VmError> {
+        if value.is_unit() {
+            return Ok(mix_u64(0x554e_4954_0000_0001));
+        }
+        if value.is_null() {
+            return Ok(mix_u64(0x4e55_4c4c_0000_0002));
+        }
+        if let Some(flag) = value.as_bool() {
+            return Ok(mix_u64(0x424f_4f4c_0000_0000 ^ u64::from(flag)));
+        }
+        if let Some(ch) = value.as_char() {
+            return Ok(mix_u64(0x4348_4152_0000_0000 ^ u64::from(ch as u32)));
+        }
+        if let Some(ty) = value.as_type() {
+            let canonical = self.canonical_type(ty)?;
+            return Ok(mix_u64(
+                0x5459_5045_0000_0000 ^ u64::from(canonical.as_u32()),
+            ));
+        }
+        if let Some((ty, variant)) = value.as_enum() {
+            if self.enum_layout(value)?.is_none() {
+                return Err(VmError::TypeError);
+            }
+            let canonical = self.canonical_type(ty)?;
+            let combined = (u64::from(canonical.as_u32()) << 32) | u64::from(variant);
+            return Ok(mix_u64(0x454e_554d_0000_0000 ^ combined));
+        }
+        // SAFETY: callers retain `value` in registered VM roots within an operation.
+        if let Some(number) = unsafe { Number::from_tagged(value) } {
+            return Ok(hash_canonical_number(number));
+        }
+        if let Some(s) = crate::builtin_ctx::heap_string_to_owned(value) {
+            return Ok(hash_string_bytes(s.as_bytes()));
+        }
+        if let Ok(layout) = self.bytes_layout(value) {
+            return Ok(hash_raw_bytes(layout.as_slice()));
+        }
+        Err(VmError::TypeError)
+    }
+}
+
+fn mix_u64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn hash_nonneg_u128(v: u128) -> u64 {
+    let lo = mix_u64((v as u64) ^ 0x4e55_4d2b_5f30_3031);
+    let hi = mix_u64((v >> 64) as u64);
+    mix_u64(lo ^ hi.rotate_left(29))
+}
+
+fn hash_neg_i128(v: i128) -> u64 {
+    debug_assert!(v < 0);
+    let bits = v as u128;
+    let lo = mix_u64((bits as u64) ^ 0x4e55_4d2d_5f30_3032);
+    let hi = mix_u64((bits >> 64) as u64);
+    mix_u64(lo ^ hi.rotate_left(29))
+}
+
+fn hash_canonical_number(number: Number) -> u64 {
+    // 2^128 as IEEE-754 binary64 (`u128::MAX as f64` rounds up to exactly 2^128).
+    const TWO_POW_128: f64 = 340282366920938463463374607431768211456.0;
+    // -2^127 as IEEE-754 binary64 (`i128::MIN` is exact in f64).
+    const MIN_I128_F64: f64 = -170141183460469231731687303715884105728.0;
+
+    match number {
+        Number::I64(v) => {
+            if v >= 0 {
+                hash_nonneg_u128(v as u128)
+            } else {
+                hash_neg_i128(i128::from(v))
+            }
+        }
+        Number::U64(v) => hash_nonneg_u128(u128::from(v)),
+        Number::I128(v) => {
+            if v >= 0 {
+                hash_nonneg_u128(v as u128)
+            } else {
+                hash_neg_i128(v)
+            }
+        }
+        Number::U128(v) => hash_nonneg_u128(v),
+        Number::F64(x) => {
+            if x.is_nan() {
+                return mix_u64(0x7ff8_0000_dead_beef);
+            }
+            if x == 0.0 {
+                // Covers both +0.0 and -0.0 so -0.0 == +0.0 == 0 share one hash.
+                return hash_nonneg_u128(0);
+            }
+            if x.is_finite() && x.fract() == 0.0 {
+                if (0.0..TWO_POW_128).contains(&x) {
+                    return hash_nonneg_u128(x as u128);
+                }
+                if (MIN_I128_F64..0.0).contains(&x) {
+                    return hash_neg_i128(x as i128);
+                }
+            }
+            mix_u64(x.to_bits() ^ 0x464c_5436_345f_6269)
+        }
+    }
+}
+
+fn hash_string_bytes(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for &b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    mix_u64(h ^ 0x5354_5247_0000_0000)
+}
+
+fn hash_raw_bytes(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for &b in bytes {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    mix_u64(h ^ 0x4259_5453_0000_0000)
 }

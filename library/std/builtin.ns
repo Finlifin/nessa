@@ -29,8 +29,9 @@ pub typealias NoReturn = .NoReturn'builtin
 pub typealias Type = .Type'builtin
 pub typealias IterationStep = .IterationStep'builtin
 
--- Runtime continuation and language trait descriptors.
+-- Runtime continuation, async future handle, and language trait descriptors.
 pub typealias Continuation = .Continuation'builtin
+pub typealias Future = .Future'builtin
 pub typealias Display = .Display'builtin
 pub typealias Hash = .Hash'builtin
 pub typealias Eq = .Eq'builtin
@@ -39,7 +40,10 @@ pub typealias PartialEq = .PartialEq'builtin
 pub typealias PartialOrd = .PartialOrd'builtin
 pub typealias Iterator = .Iterator'builtin
 pub typealias IntoIterator = .IntoIterator'builtin
+pub typealias Json = .Json'builtin
 
 pub typealias List = .List'builtin
 
 pub typealias Map = .Map'builtin
+
+pub typealias Bytes = .Bytes'builtin

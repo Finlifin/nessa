@@ -78,17 +78,20 @@ let value: i64 = entries("answer")
 ```
 
 普通用户代码不能通过impl/字段写入伪造集合内部布局。Map容量目前上限8192，
-动态String键在运行时检查。泛型Map参数、任意Hash/Eq键尚未实现，
+动态String键在运行时检查。对于任意实现了 `Hash` 与 `Eq` 的键类型，`std.collections`
+另提供纯 Nessa 实现的开放寻址 `HashMap` 与 `Set`；静态泛型参数化 `Map(K, V)` 尚未实现，
 `{property | expr}`的匿名Object语法也不作为Map字面量。
 
 ## 基础类型 trait 的当前实现
 
-`std.traits`为全部整数、`f32`/`f64`、`bool`、`char`、`String`、`Unit`和
-`Type`提供显式的`Eq`、`PartialEq`及`Display`实现。实现是普通有类型源码函数，
+`std.traits` 与 `std.scalar` 为全部整数、`f32`/`f64`、`bool`、`char`、`String`、`Unit`和
+`Type`提供显式的`Eq`、`PartialEq`及`Display`实现，并为全部整数、`bool`、`char`、`String`、
+`Unit` 提供 `Hash` 实现。实现是普通有类型源码函数，
 其具体Self签名、函数ABI、impl记录和vtable随NSBC归档保存；载入旧归档不会
 补造这些实现。Eq与PartialEq复用VM的标量比较规则，String按内容比较，128位
 整数保持精度。浮点沿用既有NaN不等于自身、正负零相等的语义；这里的Eq接口
-不额外承诺浮点比较的自反性。Ord/Ordering排序见后文；Hash及集合trait仍未补齐。
+不额外承诺浮点比较的自反性。Ord/Ordering排序见后文；`List`/`Map`/`HashMap`/`Set`/`Deque`
+的 `IntoIterator`/`Iterator`/`PartialEq` 由 `std.collections` 提供（`List` 与 `Map` 不实现全局 `Display`）。
 
 内部`__scalar_eq`避免在Eq函数体内用`==`递归调用自身；Any仅是private native
 helper的参数类型，并不会为Any、闭包、Continuation或集合注册上述trait。

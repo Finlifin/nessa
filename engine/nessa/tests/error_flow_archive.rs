@@ -200,18 +200,20 @@ fn valid_checksum_bad_error_opcode_targets_modes_registers_and_reserved_fields_r
     // register bound can test Reg(31) without changing executable instructions.
     let source = "enum E{bad};fn make(){error E.bad};fn main(){let value:!E i64=make();value match{error E.bad=>println(42),_! =>println(0)}}";
     let mut artifact = compiled(source);
-    let constructors: Vec<_> = artifact
+    let user_start = artifact
         .codegen_output
         .functions
+        .iter()
+        .position(|f| str_interner::get(f.name) == "make")
+        .unwrap();
+    let constructors: Vec<_> = artifact.codegen_output.functions[user_start..]
         .iter()
         .flat_map(|f| f.instructions.iter().copied())
         .filter(|&word| Instruction::decode(word).is_some_and(|i| i.opcode == Opcode::ErrorErr))
         .collect();
     assert_eq!(constructors.len(), 1);
     let original = constructors[0];
-    let owner = artifact
-        .codegen_output
-        .functions
+    let owner = artifact.codegen_output.functions[user_start..]
         .iter_mut()
         .find(|f| f.instructions.contains(&original))
         .unwrap();
@@ -440,7 +442,7 @@ fn unfinalized_error_metadata_non_v4_containers_and_zero_checksums_reject() {
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 9,
+        builtin_abi_version: 11,
         builtins: vec![BuiltinImport {
             id: 1,
             name: "println".into(),

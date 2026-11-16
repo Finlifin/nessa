@@ -1,6 +1,15 @@
--- std.process — process control builtins
+-- std.process — process control, assertions, and child command execution.
 
 use .builtin.*
+use .io.{IoError, io_error_from_code}
+use .traits.*
+
+private const _proc_exec: fn(String, List, ?String) -> (i64, i64, String, String) = .__proc_exec'builtin
+private const _proc_exec_cwd: fn(String, List, ?String, ?String) -> (i64, i64, String, String) = .__proc_exec_cwd'builtin
+private const _proc_shell: fn(String, ?String) -> (i64, i64, String, String) = .__proc_shell'builtin
+private const _proc_shell_cwd: fn(String, ?String, ?String) -> (i64, i64, String, String) = .__proc_shell_cwd'builtin
+private const _proc_pid: fn() -> i64 = .__proc_pid'builtin
+private const _list_init: fn() -> List = .__list_init'builtin
 
 pub const exit: fn(i64) -> NoReturn = .exit'builtin
 pub const panic: fn(Any) -> NoReturn = .panic'builtin
@@ -14,3 +23,74 @@ pub fn assert(condition: bool, .message: Any = "assertion failed") {
 pub fn assert_eq(left: Any, right: Any, .message: Any = "values are not equal") {
     if left != right { panic(message) }
 }
+
+pub struct CommandOutput {
+    pub status: i64,
+    pub stdout: String,
+    pub stderr: String,
+}
+derive Eq, PartialEq, Display for CommandOutput
+
+impl CommandOutput {
+    pub fn success(self) -> bool = self.status == 0
+}
+
+pub fn exec_command(
+    program: String,
+    .args: List = _list_init(),
+    .stdin_data: ?String = null,
+    .cwd: ?String = null,
+) -> !IoError CommandOutput {
+    let (code, exit_code, out, err) = if cwd != null {
+        _proc_exec_cwd(program, args, stdin_data, cwd)
+    } else {
+        _proc_exec(program, args, stdin_data)
+    }
+    if code == 0 {
+        CommandOutput { status: exit_code, stdout: out, stderr: err }
+    } else {
+        error io_error_from_code(code, err)
+    }
+}
+
+pub fn exec(
+    program: String,
+    .args: List = _list_init(),
+    .stdin_data: ?String = null,
+    .cwd: ?String = null,
+) -> !IoError CommandOutput {
+    exec_command(program, args = args, stdin_data = stdin_data, cwd = cwd)
+}
+
+pub fn shell_command(
+    cmd: String,
+    .stdin_data: ?String = null,
+    .cwd: ?String = null,
+) -> !IoError CommandOutput {
+    let (code, exit_code, out, err) = if cwd != null {
+        _proc_shell_cwd(cmd, stdin_data, cwd)
+    } else {
+        _proc_shell(cmd, stdin_data)
+    }
+    if code == 0 {
+        CommandOutput { status: exit_code, stdout: out, stderr: err }
+    } else {
+        error io_error_from_code(code, err)
+    }
+}
+
+pub fn shell(
+    cmd: String,
+    .stdin_data: ?String = null,
+    .cwd: ?String = null,
+) -> !IoError CommandOutput {
+    shell_command(cmd, stdin_data = stdin_data, cwd = cwd)
+}
+
+pub fn shell_available() -> bool {
+    let (code, status, _, _) = _proc_shell("", null)
+    code == 0 and status != 0
+}
+
+pub fn current_pid() -> i64 = _proc_pid()
+pub fn pid() -> i64 = _proc_pid()

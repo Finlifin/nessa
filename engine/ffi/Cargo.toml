@@ -1,0 +1,10 @@
+[package]
+name = "ffi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+interpreter = { path = "../interpreter" }
+libc.workspace = true
+libloading.workspace = true
+runtime = { path = "../runtime" }

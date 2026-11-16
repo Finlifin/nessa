@@ -71,6 +71,54 @@ pub(crate) fn construct(
     )
 }
 
+pub(crate) fn unwrap_call(
+    resolved: &ResolvedAst,
+    call: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> Option<NirValue> {
+    let callee = resolved.ast.fixed_children(call)[0];
+    if resolved.ast.node(callee).kind != ast::NodeKind::Projection {
+        return None;
+    }
+    let children = resolved.ast.fixed_children(callee);
+    if str_interner::get(resolved.ast.node(children[1]).str_id) != "unwrap" {
+        return None;
+    }
+    let receiver = builder.node_type(resolved, children[0])?;
+    resolved.type_pool.error_shape(receiver).ok()??;
+    let value = lower_expr(resolved, children[0], builder, block);
+    let value = snapshot(value, builder, *block);
+    let ok_block = builder.new_block();
+    let err_block = builder.new_block();
+    crate::patterns::test(
+        builder,
+        *block,
+        NirExpr::ErrorIsOk(value).in_source_scope(resolved, call),
+        ok_block,
+        err_block,
+    );
+    let err_payload = emit(
+        builder,
+        err_block,
+        NirExpr::ErrorPayload(value).in_source_scope(resolved, call),
+    );
+    let panic_res = builder.alloc_local();
+    builder.blocks[err_block.0 as usize]
+        .stmts
+        .push(NirStmt::Assign(
+            panic_res,
+            NirExpr::CallBuiltin(runtime::ids::PANIC, vec![err_payload]),
+        ));
+    builder.blocks[err_block.0 as usize].terminator = Terminator::Return(NirValue::Unit);
+    *block = ok_block;
+    Some(emit(
+        builder,
+        ok_block,
+        NirExpr::ErrorPayload(value).in_source_scope(resolved, call),
+    ))
+}
+
 pub(crate) fn propagate(
     resolved: &ResolvedAst,
     node: NodeIndex,
@@ -99,7 +147,8 @@ pub(crate) fn propagate(
         builder,
         error,
     );
-    builder.blocks[error.0 as usize].terminator = Terminator::Return(returned);
+    let mut error_cur = error;
+    crate::stmt::emit_return(resolved, returned, builder, &mut error_cur);
     *block = success;
     emit(
         builder,

@@ -17,6 +17,13 @@ pub(crate) struct LoopTargets {
     pub label: Option<StrId>,
     pub break_to: BlockId,
     pub continue_to: BlockId,
+    pub defer_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CleanupAction {
+    Defer(ast::NodeIndex),
+    PopHandler,
 }
 
 /// Incremental builder for [`NirFunction`].
@@ -69,6 +76,7 @@ pub(crate) struct FunctionBuilder {
     /// Whether this function is a closure.
     pub is_closure: bool,
     pub loop_targets: Vec<LoopTargets>,
+    pub defer_scopes: Vec<Vec<CleanupAction>>,
     /// Source call proven to be the only use of a fresh handler continuation.
     pub consume_continuation_at: Option<ast::NodeIndex>,
 }
@@ -224,6 +232,18 @@ impl FunctionBuilder {
             .unwrap_or(&resolved.for_loops)
             .get(&node)
     }
+    pub fn struct_pattern<'a>(
+        &'a self,
+        resolved: &'a resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<&'a resolution::StructPatternPlan> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.struct_patterns)
+            .unwrap_or(&resolved.struct_patterns)
+            .get(&node)
+    }
     pub fn coercion(
         &self,
         resolved: &resolution::ResolvedAst,
@@ -354,6 +374,84 @@ impl FunctionBuilder {
             .get(&node)
             .cloned()
     }
+    pub fn newtype_construction(
+        &self,
+        resolved: &resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<TypeIndex> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.newtype_constructions)
+            .unwrap_or(&resolved.newtype_constructions)
+            .get(&node)
+            .copied()
+    }
+    pub fn newtype_wrap(
+        &self,
+        resolved: &resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<TypeIndex> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.newtype_wraps)
+            .unwrap_or(&resolved.newtype_wraps)
+            .get(&node)
+            .copied()
+    }
+    pub fn newtype_pattern(
+        &self,
+        resolved: &resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<TypeIndex> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.newtype_patterns)
+            .unwrap_or(&resolved.newtype_patterns)
+            .get(&node)
+            .copied()
+    }
+    pub fn handler_application(
+        &self,
+        resolved: &resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<resolution::HandlerApplicationPlan> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.handler_applications)
+            .unwrap_or(&resolved.handler_applications)
+            .get(&node)
+            .cloned()
+    }
+    pub fn handles_statement(
+        &self,
+        resolved: &resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<resolution::HandlesStmtPlan> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.handles_statements)
+            .unwrap_or(&resolved.handles_statements)
+            .get(&node)
+            .cloned()
+    }
+    pub fn let_handler(
+        &self,
+        resolved: &resolution::ResolvedAst,
+        node: ast::NodeIndex,
+    ) -> Option<resolution::LetHandlerPlan> {
+        self.body_facts
+            .as_ref()
+            .filter(|facts| facts.nodes.contains(&node))
+            .map(|facts| &facts.let_handlers)
+            .unwrap_or(&resolved.let_handlers)
+            .get(&node)
+            .cloned()
+    }
     pub fn new(func_id: FuncId, name: StrId) -> Self {
         Self {
             entry_scope: None,
@@ -385,6 +483,7 @@ impl FunctionBuilder {
             next_func_id: 0,
             is_closure: false,
             loop_targets: Vec::new(),
+            defer_scopes: vec![Vec::new()],
             consume_continuation_at: None,
         }
     }

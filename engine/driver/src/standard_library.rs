@@ -1,10 +1,12 @@
 //! Load trusted standard-library source units into the same compilation graph.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use ast::{Ast, NodeIndex, NodeKind};
 use diagnostic::Diagnostic;
 use resolution::ResolveOptions;
+use sha2::{Digest, Sha256};
 
 use crate::Driver;
 
@@ -13,6 +15,10 @@ const MODULES: &[(&str, &str)] = &[
     ("ordering", include_str!("../../../library/std/ordering.ns")),
     ("traits", include_str!("../../../library/std/traits.ns")),
     ("io", include_str!("../../../library/std/io.ns")),
+    ("fs", include_str!("../../../library/std/fs.ns")),
+    ("path", include_str!("../../../library/std/path.ns")),
+    ("env", include_str!("../../../library/std/env.ns")),
+    ("time", include_str!("../../../library/std/time.ns")),
     ("math", include_str!("../../../library/std/math.ns")),
     ("string", include_str!("../../../library/std/string.ns")),
     ("process", include_str!("../../../library/std/process.ns")),
@@ -20,10 +26,43 @@ const MODULES: &[(&str, &str)] = &[
         "collections",
         include_str!("../../../library/std/collections.ns"),
     ),
+    (
+        "coroutine",
+        include_str!("../../../library/std/coroutine.ns"),
+    ),
+    ("runtime", include_str!("../../../library/std/runtime.ns")),
+    ("json", include_str!("../../../library/std/json.ns")),
     ("range", include_str!("../../../library/std/range.ns")),
     ("scalar", include_str!("../../../library/std/scalar.ns")),
+    ("fmt", include_str!("../../../library/std/fmt.ns")),
+    ("pattern", include_str!("../../../library/std/pattern.ns")),
+    ("bytes", include_str!("../../../library/std/bytes.ns")),
+    ("rand", include_str!("../../../library/std/rand.ns")),
+    ("task", include_str!("../../../library/std/task.ns")),
     ("prelude", include_str!("../../../library/std/prelude.ns")),
 ];
+
+pub(crate) fn std_library_sha256() -> [u8; 32] {
+    static STD_DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+    *STD_DIGEST.get_or_init(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"nessa.std.sources.v1\0");
+        let manifest = include_str!("../../../library/std/package.toml");
+        hasher.update((manifest.len() as u64).to_be_bytes());
+        hasher.update(manifest.as_bytes());
+        let root_mod = include_str!("../../../library/std/mod.ns");
+        hasher.update((root_mod.len() as u64).to_be_bytes());
+        hasher.update(root_mod.as_bytes());
+        hasher.update((MODULES.len() as u64).to_be_bytes());
+        for &(name, source) in MODULES {
+            hasher.update((name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update((source.len() as u64).to_be_bytes());
+            hasher.update(source.as_bytes());
+        }
+        hasher.finalize().into()
+    })
+}
 
 impl Driver {
     pub(crate) fn load_standard_library(
@@ -119,9 +158,92 @@ impl Driver {
             .build();
         Ok((ast, options))
     }
+    pub(crate) fn attach_bundled_script_packages(
+        &self,
+        ast: &mut Ast,
+        options: &mut ResolveOptions,
+        std_root: Option<NodeIndex>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut bundled_mods = Vec::new();
+        for pkg in pkg_manager::bundled_packages() {
+            let manifest = pkg.manifest.manifest();
+            let (pkg_ast, warnings) = self.package_ast(pkg)?;
+            diagnostics.extend(warnings);
+            let body = self.append_source_units(ast, vec![pkg_ast])?[0];
+
+            let (prelude, warnings) =
+                self.parse_source_named("use std.prelude.*", "implicit-bundled-prelude")?;
+            diagnostics.extend(warnings);
+            let prelude_node = self.append_source_units(ast, vec![prelude])?[0];
+            let imports = ast.multi_children(prelude_node).to_vec();
+            options.implicit_imports.extend(imports.iter().copied());
+
+            let mut items = imports;
+            items.extend_from_slice(ast.multi_children(body));
+            let span = ast.node(body).span;
+            let name_id = str_interner::intern(&manifest.name);
+            let name_node = ast.builder(NodeKind::Id, span).set_str_id(name_id).build();
+            let mod_node = ast
+                .builder(NodeKind::ModuleDef, span)
+                .add_child(name_node)
+                .add_multi_children(&items)
+                .build();
+
+            mark_ffi_permissions(ast, mod_node, pkg.manifest.ffi(), options);
+            options.package_roots.insert(mod_node);
+            options.detached_package_roots.insert(mod_node);
+            let identity =
+                crate::identity::bundled_package_identity(&pkg.manifest).map_err(|message| {
+                    let context = diagnostic::DiagnosticContext::new(&self.source_map);
+                    context
+                        .error(format!("invalid bundled package identity: {message}"))
+                        .with_primary_span(span)
+                        .emit(&context);
+                    context.diagnostics().to_vec()
+                })?;
+            options.package_identities.insert(mod_node, identity);
+            if let Some(std_node) = std_root {
+                options
+                    .package_dependencies
+                    .entry(mod_node)
+                    .or_default()
+                    .insert(str_interner::intern("std"), vec![std_node]);
+            }
+            bundled_mods.push((name_id, mod_node));
+        }
+
+        if bundled_mods.is_empty() {
+            return Ok(());
+        }
+
+        let existing = ast.multi_children(ast.root).to_vec();
+        let mut combined = Vec::with_capacity(existing.len() + bundled_mods.len());
+        if let Some(&first) = existing.first() {
+            combined.push(first);
+            for &(_, mod_node) in &bundled_mods {
+                combined.push(mod_node);
+            }
+            combined.extend_from_slice(&existing[1..]);
+        } else {
+            for &(_, mod_node) in &bundled_mods {
+                combined.push(mod_node);
+            }
+        }
+        let root_span = ast.node(ast.root).span;
+        ast.root = ast
+            .builder(NodeKind::FileScope, root_span)
+            .add_multi_children(&combined)
+            .build();
+        let root_deps = options.package_dependencies.entry(ast.root).or_default();
+        for (name_id, mod_node) in bundled_mods {
+            root_deps.entry(name_id).or_default().push(mod_node);
+        }
+        Ok(())
+    }
 }
 
-fn mark_trusted(ast: &Ast, node: NodeIndex, nodes: &mut HashSet<NodeIndex>) {
+pub(crate) fn mark_trusted(ast: &Ast, node: NodeIndex, nodes: &mut HashSet<NodeIndex>) {
     if node.is_null() || !nodes.insert(node) {
         return;
     }
@@ -131,6 +253,41 @@ fn mark_trusted(ast: &Ast, node: NodeIndex, nodes: &mut HashSet<NodeIndex>) {
         .chain(ast.multi_children(node))
     {
         mark_trusted(ast, child, nodes);
+    }
+}
+
+pub(crate) fn mark_ffi_permissions(
+    ast: &Ast,
+    node: NodeIndex,
+    ffi: &pkg_manager::FfiConfig,
+    options: &mut ResolveOptions,
+) {
+    if !ffi.allow {
+        return;
+    }
+    let allowlist = (!ffi.libraries.is_empty())
+        .then(|| ffi.libraries.iter().cloned().collect::<HashSet<String>>());
+    mark_ffi_nodes_recursive(ast, node, allowlist.as_ref(), options);
+}
+
+fn mark_ffi_nodes_recursive(
+    ast: &Ast,
+    node: NodeIndex,
+    allowlist: Option<&HashSet<String>>,
+    options: &mut ResolveOptions,
+) {
+    if node.is_null() || !options.ffi_nodes.insert(node) {
+        return;
+    }
+    if let Some(allowed) = allowlist {
+        options.ffi_library_allowlists.insert(node, allowed.clone());
+    }
+    for &child in ast
+        .fixed_children(node)
+        .iter()
+        .chain(ast.multi_children(node))
+    {
+        mark_ffi_nodes_recursive(ast, child, allowlist, options);
     }
 }
 

@@ -157,6 +157,21 @@ impl<'a> Parser<'a> {
         self.next_token_inner(self.cursor).token
     }
 
+    /// Peek at the `n`-th meaningful token (0-indexed; `peek_nth(0)` == `peek_token()`).
+    pub(crate) fn peek_nth(&self, n: usize) -> Token {
+        if self.cursor >= self.tokens.len() {
+            return Token::EOF;
+        }
+        let mut state = self.next_token_inner(self.cursor);
+        for _ in 0..n {
+            if state.cursor >= self.tokens.len() {
+                return Token::EOF;
+            }
+            state = self.next_token_inner(state.cursor);
+        }
+        state.token
+    }
+
     /// Check if the next sequence of tokens matches the given kinds.
     pub(crate) fn peek(&self, expected: &[TokenKind]) -> bool {
         if self.cursor >= self.tokens.len() {
@@ -238,8 +253,14 @@ impl<'a> Parser<'a> {
             if cursor > 0 && cursor < self.tokens.len() - 1 {
                 let prev = self.tokens[cursor - 1].kind;
                 let next = self.tokens[cursor + 1].kind;
+                let next_is_when_else = next == TokenKind::KwElse
+                    && cursor + 2 < self.tokens.len()
+                    && self.tokens[cursor + 2].kind == TokenKind::FatArrow;
+                let next_is_postfix_elim = matches!(next, TokenKind::Hash | TokenKind::Bang)
+                    && cursor + 2 < self.tokens.len()
+                    && self.tokens[cursor + 2].kind == TokenKind::LBrace;
                 if (prev.can_end_statement() || self.import_glob_end == Some(cursor))
-                    && next.can_start_statement()
+                    && ((next.can_start_statement() && !next_is_postfix_elim) || next_is_when_else)
                 {
                     // Treat newline as semicolon
                     token.kind = TokenKind::Semi;
@@ -270,7 +291,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Skip raw `Newline` tokens only when the immediately following token is one
+    /// of `targets`, without crossing physical semicolons or `Indent`/`Outdent`.
+    pub(crate) fn eat_newlines_before(&mut self, targets: &[TokenKind]) -> bool {
+        let mut idx = self.cursor;
+        while idx < self.tokens.len() && self.tokens[idx].kind == TokenKind::Newline {
+            idx += 1;
+        }
+        if idx < self.tokens.len() && targets.contains(&self.tokens[idx].kind) {
+            self.cursor = idx;
+            true
+        } else {
+            false
+        }
+    }
+
     // -- Span helpers ---------------------------------------------------------
+
+    /// Get the source text of a specific token.
+    pub(crate) fn token_text(&self, token: Token) -> &str {
+        token.text(self.source)
+    }
 
     /// Get the source text of the next token (before consuming it).
     pub(crate) fn next_token_text(&self) -> &str {

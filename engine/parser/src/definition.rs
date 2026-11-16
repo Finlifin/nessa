@@ -1,10 +1,11 @@
-use ast::NodeKind;
+use ast::{NodeIndex, NodeKind};
 use lexer::token::TokenKind;
 
 use crate::basic::{self, Rule, try_multi_in_block, try_multi_with_bracket};
 use crate::error::{ParseErrorKind, ParseResult};
 use crate::expr;
 use crate::parser::{NULL, Parser};
+use crate::pattern;
 use crate::statement;
 
 extern crate str_interner;
@@ -62,6 +63,7 @@ pub fn try_global_def(p: &mut Parser) -> ParseResult {
         .add_child(name)
         .add_child(ty)
         .add_child(value)
+        .add_child(NULL)
         .build();
     Ok(p.ast()
         .builder(NodeKind::GlobalDecl, span)
@@ -75,7 +77,7 @@ pub fn try_assoc_def(p: &mut Parser) -> ParseResult {
     if !p.eat_token(TokenKind::KwAssoc) {
         return Ok(NULL);
     }
-    let inner = if p.peek(&[TokenKind::Id]) {
+    let inner = if basic::is_ident_token(p.peek_token().kind) {
         let name = basic::try_id(p)?;
         p.expect_token(TokenKind::Colon)?;
         let ty = expr::try_expr_without_extended_call(p)?;
@@ -165,7 +167,7 @@ pub fn try_fn_def(p: &mut Parser) -> ParseResult {
 
     let params = try_multi_with_bracket(
         p,
-        &[Rule::comma("function parameter", basic::try_parameter)],
+        &[Rule::comma("function parameter", try_effect_parameter)],
         TokenKind::LParen,
         TokenKind::RParen,
     )?;
@@ -173,7 +175,11 @@ pub fn try_fn_def(p: &mut Parser) -> ParseResult {
     let ret_type = try_return_type(p)?;
     let capability = try_capability(p)?;
 
-    let body = basic::try_block_or_statement(p)?;
+    let body = if p.eat_token(TokenKind::Eq) {
+        expr::try_expr(p)?
+    } else {
+        basic::try_block_or_statement(p)?
+    };
     if body.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -321,17 +327,33 @@ fn try_effect_parameter(p: &mut Parser) -> ParseResult {
 }
 
 // ---------------------------------------------------------------------------
-// Handles statement
+// Handles statement / LetHandler
 // ---------------------------------------------------------------------------
 
-/// `handles(expr)(param*) (-> expr)? ((= expr) | block)`
+/// Parse any of the three documented `handles` forms:
+/// - `handles(eff) [handles(eff2)...] let pat (: T)? = expr` (`LetHandler`)
+/// - `handles(eff)(param*) (-> expr)? ((= expr) | block)` (`HandlesStatement`)
+/// - `handles eff_callee(param*) (-> expr)? => (block | statement)` (`HandlesStatement`)
 pub fn try_handles_def(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
     if !p.eat_token(TokenKind::KwHandles) {
         return Ok(NULL);
     }
 
-    // Parse effect expression in parens: handles(effect_expr)
+    if p.eat_token(TokenKind::KwAsync) || p.peek_token().kind != TokenKind::LParen {
+        return parse_pattern_arrow_handles(p);
+    }
+
+    let first_effect = parse_parenthesized_effect(p)?;
+
+    if p.eat_newlines_before(&[TokenKind::KwHandles, TokenKind::KwLet]) {
+        return parse_let_handler(p, first_effect);
+    }
+
+    parse_parenthesized_handles_statement(p, first_effect)
+}
+
+fn parse_parenthesized_effect(p: &mut Parser) -> ParseResult {
     p.expect_token(TokenKind::LParen)?;
     let effect = expr::try_expr(p)?;
     if effect.is_null() {
@@ -342,18 +364,98 @@ pub fn try_handles_def(p: &mut Parser) -> ParseResult {
         );
     }
     p.expect_token(TokenKind::RParen)?;
+    Ok(effect)
+}
 
-    // Parse handler parameters: (param*)
+fn parse_let_handler(p: &mut Parser, first_effect: NodeIndex) -> ParseResult {
+    let mut effects = vec![first_effect];
+    while p.eat_token(TokenKind::KwHandles) {
+        let eff = parse_parenthesized_effect(p)?;
+        effects.push(eff);
+        p.eat_newlines_before(&[TokenKind::KwHandles, TokenKind::KwLet]);
+    }
+
+    let effect_node = if effects.len() == 1 {
+        effects[0]
+    } else {
+        let first_span = p.ast().node(effects[0]).span;
+        let last_span = p.ast().node(*effects.last().unwrap()).span;
+        let span = if first_span.is_dummy() || last_span.is_dummy() {
+            p.current_span()
+        } else {
+            first_span.to(last_span)
+        };
+        p.ast()
+            .builder(NodeKind::ListOf, span)
+            .add_multi_children(&effects)
+            .build()
+    };
+
+    p.expect_token(TokenKind::KwLet)?;
+
+    let pat = pattern::try_pattern(p)?;
+    if pat.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected pattern after `let` in `handles(...) let`",
+        );
+    }
+
+    let type_ann = if p.eat_token(TokenKind::Colon) {
+        let ty = expr::try_expr_without_extended_call(p)?;
+        if ty.is_null() {
+            let _ = p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected type expression after `:` in `handles(...) let`",
+            );
+        }
+        ty
+    } else {
+        NULL
+    };
+
+    p.expect_token(TokenKind::Eq)?;
+
+    let value = expr::try_expr(p)?;
+    if value.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected expression after `=` in `handles(...) let`",
+        );
+    }
+
+    let span = p.current_span();
+    Ok(p.ast()
+        .builder(NodeKind::LetHandler, span)
+        .add_child(effect_node)
+        .add_child(pat)
+        .add_child(type_ann)
+        .add_child(value)
+        .build())
+}
+
+fn parse_parenthesized_handles_statement(p: &mut Parser, effect: NodeIndex) -> ParseResult {
+    if p.peek_token().kind != TokenKind::LParen {
+        p.expect_token(TokenKind::LParen)?;
+    }
+
     let params = try_multi_with_bracket(
         p,
-        &[Rule::comma("handler parameter", basic::try_parameter)],
+        &[Rule::comma("handler parameter", try_effect_parameter)],
         TokenKind::LParen,
         TokenKind::RParen,
     )?;
 
     let ret_type = try_return_type(p)?;
 
-    let body = basic::try_block_or_statement(p)?;
+    let body = if p.eat_token(TokenKind::Eq) {
+        expr::try_expr(p)?
+    } else {
+        basic::try_block_or_statement(p)?
+    };
     if body.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -363,15 +465,82 @@ pub fn try_handles_def(p: &mut Parser) -> ParseResult {
     }
 
     let span = p.current_span();
-    let idx = p
-        .ast()
+    Ok(p.ast()
         .builder(NodeKind::HandlesStatement, span)
         .add_child(effect)
         .add_child(ret_type)
         .add_child(body)
         .add_multi_children(&params)
-        .build();
-    Ok(idx)
+        .build())
+}
+
+fn parse_handles_callee(p: &mut Parser) -> ParseResult {
+    let _g = p.enter();
+    let mut eff_callee = basic::try_id(p)?;
+    if eff_callee.is_null() {
+        p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected effect name or `(` after `handles`",
+        )?;
+        return Ok(NULL);
+    }
+
+    while p.eat_token(TokenKind::Dot) {
+        let member = basic::try_id(p)?;
+        if member.is_null() {
+            p.err(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected identifier after `.` in `handles` target",
+            )?;
+            return Ok(NULL);
+        }
+        let span = p.current_span();
+        eff_callee = p
+            .ast()
+            .builder(NodeKind::Projection, span)
+            .add_child(eff_callee)
+            .add_child(member)
+            .build();
+    }
+
+    Ok(eff_callee)
+}
+
+fn parse_pattern_arrow_handles(p: &mut Parser) -> ParseResult {
+    let eff_callee = parse_handles_callee(p)?;
+
+    if p.peek_token().kind != TokenKind::LParen {
+        p.expect_token(TokenKind::LParen)?;
+    }
+    let params = try_multi_with_bracket(
+        p,
+        &[Rule::comma("handler parameter", try_effect_parameter)],
+        TokenKind::LParen,
+        TokenKind::RParen,
+    )?;
+
+    let ret_type = try_return_type(p)?;
+    p.expect_token(TokenKind::FatArrow)?;
+
+    let body = basic::try_block_or_statement(p)?;
+    if body.is_null() {
+        let _ = p.err(
+            ParseErrorKind::InvalidSyntax,
+            p.next_token_span(),
+            "Expected handler body after `=>`",
+        );
+    }
+
+    let span = p.current_span();
+    Ok(p.ast()
+        .builder(NodeKind::HandlesStatement, span)
+        .add_child(eff_callee)
+        .add_child(ret_type)
+        .add_child(body)
+        .add_multi_children(&params)
+        .build())
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +567,7 @@ pub fn try_struct_def(p: &mut Parser) -> ParseResult {
         p,
         "struct name",
         &[
-            Rule::comma("struct field", try_struct_field),
+            Rule::comma_or_semicolon("struct field", try_struct_field),
             Rule::semicolon(
                 "definition or statement",
                 statement::try_definition_or_statement,
@@ -420,10 +589,16 @@ pub fn try_struct_def(p: &mut Parser) -> ParseResult {
 fn try_struct_field(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    let modifier = if p.peek(&[TokenKind::KwPub, TokenKind::Id, TokenKind::Colon]) {
+    let modifier = if p.peek_nth(0).kind == TokenKind::KwPub
+        && basic::is_ident_token(p.peek_nth(1).kind)
+        && p.peek_nth(2).kind == TokenKind::Colon
+    {
         p.eat_token(TokenKind::KwPub);
         Some(NodeKind::PubDef)
-    } else if p.peek(&[TokenKind::KwPrivate, TokenKind::Id, TokenKind::Colon]) {
+    } else if p.peek_nth(0).kind == TokenKind::KwPrivate
+        && basic::is_ident_token(p.peek_nth(1).kind)
+        && p.peek_nth(2).kind == TokenKind::Colon
+    {
         p.eat_token(TokenKind::KwPrivate);
         Some(NodeKind::PrivateDef)
     } else {
@@ -498,7 +673,7 @@ pub fn try_enum_def(p: &mut Parser) -> ParseResult {
         p,
         "enum name",
         &[
-            Rule::comma("enum variant", try_enum_variant),
+            Rule::comma_or_semicolon("enum variant", try_enum_variant),
             Rule::semicolon(
                 "definition or statement",
                 statement::try_definition_or_statement,
@@ -520,13 +695,16 @@ pub fn try_enum_def(p: &mut Parser) -> ParseResult {
 fn try_enum_variant(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    let visibility = if p.peek(&[TokenKind::KwPub, TokenKind::Id]) {
-        Some(NodeKind::PubDef)
-    } else if p.peek(&[TokenKind::KwPrivate, TokenKind::Id]) {
-        Some(NodeKind::PrivateDef)
-    } else {
-        None
-    };
+    let visibility =
+        if p.peek_nth(0).kind == TokenKind::KwPub && basic::is_ident_token(p.peek_nth(1).kind) {
+            Some(NodeKind::PubDef)
+        } else if p.peek_nth(0).kind == TokenKind::KwPrivate
+            && basic::is_ident_token(p.peek_nth(1).kind)
+        {
+            Some(NodeKind::PrivateDef)
+        } else {
+            None
+        };
     if visibility.is_some() {
         p.next_token();
     }
@@ -651,7 +829,7 @@ fn try_fn_signature(p: &mut Parser) -> ParseResult {
 
     let params = try_multi_with_bracket(
         p,
-        &[Rule::comma("parameter", basic::try_parameter)],
+        &[Rule::comma("parameter", try_effect_parameter)],
         TokenKind::LParen,
         TokenKind::RParen,
     )?;
@@ -696,7 +874,7 @@ fn try_trait_derive_fn(p: &mut Parser) -> ParseResult {
 
     let params = try_multi_with_bracket(
         p,
-        &[Rule::comma("parameter", basic::try_parameter)],
+        &[Rule::comma("parameter", try_effect_parameter)],
         TokenKind::LParen,
         TokenKind::RParen,
     )?;
@@ -704,7 +882,11 @@ fn try_trait_derive_fn(p: &mut Parser) -> ParseResult {
     let ret_type = try_return_type(p)?;
     let capability = try_capability(p)?;
 
-    let body = basic::try_block_or_statement(p)?;
+    let body = if p.eat_token(TokenKind::Eq) {
+        expr::try_expr(p)?
+    } else {
+        basic::try_block_or_statement(p)?
+    };
     if body.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -1096,10 +1278,11 @@ mod global_tests {
         let value = ast.fixed_children(global)[0];
         assert_eq!(ast.node(value).kind, NodeKind::VarDecl);
         let children = ast.fixed_children(value);
-        assert_eq!(children.len(), 3);
+        assert_eq!(children.len(), 4);
         assert_eq!(str_interner::get(ast.node(children[0]).str_id), "counter");
         assert_eq!(str_interner::get(ast.node(children[1]).str_id), "i64");
         assert_eq!(ast.node(children[2]).kind, NodeKind::Int);
+        assert!(children[3].is_null());
     }
 
     #[test]

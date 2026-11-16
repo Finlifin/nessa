@@ -35,6 +35,12 @@ pub use weak::WeakObject;
 // ObjectHeader — 16 bytes before every heap object
 // ---------------------------------------------------------------------------
 
+/// Maximum 8-byte payload words addressable by a [`PayloadRole::ByteBuffer`] header (25 bits).
+pub const MAX_BYTE_BUFFER_WORDS: usize = 0x1FF_FFFF;
+
+/// Maximum byte capacity of a single [`PayloadRole::ByteBuffer`] allocation (~256 MiB).
+pub const MAX_BYTE_BUFFER_BYTES: usize = MAX_BYTE_BUFFER_WORDS * 8;
+
 /// VM-selected payload interpretation. Only checked allocators may publish
 /// non-default roles; a role is never supplied by source or archive data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +48,7 @@ pub use weak::WeakObject;
 pub enum PayloadRole {
     Ordinary = 0,
     ErrorEnvelope = 1,
+    ByteBuffer = 2,
 }
 
 /// Header stored at the beginning of every GC-managed heap object (16 bytes).
@@ -52,9 +59,9 @@ pub enum PayloadRole {
 ///
 /// `gc_meta` bit layout:
 ///   - bits 0-2:   reserved for MMTk (mark bit, forwarding bits)
-///   - bits 3-18:  payload word count (up to 65535 words)
-///   - bits 19-21: VM payload role (0 ordinary, 1 Error envelope)
-///   - bits 22-30: reserved
+///   - bits 3-18:  payload word count low 16 bits (up to 65535 words for ordinary objects)
+///   - bits 19-21: VM payload role (0 ordinary, 1 Error envelope, 2 No-Scan ByteBuffer)
+///   - bits 22-30: reserved for ordinary objects; high 9 bits of payload word count for ByteBuffer
 ///   - bit  31:    pinned flag
 ///
 /// `hash_or_fwd`:  identity hash (normal) / forwarding pointer (during GC).
@@ -65,22 +72,41 @@ pub struct ObjectHeader {
     pub hash_or_fwd: u64,
 }
 
+fn next_object_hash() -> u64 {
+    static HASH_COUNTER: AtomicU64 = AtomicU64::new(1);
+    HASH_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 impl ObjectHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
     pub fn new(type_index: TypeIndex, payload_words: u16) -> Self {
-        static HASH_COUNTER: AtomicU64 = AtomicU64::new(1);
         Self {
             type_index,
             gc_meta: (payload_words as u32) << 3,
-            hash_or_fwd: HASH_COUNTER.fetch_add(1, Ordering::Relaxed),
+            hash_or_fwd: next_object_hash(),
         }
+    }
+
+    pub fn new_byte_buffer(type_index: TypeIndex, payload_words: usize) -> Option<Self> {
+        if payload_words > MAX_BYTE_BUFFER_WORDS {
+            return None;
+        }
+        let low = (payload_words & 0xFFFF) as u32;
+        let high = ((payload_words >> 16) & 0x1FF) as u32;
+        let gc_meta = (low << 3) | ((PayloadRole::ByteBuffer as u32) << 19) | (high << 22);
+        Some(Self {
+            type_index,
+            gc_meta,
+            hash_or_fwd: next_object_hash(),
+        })
     }
 
     pub fn payload_role(&self) -> Option<PayloadRole> {
         match (self.gc_meta >> 19) & 7 {
             0 => Some(PayloadRole::Ordinary),
             1 => Some(PayloadRole::ErrorEnvelope),
+            2 => Some(PayloadRole::ByteBuffer),
             _ => None,
         }
     }
@@ -90,7 +116,13 @@ impl ObjectHeader {
     }
 
     pub fn payload_words(&self) -> usize {
-        ((self.gc_meta >> 3) & 0xFFFF) as usize
+        let low = ((self.gc_meta >> 3) & 0xFFFF) as usize;
+        if self.payload_role() == Some(PayloadRole::ByteBuffer) {
+            let high = ((self.gc_meta >> 22) & 0x1FF) as usize;
+            low | (high << 16)
+        } else {
+            low
+        }
     }
 
     pub fn object_size(&self) -> usize {
@@ -382,6 +414,10 @@ impl mmtk::vm::Scanning<NessaVM> for NessaScanning {
                 "invalid Error envelope allocation"
             );
             slot_visitor.visit_slot(NessaSlot::from_address(payload_start + 16usize));
+            return;
+        }
+        if header.payload_role() == Some(PayloadRole::ByteBuffer) {
+            // Raw byte buffers never contain managed TaggedValue reference slots.
             return;
         }
         assert!(header.is_ordinary(), "invalid VM payload role");
@@ -771,6 +807,51 @@ impl Heap {
         unsafe { self.alloc_with_role(type_index, 3, PayloadRole::ErrorEnvelope) }
     }
 
+    /// Allocate a No-Scan [`PayloadRole::ByteBuffer`] payload holding at least
+    /// `byte_len` zero-initialized bytes (rounded up to 8-byte words, up to ~256 MiB).
+    ///
+    /// # Safety
+    /// Hold a mutator operation through initialization and publication. Any live
+    /// references crossing allocation must already be registered updateable roots.
+    /// Publish the returned buffer into a registered root before another allocation
+    /// or operation exit. Never store unrooted managed pointers in a byte buffer.
+    pub unsafe fn alloc_byte_buffer(
+        &mut self,
+        type_index: TypeIndex,
+        byte_len: usize,
+    ) -> Option<NonNull<u8>> {
+        let payload_words = byte_len.checked_add(7)? / 8;
+        let header = ObjectHeader::new_byte_buffer(type_index, payload_words)?;
+        let payload_bytes = payload_words.checked_mul(8)?;
+        let total_size = ObjectHeader::SIZE.checked_add(payload_bytes)?;
+        let semantics = if total_size > LARGE_OBJECT_THRESHOLD {
+            AllocationSemantics::Los
+        } else {
+            AllocationSemantics::Default
+        };
+
+        let mutator = &mut *self.mutator;
+        let addr = mmtk::memory_manager::alloc(mutator, total_size, 8, 0, semantics);
+        if addr.is_zero() {
+            return None;
+        }
+
+        // SAFETY: MMTk returned a writable, 8-byte aligned block of `total_size` bytes.
+        unsafe { std::ptr::write(addr.to_mut_ptr::<ObjectHeader>(), header) };
+
+        let payload_addr = addr + ObjectHeader::SIZE;
+        // SAFETY: `payload_bytes` lies entirely inside the allocated block after `ObjectHeader`.
+        unsafe {
+            std::ptr::write_bytes(payload_addr.to_mut_ptr::<u8>(), 0, payload_bytes);
+        }
+        // SAFETY: `payload_addr` is non-zero and 8-byte aligned.
+        let objref = unsafe { ObjectReference::from_raw_address_unchecked(payload_addr) };
+        mmtk::memory_manager::post_alloc(mutator, objref, total_size, semantics);
+        self.alloc_count.fetch_add(1, Ordering::Relaxed);
+
+        NonNull::new(payload_addr.to_mut_ptr::<u8>())
+    }
+
     /// Check if a GC is requested.
     pub fn should_yield(&self) -> bool {
         GC_FLAGS.gc_requested.load(Ordering::Relaxed)
@@ -1035,5 +1116,77 @@ mod tests {
         );
         assert_eq!(visitor.0, vec![NessaSlot::from_address(address + 16usize)]);
         assert_eq!(fixture.payload, [0x1000, 0x2000, 0x3000]);
+    }
+
+    #[test]
+    fn byte_buffer_role_supports_25bit_word_counts_skips_scanning_and_allocates_los() {
+        #[repr(C)]
+        struct Fixture {
+            header: ObjectHeader,
+            payload: [u64; 4],
+        }
+        struct Visitor(Vec<NessaSlot>);
+        impl SlotVisitor<NessaSlot> for Visitor {
+            fn visit_slot(&mut self, slot: NessaSlot) {
+                self.0.push(slot);
+            }
+        }
+
+        for words in [
+            0usize,
+            1,
+            8192,
+            u16::MAX as usize,
+            (u16::MAX as usize) + 1,
+            200_000,
+            MAX_BYTE_BUFFER_WORDS,
+        ] {
+            let mut header = ObjectHeader::new_byte_buffer(TypeIndex::from_raw(777), words)
+                .expect("25-bit word count fits");
+            assert_eq!(header.payload_role(), Some(PayloadRole::ByteBuffer));
+            assert_eq!(header.payload_words(), words);
+            header.gc_meta |= (1 << 31) | 0b111;
+            assert_eq!(header.payload_role(), Some(PayloadRole::ByteBuffer));
+            assert_eq!(header.payload_words(), words);
+            assert_eq!(header.object_size(), ObjectHeader::SIZE + words * 8);
+        }
+        assert!(
+            ObjectHeader::new_byte_buffer(TypeIndex::from_raw(777), MAX_BYTE_BUFFER_WORDS + 1)
+                .is_none()
+        );
+
+        let fixture = Fixture {
+            header: ObjectHeader::new_byte_buffer(TypeIndex::from_raw(777), 4).unwrap(),
+            payload: [0x1000, 0x2000, 0x3000, 0x4000],
+        };
+        // SAFETY: repr(C) fixture is live, aligned, and initialized with ByteBuffer role.
+        let address = unsafe { Address::from_usize(fixture.payload.as_ptr() as usize) };
+        let object = ObjectReference::from_raw_address(address).unwrap();
+        let mut visitor = Visitor(Vec::new());
+        NessaScanning::scan_object(
+            VMWorkerThread(VMThread::UNINITIALIZED),
+            object,
+            &mut visitor,
+        );
+        assert!(visitor.0.is_empty());
+
+        let mut heap = gc_init(&GcConfig::default());
+        let byte_len = 1024 * 1024 + 37;
+        // SAFETY: exclusive operation on `heap`, inspecting and dropping the LOS allocation
+        // without triggering a synthetic-coordinator race against `live_heaps_have_distinct_mutators...`.
+        // Full real MMTk collection over LOS ByteBuffers is tested in `engine/gc/tests/byte_buffer_los_gc.rs`.
+        let op = unsafe { heap.begin_operation() };
+        let ptr =
+            unsafe { heap.alloc_byte_buffer(TypeIndex::from_raw(42), byte_len) }.expect("LOS buf");
+        unsafe {
+            ptr.as_ptr().write(0xAB);
+            ptr.as_ptr().add(byte_len - 1).write(0xCD);
+            let hdr = ObjectHeader::from_payload_ptr(ptr.as_ptr());
+            assert_eq!(hdr.payload_role(), Some(PayloadRole::ByteBuffer));
+            assert_eq!(hdr.payload_words(), byte_len.div_ceil(8));
+            assert_eq!(*ptr.as_ptr(), 0xAB);
+            assert_eq!(*ptr.as_ptr().add(byte_len - 1), 0xCD);
+        }
+        drop(op);
     }
 }

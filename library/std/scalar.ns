@@ -862,3 +862,149 @@ impl usize {
     pub fn to_be_bytes(self) -> List { native_to_be_bytes(self) }
     pub fn to_le_bytes(self) -> List { native_to_le_bytes(self) }
 }
+
+const native_char_from_code_u8: fn(i64) -> ?char = .char_from_code'builtin
+const native_f32_is_nan: fn(f64) -> bool = .is_nan'builtin
+const native_f32_is_infinite: fn(f64) -> bool = .is_infinite'builtin
+const native_f32_is_finite: fn(f64) -> bool = .is_finite'builtin
+const native_f32_is_zero: fn(f64) -> bool = .f64_is_zero'builtin
+const native_f32_is_sign_positive: fn(f64) -> bool = .is_sign_positive'builtin
+const native_f32_is_sign_negative: fn(f64) -> bool = .is_sign_negative'builtin
+const native_f32_abs: fn(Any) -> Any = .abs'builtin
+const native_f32_floor: fn(f64) -> f64 = .floor'builtin
+const native_f32_ceil: fn(f64) -> f64 = .ceil'builtin
+const native_f32_round: fn(f64) -> f64 = .round'builtin
+const native_f32_trunc: fn(f64) -> f64 = .trunc'builtin
+const native_f32_fract: fn(f64) -> f64 = .fract'builtin
+const native_f32_sqrt: fn(f64) -> f64 = .sqrt'builtin
+
+fn f32_min_positive_f64() -> f64 {
+    let bits: u64 = 0x3810000000000000
+    native_from_bits(bits)
+}
+
+impl i8 {
+    pub fn bits() -> i64 = 8
+    pub fn min_value() -> i8 = (-128).as(i8)
+    pub fn max_value() -> i8 = (127).as(i8)
+    pub fn is_zero(self) -> bool { self.as(i64) == 0 }
+    pub fn is_positive(self) -> bool { self.as(i64) > 0 }
+    pub fn is_negative(self) -> bool { self.as(i64) < 0 }
+    pub fn signum(self) -> i8 {
+        let v = self.as(i64)
+        (if v < 0 { -1 } else if v > 0 { 1 } else { 0 }).as(i8)
+    }
+    pub fn checked_abs(self) -> ?i8 {
+        let v = self.as(i64)
+        if v == -128 { null } else if v < 0 { (-v).as(i8) } else { self }
+    }
+    pub fn wrapping_abs(self) -> i8 {
+        let v = self.as(i64)
+        if v == -128 { self } else if v < 0 { (-v).as(i8) } else { self }
+    }
+    pub fn saturating_abs(self) -> i8 {
+        let v = self.as(i64)
+        if v == -128 { (127).as(i8) } else if v < 0 { (-v).as(i8) } else { self }
+    }
+}
+
+impl i16 {
+    pub fn bits() -> i64 = 16
+    pub fn min_value() -> i16 = (-32768).as(i16)
+    pub fn max_value() -> i16 = (32767).as(i16)
+    pub fn is_zero(self) -> bool { self.as(i64) == 0 }
+    pub fn is_positive(self) -> bool { self.as(i64) > 0 }
+    pub fn is_negative(self) -> bool { self.as(i64) < 0 }
+    pub fn signum(self) -> i16 {
+        let v = self.as(i64)
+        (if v < 0 { -1 } else if v > 0 { 1 } else { 0 }).as(i16)
+    }
+    pub fn checked_abs(self) -> ?i16 {
+        let v = self.as(i64)
+        if v == -32768 { null } else if v < 0 { (-v).as(i16) } else { self }
+    }
+    pub fn wrapping_abs(self) -> i16 {
+        let v = self.as(i64)
+        if v == -32768 { self } else if v < 0 { (-v).as(i16) } else { self }
+    }
+    pub fn saturating_abs(self) -> i16 {
+        let v = self.as(i64)
+        if v == -32768 { (32767).as(i16) } else if v < 0 { (-v).as(i16) } else { self }
+    }
+}
+
+impl i32 {
+    pub fn bits() -> i64 = 32
+    pub fn min_value() -> i32 = (-2147483648).as(i32)
+    pub fn max_value() -> i32 = (2147483647).as(i32)
+    pub fn is_zero(self) -> bool { self.as(i64) == 0 }
+    pub fn is_positive(self) -> bool { self.as(i64) > 0 }
+    pub fn is_negative(self) -> bool { self.as(i64) < 0 }
+    pub fn signum(self) -> i32 {
+        let v = self.as(i64)
+        (if v < 0 { -1 } else if v > 0 { 1 } else { 0 }).as(i32)
+    }
+    pub fn checked_abs(self) -> ?i32 {
+        let v = self.as(i64)
+        if v == -2147483648 { null } else if v < 0 { (-v).as(i32) } else { self }
+    }
+    pub fn wrapping_abs(self) -> i32 {
+        let v = self.as(i64)
+        if v == -2147483648 { self } else if v < 0 { (-v).as(i32) } else { self }
+    }
+    pub fn saturating_abs(self) -> i32 {
+        let v = self.as(i64)
+        if v == -2147483648 { (2147483647).as(i32) } else if v < 0 { (-v).as(i32) } else { self }
+    }
+}
+
+impl u8 {
+    pub fn bits() -> i64 = 8
+    pub fn min_value() -> u8 = (0).as(u8)
+    pub fn max_value() -> u8 = (255).as(u8)
+    pub fn is_zero(self) -> bool { self.as(i64) == 0 }
+    pub fn is_ascii(self) -> bool { self.as(i64) <= 127 }
+    pub fn to_char(self) -> char { native_char_from_code_u8(self.as(i64)).as(char) }
+}
+
+impl u16 {
+    pub fn bits() -> i64 = 16
+    pub fn min_value() -> u16 = (0).as(u16)
+    pub fn max_value() -> u16 = (65535).as(u16)
+    pub fn is_zero(self) -> bool { self.as(i64) == 0 }
+}
+
+impl u32 {
+    pub fn bits() -> i64 = 32
+    pub fn min_value() -> u32 = (0).as(u32)
+    pub fn max_value() -> u32 = (4294967295).as(u32)
+    pub fn is_zero(self) -> bool { self.as(i64) == 0 }
+}
+
+impl f32 {
+    pub fn is_nan(self) -> bool { native_f32_is_nan(self.as(f64)) }
+    pub fn is_infinite(self) -> bool { native_f32_is_infinite(self.as(f64)) }
+    pub fn is_finite(self) -> bool { native_f32_is_finite(self.as(f64)) }
+    pub fn is_zero(self) -> bool { native_f32_is_zero(self.as(f64)) }
+    pub fn is_normal(self) -> bool {
+        let v = self.as(f64)
+        native_f32_is_finite(v)
+            and (not native_f32_is_zero(v))
+            and native_f32_abs(v).as(f64) >= f32_min_positive_f64()
+    }
+    pub fn is_subnormal(self) -> bool {
+        let v = self.as(f64)
+        native_f32_is_finite(v)
+            and (not native_f32_is_zero(v))
+            and native_f32_abs(v).as(f64) < f32_min_positive_f64()
+    }
+    pub fn is_sign_positive(self) -> bool { native_f32_is_sign_positive(self.as(f64)) }
+    pub fn is_sign_negative(self) -> bool { native_f32_is_sign_negative(self.as(f64)) }
+    pub fn abs(self) -> f32 { native_f32_abs(self.as(f64)).as(f32) }
+    pub fn floor(self) -> f32 { native_f32_floor(self.as(f64)).as(f32) }
+    pub fn ceil(self) -> f32 { native_f32_ceil(self.as(f64)).as(f32) }
+    pub fn round(self) -> f32 { native_f32_round(self.as(f64)).as(f32) }
+    pub fn trunc(self) -> f32 { native_f32_trunc(self.as(f64)).as(f32) }
+    pub fn fract(self) -> f32 { native_f32_fract(self.as(f64)).as(f32) }
+    pub fn sqrt(self) -> f32 { native_f32_sqrt(self.as(f64)).as(f32) }
+}

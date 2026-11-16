@@ -24,7 +24,7 @@ pub(crate) fn contains_trait(types: &[crate::TypeInfo], root: TypeIndex) -> bool
             )
             | None => return true,
             Some(TypeKind::Typealias { target, .. }) => pending.push(*target),
-            Some(TypeKind::Optional { inner }) => pending.push(*inner),
+            Some(TypeKind::Optional { inner } | TypeKind::Future { inner }) => pending.push(*inner),
             Some(TypeKind::Tuple { elements }) => pending.extend(elements),
             Some(TypeKind::Function { params, ret } | TypeKind::Effect { params, ret, .. }) => {
                 pending.extend(params);

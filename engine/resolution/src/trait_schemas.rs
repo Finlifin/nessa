@@ -30,6 +30,12 @@ fn bootstrap_names(r: &Resolver<'_>, ty: TypeIndex) -> Option<&'static [&'static
         Some(&["next"])
     } else if ty == known.into_iterator {
         Some(&["into_iter"])
+    } else if ty == known.json {
+        if crate::json_derivation::error_type(r).is_some() {
+            Some(&["to_json", "to_json_pretty"])
+        } else {
+            Some(&["to_json"])
+        }
     } else {
         None
     }
@@ -57,11 +63,52 @@ fn bootstrap_schema(r: &mut Resolver<'_>, ty: TypeIndex) -> TraitDispatchSchema 
                     signature: Some(signature),
                 };
             }
+            if ty == r.type_pool.well_known.json {
+                let signature = crate::json_derivation::error_type(r).and_then(|err_ty| {
+                    let ret = r
+                        .type_pool
+                        .normalize_error_type(vec![err_ty], Intrinsic::Str.type_index())
+                        .ok()?;
+                    if name == "to_json_pretty" {
+                        let declaration = r.type_pool.intern_structural(TypeKind::Function {
+                            params: vec![ty, Intrinsic::I64.type_index()],
+                            ret,
+                        });
+                        Some(TraitMethodSignature {
+                            associated_paths: Vec::new(),
+                            declaration,
+                            self_paths: vec![vec![TraitTypeStep::Parameter(0)]],
+                            parameter_kinds: vec![
+                                TraitParameterKind::Receiver,
+                                TraitParameterKind::Optional,
+                            ],
+                        })
+                    } else {
+                        let declaration = r.type_pool.intern_structural(TypeKind::Function {
+                            params: vec![ty],
+                            ret,
+                        });
+                        Some(TraitMethodSignature {
+                            associated_paths: Vec::new(),
+                            declaration,
+                            self_paths: vec![vec![TraitTypeStep::Parameter(0)]],
+                            parameter_kinds: vec![TraitParameterKind::Receiver],
+                        })
+                    }
+                });
+                return TraitMethodKey {
+                    trait_owner: ty,
+                    name: str_interner::intern(name),
+                    signature,
+                };
+            }
             let contract =
                 if ty == r.type_pool.well_known.eq || ty == r.type_pool.well_known.partial_eq {
                     Some((2, Intrinsic::Bool.type_index()))
                 } else if ty == r.type_pool.well_known.display {
                     Some((1, Intrinsic::Str.type_index()))
+                } else if ty == r.type_pool.well_known.hash {
+                    Some((1, Intrinsic::U64.type_index()))
                 } else if ty == r.type_pool.well_known.ord {
                     if name == "cmp" {
                         ordering.map(|ty| (2, ty))
@@ -232,6 +279,7 @@ pub(crate) fn register(r: &mut Resolver<'_>, ast: &Ast) {
         known.hash,
         known.iterator,
         known.into_iterator,
+        known.json,
     ];
     for ty in bootstrap {
         complete.insert(ty, bootstrap_schema(r, ty));
@@ -425,6 +473,7 @@ mod tests {
                 1,
                 Intrinsic::Str.type_index(),
             ),
+            (pool.well_known.hash, "hash", 1, Intrinsic::U64.type_index()),
         ] {
             let key = pool
                 .trait_schema(owner)
@@ -491,11 +540,7 @@ mod tests {
                 }]
             );
         }
-        for owner in [
-            pool.well_known.hash,
-            pool.well_known.ord,
-            pool.well_known.partial_ord,
-        ] {
+        for owner in [pool.well_known.ord, pool.well_known.partial_ord] {
             assert!(
                 pool.trait_schema(owner)
                     .unwrap()

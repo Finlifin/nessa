@@ -148,7 +148,8 @@ pub(crate) fn checked_method(
         .canonical_type(r.symbols[function.0 as usize].type_index)?;
     if let Some(receiver) = trait_receiver.or_else(|| {
         (ast.node(declaration).kind == NodeKind::TraitDeriveFn
-            || crate::ordering::default_template(r, name) == Some(function))
+            || crate::ordering::default_template(r, name) == Some(function)
+            || crate::json_derivation::default_template(r, name) == Some(function))
         .then_some(receiver)
     }) {
         let owner = r.scopes[r.symbols[function.0 as usize].scope.0 as usize].assoc_type?;
@@ -319,13 +320,39 @@ pub(crate) fn projection(
     }
     let method = checked_method(r, ast, node, receiver, name)?;
     if r.current_call_callee != Some(node) {
-        report(
-            r,
-            ast,
-            node,
-            "bound method values are not implemented; call the method directly",
-        );
-        return None;
+        if r.type_pool
+            .canonical_type(receiver)
+            .is_some_and(|ty| matches!(r.type_pool.get(ty).kind, TypeKind::Trait { .. }))
+        {
+            report(
+                r,
+                ast,
+                node,
+                "bound method values are not implemented; call the method directly",
+            );
+            return None;
+        }
+        let declaration = r.symbols[method.function.0 as usize].def_node;
+        if !declaration.is_null()
+            && ast
+                .multi_children(declaration)
+                .iter()
+                .skip(1)
+                .any(|&param| {
+                    matches!(
+                        ast.node(param).kind,
+                        NodeKind::ParamOptional | NodeKind::ParamVarargs
+                    )
+                })
+        {
+            report(
+                r,
+                ast,
+                node,
+                "bound method values with optional or variadic parameters are not supported; wrap in a lambda",
+            );
+            return None;
+        }
     }
     r.instance_methods.insert(node, method.function);
     Some(r.register_type(TypeKind::Function {

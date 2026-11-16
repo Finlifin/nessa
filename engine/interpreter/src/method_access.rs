@@ -55,6 +55,7 @@ impl Vm {
             }
         }
         self.state.method_call_scopes = scopes;
+        self.state.jit.invalidate_all();
         Ok(())
     }
 

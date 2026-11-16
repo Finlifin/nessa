@@ -16,6 +16,7 @@ pub enum TraitTypeStep {
     EffectInner,
     EffectMember(u32),
     IterationItem,
+    FutureInner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,6 +88,7 @@ fn child(kind: &TypeKind, step: TraitTypeStep) -> Option<TypeIndex> {
             elements.get(index as usize).copied()
         }
         (TypeKind::Optional { inner }, TraitTypeStep::OptionalInner)
+        | (TypeKind::Future { inner }, TraitTypeStep::FutureInner)
         | (TypeKind::ErrorQualified { inner, .. }, TraitTypeStep::ErrorInner)
         | (TypeKind::EffectQualified { inner, .. }, TraitTypeStep::EffectInner) => Some(*inner),
         (TypeKind::ErrorQualified { errors, .. }, TraitTypeStep::ErrorMember(index)) => {
@@ -244,6 +246,7 @@ fn validate_symbolic_paths(
                     .map(|(i, &ty)| (ty, TraitTypeStep::TupleElement(i as u32))),
             ),
             TypeKind::Optional { inner } => children.push((*inner, TraitTypeStep::OptionalInner)),
+            TypeKind::Future { inner } => children.push((*inner, TraitTypeStep::FutureInner)),
             TypeKind::ErrorQualified { errors, inner } => {
                 children.push((*inner, TraitTypeStep::ErrorInner));
                 children.extend(
@@ -285,6 +288,7 @@ enum Shape {
     Function(Vec<Self>, Box<Self>),
     Effect(bool, Vec<Self>, Box<Self>),
     Optional(Box<Self>),
+    Future(Box<Self>),
     Error(Vec<Self>, Box<Self>),
     QualifiedEffect(Vec<Self>, Box<Self>),
 }
@@ -407,6 +411,11 @@ impl ShapeBuilder<'_> {
                 *inner,
                 path,
                 TraitTypeStep::OptionalInner,
+            )?)),
+            TypeKind::Future { inner } => Shape::Future(Box::new(self.nested(
+                *inner,
+                path,
+                TraitTypeStep::FutureInner,
             )?)),
             TypeKind::ErrorQualified { errors, inner } => {
                 let mut members = self.sequence(errors, path, TraitTypeStep::ErrorMember)?;
@@ -565,6 +574,9 @@ impl TypePool {
                 is_async,
             },
             Shape::Optional(inner) => TypeKind::Optional {
+                inner: self.intern_signature_shape(*inner)?,
+            },
+            Shape::Future(inner) => TypeKind::Future {
                 inner: self.intern_signature_shape(*inner)?,
             },
             Shape::Error(errors, inner) => TypeKind::ErrorQualified {

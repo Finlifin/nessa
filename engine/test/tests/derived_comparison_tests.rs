@@ -74,7 +74,7 @@ fn missing_component_traits_and_unimplemented_hash_are_rejected() {
             "comparison",
         ),
         ("struct P { value:Any }\nderive Eq for P", "comparison"),
-        ("struct P { value:i64 }\nderive Hash for P", "Hash"),
+        ("struct P { value:Any }\nderive Hash for P", "Hash"),
     ] {
         let result = driver::Driver::new().compile(source);
         assert!(result.has_errors, "{source}: expected rejection");

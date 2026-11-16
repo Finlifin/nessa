@@ -4,11 +4,74 @@
 //! trait symbols registered by Phase 3a.  Also records impl-trait
 //! relationships discovered from `ImplTraitDef` / `ExtendTraitDef` nodes.
 
-use ast::{Ast, NodeKind};
-use type_pool::{MethodSlot, TraitImplRecord, TypeKind, VTable};
+use ast::{Ast, NodeIndex, NodeKind};
+use type_pool::{MethodSlot, TraitImplRecord, TypeIndex, TypeKind, VTable};
 
 use crate::resolver::Resolver;
-use crate::{SymbolKind, TraitInfo};
+use crate::{ScopeId, SymbolKind, TraitInfo};
+
+fn denoted_type(r: &Resolver<'_>, node: NodeIndex) -> Option<TypeIndex> {
+    r.node_type_values
+        .get(&node)
+        .copied()
+        .or_else(|| {
+            r.node_symbols
+                .get(&node)
+                .map(|symbol| r.symbols[symbol.0 as usize].type_index)
+        })
+        .and_then(|ty| r.type_pool.canonical_type(ty))
+}
+
+fn type_defining_package(
+    r: &Resolver<'_>,
+    ast: &Ast,
+    expr_node: NodeIndex,
+    canon_ty: TypeIndex,
+    fallback_factory_pkg: u32,
+) -> Option<u32> {
+    if let Some(sym) = r.symbols.iter().find(|sym| {
+        !sym.def_node.is_null()
+            && matches!(
+                ast.node(sym.def_node).kind,
+                NodeKind::StructDef
+                    | NodeKind::EnumDef
+                    | NodeKind::Newtype
+                    | NodeKind::TraitDef
+                    | NodeKind::EffectDef
+                    | NodeKind::AsyncEffectDef
+                    | NodeKind::ModuleDef
+            )
+            && r.type_pool.canonical_type(sym.type_index) == Some(canon_ty)
+    }) {
+        return Some(crate::imports::package_id(r, sym.scope));
+    }
+    if matches!(r.type_pool.get(canon_ty).kind, TypeKind::Tuple { .. })
+        && let Some(&sym_id) = r.node_symbols.get(&expr_node)
+    {
+        let sym = &r.symbols[sym_id.0 as usize];
+        if !sym.def_node.is_null() && ast.node(sym.def_node).kind == NodeKind::Typealias {
+            return Some(crate::imports::package_id(r, sym.scope));
+        }
+    }
+    if matches!(
+        r.type_pool.checked_iteration_step_item(canon_ty),
+        Ok(Some(_))
+    ) {
+        return Some(fallback_factory_pkg);
+    }
+    None
+}
+
+fn node_package_id(r: &Resolver<'_>, node_idx: NodeIndex) -> u32 {
+    let scope = r
+        .imports
+        .module_scopes
+        .get(&node_idx)
+        .and_then(|&sid| r.scopes[sid.0 as usize].parent)
+        .or_else(|| r.node_scopes.get(&node_idx).copied())
+        .unwrap_or(ScopeId::ROOT);
+    crate::imports::package_id(r, scope)
+}
 
 // ---------------------------------------------------------------------------
 // Top-level entry point
@@ -146,6 +209,26 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         let (Some(trait_type), Some(implementor)) = (trait_ti, target_ti) else {
             continue;
         };
+        if ast.node(node_idx).kind == NodeKind::ImplTraitDef
+            && !r.options.builtin_access
+            && !r.options.privileged_nodes.contains(&node_idx)
+            && r.type_pool.as_intrinsic(implementor).is_none()
+            && !r.type_pool.is_reserved_collection_role(implementor)
+        {
+            let impl_pkg = node_package_id(r, node_idx);
+            let trait_pkg = type_defining_package(r, ast, trait_node, trait_type, impl_pkg);
+            let type_pkg = type_defining_package(r, ast, type_node, implementor, impl_pkg);
+            if trait_pkg != Some(impl_pkg) && type_pkg != Some(impl_pkg) {
+                r.diag_ctx
+                    .error(
+                        "orphan impl: either the implemented trait or the target type must be defined in the current package"
+                            .into(),
+                    )
+                    .with_primary_span(ast.node(node_idx).span)
+                    .emit(r.diag_ctx);
+                continue;
+            }
+        }
         let visible_scope = r
             .imports
             .extension_scopes
@@ -370,14 +453,42 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
             None
         };
 
-        let target_ti = r.node_symbols.get(&type_node).and_then(|&sym_id| {
-            let sym = &r.symbols[sym_id.0 as usize];
-            r.type_pool.canonical_type(sym.type_index)
-        });
+        let target_ti = r
+            .scopes
+            .iter()
+            .find(|s| s.node == node_idx)
+            .and_then(|s| s.assoc_type)
+            .and_then(|ty| r.type_pool.canonical_type(ty))
+            .or_else(|| {
+                r.node_symbols.get(&type_node).and_then(|&sym_id| {
+                    let sym = &r.symbols[sym_id.0 as usize];
+                    r.type_pool.canonical_type(sym.type_index)
+                })
+            });
 
         let Some(implementor) = target_ti else {
             continue;
         };
+
+        if ast.node(node_idx).kind == NodeKind::ImplDef
+            && !r.options.builtin_access
+            && !r.options.privileged_nodes.contains(&node_idx)
+            && r.type_pool.as_intrinsic(implementor).is_none()
+            && !r.type_pool.is_reserved_collection_role(implementor)
+        {
+            let impl_pkg = node_package_id(r, node_idx);
+            let type_pkg = type_defining_package(r, ast, type_node, implementor, impl_pkg);
+            if type_pkg != Some(impl_pkg) {
+                r.diag_ctx
+                    .error(
+                        "orphan impl: cannot implement inherent methods for a type defined in another package"
+                            .into(),
+                    )
+                    .with_primary_span(ast.node(node_idx).span)
+                    .emit(r.diag_ctx);
+                continue;
+            }
+        }
 
         for &member in ast.multi_children(node_idx) {
             let member = if matches!(
@@ -416,8 +527,183 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         }
     }
 
+    // ── Check orphan rules on DeriveDef & instantiate custom user trait derivations ──
+    for index in 1..ast.nodes.len() {
+        let node = NodeIndex(index as u32);
+        if ast.node(node).kind != NodeKind::DeriveDef {
+            continue;
+        }
+        let type_node = ast.fixed_children(node)[0];
+        let Some(implementor) = denoted_type(r, type_node) else {
+            continue;
+        };
+        if r.type_pool.is_reserved_collection_role(implementor) {
+            continue;
+        }
+        for &trait_node in ast.multi_children(node) {
+            let Some(trait_type) = denoted_type(r, trait_node) else {
+                continue;
+            };
+            if !r.options.builtin_access
+                && !r.options.privileged_nodes.contains(&node)
+                && r.type_pool.as_intrinsic(implementor).is_none()
+            {
+                let derive_pkg = node_package_id(r, node);
+                let trait_pkg = type_defining_package(r, ast, trait_node, trait_type, derive_pkg);
+                let type_pkg = type_defining_package(r, ast, type_node, implementor, derive_pkg);
+                if trait_pkg != Some(derive_pkg) && type_pkg != Some(derive_pkg) {
+                    r.diag_ctx
+                        .error(
+                            "orphan derive: either the derived trait or the target type must be defined in the current package"
+                                .into(),
+                        )
+                        .with_primary_span(ast.node(node).span)
+                        .emit(r.diag_ctx);
+                    continue;
+                }
+            }
+            let wk = &r.type_pool.well_known;
+            let is_builtin_derive_trait = [
+                wk.eq,
+                wk.partial_eq,
+                wk.ord,
+                wk.partial_ord,
+                wk.display,
+                wk.hash,
+                wk.iterator,
+                wk.into_iterator,
+                wk.json,
+            ]
+            .contains(&trait_type);
+            if is_builtin_derive_trait {
+                continue;
+            }
+            let Some(trait_info) = r
+                .traits
+                .iter()
+                .find(|ti| ti.type_index == trait_type)
+                .cloned()
+            else {
+                continue;
+            };
+            if !r.options.builtin_access
+                && !r.options.privileged_nodes.contains(&node)
+                && r.type_pool.as_intrinsic(implementor).is_some()
+            {
+                r.diag_ctx
+                    .error(
+                        "cannot derive traits on a builtin type outside a privileged package (std/core/alloc)"
+                            .into(),
+                    )
+                    .with_primary_span(ast.node(node).span)
+                    .emit(r.diag_ctx);
+                continue;
+            }
+            if !implementations.insert((implementor, trait_type, None))
+                || r.type_pool.has_trait_impl(implementor, trait_type)
+            {
+                r.diag_ctx
+                    .error("cannot derive a trait already implemented for this type".into())
+                    .with_primary_span(ast.node(node).span)
+                    .emit(r.diag_ctx);
+                continue;
+            }
+            if !trait_info.required_methods.is_empty() {
+                for &req_name in &trait_info.required_methods {
+                    r.diag_ctx
+                        .error(format!(
+                            "cannot derive trait `{}`: required method `{}` has no `derive fn` default",
+                            str_interner::get(trait_info.name),
+                            str_interner::get(req_name),
+                        ))
+                        .with_primary_span(ast.node(trait_node).span)
+                        .emit(r.diag_ctx);
+                }
+                continue;
+            }
+            let has_assoc = crate::associated_types::has_declarations(r, trait_type);
+            if has_assoc {
+                r.type_pool.add_trait_impl(TraitImplRecord {
+                    trait_type,
+                    implementor,
+                    methods: Vec::new(),
+                    visible_scope: None,
+                });
+                crate::associated_types::install(r, ast, node, implementor, trait_type, None);
+            }
+            let mut methods = Vec::new();
+            let trait_def_node = r
+                .symbols
+                .iter()
+                .find(|s| s.kind == SymbolKind::Trait && s.type_index == trait_type)
+                .map(|s| s.def_node);
+            if let Some(t_def) = trait_def_node
+                && !t_def.is_null()
+                && let Some(scope) = r.scopes.iter().find(|s| s.node == t_def)
+            {
+                let bindings = scope.bindings.clone();
+                let provider_scope = r
+                    .node_scopes
+                    .get(&node)
+                    .map(|s| s.0)
+                    .unwrap_or(ScopeId::ROOT.0);
+                for &derived_name in &trait_info.derived_methods {
+                    if let Some(&sym_id) = bindings.get(&derived_name) {
+                        match crate::default_methods::register(
+                            r,
+                            ast,
+                            sym_id,
+                            implementor,
+                            trait_type,
+                            None,
+                            provider_scope,
+                        ) {
+                            Ok(function) => {
+                                let slot = MethodSlot {
+                                    name: derived_name,
+                                    func_id: function.0,
+                                    access: crate::access::method_access(r, sym_id),
+                                    trait_impl: Some(trait_type),
+                                    visible_scope: None,
+                                };
+                                methods.push(slot.clone());
+                                r.type_pool.add_method(implementor, slot);
+                            }
+                            Err(message) => {
+                                r.diag_ctx
+                                    .error(message)
+                                    .with_primary_span(ast.node(node).span)
+                                    .emit(r.diag_ctx);
+                            }
+                        }
+                    }
+                }
+            }
+            for &parent in &trait_info.parent_traits {
+                parent_checks.push((trait_node, implementor, trait_type, parent, None));
+            }
+            let record = TraitImplRecord {
+                trait_type,
+                implementor,
+                methods,
+                visible_scope: None,
+            };
+            if has_assoc {
+                if let Err(error) = r.type_pool.complete_trait_impl(record) {
+                    r.diag_ctx
+                        .error(error.to_string())
+                        .with_primary_span(ast.node(node).span)
+                        .emit(r.diag_ctx);
+                }
+            } else {
+                r.type_pool.add_trait_impl(record);
+            }
+        }
+    }
+
     crate::comparison_derivation::register(r, ast);
     crate::ordering::complete_records(r, ast);
+    crate::json_derivation::complete_records(r, ast);
 
     for (node, implementor, trait_type, parent, visible_scope) in parent_checks {
         let available = match visible_scope {
@@ -451,6 +737,8 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
     build_vtables(r);
     crate::trait_signatures::validate(r, ast);
     crate::display_derivation::validate(r, ast);
+    crate::hash_derivation::validate(r, ast);
+    crate::json_derivation::validate(r, ast);
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +856,14 @@ pub(crate) fn generate_derive_methods(
     } else if trait_type == wk.display {
         methods.push(MethodSlot {
             name: str_interner::intern("to_string"),
+            func_id: DERIVE_FUNC_ID,
+            access: type_pool::MethodAccess::Public,
+            trait_impl: Some(trait_type),
+            visible_scope: None,
+        });
+    } else if trait_type == wk.json {
+        methods.push(MethodSlot {
+            name: str_interner::intern("to_json"),
             func_id: DERIVE_FUNC_ID,
             access: type_pool::MethodAccess::Public,
             trait_impl: Some(trait_type),

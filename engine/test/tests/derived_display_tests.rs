@@ -4,7 +4,7 @@ mod common;
 #[test]
 fn compositional_struct_display_formats_through_trait_proof_and_nested_fields() {
     for source in [
-        "struct P{x:i64,label:String};derive Display for P;fn show(x:Display)->String{x.to_string()};fn main(){let p=P{x:42,label:\"hello\"};if p.to_string()==\"P \\x7b x: 42, label: hello \\x7d\" and show(p)==\"P \\x7b x: 42, label: hello \\x7d\"{42}else{0}}",
+        "struct P{x:i64,label:String};derive Display for P;fn show(x:Display)->String{x.to_string()};fn main(){let p=P{x:42,label:\"hello\"};if p.to_string()==\"P \\x7b x: 42, label: \\\"hello\\\" \\x7d\" and show(p)==\"P \\x7b x: 42, label: \\\"hello\\\" \\x7d\"{42}else{0}}",
         "struct Empty{};derive Display for Empty;fn show(x:Display)->String{x.to_string()};fn main(){if show(Empty{})==\"Empty \\x7b  \\x7d\"{42}else{0}}",
         "struct P{x:i64};typealias Item=P;derive Display for Item;fn show(x:Display)->String{x.to_string()};fn main(){if show(Item{x:42})==\"P \\x7b x: 42 \\x7d\"{42}else{0}}",
         "struct Tag{id:i64};impl Display for Tag{pub fn to_string(self)->String{\"#\"++self.id.to_string()}};struct Row{tag:Tag,note:?String,pair:(String,i64)};derive Display for Row;fn main(){let a=Row{tag:Tag{id:7},note:\"ok\",pair:(\"hi\",3)};let b=Row{tag:Tag{id:8},note:null,pair:(\"yo\",4)};if a.to_string()==\"Row \\x7b tag: #7, note: \\\"ok\\\", pair: (\\\"hi\\\", 3) \\x7d\" and b.to_string()==\"Row \\x7b tag: #8, note: null, pair: (\\\"yo\\\", 4) \\x7d\"{42}else{0}}",

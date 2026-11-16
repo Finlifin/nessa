@@ -180,6 +180,8 @@ pub enum Opcode {
     ResetClosure = 0xCC,
     ResumeContinuation = 0xCD,
     ResumeContinuationOnce = 0xCE,
+    AwaitFuture = 0xCF,
+    AwaitPopHandler = 0xDF,
 
     // ── E-type (11): system ────────────────────────────────────
     Safepoint = 0xD0,
@@ -286,6 +288,8 @@ impl Opcode {
             0xCC => Some(Self::ResetClosure),
             0xCD => Some(Self::ResumeContinuation),
             0xCE => Some(Self::ResumeContinuationOnce),
+            0xCF => Some(Self::AwaitFuture),
+            0xDF => Some(Self::AwaitPopHandler),
             0xD0 => Some(Self::Safepoint),
             0xD1 => Some(Self::Unreachable),
             0xD2 => Some(Self::Nop),
@@ -862,6 +866,18 @@ impl Instruction {
         )
     }
 
+    pub fn await_pop_handler() -> Self {
+        Self::e_type(Opcode::AwaitPopHandler, 0)
+    }
+
+    pub fn await_future(dst: Reg, future: Reg) -> Self {
+        assert!(dst.0 < 32 && future.0 < 32);
+        Self::e_type(
+            Opcode::AwaitFuture,
+            ((dst.0 as u32) << 17) | ((future.0 as u32) << 12),
+        )
+    }
+
     pub fn nop() -> Self {
         Self::e_type(Opcode::Nop, 0)
     }
@@ -946,6 +962,10 @@ mod tests {
         ] {
             assert_eq!(Opcode::from_u8(retired), None);
         }
+        let await_fut = Instruction::await_future(Reg(7), Reg(19));
+        assert_eq!(Instruction::decode(await_fut.encode()), Some(await_fut));
+        let await_pop = Instruction::await_pop_handler();
+        assert_eq!(Instruction::decode(await_pop.encode()), Some(await_pop));
     }
 
     #[test]

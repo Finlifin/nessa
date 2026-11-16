@@ -130,26 +130,45 @@ pub(crate) fn descriptor(
         NodeKind::Projection | NodeKind::PropertyPattern
     ) {
         let children = ast.fixed_children(node);
-        if let Some(ty) = typing::resolve_type_expr_inner(r, ast, children[0])
-            .and_then(|ty| r.type_pool.canonical_type(ty))
-            && r.type_pool
-                .checked_iteration_step_item(ty)
-                .ok()
-                .flatten()
-                .is_some()
-            && let TypeKind::Enum { variants, .. } = &r.type_pool.get(ty).kind
-        {
-            let variant = variants
-                .iter()
-                .find(|variant| variant.name == ast.node(children[1]).str_id)?
-                .clone();
-            return Some((
-                EnumVariantRef {
-                    type_index: ty,
-                    variant_tag: variant.tag,
-                },
-                variant,
-            ));
+        if matches!(
+            ast.node(children[0]).kind,
+            NodeKind::Call
+                | NodeKind::PatternCall
+                | NodeKind::Id
+                | NodeKind::SelfUpper
+                | NodeKind::Projection
+        ) {
+            let prev_type_val = r.node_type_values.get(&children[0]).copied();
+            let resolved_ty = typing::resolve_type_expr_inner(r, ast, children[0])
+                .and_then(|ty| r.type_pool.canonical_type(ty));
+            if let Some(ty) = resolved_ty
+                && r.type_pool
+                    .checked_iteration_step_item(ty)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                && let TypeKind::Enum { variants, .. } = &r.type_pool.get(ty).kind
+                && let Some(variant) = variants
+                    .iter()
+                    .find(|variant| variant.name == ast.node(children[1]).str_id)
+                    .cloned()
+            {
+                return Some((
+                    EnumVariantRef {
+                        type_index: ty,
+                        variant_tag: variant.tag,
+                    },
+                    variant,
+                ));
+            }
+            match prev_type_val {
+                Some(prev) => {
+                    r.node_type_values.insert(children[0], prev);
+                }
+                None => {
+                    r.node_type_values.remove(&children[0]);
+                }
+            }
         }
     }
     let symbol = r.node_symbols.get(&node).copied().or_else(|| {
@@ -230,7 +249,7 @@ pub(crate) fn construction(r: &mut Resolver<'_>, ast: &Ast, call: NodeIndex) -> 
             }
             return Some(reference.type_index);
         }
-        let Some(plan) = crate::arguments::plan_parameters(
+        let Some(mut plan) = crate::arguments::plan_parameters(
             r,
             ast,
             call,
@@ -240,31 +259,40 @@ pub(crate) fn construction(r: &mut Resolver<'_>, ast: &Ast, call: NodeIndex) -> 
             None,
         ) else {
             for &argument in arguments {
-                typing::resolve_types(r, ast, crate::arguments::argument_value_node(ast, argument));
+                typing::resolve_call_argument_or_spread(r, ast, argument, None, None);
             }
             return Some(reference.type_index);
         };
         let mut expected = vec![None; arguments.len()];
-        for (index, binding) in plan.parameters.iter().enumerate() {
-            match &binding.value {
+        for (index, binding) in plan.parameters.iter_mut().enumerate() {
+            match &mut binding.value {
                 crate::CallArgumentValue::Explicit { source_index } => {
                     expected[*source_index] = Some(variant.fields[index].ty)
                 }
                 crate::CallArgumentValue::Variadic { source_indices } => {
-                    for &index in source_indices {
+                    for &index in source_indices.iter() {
                         expected[index] = Some(type_pool::Intrinsic::Any.type_index());
                     }
                 }
-                crate::CallArgumentValue::Default { .. }
+                crate::CallArgumentValue::Unpacked { target_type, .. } => {
+                    if let Some(field) = variant.fields.get(index) {
+                        typing::validate_spread_target_type(r, ast, call, field.ty);
+                        *target_type = Some(field.ty);
+                    }
+                }
+                crate::CallArgumentValue::UnpackedTail
+                | crate::CallArgumentValue::Default { .. }
                 | crate::CallArgumentValue::MapVariadic { .. } => {}
             }
         }
         for (&argument, target) in arguments.iter().zip(expected) {
-            let value = crate::arguments::argument_value_node(ast, argument);
-            typing::resolve_types_expected(r, ast, value, target);
-            if let Some(target) = target {
-                typing::check_expected_type(r, ast, value, target, "enum constructor field");
-            }
+            typing::resolve_call_argument_or_spread(
+                r,
+                ast,
+                argument,
+                target,
+                target.map(|_| "enum constructor field"),
+            );
         }
         let argument_type = argument_type(r, &variant);
         r.call_arguments.insert(call, plan);
@@ -425,7 +453,15 @@ pub(crate) fn pattern(
                 pattern(r, ast, child, Some(ty));
             }
         }
+        NodeKind::PatternExtendedCall => {
+            crate::structs::resolve_pattern(r, ast, node, Some(expected), false, pattern);
+        }
         NodeKind::PatternCall | NodeKind::PropertyPattern | NodeKind::Projection => {
+            if ast.node(node).kind == NodeKind::PatternCall
+                && crate::newtype::resolve_pattern(r, ast, node, Some(expected), false, pattern)
+            {
+                return;
+            }
             let callee = if ast.node(node).kind == NodeKind::PatternCall {
                 ast.fixed_children(node)[0]
             } else {
@@ -533,22 +569,22 @@ pub(crate) fn method_signature(
     ty: TypeIndex,
 ) -> Option<TypeIndex> {
     let name = ast.node(ast.fixed_children(node)[1]).str_id;
-    if r.current_call_callee != Some(node) {
-        report(
-            r,
-            ast,
-            node,
-            "bound enum method values are not implemented; call the method directly",
-        );
-        return None;
-    }
-    let symbol = match crate::associated::member(r, ty, name) {
+    let sym_id = match crate::associated::member(r, ty, name) {
         Ok(symbol) => symbol,
         Err(error) => {
+            let scope = r.node_scopes.get(&node).copied().unwrap_or(r.current_scope);
+            if matches!(
+                crate::default_methods::source_member(r, ast, ty, name, scope),
+                Ok(Some(_))
+            ) {
+                return crate::methods::projection(r, ast, node, ty);
+            }
             if error.starts_with("unknown member")
                 && let Some(signature) =
                     crate::comparison_derivation::declared_method_signature(r, ast, ty, name)
                         .or_else(|| crate::display_derivation::declared_signature(r, ast, ty, name))
+                        .or_else(|| crate::hash_derivation::declared_signature(r, ast, ty, name))
+                        .or_else(|| crate::json_derivation::declared_signature(r, ast, ty, name))
             {
                 return Some(signature);
             }
@@ -556,7 +592,7 @@ pub(crate) fn method_signature(
             return None;
         }
     };
-    let symbol = &r.symbols[symbol.0 as usize];
+    let symbol = &r.symbols[sym_id.0 as usize];
     if symbol.kind != SymbolKind::Function || symbol.def_node.is_null() {
         report(r, ast, node, "enum instance members must be methods");
         return None;
@@ -574,6 +610,28 @@ pub(crate) fn method_signature(
         );
         return None;
     }
+    if r.current_call_callee != Some(node) {
+        if ast
+            .multi_children(symbol.def_node)
+            .iter()
+            .skip(1)
+            .any(|&param| {
+                matches!(
+                    ast.node(param).kind,
+                    NodeKind::ParamOptional | NodeKind::ParamVarargs
+                )
+            })
+        {
+            report(
+                r,
+                ast,
+                node,
+                "bound method values with optional or variadic parameters are not supported; wrap in a lambda",
+            );
+            return None;
+        }
+        r.instance_methods.insert(node, sym_id);
+    }
     let signature = r.type_pool.canonical_type(symbol.type_index)?;
     let TypeKind::Function { params, ret } = r.type_pool.get(signature).kind.clone() else {
         return None;
@@ -586,7 +644,7 @@ pub(crate) fn method_signature(
 
 #[cfg(test)]
 mod tests {
-    use diagnostic::DiagnosticContext;
+    use diagnostic::{DiagnosticContext, Level};
     use rustc_span::{FileName, SourceMap, source_map::FilePathMapping};
     use type_pool::Intrinsic;
 
@@ -603,6 +661,7 @@ mod tests {
         let errors = diagnostics
             .diagnostics()
             .iter()
+            .filter(|diagnostic| diagnostic.level == Level::Error)
             .map(|diagnostic| diagnostic.message.clone())
             .collect();
         (resolved, errors)
@@ -786,7 +845,7 @@ mod tests {
 
     #[test]
     fn enum_hash_derivation_and_unimplemented_pattern_operations_are_rejected() {
-        let (_, errors) = resolve("enum E { none, }\nderive Hash for E\nfn main() {} ");
+        let (_, errors) = resolve("enum E { some(x: Any), }\nderive Hash for E\nfn main() {} ");
         assert!(
             errors.iter().any(|error| error.contains("Hash derivation")),
             "{errors:?}"

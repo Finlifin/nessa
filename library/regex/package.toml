@@ -1,0 +1,9 @@
+[package]
+domain = "nessa"
+name = "regex"
+version = "0.1.0"
+type = "lib"
+
+[ffi]
+allow = true
+libraries = ["nessa_regex_ffi"]

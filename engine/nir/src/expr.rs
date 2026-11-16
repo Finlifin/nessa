@@ -91,11 +91,12 @@ fn lower_expr_uncoerced(
     }
     let ast = &resolved.ast;
     let node = ast.node(node_idx);
-    if let Some(ty) = builder
-        .self_type_values
-        .get(&node_idx)
-        .copied()
-        .or_else(|| builder.type_value(resolved, node_idx))
+    if node.kind != NodeKind::Unit
+        && let Some(ty) = builder
+            .self_type_values
+            .get(&node_idx)
+            .copied()
+            .or_else(|| builder.type_value(resolved, node_idx))
     {
         return NirValue::ConstType(ty);
     }
@@ -189,11 +190,15 @@ fn lower_expr_uncoerced(
 
         // ── Call ───────────────────────────────────────────────────
         NodeKind::Call => lower_call(resolved, ast, node_idx, builder, block),
+        NodeKind::InfixFnCall => lower_infix_call(resolved, ast, node_idx, builder, block),
         NodeKind::EffectPropagation => {
             lower_expr(resolved, ast.fixed_children(node_idx)[0], builder, block)
         }
         NodeKind::EffectElimination => {
             lower_effect_elimination(resolved, ast, node_idx, builder, block)
+        }
+        NodeKind::HandlerApplication => {
+            crate::capability::lower_handler_application(resolved, node_idx, builder, block)
         }
 
         // ── Struct / enum construction: TypeName { field: val, ... }
@@ -299,27 +304,187 @@ fn lower_expr_uncoerced(
         NodeKind::OptionPropagation => {
             crate::optional::propagate(resolved, node_idx, builder, block)
         }
+        NodeKind::Await => {
+            let inner = ast.fixed_children(node_idx)[0];
+            let future = lower_expr(resolved, inner, builder, block);
+            let local = builder.alloc_local();
+            builder.blocks[block.0 as usize]
+                .stmts
+                .push(NirStmt::Assign(local, NirExpr::Await(future)));
+            if let Some(expected) = builder.node_type(resolved, node_idx)
+                && resolved.type_pool.as_intrinsic(expected) != Some(Intrinsic::Any)
+                && crate::trait_parameters::bare_trait(resolved, expected).is_none()
+            {
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    local,
+                    NirExpr::TypeAssert(NirValue::Local(local), expected)
+                        .in_source_scope(resolved, node_idx),
+                ));
+            }
+            NirValue::Local(local)
+        }
         NodeKind::IfStatement => lower_if_value(resolved, ast, node_idx, builder, block),
+        NodeKind::WhenStatement => lower_when_value(resolved, ast, node_idx, builder, block),
 
         // ── Match expression ────────────────────────────────────────
         NodeKind::PostMatch => crate::patterns::lower_match(resolved, node_idx, builder, block),
         NodeKind::BoolMatches => crate::patterns::lower_matches(resolved, node_idx, builder, block),
 
-        // ── Lambda ─────────────────────────────────────────────────
+        // ── Lambda & case closure ──────────────────────────────────
         NodeKind::Lambda => lower_lambda(resolved, ast, node_idx, builder, block),
+        NodeKind::CaseMap | NodeKind::CaseAlternative => {
+            lower_case_closure(resolved, ast, node_idx, builder, block)
+        }
 
         // ── Named argument — lower value only ──────────────────────
-        NodeKind::NamedArg => {
+        NodeKind::NamedArg | NodeKind::PropertyAssignment => {
             let children = ast.fixed_children(node_idx);
             // children[0] = parameter name (Id) — skip
             // children[1] = value expression — lower
             lower_expr(resolved, children[1], builder, block)
         }
+        NodeKind::SpreadArg => {
+            let inner = ast.fixed_children(node_idx)[0];
+            let val = lower_expr(resolved, inner, builder, block);
+            let canon = builder
+                .node_type(resolved, inner)
+                .and_then(|ty| resolved.type_pool.canonical_type(ty));
+            if let Some(canon_ty) = canon
+                && let type_pool::TypeKind::Tuple { elements } =
+                    resolved.type_pool.get(canon_ty).kind.clone()
+            {
+                let tuple_val = match val {
+                    NirValue::Local(_) => val,
+                    _ => {
+                        let tmp = builder.alloc_local();
+                        builder.blocks[block.0 as usize]
+                            .stmts
+                            .push(NirStmt::Assign(tmp, NirExpr::Use(val)));
+                        NirValue::Local(tmp)
+                    }
+                };
+                let mut unpacked = Vec::with_capacity(elements.len());
+                for idx in 0..elements.len() {
+                    let elem = builder.alloc_local();
+                    builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                        elem,
+                        NirExpr::FieldAccess(tuple_val, idx as u32),
+                    ));
+                    unpacked.push(NirValue::Local(elem));
+                }
+                crate::lists::build_list(&unpacked, builder, *block)
+            } else if canon.is_none_or(|ty| {
+                resolved.type_pool.collection_role(ty) != Some(type_pool::CollectionRole::List)
+            }) && let Some(list_ty) = resolved.type_pool.list_type()
+            {
+                let checked = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    checked,
+                    NirExpr::TypeAssert(val, list_ty).in_source_scope(resolved, node_idx),
+                ));
+                NirValue::Local(checked)
+            } else {
+                val
+            }
+        }
 
         NodeKind::Tuple => crate::tuples::lower_tuple(resolved, node_idx, builder, block),
 
-        // ── Default: produce unit ──────────────────────────────────
-        _ => NirValue::Unit,
+        // ── Statement-only nodes evaluated in expression position ──
+        NodeKind::LetDecl
+        | NodeKind::ConstDecl
+        | NodeKind::VarDecl
+        | NodeKind::DeferStatement
+        | NodeKind::ReturnStatement
+        | NodeKind::ResumeStatement
+        | NodeKind::BreakStatement
+        | NodeKind::ContinueStatement
+        | NodeKind::ForLoop
+        | NodeKind::WhileLoop
+        | NodeKind::PubDef
+        | NodeKind::PrivateDef
+        | NodeKind::GlobalDecl => {
+            crate::stmt::lower_stmt(resolved, node_idx, builder, block, false);
+            NirValue::Unit
+        }
+
+        // ── Non-runtime declarations, types, patterns, and rejected surface constructs ──
+        NodeKind::Invalid
+        | NodeKind::Underscore
+        | NodeKind::Symbol
+        | NodeKind::Object
+        | NodeKind::OptionalType
+        | NodeKind::EffectQualifiedType
+        | NodeKind::ErrorQualifiedType
+        | NodeKind::Arrow
+        | NodeKind::Pipeline
+        | NodeKind::PostDo
+        | NodeKind::ResetExpr
+        | NodeKind::ShiftExpr
+        | NodeKind::FnType
+        | NodeKind::EffectType
+        | NodeKind::AsyncEffectType
+        | NodeKind::AssocDecl
+        | NodeKind::AssocBinding
+        | NodeKind::LetHandler
+        | NodeKind::ConditionArm
+        | NodeKind::ElseConditionArm
+        | NodeKind::CaseArm
+        | NodeKind::CatchArm
+        | NodeKind::PatternOr
+        | NodeKind::PatternNot
+        | NodeKind::PatternError
+        | NodeKind::PatternEffect
+        | NodeKind::PatternTypeFamily
+        | NodeKind::PatternCall
+        | NodeKind::PatternExtendedCall
+        | NodeKind::PatternAsBind
+        | NodeKind::PatternTyped
+        | NodeKind::PatternIfGuard
+        | NodeKind::PatternAndIs
+        | NodeKind::PatternOptionSome
+        | NodeKind::PatternErrorOk
+        | NodeKind::PatternList
+        | NodeKind::PatternTuple
+        | NodeKind::PatternRecord
+        | NodeKind::PatternRestBind
+        | NodeKind::PatternAsync
+        | NodeKind::PatternFromExpr
+        | NodeKind::PropertyPattern
+        | NodeKind::FunctionDef
+        | NodeKind::EffectDef
+        | NodeKind::AsyncEffectDef
+        | NodeKind::HandlesStatement
+        | NodeKind::StructDef
+        | NodeKind::StructField
+        | NodeKind::EnumDef
+        | NodeKind::EnumVariant
+        | NodeKind::TraitDef
+        | NodeKind::TraitDefFn
+        | NodeKind::TraitDeriveFn
+        | NodeKind::ImplDef
+        | NodeKind::ImplTraitDef
+        | NodeKind::ExtendDef
+        | NodeKind::ExtendTraitDef
+        | NodeKind::DeriveDef
+        | NodeKind::Typealias
+        | NodeKind::Newtype
+        | NodeKind::ModuleDef
+        | NodeKind::UseStatement
+        | NodeKind::SuperPath
+        | NodeKind::PackagePath
+        | NodeKind::PathProjection
+        | NodeKind::PathProjectionAll
+        | NodeKind::PathProjectionMulti
+        | NodeKind::PathAsBind
+        | NodeKind::ParamSelf
+        | NodeKind::ParamVarargs
+        | NodeKind::ParamOptional
+        | NodeKind::ParamLambda
+        | NodeKind::ParamTyped
+        | NodeKind::ParamCatch
+        | NodeKind::Property
+        | NodeKind::FileScope => NirValue::Unit,
     }
 }
 
@@ -371,6 +536,34 @@ pub(crate) fn lower_cast(
     block: BlockId,
 ) -> NirLocal {
     let local = builder.alloc_local();
+    if let Some(nt_ty) = builder.newtype_wrap(resolved, node) {
+        let mut inner_val = source;
+        if let Some(nt_canon) = resolved.type_pool.canonical_type(nt_ty)
+            && let type_pool::TypeKind::Newtype { inner, .. } =
+                resolved.type_pool.get(nt_canon).kind
+        {
+            let src_ty = resolved
+                .ast
+                .fixed_children(node)
+                .first()
+                .and_then(|&src_node| builder.node_type(resolved, src_node));
+            if src_ty.and_then(|s| resolved.type_pool.canonical_type(s))
+                != resolved.type_pool.canonical_type(inner)
+            {
+                let cast_local = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    cast_local,
+                    NirExpr::TypeCast(source, inner).in_source_scope(resolved, node),
+                ));
+                inner_val = NirValue::Local(cast_local);
+            }
+        }
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::NewObject(nt_ty, vec![inner_val]).in_source_scope(resolved, node),
+        ));
+        return local;
+    }
     if let Some(view) = crate::trait_parameters::bare_trait(resolved, target) {
         let proof =
             crate::trait_parameters::proof_for(resolved, node, source, view, builder, block);
@@ -715,9 +908,9 @@ mod function_value_tests {
         let mut block = builder.new_block();
         super::lower_closure(
             &resolved,
-            &resolved.ast,
             reference,
             &[parameter],
+            None,
             None,
             &mut builder,
             &mut block,
@@ -1272,9 +1465,43 @@ fn lower_call(
     if let Some(value) = crate::optional::unwrap_call(resolved, node_idx, builder, block) {
         return value;
     }
+    if let Some(value) = crate::errors::unwrap_call(resolved, node_idx, builder, block) {
+        return value;
+    }
     if builder.enum_plan(resolved, node_idx).is_some() {
         return crate::enums::lower_construction(resolved, node_idx, builder, block);
     }
+    if let Some(nt_ty) = builder.newtype_construction(resolved, node_idx) {
+        let is_pipeline = resolved.pipeline_calls.contains(&node_idx);
+        let pre_first_arg = if is_pipeline && !ast.multi_children(node_idx).is_empty() {
+            let first_node = resolution::argument_value_node(ast, ast.multi_children(node_idx)[0]);
+            let val = lower_expr(resolved, first_node, builder, block);
+            Some(crate::arguments::snapshot(val, builder, *block))
+        } else {
+            None
+        };
+        let args = crate::arguments::lower_arguments_with_first(
+            resolved,
+            node_idx,
+            pre_first_arg,
+            builder,
+            block,
+        );
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::NewObject(nt_ty, args).in_source_scope(resolved, node_idx),
+        ));
+        return NirValue::Local(local);
+    }
+    let is_pipeline = resolved.pipeline_calls.contains(&node_idx);
+    let pre_first_arg = if is_pipeline && !ast.multi_children(node_idx).is_empty() {
+        let first_node = resolution::argument_value_node(ast, ast.multi_children(node_idx)[0]);
+        let val = lower_expr(resolved, first_node, builder, block);
+        Some(crate::arguments::snapshot(val, builder, *block))
+    } else {
+        None
+    };
     let children = ast.fixed_children(node_idx);
     // Materialize the receiver/callable before arguments, and freeze its value
     // before a later expression can assign to the same source variable.
@@ -1284,8 +1511,13 @@ fn lower_call(
         let receiver = lower_expr(resolved, callee_node, builder, block);
         let receiver = crate::arguments::snapshot(receiver, builder, *block);
         let mut args = vec![receiver];
-        args.extend(crate::arguments::lower_method_arguments(
-            resolved, node_idx, receiver, builder, block,
+        args.extend(crate::arguments::lower_method_arguments_with_first(
+            resolved,
+            node_idx,
+            receiver,
+            pre_first_arg,
+            builder,
+            block,
         ));
         let result = builder.alloc_local();
         builder.blocks[block.0 as usize]
@@ -1324,15 +1556,22 @@ fn lower_call(
         crate::arguments::snapshot(value, builder, *block)
     });
     let args = if instance_receiver.is_some() {
-        crate::arguments::lower_method_arguments(
+        crate::arguments::lower_method_arguments_with_first(
             resolved,
             node_idx,
             callable.expect("instance receiver was evaluated"),
+            pre_first_arg,
             builder,
             block,
         )
     } else {
-        crate::arguments::lower_arguments(resolved, node_idx, builder, block)
+        crate::arguments::lower_arguments_with_first(
+            resolved,
+            node_idx,
+            pre_first_arg,
+            builder,
+            block,
+        )
     };
     if let Some(expression) = callable.and_then(|receiver| {
         crate::collections::index_access(resolved, callee_node, receiver, &args, builder)
@@ -1564,33 +1803,210 @@ fn lower_block_expr(
     builder: &mut FunctionBuilder,
     block: &mut BlockId,
 ) -> NirValue {
-    let stmts = ast.multi_children(node_idx);
-    let mut last_val = NirValue::Unit;
-    for (i, &stmt) in stmts.iter().enumerate() {
-        if !matches!(
-            builder.blocks[block.0 as usize].terminator,
-            Terminator::Unreachable
-        ) {
-            break;
-        }
-        if i == stmts.len() - 1
-            && !matches!(
-                ast.node(stmt).kind,
-                NodeKind::LetDecl
-                    | NodeKind::ConstDecl
-                    | NodeKind::VarDecl
-                    | NodeKind::ReturnStatement
-                    | NodeKind::ResumeStatement
-                    | NodeKind::BreakStatement
-                    | NodeKind::ContinueStatement
-            )
-        {
-            last_val = lower_expr(resolved, stmt, builder, block);
+    crate::capability::lower_block_statements(
+        resolved,
+        ast.multi_children(node_idx),
+        crate::capability::BlockExecMode::ExprValue {
+            block_node: node_idx,
+        },
+        builder,
+        block,
+    )
+}
+
+fn lower_infix_call(
+    resolved: &ResolvedAst,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    let operands = ast.fixed_children(node_idx);
+    let lhs = lower_expr(resolved, operands[0], builder, block);
+    let lhs = crate::arguments::snapshot(lhs, builder, *block);
+
+    if let Some(function) = builder.application_call(resolved, node_idx) {
+        let function = builder.func_map[&function];
+        let receiver = lower_id(resolved, node_idx, builder, block);
+        let receiver = crate::arguments::snapshot(receiver, builder, *block);
+        let mut args = vec![receiver];
+        args.extend(crate::arguments::lower_method_arguments_with_first(
+            resolved,
+            node_idx,
+            receiver,
+            Some(lhs),
+            builder,
+            block,
+        ));
+        let result = builder.alloc_local();
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(result, NirExpr::Call(function, args)));
+        return NirValue::Local(result);
+    }
+
+    let Some(sym_id) = resolved_symbol_in(resolved, node_idx, builder) else {
+        lower_expr(resolved, operands[1], builder, block);
+        return NirValue::Unit;
+    };
+    let static_target = resolved.builtin_fns.contains_key(&sym_id)
+        || resolved.symbols[sym_id.0 as usize].kind == SymbolKind::Effect
+        || (resolved.symbols[sym_id.0 as usize].kind == SymbolKind::Function
+            && builder.func_map.contains_key(&sym_id));
+    let callable = (!static_target).then(|| {
+        let val = lower_id(resolved, node_idx, builder, block);
+        crate::arguments::snapshot(val, builder, *block)
+    });
+    let args =
+        crate::arguments::lower_arguments_with_first(resolved, node_idx, Some(lhs), builder, block);
+
+    if let Some(&builtin_id) = resolved.builtin_fns.get(&sym_id) {
+        let expression = if declared_function_type(resolved, node_idx, sym_id, builder).is_some() {
+            let function = callable_function(resolved, node_idx, sym_id, builder)
+                .expect("typed native symbol produces an adapter");
+            NirExpr::Call(function, args)
         } else {
-            crate::stmt::lower_stmt(resolved, stmt, builder, block, false);
+            NirExpr::CallBuiltin(builtin_id, args)
+        };
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(local, expression));
+        return NirValue::Local(local);
+    }
+
+    let sym = &resolved.symbols[sym_id.0 as usize];
+    if sym.kind == SymbolKind::Effect {
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::EffectCall(sym.type_index, args),
+        ));
+        return NirValue::Local(local);
+    }
+    if sym.kind == SymbolKind::Function
+        && let Some(&func_id) = builder.func_map.get(&sym_id)
+    {
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(local, NirExpr::Call(func_id, args)));
+        return NirValue::Local(local);
+    }
+
+    let callee_val = callable.expect("dynamic infix callable was evaluated");
+    let callee_ti = builder.symbol_type(resolved, sym_id);
+    let is_function_type = resolved
+        .type_pool
+        .canonical_type(callee_ti)
+        .is_some_and(|ty| {
+            matches!(
+                resolved.type_pool.get(ty).kind,
+                type_pool::TypeKind::Function { .. }
+            )
+        });
+    let callee_intrinsic = resolved
+        .type_pool
+        .canonical_type(callee_ti)
+        .and_then(|ty| resolved.type_pool.as_intrinsic(ty));
+    if is_function_type
+        || callee_ti == type_pool::TypeIndex::INVALID
+        || callee_intrinsic == Some(type_pool::Intrinsic::Any)
+    {
+        let local = builder.alloc_local();
+        let (args, changed) = crate::trait_parameters::expand_arguments(
+            resolved, node_idx, callee_ti, args, builder, *block,
+        );
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            if changed {
+                NirExpr::CallIndirectProof(callee_val, args)
+            } else {
+                NirExpr::CallIndirect(callee_val, args)
+            },
+        ));
+        check_indirect_return(resolved, node_idx, local, builder, *block);
+        return NirValue::Local(local);
+    }
+
+    let apply_str = str_interner::intern("apply");
+    let local = builder.alloc_local();
+    builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+        local,
+        NirExpr::MethodCall(callee_val, apply_str, args),
+    ));
+    NirValue::Local(local)
+}
+
+fn lower_when_value(
+    resolved: &ResolvedAst,
+    ast: &Ast,
+    node: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    let arms = ast.multi_children(node);
+    let has_else = arms
+        .iter()
+        .any(|&arm| !arm.is_null() && ast.node(arm).kind == NodeKind::ElseConditionArm);
+    let result = builder.alloc_local();
+    let merge = builder.new_block();
+
+    for &arm in arms {
+        if arm.is_null() {
+            continue;
+        }
+        match ast.node(arm).kind {
+            NodeKind::ConditionArm => {
+                let children = ast.fixed_children(arm);
+                let cond = lower_expr(resolved, children[0], builder, block);
+                let mut arm_block = builder.new_block();
+                let next_block = builder.new_block();
+                builder.blocks[block.0 as usize].terminator =
+                    Terminator::Branch(cond, arm_block, next_block);
+                let val = lower_expr(resolved, children[1], builder, &mut arm_block);
+                if matches!(
+                    builder.blocks[arm_block.0 as usize].terminator,
+                    Terminator::Unreachable
+                ) {
+                    let stored = if has_else { val } else { NirValue::Unit };
+                    builder.blocks[arm_block.0 as usize]
+                        .stmts
+                        .push(NirStmt::Assign(result, NirExpr::Use(stored)));
+                    builder.blocks[arm_block.0 as usize].terminator = Terminator::Goto(merge);
+                }
+                *block = next_block;
+            }
+            NodeKind::ElseConditionArm => {
+                let body = ast.fixed_children(arm)[0];
+                let val = lower_expr(resolved, body, builder, block);
+                if matches!(
+                    builder.blocks[block.0 as usize].terminator,
+                    Terminator::Unreachable
+                ) {
+                    builder.blocks[block.0 as usize]
+                        .stmts
+                        .push(NirStmt::Assign(result, NirExpr::Use(val)));
+                    builder.blocks[block.0 as usize].terminator = Terminator::Goto(merge);
+                }
+                *block = merge;
+                return NirValue::Local(result);
+            }
+            _ => {}
         }
     }
-    last_val
+
+    if matches!(
+        builder.blocks[block.0 as usize].terminator,
+        Terminator::Unreachable
+    ) {
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(result, NirExpr::Use(NirValue::Unit)));
+        builder.blocks[block.0 as usize].terminator = Terminator::Goto(merge);
+    }
+    *block = merge;
+    NirValue::Local(result)
 }
 
 fn lower_if_value(
@@ -1663,6 +2079,95 @@ fn lower_projection(
     }
 
     let field_name = ast.node(member_node).str_id;
+    if let Some(signature) = builder
+        .self_function_types
+        .get(&node_idx)
+        .copied()
+        .or_else(|| builder.node_type(resolved, node_idx))
+        .and_then(|sig| resolved.type_pool.canonical_type(sig))
+        && let type_pool::TypeKind::Function { params, ret } =
+            resolved.type_pool.get(signature).kind.clone()
+    {
+        let receiver = crate::arguments::snapshot(object, builder, *block);
+        let recv_ty = builder
+            .node_type(resolved, children[0])
+            .unwrap_or(type_pool::Intrinsic::Any.type_index());
+        let wrapper_id = builder.alloc_func_id();
+        let mut wrapper = FunctionBuilder::new(wrapper_id, str_interner::intern("<bound-method>"));
+        wrapper.entry_scope = resolved
+            .node_scopes
+            .get(&node_idx)
+            .map(|scope| scope.0)
+            .or(builder.entry_scope);
+        wrapper.body_facts = builder.body_facts.clone();
+        wrapper.specialized_node_types = builder.specialized_node_types.clone();
+        wrapper.specialized_symbol_types = builder.specialized_symbol_types.clone();
+        wrapper.specialized_coercion_targets = builder.specialized_coercion_targets.clone();
+        wrapper.self_type_values = builder.self_type_values.clone();
+        wrapper.self_function_types = builder.self_function_types.clone();
+        wrapper.self_function_parameters = builder.self_function_parameters.clone();
+        wrapper.default_trait_view = builder.default_trait_view;
+        wrapper.func_map = builder.func_map.clone();
+        wrapper.derived_functions = builder.derived_functions.clone();
+        wrapper.global_map = builder.global_map.clone();
+        wrapper.native_adapters = builder.native_adapters.clone();
+        wrapper.next_func_id = builder.next_func_id;
+        wrapper.is_closure = true;
+        wrapper.function_type = signature;
+        wrapper.return_type = ret;
+
+        let captured_recv = wrapper.alloc_local();
+        wrapper.params.push(NirParam {
+            local: captured_recv,
+            name: str_interner::intern("<receiver>"),
+            type_index: recv_ty,
+            role: crate::NirParamRole::Capture,
+        });
+        let mut user_locals = Vec::with_capacity(params.len());
+        for (idx, &param_ty) in params.iter().enumerate() {
+            let arg_local = wrapper.alloc_local();
+            user_locals.push(NirValue::Local(arg_local));
+            wrapper.params.push(NirParam {
+                local: arg_local,
+                name: str_interner::intern(&format!("<arg{idx}>")),
+                type_index: param_ty,
+                role: crate::NirParamRole::User,
+            });
+        }
+        crate::trait_parameters::prepare_parameters(resolved, &mut wrapper);
+        let entry = wrapper.new_block();
+        wrapper.entry_block = entry;
+        let res_local = wrapper.alloc_local();
+        if let Some(method_sym) = builder.instance_method(resolved, node_idx)
+            && let Some(&func_id) = wrapper.func_map.get(&method_sym)
+        {
+            let mut call_args = vec![NirValue::Local(captured_recv)];
+            call_args.extend(user_locals);
+            wrapper.blocks[entry.0 as usize].stmts.push(NirStmt::Assign(
+                res_local,
+                NirExpr::Call(func_id, call_args),
+            ));
+            crate::trait_parameters::finish_statements(resolved, node_idx, &[0], &mut wrapper);
+        } else {
+            wrapper.blocks[entry.0 as usize].stmts.push(NirStmt::Assign(
+                res_local,
+                NirExpr::MethodCall(NirValue::Local(captured_recv), field_name, user_locals)
+                    .in_source_scope(resolved, node_idx),
+            ));
+        }
+        wrapper.blocks[entry.0 as usize].terminator =
+            Terminator::Return(NirValue::Local(res_local));
+        builder.next_func_id = wrapper.next_func_id;
+        builder.lambda_functions.push(wrapper.build());
+
+        let closure_local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            closure_local,
+            NirExpr::NewClosure(wrapper_id, vec![receiver]),
+        ));
+        return NirValue::Local(closure_local);
+    }
+
     let local = builder.alloc_local();
     builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
         local,
@@ -1693,7 +2198,7 @@ fn lower_lambda(
     let children = ast.fixed_children(node_idx);
     let body_node = children[0];
     let params = ast.multi_children(node_idx);
-    let (value, function) = lower_closure(resolved, ast, body_node, params, None, builder, block);
+    let (value, function) = lower_closure(resolved, body_node, params, None, None, builder, block);
     if let Some(signature) = builder
         .self_function_types
         .get(&node_idx)
@@ -1712,18 +2217,168 @@ fn lower_lambda(
     value
 }
 
-fn lower_closure(
+fn lower_case_closure(
     resolved: &ResolvedAst,
     ast: &Ast,
+    node_idx: NodeIndex,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    let mut free_vars: Vec<(resolution::SymbolId, NirLocal)> = Vec::new();
+    collect_free_vars(resolved, ast, node_idx, builder, &mut free_vars);
+    let mut seen = std::collections::HashSet::new();
+    free_vars.retain(|(sym, _)| seen.insert(*sym));
+
+    let signature = builder
+        .self_function_types
+        .get(&node_idx)
+        .copied()
+        .or_else(|| builder.node_type(resolved, node_idx))
+        .and_then(|sig| resolved.type_pool.canonical_type(sig));
+    let (param_ty, ret_ty) = signature
+        .and_then(|sig| match &resolved.type_pool.get(sig).kind {
+            type_pool::TypeKind::Function { params, ret } => Some((
+                params
+                    .first()
+                    .copied()
+                    .unwrap_or(type_pool::Intrinsic::Any.type_index()),
+                *ret,
+            )),
+            _ => None,
+        })
+        .unwrap_or((
+            type_pool::Intrinsic::Any.type_index(),
+            type_pool::Intrinsic::Unit.type_index(),
+        ));
+
+    let lambda_name = str_interner::intern("<case>");
+    let lambda_func_id = builder.alloc_func_id();
+    let mut lambda_builder = FunctionBuilder::new(lambda_func_id, lambda_name);
+    lambda_builder.entry_scope = resolved.node_scopes.get(&node_idx).map(|scope| scope.0);
+    lambda_builder.body_facts = builder.body_facts.clone();
+    lambda_builder.specialized_node_types = builder.specialized_node_types.clone();
+    lambda_builder.specialized_symbol_types = builder.specialized_symbol_types.clone();
+    lambda_builder.specialized_coercion_targets = builder.specialized_coercion_targets.clone();
+    lambda_builder.self_type_values = builder.self_type_values.clone();
+    lambda_builder.self_function_types = builder.self_function_types.clone();
+    lambda_builder.self_function_parameters = builder.self_function_parameters.clone();
+    lambda_builder.default_trait_view = builder.default_trait_view;
+    lambda_builder.func_map = builder.func_map.clone();
+    lambda_builder.derived_functions = builder.derived_functions.clone();
+    lambda_builder.global_map = builder.global_map.clone();
+    lambda_builder.native_adapters = builder.native_adapters.clone();
+    lambda_builder.next_func_id = builder.next_func_id;
+    lambda_builder.is_closure = true;
+    if let Some(sig) = signature {
+        lambda_builder.function_type = sig;
+    }
+    lambda_builder.return_type = ret_ty;
+
+    for (sym_id, parent_local) in &free_vars {
+        let local = lambda_builder.alloc_local();
+        lambda_builder.symbol_to_local.insert(*sym_id, local);
+        lambda_builder.params.push(NirParam {
+            local,
+            name: resolved.symbols[sym_id.0 as usize].name,
+            type_index: builder.symbol_type(resolved, *sym_id),
+            role: crate::NirParamRole::Capture,
+        });
+        if let Some(&(_, view)) = builder.value_proofs.get(parent_local) {
+            let proof = lambda_builder.alloc_local();
+            lambda_builder.params.push(NirParam {
+                local: proof,
+                name: str_interner::intern("<captured-proof>"),
+                type_index: type_pool::TypeIndex::INVALID,
+                role: crate::NirParamRole::CaptureProof { view },
+            });
+            lambda_builder.value_proofs.insert(local, (proof, view));
+        }
+    }
+
+    let scrutinee_local = lambda_builder.alloc_local();
+    lambda_builder.params.push(NirParam {
+        local: scrutinee_local,
+        name: str_interner::intern("<case-arg>"),
+        type_index: param_ty,
+        role: crate::NirParamRole::User,
+    });
+    crate::trait_parameters::prepare_parameters(resolved, &mut lambda_builder);
+
+    let entry = lambda_builder.new_block();
+    lambda_builder.entry_block = entry;
+    let scrutinee = NirValue::Local(scrutinee_local);
+
+    let mut arms = Vec::new();
+    resolution::flatten_case_arms(ast, node_idx, &mut arms);
+    let mut current = entry;
+    for arm in arms {
+        let children = ast.fixed_children(arm);
+        let mut arm_body = lambda_builder.new_block();
+        let next = lambda_builder.new_block();
+        crate::patterns::branch(
+            resolved,
+            children[0],
+            scrutinee,
+            &mut lambda_builder,
+            current,
+            arm_body,
+            next,
+        );
+        crate::stmt::lower_body_into(resolved, children[1], &mut lambda_builder, &mut arm_body);
+        current = next;
+    }
+    lambda_builder.blocks[current.0 as usize].terminator = Terminator::MatchFail;
+
+    builder.next_func_id = lambda_builder.next_func_id;
+    let nested_lambdas = std::mem::take(&mut lambda_builder.lambda_functions);
+    let lambda_fn = lambda_builder.build();
+    builder.lambda_functions.push(lambda_fn);
+    builder.lambda_functions.extend(nested_lambdas);
+
+    let mut captures = Vec::new();
+    for (_, parent_local) in &free_vars {
+        captures.push(NirValue::Local(*parent_local));
+        if let Some(&(proof, _)) = builder.value_proofs.get(parent_local) {
+            captures.push(NirValue::Local(proof));
+        }
+    }
+
+    let result = builder.alloc_local();
+    builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+        result,
+        NirExpr::NewClosure(lambda_func_id, captures),
+    ));
+    NirValue::Local(result)
+}
+
+pub(crate) fn lower_closure(
+    resolved: &ResolvedAst,
     body_node: NodeIndex,
     params: &[NodeIndex],
     fresh_continuation: Option<resolution::SymbolId>,
+    explicit_return_type: Option<type_pool::TypeIndex>,
     builder: &mut FunctionBuilder,
     block: &mut BlockId,
 ) -> (NirValue, FuncId) {
+    let ast = &resolved.ast;
     // Phase 1: discover free variables by collecting all referenced symbols
-    // in the body that are already known in the parent's scope.
+    // in the body (and any pattern guards) that are already known in the parent's scope.
     let mut free_vars: Vec<(resolution::SymbolId, NirLocal)> = Vec::new();
+    for &param in params {
+        if !param.is_null()
+            && !matches!(
+                ast.node(param).kind,
+                NodeKind::ParamTyped
+                    | NodeKind::ParamLambda
+                    | NodeKind::ParamSelf
+                    | NodeKind::ParamOptional
+                    | NodeKind::ParamVarargs
+                    | NodeKind::ParamCatch
+            )
+        {
+            collect_free_vars(resolved, ast, param, builder, &mut free_vars);
+        }
+    }
     collect_free_vars(resolved, ast, body_node, builder, &mut free_vars);
     // Deduplicate preserving order.
     let mut seen = std::collections::HashSet::new();
@@ -1777,10 +2432,22 @@ fn lower_closure(
 
     // Add explicit lambda parameters.
     let mut tuple_parameters = Vec::new();
+    let mut handler_patterns = Vec::new();
     for &param in params {
         let param_node = ast.node(param);
         match param_node.kind {
-            NodeKind::Id | NodeKind::Underscore => {
+            NodeKind::Underscore => {
+                let local = lambda_builder.alloc_local();
+                lambda_builder.params.push(NirParam {
+                    local,
+                    name: param_node.str_id,
+                    type_index: builder
+                        .node_type(resolved, param)
+                        .unwrap_or(type_pool::Intrinsic::Any.type_index()),
+                    role: crate::NirParamRole::User,
+                });
+            }
+            NodeKind::Id if builder.enum_variant(resolved, param).is_none() => {
                 let local = if let Some(&symbol) = resolved.node_symbols.get(&param) {
                     lambda_builder.local_for_symbol(symbol)
                 } else {
@@ -1817,21 +2484,31 @@ fn lower_closure(
                         .unwrap_or(type_pool::TypeIndex::INVALID),
                     role: crate::NirParamRole::User,
                 });
-                if pat_node.kind == NodeKind::PatternTuple {
+                if matches!(
+                    pat_node.kind,
+                    NodeKind::PatternTuple
+                        | NodeKind::PatternExtendedCall
+                        | NodeKind::PatternTyped
+                        | NodeKind::PatternCall
+                ) {
                     tuple_parameters.push((pat_node_idx, local));
                 }
             }
-            NodeKind::PatternTuple => {
-                let local = lambda_builder.alloc_local();
+            NodeKind::ParamCatch => {
+                let param_children = ast.fixed_children(param);
+                let id_node_idx = param_children[0];
+                let id_node = ast.node(id_node_idx);
+                let local = if let Some(&sym_id) = resolved.node_symbols.get(&id_node_idx) {
+                    lambda_builder.local_for_symbol(sym_id)
+                } else {
+                    lambda_builder.alloc_local()
+                };
                 lambda_builder.params.push(NirParam {
                     local,
-                    name: str_interner::intern("<tuple>"),
-                    type_index: builder
-                        .node_type(resolved, param)
-                        .unwrap_or(type_pool::TypeIndex::INVALID),
+                    name: id_node.str_id,
+                    type_index: type_pool::Intrinsic::Continuation.type_index(),
                     role: crate::NirParamRole::User,
                 });
-                tuple_parameters.push((param, local));
             }
             NodeKind::ParamSelf => {
                 let local = lambda_builder.alloc_local();
@@ -1881,7 +2558,18 @@ fn lower_closure(
                     role: crate::NirParamRole::User,
                 });
             }
-            _ => {}
+            _ => {
+                let local = lambda_builder.alloc_local();
+                lambda_builder.params.push(NirParam {
+                    local,
+                    name: str_interner::intern("<param>"),
+                    type_index: builder
+                        .node_type(resolved, param)
+                        .unwrap_or(type_pool::TypeIndex::INVALID),
+                    role: crate::NirParamRole::User,
+                });
+                handler_patterns.push((param, local));
+            }
         }
     }
 
@@ -1929,8 +2617,33 @@ fn lower_closure(
             entry,
         );
     }
-    lambda_builder.return_type = builder
-        .node_type(resolved, body_node)
+    for (pattern, local) in handler_patterns {
+        if crate::tuples::is_irrefutable_binding(resolved, pattern) {
+            crate::tuples::bind_pattern(
+                resolved,
+                pattern,
+                NirValue::Local(local),
+                &mut lambda_builder,
+                entry,
+            );
+        } else {
+            let next = lambda_builder.new_block();
+            let fail = lambda_builder.new_block();
+            lambda_builder.blocks[fail.0 as usize].terminator = Terminator::MatchFail;
+            crate::patterns::branch(
+                resolved,
+                pattern,
+                NirValue::Local(local),
+                &mut lambda_builder,
+                entry,
+                next,
+                fail,
+            );
+            entry = next;
+        }
+    }
+    lambda_builder.return_type = explicit_return_type
+        .or_else(|| builder.node_type(resolved, body_node))
         .unwrap_or(type_pool::Intrinsic::Unit.type_index());
     if let Some((_, &signature)) = specialization
         && let type_pool::TypeKind::Function { ret, .. } = resolved.type_pool.get(signature).kind
@@ -1988,7 +2701,12 @@ fn lower_effect_elimination(
     let mut captures = false;
     for &arm in arms {
         let children = ast.fixed_children(arm);
-        let pattern = children[0];
+        let raw_pattern = children[0];
+        let pattern = if ast.node(raw_pattern).kind == NodeKind::PatternAsync {
+            ast.fixed_children(raw_pattern)[0]
+        } else {
+            raw_pattern
+        };
         let callee = ast.fixed_children(pattern)[0];
         let symbol = resolved.node_symbols[&callee];
         let effect = resolved.symbols[symbol.0 as usize].type_index;
@@ -2005,10 +2723,10 @@ fn lower_effect_elimination(
             .copied();
         let (closure, _) = lower_closure(
             resolved,
-            ast,
             children[1],
             ast.multi_children(pattern),
             fresh_continuation,
+            None,
             builder,
             block,
         );
@@ -2020,34 +2738,18 @@ fn lower_effect_elimination(
                 continuation_param,
             });
     }
-    let result = if captures {
-        let (body, _) = lower_closure(
-            resolved,
-            ast,
-            ast.fixed_children(node)[0],
-            &[],
-            None,
-            builder,
-            block,
-        );
-        let local = builder.alloc_local();
-        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
-            local,
-            NirExpr::DelimitedCall {
-                body,
-                handler_count: arms.len() as u8,
-            },
-        ));
-        NirValue::Local(local)
-    } else {
-        lower_expr(resolved, ast.fixed_children(node)[0], builder, block)
-    };
-    for _ in arms {
-        builder.blocks[block.0 as usize]
-            .stmts
-            .push(NirStmt::PopHandler);
-    }
-    result
+    crate::stmt::finish_handler_scope_expr(
+        resolved,
+        crate::stmt::HandlerScopeSpec {
+            scope_node: node,
+            expr_node: ast.fixed_children(node)[0],
+            count: arms.len(),
+            captures,
+            answer_type: None,
+        },
+        builder,
+        block,
+    )
 }
 
 /// Recursively collect free variables referenced in a subtree.
@@ -2055,7 +2757,7 @@ fn lower_effect_elimination(
 /// A "free variable" is any identifier whose resolved SymbolId is already
 /// mapped to a NirLocal in the *parent* builder — i.e., it was defined in
 /// an enclosing scope and needs to be captured.
-fn collect_free_vars(
+pub(crate) fn collect_free_vars(
     resolved: &ResolvedAst,
     ast: &Ast,
     node_idx: NodeIndex,

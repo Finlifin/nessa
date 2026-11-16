@@ -22,7 +22,8 @@ pub use access::{MethodAccess, MethodAccessError, ScopeContext};
 pub use associated::AssociatedTypeBinding;
 pub use associated_defaults::{AssociatedTypeDefault, AssociatedTypeExpr};
 pub use collections::{
-    CollectionRole, LIST_BUFFER_TYPE_ID, LIST_TYPE_ID, MAP_BUFFER_TYPE_ID, MAP_TYPE_ID,
+    BYTES_BUFFER_TYPE_ID, BYTES_TYPE_ID, CollectionRole, LIST_BUFFER_TYPE_ID, LIST_TYPE_ID,
+    MAP_BUFFER_TYPE_ID, MAP_TYPE_ID,
 };
 pub use dispatch::{TraitDispatchSchema, TraitMethodDescriptor, TraitMethodKey, TraitProofError};
 pub use functions::DerivedMethodError;
@@ -60,6 +61,7 @@ pub struct WellKnownTraits {
     pub partial_ord: TypeIndex,
     pub iterator: TypeIndex,
     pub into_iterator: TypeIndex,
+    pub json: TypeIndex,
 }
 
 impl WellKnownTraits {
@@ -72,6 +74,7 @@ impl WellKnownTraits {
         partial_ord: TypeIndex::INVALID,
         iterator: TypeIndex::INVALID,
         into_iterator: TypeIndex::INVALID,
+        json: TypeIndex::INVALID,
     };
 
     /// Well-known trait names in registration order.
@@ -84,6 +87,7 @@ impl WellKnownTraits {
         "PartialOrd",
         "Iterator",
         "IntoIterator",
+        "Json",
     ];
 }
 
@@ -305,6 +309,9 @@ pub enum TypeKind {
     /// Optional type `?T`.
     Optional { inner: TypeIndex },
 
+    /// Asynchronous task handle `Future(T)`.
+    Future { inner: TypeIndex },
+
     /// Error-qualified type `!E T`.
     ErrorQualified {
         errors: Vec<TypeIndex>,
@@ -466,7 +473,7 @@ pub struct TypePool {
     null_type: TypeIndex,
     identity_input: Option<TypeIdentityInput>,
     identity_dirty: std::sync::atomic::AtomicBool,
-    identity_known: [TypeIndex; 8],
+    identity_known: [TypeIndex; 9],
     /// Types confirmed free of associated binders and templates. Appending
     /// types cannot change a confirmed result; `get_mut` clears the cache.
     concrete_types: std::sync::Mutex<Vec<bool>>,
@@ -491,7 +498,7 @@ impl TypePool {
             null_type: TypeIndex::INVALID,
             identity_input: None,
             identity_dirty: std::sync::atomic::AtomicBool::new(false),
-            identity_known: [TypeIndex::INVALID; 8],
+            identity_known: [TypeIndex::INVALID; 9],
             concrete_types: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -537,6 +544,7 @@ impl TypePool {
         let partial_ord_name = str_interner::intern("PartialOrd");
         let iterator_name = str_interner::intern("Iterator");
         let into_iterator_name = str_interner::intern("IntoIterator");
+        let json_name = str_interner::intern("Json");
 
         let mk = |pool: &mut Self, name: StrId, ordinal: u64| -> TypeIndex {
             pool.push(TypeInfo {
@@ -560,12 +568,18 @@ impl TypePool {
             partial_ord: mk(self, partial_ord_name, 6),
             iterator: mk(self, iterator_name, 7),
             into_iterator: mk(self, into_iterator_name, 8),
+            json: mk(self, json_name, 9),
         };
     }
 
     /// Register a new type, returning its [`TypeIndex`].
     pub fn register(&mut self, info: TypeInfo) -> TypeIndex {
         self.push(info)
+    }
+
+    /// Intern `Future(inner)` with its 1-word runtime handle layout.
+    pub fn intern_future(&mut self, inner: TypeIndex) -> TypeIndex {
+        self.intern_structural(TypeKind::Future { inner })
     }
 
     /// Reuse structural types by shape, resolving valid alias references first.
@@ -581,6 +595,7 @@ impl TypePool {
                 | TypeKind::Function { .. }
                 | TypeKind::Effect { .. }
                 | TypeKind::Optional { .. }
+                | TypeKind::Future { .. }
                 | TypeKind::ErrorQualified { .. }
                 | TypeKind::EffectQualified { .. }
         );
@@ -594,13 +609,18 @@ impl TypePool {
                 return index;
             }
         }
+        let (size, align) = if matches!(kind, TypeKind::Future { .. }) {
+            (8, 8)
+        } else {
+            (0, 0)
+        };
         let index = self.register(TypeInfo {
             kind,
             // Stable identities require package identity, version and layout.
             // Structural interning must not invent a substitute persistent ID.
             type_id: TypeId::ZERO,
-            size: 0,
-            align: 0,
+            size,
+            align,
         });
         if structural {
             self.structural_types.push(index);
@@ -621,7 +641,7 @@ impl TypePool {
                 params.iter_mut().for_each(normalize);
                 normalize(ret);
             }
-            TypeKind::Optional { inner } => normalize(inner),
+            TypeKind::Optional { inner } | TypeKind::Future { inner } => normalize(inner),
             TypeKind::ErrorQualified { errors, inner } => {
                 errors.iter_mut().for_each(normalize);
                 errors.sort_unstable_by_key(|ty| ty.as_u32());
@@ -710,6 +730,10 @@ impl TypePool {
             TypeKind::Optional { inner } => {
                 Some(format!("?{}", self.display_name_inner(*inner, active)?))
             }
+            TypeKind::Future { inner } => Some(format!(
+                "Future({})",
+                self.display_name_inner(*inner, active)?
+            )),
             TypeKind::ErrorQualified { errors, inner } => {
                 self.display_qualified("!", errors, *inner, active)
             }
@@ -906,6 +930,19 @@ impl TypePool {
         TypeIndex(intr as u32)
     }
 
+    /// Look up a pre-interned `Future(inner)` type without mutating the pool.
+    pub fn find_future(&self, inner: TypeIndex) -> Option<TypeIndex> {
+        let canon_inner = self.canonical_type(inner)?;
+        for (idx, info) in self.types.iter().enumerate() {
+            if let TypeKind::Future { inner: cand } = info.kind
+                && self.canonical_type(cand) == Some(canon_inner)
+            {
+                return Some(TypeIndex(idx as u32));
+            }
+        }
+        None
+    }
+
     // -- Type lattice queries ------------------------------------------------
 
     /// Is `sub` a subtype of `sup` in the type lattice?
@@ -949,7 +986,8 @@ impl TypePool {
                     || self.is_gradually_consistent(*ai, *bi)
                     || self.is_subtype(*ai, *bi)
             }
-            (TypeKind::Optional { inner: ai }, TypeKind::Optional { inner: bi }) => {
+            (TypeKind::Optional { inner: ai }, TypeKind::Optional { inner: bi })
+            | (TypeKind::Future { inner: ai }, TypeKind::Future { inner: bi }) => {
                 self.is_gradually_consistent(*ai, *bi)
             }
             (TypeKind::Tuple { elements: ae }, TypeKind::Tuple { elements: be }) => {
@@ -1042,7 +1080,8 @@ fn same_structural_shape(left: &TypeKind, right: &TypeKind) -> bool {
                 is_async: right_async,
             },
         ) => left == right && left_ret == right_ret && left_async == right_async,
-        (TypeKind::Optional { inner: left }, TypeKind::Optional { inner: right }) => left == right,
+        (TypeKind::Optional { inner: left }, TypeKind::Optional { inner: right })
+        | (TypeKind::Future { inner: left }, TypeKind::Future { inner: right }) => left == right,
         (
             TypeKind::ErrorQualified {
                 errors: left,
@@ -1112,10 +1151,10 @@ mod tests {
     #[test]
     fn intrinsics_populated() {
         let pool = TypePool::with_intrinsics();
-        // Intrinsics, well-known traits, null, and two collection role pairs.
+        // Intrinsics, well-known traits, null, and three collection role pairs.
         assert_eq!(
             pool.len(),
-            Intrinsic::COUNT + WellKnownTraits::NAMES.len() + 5
+            Intrinsic::COUNT + WellKnownTraits::NAMES.len() + 7
         );
         assert_eq!(
             pool.intrinsic(Intrinsic::U32).as_u32(),
@@ -1186,7 +1225,7 @@ mod tests {
         let idx = pool.register(info);
         assert_eq!(
             idx.as_u32(),
-            (Intrinsic::COUNT + WellKnownTraits::NAMES.len() + 5) as u32
+            (Intrinsic::COUNT + WellKnownTraits::NAMES.len() + 7) as u32
         );
         assert!(matches!(pool.get(idx).kind, TypeKind::Struct { .. }));
     }
