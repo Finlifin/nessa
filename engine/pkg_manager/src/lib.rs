@@ -23,10 +23,12 @@ pub use identity::PackageIdentity;
 pub use lockfile::{
     LOCKFILE_VERSION, LockedPackage, Lockfile, compute_package_sha256, relative_normalized_path,
 };
-pub use manifest::{FfiConfig, ManifestDocument, PathDependency};
+pub use manifest::{
+    FfiConfig, FfiWasmExportSpec, FfiWasmModuleSpec, ManifestDocument, PathDependency,
+};
 pub use resolver::{PackageResolver, ResolvedPackageGraph};
 pub use source::{
-    ModuleSources, PackageSourceError, PackageSources, SourceFile, SourceLoadLimits,
+    ModuleSources, PackageSourceError, PackageSources, SourceFile, SourceLoadLimits, WasmAsset,
     discover_modules, discover_modules_with_limits, load_package_sources,
     load_package_sources_with_limits,
 };

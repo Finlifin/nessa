@@ -34,14 +34,16 @@ fn print_usage() {
         "Usage: nessa <command> [options]\n\
          \n\
          Commands:\n\
-         \x20 run <file.ns|file.nsbc|directory> [-- <args...>]  Run source, package or archive\n\
-         \x20 build <file.ns|directory>                         Compile to .nsbc archive\n\
-         \x20 check <file.ns|directory>                         Type-check without running\n\
-         \x20 disasm <file.ns|file.nsbc|directory>              Disassemble bytecode to stdout\n\
-         \x20 version                                           Print version\n\
-         \x20 help                                              Print this help\n\
+         \x20 run <file.ns|file.nsbc|file.wasm|directory> [-- <args...>]  Run source, package, archive or .wasm\n\
+         \x20 build <file.ns|directory> [--target <...>] [-o <path>]      Compile to .nsbc archive or .wasm\n\
+         \x20 check <file.ns|directory>                                   Type-check without running\n\
+         \x20 disasm <file.ns|file.nsbc|file.wasm|directory>              Disassemble bytecode or .wasm\n\
+         \x20 version                                                     Print version\n\
+         \x20 help                                                        Print this help\n\
          \n\
          Options:\n\
+         \x20 --target <nsbc|wasm32-wasi|wasm32-freestanding>  Select `build` output target (default: nsbc)\n\
+         \x20 -o, --output <path>         Explicit output file path for `build`\n\
          \x20 -O0, -O1, -O2, -O3, -O      Set AOT optimization level (`-O` aliases `-O2`; default: `-O0`)\n\
          \x20 --opt-level <0|1|2|3>       Set AOT optimization level explicitly\n\
          \x20 --locked                    Require and verify package.lock without modifying it\n\
@@ -57,6 +59,12 @@ fn print_usage() {
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildTarget {
+    Nsbc,
+    Wasm(driver::WasmTarget),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CompileCmdArgs<'a> {
     file: &'a str,
@@ -64,6 +72,8 @@ struct CompileCmdArgs<'a> {
     emit_ast_dump: bool,
     emit_bc_dump: bool,
     opt_level: Option<driver::OptLevel>,
+    target: Option<BuildTarget>,
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,6 +106,19 @@ fn parse_cli_jit_mode(raw: &str) -> Result<driver::JitMode, String> {
     }
 }
 
+fn parse_cli_build_target(raw: &str) -> Result<BuildTarget, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "nsbc" | "bytecode" => Ok(BuildTarget::Nsbc),
+        other => driver::WasmTarget::parse_str(other)
+            .map(BuildTarget::Wasm)
+            .ok_or_else(|| {
+                format!(
+                    "error: invalid --target '{raw}' (expected nsbc, wasm32-wasi, or wasm32-freestanding)"
+                )
+            }),
+    }
+}
+
 fn parse_compile_args(
     args: &[String],
     allow_dump_flags: bool,
@@ -105,6 +128,8 @@ fn parse_compile_args(
     let mut emit_ast_dump = false;
     let mut emit_bc_dump = false;
     let mut opt_level = None;
+    let mut target = None;
+    let mut output = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -125,6 +150,27 @@ fn parse_compile_args(
             s if allow_dump_flags && s.starts_with("--opt-level=") => {
                 opt_level = Some(parse_cli_opt_level(&s["--opt-level=".len()..])?);
             }
+            "--target" if allow_dump_flags => {
+                let Some(raw) = iter.next() else {
+                    return Err(
+                        "error: --target requires a target (nsbc|wasm32-wasi|wasm32-freestanding)"
+                            .to_owned(),
+                    );
+                };
+                target = Some(parse_cli_build_target(raw)?);
+            }
+            s if allow_dump_flags && s.starts_with("--target=") => {
+                target = Some(parse_cli_build_target(&s["--target=".len()..])?);
+            }
+            "-o" | "--output" if allow_dump_flags => {
+                let Some(raw) = iter.next() else {
+                    return Err("error: -o/--output requires a file path".to_owned());
+                };
+                output = Some(PathBuf::from(raw));
+            }
+            s if allow_dump_flags && s.starts_with("--output=") => {
+                output = Some(PathBuf::from(&s["--output=".len()..]));
+            }
             _ if file.is_none() && !arg.starts_with('-') => file = Some(arg.as_str()),
             other => return Err(format!("unknown option: {other}")),
         }
@@ -140,6 +186,8 @@ fn parse_compile_args(
         emit_ast_dump,
         emit_bc_dump,
         opt_level,
+        target,
+        output,
     })
 }
 
@@ -318,6 +366,11 @@ fn is_nsbc_file(path: &Path) -> bool {
         .is_some_and(|extension| extension == "nsbc")
 }
 
+fn is_wasm_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "wasm")
+}
+
 fn reject_locked_for_non_package(locked: bool) {
     if locked {
         eprintln!("error: --locked requires a package directory");
@@ -364,6 +417,26 @@ fn cmd_run(args: &[String]) {
             }
         }
         driver.run_archive_file(input)
+    } else if is_wasm_file(input) {
+        reject_locked_for_non_package(cmd.locked);
+        if cmd.emit_ast_dump {
+            eprintln!("error: --emit-ast-dump requires source input");
+            process::exit(1);
+        }
+        if cmd.emit_bc_dump {
+            match driver.disassemble_wasm_file(input) {
+                Ok(dump) => write_bc_dump_or_exit(&bc_dump_path(input), &dump),
+                Err(error) => {
+                    eprintln!("runtime error: wasm load failed: {error}");
+                    process::exit(1);
+                }
+            }
+        }
+        match driver.run_wasm_file(input) {
+            Ok(0) => driver::RunResult::Ok,
+            Ok(code) => process::exit(code),
+            Err(error) => driver::RunResult::RuntimeError(error),
+        }
     } else {
         reject_locked_for_non_package(cmd.locked);
         let source = read_source(cmd.file);
@@ -402,32 +475,78 @@ fn cmd_build(args: &[String]) {
     let input = Path::new(cmd.file);
     let mut driver = driver::Driver::new();
     driver.set_opt_level(cmd.opt_level);
-    let (output_path, result) = if input.is_dir() {
-        let output = input.join("package.nsbc");
-        let result = if cmd.locked {
-            driver.compile_package_to_archive_locked(input, &output)
+
+    let effective_target = cmd.target.unwrap_or_else(|| {
+        if cmd.output.as_deref().is_some_and(is_wasm_file) {
+            BuildTarget::Wasm(driver::WasmTarget::WasiPreview1)
         } else {
-            driver.compile_package_to_archive(input, &output)
-        };
-        if result.is_ok() {
-            maybe_emit_ast_dump(cmd.file, cmd.emit_ast_dump, cmd.locked, None);
+            BuildTarget::Nsbc
         }
-        (output, result)
-    } else {
-        reject_locked_for_non_package(cmd.locked);
-        let source = read_source(cmd.file);
-        let output = input.with_extension("nsbc");
-        let result = driver.compile_to_archive(&source, &output);
-        if result.is_ok() {
-            maybe_emit_ast_dump(cmd.file, cmd.emit_ast_dump, false, Some(&source));
+    });
+
+    let (output_path, result) = match effective_target {
+        BuildTarget::Nsbc => {
+            if input.is_dir() {
+                let output = cmd.output.unwrap_or_else(|| input.join("package.nsbc"));
+                let result = if cmd.locked {
+                    driver.compile_package_to_archive_locked(input, &output)
+                } else {
+                    driver.compile_package_to_archive(input, &output)
+                };
+                if result.is_ok() {
+                    maybe_emit_ast_dump(cmd.file, cmd.emit_ast_dump, cmd.locked, None);
+                }
+                (output, result)
+            } else {
+                reject_locked_for_non_package(cmd.locked);
+                let source = read_source(cmd.file);
+                let output = cmd.output.unwrap_or_else(|| input.with_extension("nsbc"));
+                let result = driver.compile_to_archive(&source, &output);
+                if result.is_ok() {
+                    maybe_emit_ast_dump(cmd.file, cmd.emit_ast_dump, false, Some(&source));
+                }
+                (output, result)
+            }
         }
-        (output, result)
+        BuildTarget::Wasm(wasm_target) => {
+            let options = driver::WasmCompileOptions {
+                target: wasm_target,
+                export_all_pub: true,
+            };
+            if input.is_dir() {
+                let output = cmd.output.unwrap_or_else(|| input.join("package.wasm"));
+                let result = if cmd.locked {
+                    driver.compile_package_to_wasm_locked(input, &output, options)
+                } else {
+                    driver.compile_package_to_wasm(input, &output, options)
+                };
+                if result.is_ok() {
+                    maybe_emit_ast_dump(cmd.file, cmd.emit_ast_dump, cmd.locked, None);
+                }
+                (output, result)
+            } else {
+                reject_locked_for_non_package(cmd.locked);
+                let source = read_source(cmd.file);
+                let output = cmd.output.unwrap_or_else(|| input.with_extension("wasm"));
+                let result = driver.compile_to_wasm(&source, &output, options);
+                if result.is_ok() {
+                    maybe_emit_ast_dump(cmd.file, cmd.emit_ast_dump, false, Some(&source));
+                }
+                (output, result)
+            }
+        }
     };
     match result {
         Ok(()) => {
             if cmd.emit_bc_dump {
                 let dump_path = bc_dump_path(input);
-                match driver.emit_archive_bc_dump(&output_path, &dump_path) {
+                let dump_res = match effective_target {
+                    BuildTarget::Nsbc => driver.emit_archive_bc_dump(&output_path, &dump_path),
+                    BuildTarget::Wasm(_) => driver
+                        .disassemble_wasm_file(&output_path)
+                        .and_then(|d| std::fs::write(&dump_path, d)),
+                };
+                match dump_res {
                     Ok(()) => eprintln!("wrote {}", dump_path.display()),
                     Err(e) => {
                         eprintln!("error writing bytecode dump: {e}");
@@ -446,6 +565,10 @@ fn cmd_build(args: &[String]) {
 
 fn cmd_check(args: &[String]) {
     let cmd = parse_compile_or_exit(args, true);
+    if cmd.target.is_some() || cmd.output.is_some() {
+        eprintln!("error: --target and -o/--output are only supported with `nessa build`");
+        process::exit(1);
+    }
     let mut driver = driver::Driver::new();
     driver.set_opt_level(cmd.opt_level);
     let input = Path::new(cmd.file);
@@ -498,6 +621,10 @@ fn cmd_disasm(args: &[String]) {
         eprintln!("unknown option: --emit-ast-dump");
         process::exit(1);
     }
+    if cmd.target.is_some() || cmd.output.is_some() {
+        eprintln!("error: --target and -o/--output are only supported with `nessa build`");
+        process::exit(1);
+    }
     let mut driver = driver::Driver::new();
     driver.set_opt_level(cmd.opt_level);
     let input = Path::new(cmd.file);
@@ -510,6 +637,9 @@ fn cmd_disasm(args: &[String]) {
     } else if is_nsbc_file(input) {
         reject_locked_for_non_package(cmd.locked);
         driver.disassemble_archive_file(input)
+    } else if is_wasm_file(input) {
+        reject_locked_for_non_package(cmd.locked);
+        driver.disassemble_wasm_file(input)
     } else {
         reject_locked_for_non_package(cmd.locked);
         let source = read_source(cmd.file);
@@ -583,13 +713,44 @@ mod tests {
     }
 
     #[test]
-    fn compile_args_support_emit_bc_dump_and_reject_trailing_arguments() {
+    fn compile_args_support_emit_bc_dump_wasm_targets_and_reject_trailing_arguments() {
         let raw = strings(&["src/main.ns", "--emit-bc-dump", "--emit-ast-dump"]);
         let parsed = parse_compile_args(&raw, true).unwrap();
         assert_eq!(parsed.file, "src/main.ns");
         assert!(parsed.emit_ast_dump);
         assert!(parsed.emit_bc_dump);
+        assert_eq!(parsed.target, None);
+        assert_eq!(parsed.output, None);
 
+        let wasm_raw = strings(&[
+            "src/main.ns",
+            "--target",
+            "wasm32-wasi",
+            "-o",
+            "dist/app.wasm",
+            "-O3",
+        ]);
+        let wasm_parsed = parse_compile_args(&wasm_raw, true).unwrap();
+        assert_eq!(
+            wasm_parsed.target,
+            Some(BuildTarget::Wasm(driver::WasmTarget::WasiPreview1))
+        );
+        assert_eq!(wasm_parsed.output, Some(PathBuf::from("dist/app.wasm")));
+        assert_eq!(wasm_parsed.opt_level, Some(driver::OptLevel::O3));
+
+        let free_raw = strings(&[
+            "--target=wasm32-freestanding",
+            "--output=lib.wasm",
+            "lib.ns",
+        ]);
+        let free_parsed = parse_compile_args(&free_raw, true).unwrap();
+        assert_eq!(
+            free_parsed.target,
+            Some(BuildTarget::Wasm(driver::WasmTarget::Freestanding))
+        );
+        assert_eq!(free_parsed.output, Some(PathBuf::from("lib.wasm")));
+
+        assert!(parse_compile_args(&strings(&["--target=bogus", "a.ns"]), true).is_err());
         assert!(parse_compile_args(&strings(&["a.ns", "extra.ns"]), true).is_err());
         assert!(parse_compile_args(&strings(&["a.nsbc", "--emit-bc-dump"]), false).is_err());
     }

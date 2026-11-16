@@ -5,7 +5,8 @@ use std::io;
 
 use nsbc::{
     BuiltinImport, CaptureAbi, CodegenOutput, CompiledArtifact, CompiledFunction, FuncId,
-    FunctionAbi, GlobalInfo, MethodCallScope, ParameterAbi, SectionKind, validate_artifact,
+    FunctionAbi, GlobalInfo, MethodCallScope, ParameterAbi, SectionKind, WasmBindingDef,
+    WasmModuleDef, validate_artifact,
 };
 use type_pool::TypeIndex;
 
@@ -41,6 +42,9 @@ impl Writer {
     fn u32(&mut self, value: u32) -> io::Result<()> {
         self.data(&value.to_le_bytes())
     }
+    fn u64(&mut self, value: u64) -> io::Result<()> {
+        self.data(&value.to_le_bytes())
+    }
     fn count(&mut self, count: usize) -> io::Result<()> {
         let count = u32::try_from(count)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "artifact count overflow"))?;
@@ -72,6 +76,11 @@ impl<'a> Reader<'a> {
         let mut bytes = [0; 4];
         bytes.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(bytes))
+    }
+    fn u64(&mut self) -> io::Result<u64> {
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(bytes))
     }
     fn count(&mut self, minimum_size: usize) -> io::Result<usize> {
         let count = self.u32()? as usize;
@@ -269,9 +278,190 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
     writer.add_raw_section(SectionKind::Code, code.0);
     writer.add_constants_section(&relocated.constants)?;
     writer.add_raw_section(SectionKind::StackMaps, stack_maps.0);
+    if !artifact.wasm_modules.is_empty() {
+        writer.add_raw_section(
+            SectionKind::Wasm,
+            encode_wasm_section(&artifact.wasm_modules)?,
+        );
+    }
     let mut bytes = Vec::new();
     writer.write_to(&mut bytes)?;
     Ok(bytes)
+}
+
+fn encode_wasm_section(modules: &[WasmModuleDef]) -> io::Result<Vec<u8>> {
+    // Intern unique section strings so `WasmModuleEntry` & `WasmBinding` store
+    // compact `u32` string-pool indices per `docs/dev/nessa-bytecode/wasm-in-archive.md`.
+    let mut string_pool: Vec<&str> = Vec::new();
+    let mut string_map: BTreeMap<&str, u32> = BTreeMap::new();
+    for m in modules {
+        if !string_map.contains_key(m.name.as_str()) {
+            let idx = u32::try_from(string_pool.len())
+                .map_err(|_| invalid("WASM section string pool overflow"))?;
+            string_pool.push(m.name.as_str());
+            string_map.insert(m.name.as_str(), idx);
+        }
+        for b in &m.bindings {
+            for s in [b.nessa_name.as_str(), b.wasm_export.as_str()] {
+                if !string_map.contains_key(s) {
+                    let idx = u32::try_from(string_pool.len())
+                        .map_err(|_| invalid("WASM section string pool overflow"))?;
+                    string_pool.push(s);
+                    string_map.insert(s, idx);
+                }
+            }
+        }
+    }
+
+    // Compute exact header + string-table byte size before writing `wasm_offset`s:
+    //   module_count: u32 (4B)
+    //   each module: name(4) + wasm_offset(8) + wasm_size(8) + binding_count(4) + bindings(12 * B)
+    //   string_count: u32 (4B) + each string: len(4) + bytes
+    let mut header_size = 4usize;
+    for m in modules {
+        let bbytes = m
+            .bindings
+            .len()
+            .checked_mul(12)
+            .ok_or_else(|| invalid("WASM binding table overflow"))?;
+        header_size = header_size
+            .checked_add(24)
+            .and_then(|n| n.checked_add(bbytes))
+            .ok_or_else(|| invalid("WASM header overflow"))?;
+    }
+    header_size = header_size
+        .checked_add(4)
+        .ok_or_else(|| invalid("WASM string table overflow"))?;
+    for s in &string_pool {
+        header_size = header_size
+            .checked_add(4)
+            .and_then(|n| n.checked_add(s.len()))
+            .ok_or_else(|| invalid("WASM string table overflow"))?;
+    }
+
+    let mut out = Writer(Vec::new());
+    out.count(modules.len())?;
+    let mut payload_offset = header_size;
+    for m in modules {
+        let next = payload_offset
+            .checked_add(m.wasm_bytes.len())
+            .filter(|&end| end <= MAX_ARCHIVE_SIZE)
+            .ok_or_else(|| invalid("WASM section exceeds MAX_ARCHIVE_SIZE"))?;
+        out.u32(string_map[m.name.as_str()])?;
+        out.u64(payload_offset as u64)?;
+        out.u64(m.wasm_bytes.len() as u64)?;
+        out.count(m.bindings.len())?;
+        for b in &m.bindings {
+            out.u32(string_map[b.nessa_name.as_str()])?;
+            out.u32(string_map[b.wasm_export.as_str()])?;
+            out.u32(b.signature.as_u32())?;
+        }
+        payload_offset = next;
+    }
+
+    out.count(string_pool.len())?;
+    for s in &string_pool {
+        out.string(s)?;
+    }
+    debug_assert_eq!(out.0.len(), header_size);
+    for m in modules {
+        out.data(&m.wasm_bytes)?;
+    }
+    Ok(out.0)
+}
+
+fn decode_wasm_section(bytes: &[u8]) -> io::Result<Vec<WasmModuleDef>> {
+    let mut reader = Reader { remaining: bytes };
+    let module_count = reader.count(24)?;
+    if module_count == 0 {
+        return Err(invalid("empty WASM section is not permitted"));
+    }
+    struct RawEntry {
+        name_idx: u32,
+        offset: usize,
+        end: usize,
+        bindings: Vec<(u32, u32, TypeIndex)>,
+    }
+    let mut raw_entries = Vec::with_capacity(module_count);
+    let mut total_bindings = 0usize;
+    for _ in 0..module_count {
+        let name_idx = reader.u32()?;
+        let offset =
+            usize::try_from(reader.u64()?).map_err(|_| invalid("WASM payload offset overflow"))?;
+        let size =
+            usize::try_from(reader.u64()?).map_err(|_| invalid("WASM payload size overflow"))?;
+        let end = offset
+            .checked_add(size)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| invalid("WASM module payload is outside section data"))?;
+        let bcount = reader.count(12)?;
+        total_bindings = total_bindings
+            .checked_add(bcount)
+            .filter(|&n| n <= MAX_ITEMS)
+            .ok_or_else(|| invalid("WASM binding count limit exceeded"))?;
+        let mut bindings = Vec::with_capacity(bcount);
+        for _ in 0..bcount {
+            bindings.push((
+                reader.u32()?,
+                reader.u32()?,
+                TypeIndex::from_raw(reader.u32()?),
+            ));
+        }
+        raw_entries.push(RawEntry {
+            name_idx,
+            offset,
+            end,
+            bindings,
+        });
+    }
+
+    let str_count = reader.count(4)?;
+    let mut strings = Vec::with_capacity(str_count);
+    for _ in 0..str_count {
+        strings.push(reader.string()?);
+    }
+
+    let data_start = bytes.len() - reader.remaining.len();
+    let mut ranges: Vec<(usize, usize)> = raw_entries.iter().map(|e| (e.offset, e.end)).collect();
+    ranges.sort_unstable();
+    let mut previous = data_start;
+    for (start, end) in ranges {
+        if start != previous {
+            return Err(invalid(
+                "WASM module payloads overlap or leave unclaimed bytes",
+            ));
+        }
+        previous = end;
+    }
+    if previous != bytes.len() {
+        return Err(invalid("trailing unclaimed bytes in WASM section"));
+    }
+
+    let get_str = |idx: u32| -> io::Result<String> {
+        strings
+            .get(idx as usize)
+            .cloned()
+            .ok_or_else(|| invalid("WASM section string index out of bounds"))
+    };
+
+    let mut modules = Vec::with_capacity(module_count);
+    for raw in raw_entries {
+        let name = get_str(raw.name_idx)?;
+        let mut bindings = Vec::with_capacity(raw.bindings.len());
+        for (n_idx, e_idx, sig) in raw.bindings {
+            bindings.push(WasmBindingDef {
+                nessa_name: get_str(n_idx)?,
+                wasm_export: get_str(e_idx)?,
+                signature: sig,
+            });
+        }
+        modules.push(WasmModuleDef {
+            name,
+            wasm_bytes: bytes[raw.offset..raw.end].to_vec(),
+            bindings,
+        });
+    }
+    Ok(modules)
 }
 
 struct FunctionMetadata {
@@ -575,10 +765,19 @@ pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
                     | SectionKind::Code
                     | SectionKind::Constants
                     | SectionKind::StackMaps
+                    | SectionKind::Wasm
             )
         ) {
             return Err(invalid("unsupported section in complete artifact"));
         }
+    }
+    let wasm_section_count = archive
+        .sections
+        .iter()
+        .filter(|(e, _)| e.kind == SectionKind::Wasm as u8)
+        .count();
+    if wasm_section_count > 1 {
+        return Err(invalid("duplicate Wasm section in complete artifact"));
     }
     let section = |kind| {
         archive
@@ -592,6 +791,10 @@ pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
         &mut metadata.functions,
         &mut stack_maps,
     )?;
+    let wasm_modules = match archive.find_section(SectionKind::Wasm) {
+        Some(wasm_bytes) => decode_wasm_section(wasm_bytes)?,
+        None => Vec::new(),
+    };
     let mut output = CodegenOutput {
         method_call_scopes: metadata.method_call_scopes,
         functions,
@@ -605,6 +808,7 @@ pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
         entry: metadata.entry,
         builtin_abi_version: metadata.builtin_abi_version,
         builtins: metadata.builtins,
+        wasm_modules,
     };
     validate_artifact(&artifact).map_err(|error| invalid(error.to_string()))?;
     Ok(artifact)

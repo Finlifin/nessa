@@ -30,6 +30,7 @@ fn package(
         root,
         manifest: ManifestDocument::parse(&manifest).unwrap(),
         modules: vec![],
+        wasm_assets: vec![],
     }
 }
 fn module(package: &mut PackageSources, name: &str, source: &str) {

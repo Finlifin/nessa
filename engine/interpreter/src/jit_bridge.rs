@@ -753,6 +753,7 @@ def_jit_helper!(
             instr.opcode,
             Opcode::Call
                 | Opcode::CallFar
+                | Opcode::CallWasm
                 | Opcode::CallIndirect
                 | Opcode::CallIndirectProof
                 | Opcode::CallMethod

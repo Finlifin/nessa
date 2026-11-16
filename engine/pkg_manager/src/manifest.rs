@@ -22,14 +22,33 @@ pub struct PathDependency {
     pub constraint: Option<VersionConstraint>,
 }
 
+/// One exported WebAssembly function binding inside a `[[ffi.wasm]]` manifest entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfiWasmExportSpec {
+    pub nessa_name: String,
+    pub wasm_export: String,
+    pub params: Vec<String>,
+    pub ret: String,
+}
+
+/// An embedded WebAssembly module declared via `[[ffi.wasm]]` in `package.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfiWasmModuleSpec {
+    pub name: String,
+    pub file: String,
+    pub exports: Vec<FfiWasmExportSpec>,
+}
+
 /// Declared FFI capability permissions from `[ffi]` in `package.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FfiConfig {
-    /// Whether this package is authorized to invoke `__ffi_*` builtins.
+    /// Whether this package is authorized to invoke `__ffi_*` builtins or embed `[[ffi.wasm]]`.
     pub allow: bool,
     /// Optional explicit allowlist of native library names permitted in `__ffi_dlopen`.
     /// When empty and `allow == true`, any library name may be passed to `__ffi_dlopen`.
     pub libraries: Vec<String>,
+    /// Embedded WebAssembly modules bound to generated Nessa modules via `Opcode::CallWasm`.
+    pub wasm: Vec<FfiWasmModuleSpec>,
 }
 
 /// Complete semantic TOML, including fields not yet interpreted by the engine.
@@ -295,7 +314,7 @@ fn parse_ffi_config(value: Option<&toml::Value>) -> Result<FfiConfig, PackageErr
         .as_table()
         .ok_or_else(|| PackageError::Manifest("[ffi] must be a table".into()))?;
     for key in table.keys() {
-        if key != "allow" && key != "libraries" {
+        if key != "allow" && key != "libraries" && key != "wasm" {
             return Err(PackageError::Manifest(format!(
                 "unknown field in [ffi]: {key}"
             )));
@@ -332,7 +351,209 @@ fn parse_ffi_config(value: Option<&toml::Value>) -> Result<FfiConfig, PackageErr
             "ffi.libraries requires `allow = true` in [ffi]".into(),
         ));
     }
-    Ok(FfiConfig { allow, libraries })
+
+    let mut wasm = Vec::new();
+    if let Some(wasm_val) = table.get("wasm") {
+        if !allow {
+            return Err(PackageError::Manifest(
+                "[[ffi.wasm]] requires `allow = true` in [ffi]".into(),
+            ));
+        }
+        let arr = wasm_val.as_array().ok_or_else(|| {
+            PackageError::Manifest("ffi.wasm must be an array of [[ffi.wasm]] tables".into())
+        })?;
+        if arr.len() > 1024 {
+            return Err(PackageError::Capacity("ffi.wasm (1024)"));
+        }
+        let mut seen_mod_names = BTreeSet::new();
+        for item in arr {
+            let mod_tbl = item.as_table().ok_or_else(|| {
+                PackageError::Manifest("[[ffi.wasm]] entry must be a table".into())
+            })?;
+            for key in mod_tbl.keys() {
+                if key != "name" && key != "file" && key != "exports" {
+                    return Err(PackageError::Manifest(format!(
+                        "unknown field in [[ffi.wasm]]: {key}"
+                    )));
+                }
+            }
+            let mod_name = required_string(mod_tbl, "name")?.to_owned();
+            validate_nessa_ident(&mod_name, "[[ffi.wasm]] name")?;
+            if !seen_mod_names.insert(mod_name.clone()) {
+                return Err(PackageError::Manifest(format!(
+                    "duplicate [[ffi.wasm]] module name: {mod_name}"
+                )));
+            }
+            let file_path = required_string(mod_tbl, "file")?.to_owned();
+            if file_path.contains('\0')
+                || std::path::Path::new(&file_path).is_absolute()
+                || std::path::Path::new(&file_path)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(PackageError::Manifest(format!(
+                    "[[ffi.wasm]] file must be a safe package-relative path: {file_path}"
+                )));
+            }
+            let exports_tbl = mod_tbl
+                .get("exports")
+                .and_then(toml::Value::as_table)
+                .ok_or_else(|| {
+                    PackageError::Manifest(format!(
+                        "[[ffi.wasm]] `{mod_name}` missing [ffi.wasm.exports] table"
+                    ))
+                })?;
+            let mut exports = Vec::new();
+            for (nessa_name, exp_val) in exports_tbl {
+                validate_nessa_ident(nessa_name, "[[ffi.wasm]] export binding")?;
+                let exp_tbl = exp_val.as_table().ok_or_else(|| {
+                    PackageError::Manifest(format!(
+                        "[[ffi.wasm]] export `{nessa_name}` must be an inline table"
+                    ))
+                })?;
+                for k in exp_tbl.keys() {
+                    if k != "export" && k != "params" && k != "ret" {
+                        return Err(PackageError::Manifest(format!(
+                            "unknown field in [[ffi.wasm]] export `{nessa_name}`: {k}"
+                        )));
+                    }
+                }
+                let wasm_export = match exp_tbl.get("export") {
+                    Some(v) => v
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            PackageError::Manifest(format!(
+                                "[[ffi.wasm]] `{nessa_name}.export` must be a non-empty string"
+                            ))
+                        })?
+                        .to_owned(),
+                    None => nessa_name.clone(),
+                };
+                let mut params = Vec::new();
+                if let Some(p_val) = exp_tbl.get("params") {
+                    let p_arr = p_val.as_array().ok_or_else(|| {
+                        PackageError::Manifest(format!(
+                            "[[ffi.wasm]] `{nessa_name}.params` must be an array of type names"
+                        ))
+                    })?;
+                    if p_arr.len() > 31 {
+                        return Err(PackageError::Manifest(format!(
+                            "[[ffi.wasm]] `{nessa_name}` exceeds 31 parameter limit"
+                        )));
+                    }
+                    for p in p_arr {
+                        let ty = p.as_str().ok_or_else(|| {
+                            PackageError::Manifest(format!(
+                                "[[ffi.wasm]] `{nessa_name}.params` entries must be strings"
+                            ))
+                        })?;
+                        validate_wasm_param_type(ty, nessa_name)?;
+                        params.push(ty.to_owned());
+                    }
+                }
+                let ret = match exp_tbl.get("ret") {
+                    Some(v) => {
+                        let ty = v.as_str().ok_or_else(|| {
+                            PackageError::Manifest(format!(
+                                "[[ffi.wasm]] `{nessa_name}.ret` must be a string"
+                            ))
+                        })?;
+                        let normalized = if ty == "()" { "Unit" } else { ty };
+                        validate_wasm_ret_type(normalized, nessa_name)?;
+                        normalized.to_owned()
+                    }
+                    None => "Unit".to_owned(),
+                };
+                exports.push(FfiWasmExportSpec {
+                    nessa_name: nessa_name.clone(),
+                    wasm_export,
+                    params,
+                    ret,
+                });
+            }
+            wasm.push(FfiWasmModuleSpec {
+                name: mod_name,
+                file: file_path,
+                exports,
+            });
+        }
+    }
+
+    Ok(FfiConfig {
+        allow,
+        libraries,
+        wasm,
+    })
+}
+
+fn validate_nessa_ident(ident: &str, ctx: &str) -> Result<(), PackageError> {
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return Err(PackageError::Manifest(format!("{ctx} must not be empty")));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic())
+        || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    {
+        return Err(PackageError::Manifest(format!(
+            "{ctx} `{ident}` must be a valid ASCII Nessa identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_wasm_param_type(ty: &str, binding: &str) -> Result<(), PackageError> {
+    if matches!(
+        ty,
+        "i8" | "u8"
+            | "i16"
+            | "u16"
+            | "i32"
+            | "u32"
+            | "bool"
+            | "char"
+            | "i64"
+            | "u64"
+            | "isize"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "String"
+            | "Bytes"
+    ) {
+        Ok(())
+    } else {
+        Err(PackageError::Manifest(format!(
+            "unsupported [[ffi.wasm]] parameter type `{ty}` in `{binding}`"
+        )))
+    }
+}
+
+fn validate_wasm_ret_type(ty: &str, binding: &str) -> Result<(), PackageError> {
+    if matches!(
+        ty,
+        "Unit"
+            | "i8"
+            | "u8"
+            | "i16"
+            | "u16"
+            | "i32"
+            | "u32"
+            | "bool"
+            | "char"
+            | "i64"
+            | "u64"
+            | "isize"
+            | "usize"
+            | "f32"
+            | "f64"
+    ) {
+        Ok(())
+    } else {
+        Err(PackageError::Manifest(format!(
+            "unsupported [[ffi.wasm]] return type `{ty}` in `{binding}`"
+        )))
+    }
 }
 
 fn dependency_constraint(value: &toml::Value) -> Result<VersionConstraint, PackageError> {

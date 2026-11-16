@@ -50,6 +50,7 @@ pub(crate) mod sync_primitives;
 mod trait_proofs;
 mod tuples;
 mod types;
+pub mod wasm_bridge;
 pub use builtin_ctx::{
     BuiltinCtx, BuiltinFn, BuiltinFnTable, BuiltinOutcome, BuiltinRoot, HostCallOutcome,
     HostHandler, NativeValue, VmIoContext,
@@ -438,6 +439,7 @@ pub(crate) struct SharedVm {
     pub(crate) files: resources::VmFileTable,
     pub(crate) json: Mutex<json_kernel::VmJsonState>,
     pub(crate) resources: Mutex<resources::VmResourceTable>,
+    pub(crate) embedded_wasm: ShardedRwLock<wasm_bridge::EmbeddedWasmStore>,
     pub(crate) ffi_allowlist: RwLock<Option<std::collections::HashSet<String>>>,
     pub(crate) host_handler: Mutex<Option<Box<dyn HostHandler>>>,
     pub(crate) jit_config: RwLock<jit::JitConfig>,
@@ -470,6 +472,7 @@ pub(crate) struct VmRoots {
     pub(crate) promises: futures::PromiseTable,
     pub(crate) handler_scopes: futures::HandlerScopeTable,
     pub(crate) json_writer_ancestors: Mutex<std::collections::HashMap<i64, Vec<TaggedValue>>>,
+    pub(crate) wasm_host_imports: Mutex<std::collections::HashMap<i64, Vec<TaggedValue>>>,
     pub(crate) sync: Arc<sync_primitives::SyncRegistry>,
     pub(crate) uncollected_terminal_promises: AtomicUsize,
 }
@@ -603,6 +606,7 @@ impl Vm {
             promises: futures::PromiseTable::new(),
             handler_scopes: futures::HandlerScopeTable::new(),
             json_writer_ancestors: Mutex::new(std::collections::HashMap::new()),
+            wasm_host_imports: Mutex::new(std::collections::HashMap::new()),
             sync,
             uncollected_terminal_promises: AtomicUsize::new(0),
         })));
@@ -632,6 +636,10 @@ impl Vm {
             files: resources::VmFileTable::new(),
             json: Mutex::new(json_kernel::VmJsonState::new()),
             resources: Mutex::new(resources::VmResourceTable::new()),
+            embedded_wasm: ShardedRwLock::new(
+                wasm_bridge::EmbeddedWasmStore::default(),
+                configured_workers,
+            ),
             ffi_allowlist: RwLock::new(None),
             host_handler: Mutex::new(None),
             jit_config: RwLock::new(jit::JitConfig::default()),
@@ -2536,6 +2544,12 @@ impl Vm {
                 )
             }
 
+            Opcode::CallWasm => {
+                let payload = c_payload(&instr);
+                let (arg_count, binding_id) = Instruction::c_arg_count_func_id(payload);
+                self.exec_call_wasm(task_id, binding_id, arg_count)
+            }
+
             Opcode::CallIndirect | Opcode::CallIndirectProof => {
                 let payload = c_payload(&instr);
                 let (arg_count, closure_reg) = Instruction::c_call_indirect(payload);
@@ -3381,6 +3395,7 @@ pub enum VmError {
     TraitLookup(type_pool::TraitLookupError),
     MissingTraitContext,
     EffectAcrossNativeFrame,
+    WasmTrap(String),
     Panic(String),
 }
 
@@ -3444,6 +3459,7 @@ impl std::fmt::Display for VmError {
             Self::EffectAcrossNativeFrame => {
                 f.write_str("cannot capture or suspend continuation across active native FFI frame")
             }
+            Self::WasmTrap(message) => write!(f, "{message}"),
             Self::Panic(message) => write!(f, "panic: {message}"),
         }
     }
@@ -3494,6 +3510,14 @@ unsafe fn scan_vm_roots(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) 
     let json_ancestors = unsafe { &mut *vm.json_writer_ancestors.data_ptr() };
     for stack in json_ancestors.values_mut() {
         for value in stack.iter_mut() {
+            visit_tagged_slot(visitor, value);
+        }
+    }
+
+    // SAFETY: Under STW, no mutator is reading or writing `wasm_host_imports`.
+    let wasm_imports = unsafe { &mut *vm.wasm_host_imports.data_ptr() };
+    for closures in wasm_imports.values_mut() {
+        for value in closures.iter_mut() {
             visit_tagged_slot(visitor, value);
         }
     }

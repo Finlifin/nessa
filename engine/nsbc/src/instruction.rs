@@ -160,6 +160,8 @@ pub enum Opcode {
     Call = 0x88,
     CallIndirect = 0x89,
     CallMethod = 0x8A,
+    /// Call a bound export in an embedded `SectionKind::Wasm` module by flat binding ID.
+    CallWasm = 0x8B,
     /// Call a registered builtin by `BuiltinFnId`.
     CallBuiltin = 0x8D,
     ReturnUnit = 0x8E,
@@ -274,6 +276,7 @@ impl Opcode {
             0x88 => Some(Self::Call),
             0x89 => Some(Self::CallIndirect),
             0x8A => Some(Self::CallMethod),
+            0x8B => Some(Self::CallWasm),
             0x8D => Some(Self::CallBuiltin),
             0x8E => Some(Self::ReturnUnit),
             0x8F => Some(Self::Return),
@@ -656,6 +659,12 @@ impl Instruction {
         Self::c_type(Opcode::CallFar, payload)
     }
 
+    pub fn call_wasm(binding_id: u32, arg_count: u8) -> Self {
+        debug_assert!(binding_id < (1 << 14));
+        let payload = ((arg_count as u32) << 14) | (binding_id & 0x3FFF);
+        Self::c_type(Opcode::CallWasm, payload)
+    }
+
     pub fn call_builtin(builtin_id: u32, arg_count: u8) -> Self {
         let payload = ((arg_count as u32) << 14) | (builtin_id & 0x3FFF);
         Self::c_type(Opcode::CallBuiltin, payload)
@@ -957,11 +966,11 @@ mod tests {
                 assert_eq!(opcode as u8, raw);
             }
         }
-        for retired in [
-            0x56, 0x8B, 0x8C, 0xC0, 0xC2, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9,
-        ] {
+        for retired in [0x56, 0x8C, 0xC0, 0xC2, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9] {
             assert_eq!(Opcode::from_u8(retired), None);
         }
+        let call_wasm = Instruction::call_wasm(42, 3);
+        assert_eq!(Instruction::decode(call_wasm.encode()), Some(call_wasm));
         let await_fut = Instruction::await_future(Reg(7), Reg(19));
         assert_eq!(Instruction::decode(await_fut.encode()), Some(await_fut));
         let await_pop = Instruction::await_pop_handler();

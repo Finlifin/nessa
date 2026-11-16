@@ -1886,7 +1886,7 @@ fn instr_use_def(instr: &Instruction) -> (Option<u32>, Option<u32>, u32, u32) {
             };
             (None, None, arg_mask(base.0 as usize), rbit(dst))
         }
-        Opcode::Call | Opcode::CallFar | Opcode::CallBuiltin => {
+        Opcode::Call | Opcode::CallFar | Opcode::CallWasm | Opcode::CallBuiltin => {
             let InstructionData::C { payload } = instr.data else {
                 return (None, None, u32::MAX, 1);
             };

@@ -14,4 +14,5 @@ runtime = { path = "../runtime" }
 scheduler = { path = "../scheduler" }
 stack_pool = { path = "../stack_pool" }
 str_interner = { path = "../str_interner" }
+wasm = { path = "../wasm" }
 parking_lot = "0.12.5"

@@ -19,6 +19,9 @@ mod standard_library;
 pub use execution::{ArtifactLoadError, install_artifact};
 pub use initialization::{EngineConfig, JitConfig, JitMode, JitStats};
 pub use nir::OptLevel;
+pub use wasm::{
+    WasmCompileError, WasmCompileOptions, WasmTarget, inspect_wasm_bytes, validate_wasm_bytes,
+};
 
 use ast::dump::dump_ast_to_string_pretty;
 use diagnostic::{Diagnostic, DiagnosticContext, Level, NessaError};
@@ -41,6 +44,8 @@ pub struct CompileResult {
     pub type_pool: type_pool::TypePool,
     /// Startup entry, which initializes modules before invoking user main.
     pub entry_func_id: Option<nsbc::FuncId>,
+    /// Embedded WebAssembly modules bound via `[[ffi.wasm]]`.
+    pub wasm_modules: Vec<nsbc::WasmModuleDef>,
 }
 
 impl CompileResult {
@@ -69,6 +74,7 @@ impl CompileResult {
             entry: self.entry_func_id,
             builtin_abi_version: runtime::BUILTIN_ABI_VERSION,
             builtins,
+            wasm_modules: self.wasm_modules,
         })
     }
 
@@ -84,6 +90,7 @@ impl CompileResult {
             has_errors: true,
             entry_func_id: None,
             type_pool,
+            wasm_modules: Vec::new(),
         }
     }
 }
@@ -494,6 +501,7 @@ impl Driver {
             entry_func_id: nir_module.entry,
             diagnostics,
             has_errors,
+            wasm_modules: Vec::new(),
         }
     }
 
@@ -519,13 +527,83 @@ impl Driver {
         Ok(artifact)
     }
 
-    /// Compile and write an `.nsbc` archive to a file, reusing/populating the `.nsbc` cache.
+    /// Compile source and write an `.nsbc` archive to a file, reusing/populating the `.nsbc` cache.
     pub fn compile_to_archive(&self, source: &str, output_path: &Path) -> std::io::Result<()> {
         let artifact = self
             .compile_cached_artifact(source)
             .map_err(|diagnostics| compilation_error(&diagnostics))?;
         let bytes = nsbc_io::write_artifact(&artifact)?;
         std::fs::write(output_path, bytes)
+    }
+
+    /// Compile Nessa source directly to standalone `.wasm` binary bytes (`wasm32-wasi` or `wasm32-freestanding`).
+    pub fn compile_to_wasm_bytes(
+        &self,
+        source: &str,
+        options: WasmCompileOptions,
+    ) -> std::io::Result<Vec<u8>> {
+        let artifact = self
+            .compile_cached_artifact(source)
+            .map_err(|diagnostics| compilation_error(&diagnostics))?;
+        wasm::compile_artifact_to_wasm(&artifact, &options).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("wasm compilation failed: {err}"),
+            )
+        })
+    }
+
+    /// Compile Nessa source to a standalone `.wasm` binary file.
+    pub fn compile_to_wasm(
+        &self,
+        source: &str,
+        output_path: &Path,
+        options: WasmCompileOptions,
+    ) -> std::io::Result<()> {
+        let bytes = self.compile_to_wasm_bytes(source, options)?;
+        std::fs::write(output_path, bytes)
+    }
+
+    /// Read a `.wasm` binary file with a bounded allocation and render its structural summary.
+    pub fn disassemble_wasm_file(&self, path: &Path) -> std::io::Result<String> {
+        use std::io::Read;
+        const MAX_WASM_FILE_BYTES: u64 = 64 * 1024 * 1024;
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_WASM_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_WASM_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "wasm file exceeds 64 MiB limit",
+            ));
+        }
+        wasm::inspect_wasm_bytes(&bytes)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
+    }
+
+    /// Execute a standalone `.wasm` WASI command binary with live stdio forwarding.
+    pub fn run_wasm_file(&self, path: &Path) -> Result<i32, String> {
+        use std::io::Read;
+        const MAX_WASM_FILE_BYTES: u64 = 64 * 1024 * 1024;
+        let file = std::fs::File::open(path)
+            .map_err(|err| format!("cannot read wasm file {}: {err}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_WASM_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("cannot read wasm file {}: {err}", path.display()))?;
+        if bytes.len() as u64 > MAX_WASM_FILE_BYTES {
+            return Err("wasm file exceeds 64 MiB limit".into());
+        }
+        let cfg = wasm::WasiConfig {
+            args: self.script_args.clone(),
+            env: std::env::vars().collect(),
+            stdin: Vec::new(),
+            inherit_stdio: true,
+            limits: wasm::WasmConfig::default(),
+        };
+        wasm::run_wasi_bytes(&bytes, cfg)
+            .map(|out| out.exit_code)
+            .map_err(|err| err.to_string())
     }
 
     /// Parse source and write a pretty-printed AST S-expression dump to a file.

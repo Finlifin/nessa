@@ -1222,6 +1222,7 @@ mod tests {
         NirModule {
             derived_methods: Vec::new(),
             function_symbols: Default::default(),
+            exported_roots: Vec::new(),
             globals: Vec::new(),
             entry: None,
             functions: vec![NirFunction {

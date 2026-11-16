@@ -29,6 +29,7 @@ pub fn bundled_packages() -> &'static [PackageSources] {
                 source: include_str!("../../../library/regex/src/lib.ns").to_owned(),
             },
             modules: Vec::new(),
+            wasm_assets: Vec::new(),
         };
         vec![regex_pkg]
     })

@@ -228,10 +228,14 @@ impl NirLowering {
             &mut self.functions,
             &mut derived_methods,
         );
+        let mut exported_roots = Vec::new();
+        self.collect_exported_roots(resolved, resolved.ast.root, &mut exported_roots);
+
         self.functions.sort_by_key(|function| function.func_id.0);
         NirModule {
             derived_methods,
             function_symbols: self.func_map,
+            exported_roots,
             functions: self.functions,
             globals: initialization.globals,
             entry,
@@ -301,6 +305,52 @@ impl NirLowering {
         builder.blocks[block.0 as usize].terminator = Terminator::Return(value);
         self.functions.push(builder.build());
         Some(entry)
+    }
+
+    fn collect_exported_roots(
+        &self,
+        resolved: &ResolvedAst,
+        scope_node: NodeIndex,
+        out: &mut Vec<FuncId>,
+    ) {
+        if scope_node.is_null() {
+            return;
+        }
+        let root_pkg = resolved.type_pool.scope_context(0).map(|s| s.package);
+        let ast = &resolved.ast;
+        for &child in ast.multi_children(scope_node) {
+            if ast.node(child).kind != NodeKind::PubDef {
+                continue;
+            }
+            let inner = ast.fixed_children(child)[0];
+            if inner.is_null() {
+                continue;
+            }
+            match ast.node(inner).kind {
+                NodeKind::FunctionDef => {
+                    let name_node = ast.fixed_children(inner)[0];
+                    if !name_node.is_null()
+                        && let Some(&sym) = resolved.node_symbols.get(&name_node)
+                        && let Some(&fid) = self.func_map.get(&sym)
+                    {
+                        out.push(fid);
+                    }
+                }
+                NodeKind::ModuleDef => {
+                    // Do not cross package boundaries (such as `pub mod std` or external packages).
+                    let same_pkg = resolved
+                        .scopes
+                        .iter()
+                        .find(|sc| sc.node == inner)
+                        .and_then(|sc| resolved.type_pool.scope_context(sc.id.0))
+                        .is_some_and(|ctx| Some(ctx.package) == root_pkg);
+                    if same_pkg {
+                        self.collect_exported_roots(resolved, inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Pass 1: walk the AST collecting function definitions.

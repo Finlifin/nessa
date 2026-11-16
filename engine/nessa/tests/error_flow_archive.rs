@@ -442,11 +442,12 @@ fn unfinalized_error_metadata_non_v4_containers_and_zero_checksums_reject() {
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 12,
+        builtin_abi_version: 13,
         builtins: vec![BuiltinImport {
             id: 1,
             name: "println".into(),
         }],
+        wasm_modules: vec![],
     };
     assert!(nsbc_io::write_artifact(&unfinalized).is_err());
 

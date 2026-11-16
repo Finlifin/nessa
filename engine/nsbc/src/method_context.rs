@@ -137,6 +137,7 @@ mod tests {
             entry: Some(FuncId(0)),
             builtin_abi_version: 9,
             builtins: vec![],
+            wasm_modules: vec![],
         };
         crate::validate_artifact(&artifact).unwrap();
 

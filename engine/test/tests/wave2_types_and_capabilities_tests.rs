@@ -100,6 +100,7 @@ fn pkg(
         root,
         manifest: ManifestDocument::parse(&manifest).unwrap(),
         modules: vec![],
+        wasm_assets: vec![],
     }
 }
 

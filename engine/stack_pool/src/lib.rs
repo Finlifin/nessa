@@ -34,11 +34,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Size of a single stack slot (8 MB).
+/// Size of a single stack slot (8 MB on native Unix, 128 KB on portable/wasm32).
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 const SLOT_SIZE: usize = 8 * 1024 * 1024;
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+const SLOT_SIZE: usize = 128 * 1024;
 
 /// Initial segment capacity (number of slots).
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 const INITIAL_SEGMENT_SLOTS: usize = 64;
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+const INITIAL_SEGMENT_SLOTS: usize = 16;
 
 /// Maximum slots per newly grown segment (caps VMA split burst while allowing >1M total slots).
 const MAX_SEGMENT_SLOTS: usize = 1024;
@@ -103,19 +109,21 @@ unsafe impl Sync for StackHandle {}
 // ---------------------------------------------------------------------------
 
 struct Segment {
-    /// Base address of the mmap'd region.
+    /// Base address of the segment region.
     base: *mut u8,
     /// Number of slots in this segment.
     slot_count: usize,
-    /// Total mmap'd size in bytes.
+    /// Total region size in bytes.
     mmap_size: usize,
     /// Slot in the lock-free signal guard table.
     guard_slot: Option<usize>,
     /// Tracks whether each slot's guard page has been `mprotect(PROT_NONE)`-initialized.
     guarded: Box<[AtomicBool]>,
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    _owned: Box<[u8]>,
 }
 
-// SAFETY: Segment exclusively owns its mmap reservation, which has no thread
+// SAFETY: Segment exclusively owns its mmap/heap reservation, which has no thread
 // affinity. StackPool only accesses segment metadata while holding its mutex;
 // live StackHandles keep the owning pool alive through the runtime's OwnedStack.
 // Moving the metadata does not move the mapping or dereference stack contents.
@@ -123,6 +131,7 @@ unsafe impl Send for Segment {}
 
 impl Segment {
     /// Create a new segment with `slot_count` slots.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
     fn new(slot_count: usize) -> Self {
         let mmap_size = slot_count * SLOT_SIZE;
         let base = unsafe {
@@ -153,6 +162,22 @@ impl Segment {
         }
     }
 
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    fn new(slot_count: usize) -> Self {
+        let mmap_size = slot_count * SLOT_SIZE;
+        let mut owned = vec![0u8; mmap_size].into_boxed_slice();
+        let base = owned.as_mut_ptr();
+        let guarded: Vec<AtomicBool> = (0..slot_count).map(|_| AtomicBool::new(true)).collect();
+        Self {
+            base,
+            slot_count,
+            mmap_size,
+            guard_slot: None,
+            guarded: guarded.into_boxed_slice(),
+            _owned: owned,
+        }
+    }
+
     /// Get the memory layout for slot `offset` within this segment.
     fn slot_layout(&self, offset: usize) -> StackHandle {
         debug_assert!(offset < self.slot_count);
@@ -173,9 +198,16 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        unregister_guard_segment(self.guard_slot);
-        unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.mmap_size);
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            unregister_guard_segment(self.guard_slot);
+            unsafe {
+                libc::munmap(self.base as *mut libc::c_void, self.mmap_size);
+            }
+        }
+        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        {
+            let _ = self.guard_slot;
         }
     }
 }
@@ -250,16 +282,20 @@ impl StackPool {
         };
 
         if need_guard {
-            let ps = page_size();
-            // SAFETY: `handle` is exclusively owned by this caller, and `handle.guard`
-            // is page-aligned within the owning `Segment`'s live `mmap` reservation.
-            let rc =
-                unsafe { libc::mprotect(handle.guard as *mut libc::c_void, ps, libc::PROT_NONE) };
-            assert!(
-                rc == 0,
-                "mprotect guard page failed for slot {:?}",
-                handle.id
-            );
+            #[cfg(all(unix, not(target_arch = "wasm32")))]
+            {
+                let ps = page_size();
+                // SAFETY: `handle` is exclusively owned by this caller, and `handle.guard`
+                // is page-aligned within the owning `Segment`'s live `mmap` reservation.
+                let rc = unsafe {
+                    libc::mprotect(handle.guard as *mut libc::c_void, ps, libc::PROT_NONE)
+                };
+                assert!(
+                    rc == 0,
+                    "mprotect guard page failed for slot {:?}",
+                    handle.id
+                );
+            }
         }
 
         handle
@@ -272,17 +308,20 @@ impl StackPool {
     /// reservation and guard page intact without holding the pool mutex across
     /// the syscall.
     pub fn dealloc(&self, handle: &StackHandle) {
-        let usable_start = handle.base;
-        let usable_size = handle.usable_size();
-        // SAFETY: The caller exclusively owns `handle` until its `SlotId` is pushed back
-        // onto `free_list` below, and `[handle.base, handle.top)` is the usable mmap region
-        // above the slot's guard page.
-        unsafe {
-            libc::madvise(
-                usable_start as *mut libc::c_void,
-                usable_size,
-                libc::MADV_DONTNEED,
-            );
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            let usable_start = handle.base;
+            let usable_size = handle.usable_size();
+            // SAFETY: The caller exclusively owns `handle` until its `SlotId` is pushed back
+            // onto `free_list` below, and `[handle.base, handle.top)` is the usable mmap region
+            // above the slot's guard page.
+            unsafe {
+                libc::madvise(
+                    usable_start as *mut libc::c_void,
+                    usable_size,
+                    libc::MADV_DONTNEED,
+                );
+            }
         }
 
         let mut inner = self.inner.lock().unwrap();
@@ -387,7 +426,9 @@ impl GuardRegion {
 static GUARD_REGIONS: [GuardRegion; MAX_GUARD_SEGMENTS] =
     [const { GuardRegion::empty() }; MAX_GUARD_SEGMENTS];
 static CACHED_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 static SIGACTION_INIT: Once = Once::new();
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 static mut PREV_SIGACTION: libc::sigaction = unsafe { std::mem::zeroed() };
 
 fn register_guard_segment(base: usize, size: usize) -> Option<usize> {
@@ -443,6 +484,7 @@ fn is_registered_guard_page(addr: usize) -> bool {
 ///
 /// Idempotent across multiple engines; live `StackPool` segments register and
 /// unregister themselves automatically in the lock-free guard region table.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 pub fn install_guard_page_handler() {
     let _ = page_size();
     SIGACTION_INIT.call_once(|| {
@@ -487,6 +529,10 @@ pub fn install_guard_page_handler() {
     });
 }
 
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+pub fn install_guard_page_handler() {}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 extern "C" fn guard_page_sigsegv_handler(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
@@ -532,8 +578,11 @@ fn page_size() -> usize {
     if cached != 0 {
         return cached;
     }
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no preconditions.
     let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    let ps = 4096usize;
     CACHED_PAGE_SIZE.store(ps, Ordering::Relaxed);
     ps
 }

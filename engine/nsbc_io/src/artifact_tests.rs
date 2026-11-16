@@ -180,6 +180,7 @@ fn fixture() -> CompiledArtifact {
         entry: Some(FuncId(0)),
         builtin_abi_version: 1,
         builtins: vec![],
+        wasm_modules: vec![],
     }
 }
 
@@ -1375,4 +1376,74 @@ fn error_opcodes_and_error_layouts_roundtrip_and_validate_authenticated_types() 
             .to_string()
             .contains("unsupported legacy Error layout")
     );
+}
+
+#[test]
+fn wasm_section_and_call_wasm_roundtrip_and_reject_corrupt_sections() {
+    // Minimal valid Wasm module exporting `(func "add_i64" (param i64 i64) (result i64))`
+    // Binary bytes:
+    //   \0asm \x01\0\0\0
+    //   TypeSection (1): 1 type: (func (param i64 i64) (result i64)) -> 0x60 0x02 0x7E 0x7E 0x01 0x7E
+    //   FuncSection (3): 1 func -> type 0
+    //   ExportSection (7): 1 export "add_i64" -> func 0
+    //   CodeSection (10): 1 body: 0 locals, local.get 0, local.get 1, i64.add, end
+    let valid_wasm: Vec<u8> = vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7e, 0x7e, 0x01, 0x7e, // type section
+        0x03, 0x02, 0x01, 0x00, // func section
+        0x07, 0x0b, 0x01, 0x07, b'a', b'd', b'd', b'_', b'i', b'6', b'4', 0x00,
+        0x00, // export
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x7c, 0x0b, // code
+    ];
+
+    let mut artifact = fixture();
+    let i64_ty = Intrinsic::I64.type_index();
+    let fn_sig = artifact.type_pool.intern_structural(TypeKind::Function {
+        params: vec![i64_ty, i64_ty],
+        ret: i64_ty,
+    });
+    finalize_pool(&mut artifact.type_pool);
+    artifact.wasm_modules.push(WasmModuleDef {
+        name: "math_kernel".into(),
+        wasm_bytes: valid_wasm.clone(),
+        bindings: vec![WasmBindingDef {
+            nessa_name: "wasm_add".into(),
+            wasm_export: "add_i64".into(),
+            signature: fn_sig,
+        }],
+    });
+    artifact.codegen_output.functions[0].safepoint_pcs.clear();
+    artifact.codegen_output.functions[0].abi = FunctionAbi::value_only(0);
+    artifact.codegen_output.functions[0].instructions = vec![
+        Instruction::load_imm(Reg(0), 20).encode(),
+        Instruction::load_imm(Reg(1), 22).encode(),
+        Instruction::call_wasm(0, 2).encode(),
+        Instruction::ret(Reg(0)).encode(),
+    ];
+    artifact.codegen_output.method_call_scopes.clear();
+
+    let encoded = write_artifact(&artifact).unwrap();
+    let decoded = read_artifact(&encoded).unwrap();
+    assert_eq!(decoded.wasm_modules, artifact.wasm_modules);
+    assert_eq!(write_artifact(&decoded).unwrap(), encoded);
+
+    let disasm = crate::disassemble_bytes(&encoded).unwrap();
+    assert!(disasm.contains("section .wasm (1 modules):"), "{disasm}");
+    assert!(
+        disasm.contains("CallWasm wasm[0] (wasm_add -> math_kernel::add_i64), argc=2"),
+        "{disasm}"
+    );
+
+    // Corrupt embedded Wasm magic inside `SectionKind::Wasm` -> rejected!
+    let corrupted_wasm = rewrite_section(&encoded, SectionKind::Wasm, |wsec| {
+        let end = wsec.len();
+        wsec[end - valid_wasm.len()] = 0xFF;
+    });
+    rejects(&corrupted_wasm, "invalid embedded wasm binary");
+
+    // Corrupt `wasm_offset` in `WasmModuleEntry` -> rejected!
+    let corrupted_offset = rewrite_section(&encoded, SectionKind::Wasm, |wsec| {
+        wsec[8..16].copy_from_slice(&0u64.to_le_bytes());
+    });
+    rejects(&corrupted_offset, "overlap");
 }

@@ -1303,6 +1303,7 @@ pub(crate) fn emit_baseline_instruction(
         }
 
         Opcode::CallFar
+        | Opcode::CallWasm
         | Opcode::CallIndirect
         | Opcode::CallIndirectProof
         | Opcode::CallMethod

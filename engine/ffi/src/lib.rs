@@ -7,6 +7,7 @@
 //! captures across native C stack frames.
 
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -46,6 +47,7 @@ fn lookup_host_library(name: &str) -> Option<HostSymbolMap> {
 enum LibraryBacking {
     BuiltinControl,
     Host(HostSymbolMap),
+    #[cfg(not(target_arch = "wasm32"))]
     Dynamic(libloading::Library),
 }
 
@@ -57,6 +59,7 @@ impl LibraryBacking {
         match self {
             Self::BuiltinControl => Ok(None),
             Self::Host(map) => Ok(map.get(symbol).copied()),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Dynamic(lib) => {
                 let mut nul_terminated = Vec::with_capacity(symbol.len() + 1);
                 nul_terminated.extend_from_slice(symbol.as_bytes());
@@ -208,6 +211,7 @@ fn parse_signature(sig: &str) -> Result<SymbolKind, VmError> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn open_dynamic_library(spec: &str) -> Result<libloading::Library, VmError> {
     // SAFETY: `dlopen` loads a host dynamic library requested by a capability-authorized
     // `[ffi]` package; any C constructor runs outside managed GC frames.
@@ -248,10 +252,17 @@ pub fn ffi_dlopen(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     let backing = if let Some(host_map) = lookup_host_library(&name) {
         Arc::new(LibraryBacking::Host(host_map))
     } else {
-        let Ok(lib) = open_dynamic_library(&name) else {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Ok(lib) = open_dynamic_library(&name) else {
+                return ctx.return_i64(-1);
+            };
+            Arc::new(LibraryBacking::Dynamic(lib))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
             return ctx.return_i64(-1);
-        };
-        Arc::new(LibraryBacking::Dynamic(lib))
+        }
     };
     let handle = ctx.resources_mut().insert(
         TAG_FFI_LIBRARY,

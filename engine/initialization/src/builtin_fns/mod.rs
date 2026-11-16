@@ -20,6 +20,7 @@ mod sys;
 mod task;
 #[cfg(test)]
 mod tests;
+mod wasm;
 
 use interpreter::Vm;
 use runtime::ids;
@@ -788,5 +789,25 @@ pub fn register_all(vm: &mut Vm) {
     vm.register_builtin(ids::NET_UDP_LOCAL_ADDR, net::udp_local_addr);
     vm.register_builtin(ids::NET_UDP_CLOSE, net::udp_close);
     vm.register_builtin(ids::NET_RESOLVE_HOST, net::resolve_host);
+
+    vm.register_builtin(ids::WASM_VALIDATE, wasm::validate);
+    vm.register_builtin(ids::WASM_INSPECT, wasm::inspect);
+    vm.register_builtin(ids::WASM_COMPILE, wasm::compile);
+    vm.register_builtin(ids::WASM_MODULE_EXPORTS, wasm::module_exports);
+    vm.register_builtin(ids::WASM_MODULE_IMPORTS, wasm::module_imports);
+    vm.register_builtin(ids::WASM_INSTANTIATE, wasm::instantiate);
+    vm.register_builtin(ids::WASM_CALL, wasm::call);
+    vm.register_builtin(ids::WASM_MEM_PAGES, wasm::mem_pages);
+    vm.register_builtin(ids::WASM_MEM_GROW, wasm::mem_grow);
+    vm.register_builtin(ids::WASM_MEM_READ, wasm::mem_read);
+    vm.register_builtin(ids::WASM_MEM_WRITE, wasm::mem_write);
+    vm.register_builtin(ids::WASM_MEM_READ_STR, wasm::mem_read_str);
+    vm.register_builtin(ids::WASM_MEM_WRITE_STR, wasm::mem_write_str);
+    vm.register_builtin(ids::WASM_GLOBAL_GET, wasm::global_get);
+    vm.register_builtin(ids::WASM_GLOBAL_SET, wasm::global_set);
+    vm.register_builtin(ids::WASM_FUEL, wasm::fuel);
+    vm.register_builtin(ids::WASM_RUN_WASI, wasm::run_wasi);
+    vm.register_builtin(ids::WASM_CLOSE, wasm::close);
+
     vm.enable_standard_builtin_fast_paths();
 }

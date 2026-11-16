@@ -1,0 +1,422 @@
+-- std.wasm — Embedded WebAssembly 2.0 (+ simd128) validation, inspection, instantiation,
+-- linear memory & mutable global access, GC-rooted host imports, and sandboxed WASI execution.
+
+use .builtin.*
+pub use .builtin.Bytes
+use .collections.*
+use .fs
+use .traits.*
+
+private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+private const _list_len: fn(List) -> i64 = .__list_len'builtin
+private const _list_get: fn(List, usize) -> Any = .__list_get'builtin
+private const _bytes_new: fn(usize) -> Bytes = .__bytes_new'builtin
+private const _bytes_to_str: fn(Bytes) -> ?String = .__bytes_to_str'builtin
+private const _map_init: fn() -> Map = .__map_init'builtin
+
+private const _wasm_validate: fn(Bytes) -> (i64, String) = .__wasm_validate'builtin
+private const _wasm_inspect: fn(Bytes) -> (i64, String, String) = .__wasm_inspect'builtin
+private const _wasm_compile: fn(Bytes) -> (i64, String, i64) = .__wasm_compile'builtin
+private const _wasm_module_exports: fn(i64) -> List = .__wasm_module_exports'builtin
+private const _wasm_module_imports: fn(i64) -> List = .__wasm_module_imports'builtin
+private const _wasm_instantiate: fn(i64, Map, i64, i64, i64) -> (i64, String, i64) = .__wasm_instantiate'builtin
+private const _wasm_call: fn(i64, String, List) -> (i64, String, List) = .__wasm_call'builtin
+private const _wasm_mem_pages: fn(i64) -> i64 = .__wasm_mem_pages'builtin
+private const _wasm_mem_grow: fn(i64, i64) -> (i64, String, i64) = .__wasm_mem_grow'builtin
+private const _wasm_mem_read: fn(i64, i64, i64) -> (i64, String, Bytes) = .__wasm_mem_read'builtin
+private const _wasm_mem_write: fn(i64, i64, Bytes) -> (i64, String) = .__wasm_mem_write'builtin
+private const _wasm_mem_read_str: fn(i64, i64, i64) -> (i64, String, String) = .__wasm_mem_read_str'builtin
+private const _wasm_mem_write_str: fn(i64, i64, String) -> (i64, String, i64) = .__wasm_mem_write_str'builtin
+private const _wasm_global_get: fn(i64, String) -> (i64, String, Any) = .__wasm_global_get'builtin
+private const _wasm_global_set: fn(i64, String, Any) -> (i64, String) = .__wasm_global_set'builtin
+private const _wasm_fuel: fn(i64) -> ?i64 = .__wasm_fuel'builtin
+private const _wasm_run_wasi: fn(Bytes, List, Map, Bytes, i64, i64) -> (i64, String, i64, Bytes, Bytes) = .__wasm_run_wasi'builtin
+private const _wasm_close: fn(i64) -> bool = .__wasm_close'builtin
+
+pub enum WasmError {
+    pub Validation(message: String),
+    pub Unsupported(message: String),
+    pub Link(message: String),
+    pub UnknownExport(message: String),
+    pub SignatureMismatch(message: String),
+    pub MemoryLimit(message: String),
+    pub ImmutableGlobal(message: String),
+    pub OutOfFuel(message: String),
+    pub Trap(message: String),
+}
+
+derive Eq, PartialEq for WasmError
+
+impl Display for WasmError {
+    pub fn to_string(self) -> String {
+        self match {
+            WasmError.Validation(m) => m,
+            WasmError.Unsupported(m) => m,
+            WasmError.Link(m) => m,
+            WasmError.UnknownExport(m) => m,
+            WasmError.SignatureMismatch(m) => m,
+            WasmError.MemoryLimit(m) => m,
+            WasmError.ImmutableGlobal(m) => m,
+            WasmError.OutOfFuel(m) => m,
+            WasmError.Trap(m) => m,
+        }
+    }
+}
+
+private fn _error_from_code(code: i64, msg: String) -> WasmError {
+    if code == 1 { return WasmError.Validation(msg) }
+    if code == 2 { return WasmError.Unsupported(msg) }
+    if code == 3 { return WasmError.Link(msg) }
+    if code == 4 { return WasmError.UnknownExport(msg) }
+    if code == 5 { return WasmError.SignatureMismatch(msg) }
+    if code == 6 { return WasmError.MemoryLimit(msg) }
+    if code == 7 { return WasmError.ImmutableGlobal(msg) }
+    if code == 8 { return WasmError.OutOfFuel(msg) }
+    WasmError.Trap(msg)
+}
+
+pub struct WasmExport {
+    pub name: String,
+    pub kind: String,
+    pub detail: String,
+}
+
+derive Eq, PartialEq for WasmExport
+
+impl Display for WasmExport {
+    pub fn to_string(self) -> String {
+        self.kind ++ " " ++ self.name ++ " " ++ self.detail
+    }
+}
+
+pub struct WasmImport {
+    pub module: String,
+    pub name: String,
+    pub kind: String,
+    pub detail: String,
+}
+
+derive Eq, PartialEq for WasmImport
+
+impl Display for WasmImport {
+    pub fn to_string(self) -> String {
+        self.module ++ "::" ++ self.name ++ " (" ++ self.kind ++ " " ++ self.detail ++ ")"
+    }
+}
+
+pub struct WasiResult {
+    pub exit_code: i64,
+    pub stdout: Bytes,
+    pub stderr: Bytes,
+}
+
+impl WasiResult {
+    pub fn stdout_str(self) -> String {
+        let s = _bytes_to_str(self.stdout)
+        if s == null { "" } else { s.as(String) }
+    }
+
+    pub fn stderr_str(self) -> String {
+        let s = _bytes_to_str(self.stderr)
+        if s == null { "" } else { s.as(String) }
+    }
+}
+
+-- Validate raw `.wasm` binary bytes against the W3C WebAssembly 2.0 specification.
+pub fn validate(bytes: Bytes) -> !WasmError Unit {
+    let (code, msg) = _wasm_validate(bytes)
+    if code == 0 {
+        ()
+    } else {
+        error _error_from_code(code, msg)
+    }
+}
+
+-- Return a human-readable structural summary of a `.wasm` binary.
+pub fn inspect(bytes: Bytes) -> !WasmError String {
+    let (code, msg, summary) = _wasm_inspect(bytes)
+    if code == 0 {
+        summary
+    } else {
+        error _error_from_code(code, msg)
+    }
+}
+
+-- Compile `.wasm` bytes into a reusable `WasmModule`.
+pub fn compile(bytes: Bytes) -> !WasmError WasmModule {
+    WasmModule.from_bytes(bytes)
+}
+
+-- Read a `.wasm` file from disk and compile it into a reusable `WasmModule`.
+pub fn compile_file(path: String) -> !WasmError WasmModule {
+    let bytes = fs.read_raw_bytes(path)!{
+        e => return error WasmError.Validation("io error reading `" ++ path ++ "`: " ++ e.to_string())
+    }
+    WasmModule.from_bytes(bytes)
+}
+
+-- Execute a WASI Preview 1 command module (`_start`) in a memory- and fuel-bounded virtual sandbox.
+pub fn run_wasi(
+    bytes: Bytes,
+    .args: List = [],
+    .env: ?Map = null,
+    .stdin: ?Bytes = null,
+    .max_memory_pages: i64 = 1024,
+    .fuel: i64 = -1,
+) -> !WasmError WasiResult {
+    let env_map = if env == null { _map_init() } else { env.as(Map) }
+    let stdin_bytes = if stdin == null { _bytes_new(0) } else { stdin.as(Bytes) }
+    let (code, msg, exit_code, out, err_bytes) = _wasm_run_wasi(
+        bytes,
+        args,
+        env_map,
+        stdin_bytes,
+        max_memory_pages,
+        fuel,
+    )
+    if code == 0 {
+        WasiResult {
+            exit_code: exit_code,
+            stdout: out,
+            stderr: err_bytes,
+        }
+    } else {
+        error _error_from_code(code, msg)
+    }
+}
+
+-- Read a WASI Preview 1 `.wasm` binary from disk and execute it in the virtual sandbox.
+pub fn run_wasi_file(
+    path: String,
+    .args: List = [],
+    .env: ?Map = null,
+    .stdin: ?Bytes = null,
+    .max_memory_pages: i64 = 1024,
+    .fuel: i64 = -1,
+) -> !WasmError WasiResult {
+    let bytes = fs.read_raw_bytes(path)!{
+        e => return error WasmError.Validation("io error reading `" ++ path ++ "`: " ++ e.to_string())
+    }
+    run_wasi(
+        bytes,
+        args = args,
+        env = env,
+        stdin = stdin,
+        max_memory_pages = max_memory_pages,
+        fuel = fuel,
+    )
+}
+
+pub struct WasmModule {
+    handle_id: i64,
+}
+
+derive Eq, PartialEq for WasmModule
+
+impl Display for WasmModule {
+    pub fn to_string(self) -> String {
+        "WasmModule(#" ++ _to_string_raw(self.handle_id) ++ ")"
+    }
+}
+
+impl WasmModule {
+    pub fn from_bytes(bytes: Bytes) -> !WasmError WasmModule {
+        let (code, msg, id) = _wasm_compile(bytes)
+        if code == 0 {
+            WasmModule { handle_id: id }
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn exports(self) -> List {
+        let raw = _wasm_module_exports(self.handle_id)
+        let n = _list_len(raw)
+        var out = []
+        var i: usize = 0
+        while i < n {
+            let (name, kind, detail) = _list_get(raw, i).as((String, String, String))
+            out.push(WasmExport {
+                name: name,
+                kind: kind,
+                detail: detail,
+            })
+            i += 1
+        }
+        out
+    }
+
+    pub fn imports(self) -> List {
+        let raw = _wasm_module_imports(self.handle_id)
+        let n = _list_len(raw)
+        var out = []
+        var i: usize = 0
+        while i < n {
+            let (mod_name, item_name, kind, detail) = _list_get(raw, i).as((String, String, String, String))
+            out.push(WasmImport {
+                module: mod_name,
+                name: item_name,
+                kind: kind,
+                detail: detail,
+            })
+            i += 1
+        }
+        out
+    }
+
+    pub fn instantiate(
+        self,
+        .imports: ?Map = null,
+        .max_memory_pages: i64 = 1024,
+        .max_call_depth: i64 = 1024,
+        .fuel: i64 = -1,
+    ) -> !WasmError WasmInstance {
+        let imp_map = if imports == null { _map_init() } else { imports.as(Map) }
+        let (code, msg, inst_id) = _wasm_instantiate(
+            self.handle_id,
+            imp_map,
+            max_memory_pages,
+            max_call_depth,
+            fuel,
+        )
+        if code == 0 {
+            WasmInstance { handle_id: inst_id }
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn close(self) -> bool = _wasm_close(self.handle_id)
+}
+
+pub struct WasmInstance {
+    handle_id: i64,
+}
+
+derive Eq, PartialEq for WasmInstance
+
+impl Display for WasmInstance {
+    pub fn to_string(self) -> String {
+        "WasmInstance(#" ++ _to_string_raw(self.handle_id) ++ ")"
+    }
+}
+
+impl WasmInstance {
+    -- Invoke an exported function and return all multi-value results as a `List`.
+    pub fn call_multi(self, export_name: String, .args: List = []) -> !WasmError List {
+        let (code, msg, results) = _wasm_call(self.handle_id, export_name, args)
+        if code == 0 {
+            results
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    -- Invoke an exported function returning `()` (if 0 results), a single value (if 1 result),
+    -- or a `List` (if multi-value).
+    pub fn call(self, export_name: String, .args: List = []) -> !WasmError Any {
+        let (code, msg, results) = _wasm_call(self.handle_id, export_name, args)
+        if code != 0 {
+            return error _error_from_code(code, msg)
+        }
+        let n = _list_len(results)
+        if n == 0 {
+            ()
+        } else if n == 1 {
+            _list_get(results, 0)
+        } else {
+            results
+        }
+    }
+
+    pub fn call_i64(self, export_name: String, .args: List = []) -> !WasmError i64 {
+        let (code, msg, results) = _wasm_call(self.handle_id, export_name, args)
+        if code != 0 {
+            return error _error_from_code(code, msg)
+        }
+        if _list_len(results) != 1 {
+            return error WasmError.SignatureMismatch("expected single integer return value")
+        }
+        _list_get(results, 0).as(i64)
+    }
+
+    pub fn call_f64(self, export_name: String, .args: List = []) -> !WasmError f64 {
+        let (code, msg, results) = _wasm_call(self.handle_id, export_name, args)
+        if code != 0 {
+            return error _error_from_code(code, msg)
+        }
+        if _list_len(results) != 1 {
+            return error WasmError.SignatureMismatch("expected single float return value")
+        }
+        _list_get(results, 0).as(f64)
+    }
+
+    pub fn memory_pages(self) -> i64 = _wasm_mem_pages(self.handle_id)
+
+    pub fn memory_grow(self, delta_pages: i64) -> !WasmError i64 {
+        let (code, msg, prev) = _wasm_mem_grow(self.handle_id, delta_pages)
+        if code == 0 {
+            prev
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn read_memory(self, offset: i64, len: i64) -> !WasmError Bytes {
+        let (code, msg, bytes) = _wasm_mem_read(self.handle_id, offset, len)
+        if code == 0 {
+            bytes
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn write_memory(self, offset: i64, data: Bytes) -> !WasmError Unit {
+        let (code, msg) = _wasm_mem_write(self.handle_id, offset, data)
+        if code == 0 {
+            ()
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn read_str(self, offset: i64, len: i64) -> !WasmError String {
+        let (code, msg, text) = _wasm_mem_read_str(self.handle_id, offset, len)
+        if code == 0 {
+            text
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn write_str(self, offset: i64, text: String) -> !WasmError i64 {
+        let (code, msg, n) = _wasm_mem_write_str(self.handle_id, offset, text)
+        if code == 0 {
+            n
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn get_global(self, name: String) -> !WasmError Any {
+        let (code, msg, val) = _wasm_global_get(self.handle_id, name)
+        if code == 0 {
+            val
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn set_global(self, name: String, value: Any) -> !WasmError Unit {
+        let (code, msg) = _wasm_global_set(self.handle_id, name, value)
+        if code == 0 {
+            ()
+        } else {
+            error _error_from_code(code, msg)
+        }
+    }
+
+    pub fn fuel_remaining(self) -> ?i64 = _wasm_fuel(self.handle_id)
+
+    pub fn close(self) -> bool = _wasm_close(self.handle_id)
+}

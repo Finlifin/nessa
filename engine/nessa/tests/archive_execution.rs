@@ -2412,6 +2412,7 @@ fn finalized_archive_fixture(
         entry: Some(nsbc::FuncId(0)),
         builtin_abi_version,
         builtins,
+        wasm_modules: vec![],
     }
 }
 
@@ -3294,7 +3295,7 @@ fn generated_enum_and_tuple_display_archives_require_exact_quote_native_capabili
     let compiled = driver::Driver::new().compile(source);
     assert!(!compiled.has_errors, "{:?}", compiled.diagnostics);
     let artifact = compiled.into_artifact().unwrap();
-    assert_eq!(artifact.builtin_abi_version, 12);
+    assert_eq!(artifact.builtin_abi_version, 13);
     assert!(
         artifact
             .builtins

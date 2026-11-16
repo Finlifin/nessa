@@ -455,6 +455,8 @@ pub struct NirModule {
     pub derived_methods: Vec<DerivedMethod>,
     /// Source function symbols relocated to their generated code identities.
     pub function_symbols: std::collections::HashMap<resolution::SymbolId, FuncId>,
+    /// Public functions exported at the root compilation unit (retained across DFE).
+    pub exported_roots: Vec<FuncId>,
     pub functions: Vec<NirFunction>,
     pub globals: Vec<GlobalInfo>,
     /// Startup function that initializes loaded modules and invokes user main.

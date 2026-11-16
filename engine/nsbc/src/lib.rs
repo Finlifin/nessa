@@ -115,6 +115,8 @@ pub struct CompiledArtifact {
     pub entry: Option<FuncId>,
     pub builtin_abi_version: u32,
     pub builtins: Vec<BuiltinImport>,
+    /// Embedded WebAssembly modules (`SectionKind::Wasm`) and their typed bindings.
+    pub wasm_modules: Vec<WasmModuleDef>,
 }
 
 impl std::fmt::Debug for CompiledArtifact {
@@ -126,6 +128,7 @@ impl std::fmt::Debug for CompiledArtifact {
             .field("entry", &self.entry)
             .field("builtin_abi_version", &self.builtin_abi_version)
             .field("builtins", &self.builtins)
+            .field("wasm_modules", &self.wasm_modules.len())
             .finish()
     }
 }
@@ -134,4 +137,20 @@ impl std::fmt::Debug for CompiledArtifact {
 pub struct BuiltinImport {
     pub id: u32,
     pub name: String,
+}
+
+/// Typed Nessa <-> WebAssembly export binding inside an embedded [`WasmModuleDef`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmBindingDef {
+    pub nessa_name: String,
+    pub wasm_export: String,
+    pub signature: type_pool::TypeIndex,
+}
+
+/// Embedded WebAssembly module stored in `SectionKind::Wasm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmModuleDef {
+    pub name: String,
+    pub wasm_bytes: Vec<u8>,
+    pub bindings: Vec<WasmBindingDef>,
 }

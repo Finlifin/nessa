@@ -6,7 +6,9 @@ use crate::{DiscoveredModule, ManifestDocument};
 
 use super::discovery::discover_modules_with_limits;
 use super::error::io_error;
-use super::{ModuleSources, PackageSourceError, PackageSources, SourceFile, SourceLoadLimits};
+use super::{
+    ModuleSources, PackageSourceError, PackageSources, SourceFile, SourceLoadLimits, WasmAsset,
+};
 
 /// Read the complete package manifest and source tree into owned UTF-8 inputs.
 pub fn load_package_sources(root: &Path) -> Result<PackageSources, PackageSourceError> {
@@ -45,11 +47,32 @@ pub fn load_package_sources_with_limits(
         .into_iter()
         .map(|module| read_module(module, limits, &mut used_bytes))
         .collect::<Result<_, _>>()?;
+    let mut wasm_assets = Vec::with_capacity(manifest.ffi().wasm.len());
+    for wspec in &manifest.ffi().wasm {
+        let wasm_path = root.join(&wspec.file);
+        let bytes = read_bounded_bytes(
+            &wasm_path,
+            limits.max_file_bytes,
+            "file_bytes",
+            limits.max_file_bytes,
+        )?;
+        let canon = fs::canonicalize(&wasm_path)
+            .map_err(|error| io_error("resolve wasm file", &wasm_path, error))?;
+        if !canon.starts_with(&root) {
+            return Err(PackageSourceError::InvalidEntry { path: wasm_path });
+        }
+        wasm_assets.push(WasmAsset {
+            name: wspec.name.clone(),
+            rel_path: wspec.file.clone(),
+            bytes,
+        });
+    }
     Ok(PackageSources {
         root,
         manifest,
         entry,
         modules,
+        wasm_assets,
     })
 }
 
@@ -91,12 +114,12 @@ fn read_source(
     })
 }
 
-fn read_bounded(
+fn read_bounded_bytes(
     path: &Path,
     bound: usize,
     resource: &'static str,
     limit: usize,
-) -> Result<String, PackageSourceError> {
+) -> Result<Vec<u8>, PackageSourceError> {
     // Reject special files before open: opening a FIFO could wait indefinitely.
     let metadata =
         fs::metadata(path).map_err(|error| io_error("inspect source file", path, error))?;
@@ -124,6 +147,16 @@ fn read_bounded(
     if bytes.len() > bound {
         return Err(PackageSourceError::Capacity { resource, limit });
     }
+    Ok(bytes)
+}
+
+fn read_bounded(
+    path: &Path,
+    bound: usize,
+    resource: &'static str,
+    limit: usize,
+) -> Result<String, PackageSourceError> {
+    let bytes = read_bounded_bytes(path, bound, resource, limit)?;
     String::from_utf8(bytes).map_err(|error| {
         io_error(
             "decode source file",

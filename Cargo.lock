@@ -417,6 +417,7 @@ dependencies = [
  "sha2",
  "str_interner",
  "type_pool",
+ "wasm",
 ]
 
 [[package]]
@@ -605,6 +606,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "foldhash",
+ "serde",
 ]
 
 [[package]]
@@ -786,6 +788,7 @@ dependencies = [
  "stack_pool",
  "str_interner",
  "type_pool",
+ "wasm",
 ]
 
 [[package]]
@@ -1094,6 +1097,8 @@ dependencies = [
  "rustc_span",
  "str_interner",
  "type_pool",
+ "wasm",
+ "wasm-encoder",
 ]
 
 [[package]]
@@ -1126,6 +1131,7 @@ version = "0.1.0"
 dependencies = [
  "str_interner",
  "type_pool",
+ "wasmparser",
 ]
 
 [[package]]
@@ -1950,6 +1956,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm"
+version = "0.1.0"
+dependencies = [
+ "nsbc",
+ "str_interner",
+ "type_pool",
+ "wasm-encoder",
+ "wasmparser",
+]
+
+[[package]]
 name = "wasm-encoder"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1981,6 +1998,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.13.0",
  "semver",
+ "serde",
 ]
 
 [[package]]

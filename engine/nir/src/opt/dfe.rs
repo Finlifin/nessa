@@ -36,6 +36,9 @@ pub(crate) fn eliminate_dead_functions(module: &mut NirModule, type_pool: &mut T
     };
 
     enqueue(entry_id.0, &mut reachable, &mut queue);
+    for &exp_id in &module.exported_roots {
+        enqueue(exp_id.0, &mut reachable, &mut queue);
+    }
     for id in type_pool.referenced_function_ids() {
         enqueue(id, &mut reachable, &mut queue);
     }
@@ -97,6 +100,12 @@ pub(crate) fn eliminate_dead_functions(module: &mut NirModule, type_pool: &mut T
     }
 
     module.entry = Some(FuncId(remap[&entry_id.0]));
+    module
+        .exported_roots
+        .retain(|fid| remap.contains_key(&fid.0));
+    for fid in &mut module.exported_roots {
+        *fid = FuncId(remap[&fid.0]);
+    }
     for dm in &mut module.derived_methods {
         if let Some(&new_id) = remap.get(&dm.func_id.0) {
             dm.func_id = FuncId(new_id);

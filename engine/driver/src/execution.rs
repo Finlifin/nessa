@@ -75,6 +75,10 @@ pub const fn builtin_requires_list_roles(id: runtime::BuiltinFnId) -> bool {
             | runtime::ids::NET_UDP_SEND_BYTES
             | runtime::ids::NET_UDP_RECV
             | runtime::ids::NET_RESOLVE_HOST
+            | runtime::ids::WASM_MODULE_EXPORTS
+            | runtime::ids::WASM_MODULE_IMPORTS
+            | runtime::ids::WASM_CALL
+            | runtime::ids::WASM_RUN_WASI
     )
 }
 
@@ -89,6 +93,8 @@ pub const fn builtin_requires_map_roles(id: runtime::BuiltinFnId) -> bool {
             | runtime::ids::MAP_COPY
             | runtime::ids::ENV_VARS
             | runtime::ids::HOST_CALL
+            | runtime::ids::WASM_INSTANTIATE
+            | runtime::ids::WASM_RUN_WASI
     )
 }
 
@@ -96,7 +102,15 @@ pub const fn builtin_requires_map_roles(id: runtime::BuiltinFnId) -> bool {
 pub const fn builtin_requires_bytes_roles(id: runtime::BuiltinFnId) -> bool {
     matches!(
         id,
-        runtime::ids::BYTES_NEW..=runtime::ids::BYTES_EQ | runtime::ids::BYTES_READ_U64_LE
+        runtime::ids::BYTES_NEW..=runtime::ids::BYTES_EQ
+            | runtime::ids::BYTES_READ_U64_LE
+            | runtime::ids::WASM_VALIDATE..=runtime::ids::WASM_COMPILE
+            | runtime::ids::WASM_CALL
+            | runtime::ids::WASM_MEM_READ
+            | runtime::ids::WASM_MEM_WRITE
+            | runtime::ids::WASM_GLOBAL_GET
+            | runtime::ids::WASM_GLOBAL_SET
+            | runtime::ids::WASM_RUN_WASI
     )
 }
 
@@ -174,6 +188,8 @@ pub fn install_artifact(
     }
 
     vm.install_type_pool(artifact.type_pool);
+    vm.install_wasm_modules(&artifact.wasm_modules)
+        .map_err(ArtifactLoadError::Runtime)?;
     vm.initialize_globals(&artifact.codegen_output.globals)
         .map_err(ArtifactLoadError::Runtime)?;
     for function in artifact.codegen_output.functions {
@@ -239,6 +255,7 @@ mod tests {
             entry: None,
             builtin_abi_version: revision,
             builtins: vec![import],
+            wasm_modules: vec![],
         }
     }
 

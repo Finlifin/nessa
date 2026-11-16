@@ -73,6 +73,14 @@ pub struct ModuleSources {
     pub children: Vec<ModuleSources>,
 }
 
+/// Embedded `.wasm` binary asset referenced by `[[ffi.wasm]]` in `package.toml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WasmAsset {
+    pub name: String,
+    pub rel_path: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Complete filesystem inputs for one package. Dependency selection and compilation
 /// consume this data separately; paths are not package or type identity inputs.
 #[derive(Clone, Debug)]
@@ -81,4 +89,5 @@ pub struct PackageSources {
     pub manifest: ManifestDocument,
     pub entry: SourceFile,
     pub modules: Vec<ModuleSources>,
+    pub wasm_assets: Vec<WasmAsset>,
 }

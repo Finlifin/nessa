@@ -28,3 +28,5 @@ driver = { path = "../driver" }
 pkg_manager = { path = "../pkg_manager" }
 ffi = { path = "../ffi" }
 regex_ffi = { path = "../regex_ffi" }
+wasm = { path = "../wasm" }
+wasm-encoder = { workspace = true }

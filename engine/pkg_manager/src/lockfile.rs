@@ -327,6 +327,18 @@ pub fn compute_package_sha256(sources: &PackageSources) -> String {
         hasher.update((content.len() as u64).to_be_bytes());
         hasher.update(content.as_bytes());
     }
+    if !sources.wasm_assets.is_empty() {
+        hasher.update(b"nessa.package.wasm.v1\0");
+        hasher.update((sources.wasm_assets.len() as u64).to_be_bytes());
+        for asset in &sources.wasm_assets {
+            hasher.update((asset.name.len() as u64).to_be_bytes());
+            hasher.update(asset.name.as_bytes());
+            hasher.update((asset.rel_path.len() as u64).to_be_bytes());
+            hasher.update(asset.rel_path.as_bytes());
+            hasher.update((asset.bytes.len() as u64).to_be_bytes());
+            hasher.update(&asset.bytes);
+        }
+    }
 
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);

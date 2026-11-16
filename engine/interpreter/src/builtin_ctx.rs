@@ -100,6 +100,7 @@ pub enum NativeValue {
     U64(u64),
     F64(f64),
     Str(String),
+    Bytes(Vec<u8>),
     OptI64(Option<i64>),
     OptF64(Option<f64>),
     OptStr(Option<String>),
@@ -2654,6 +2655,14 @@ impl Vm {
                 let v = self.alloc_string(&s)?;
                 Ok((v, Intrinsic::Str.type_index()))
             }
+            NativeValue::Bytes(data) => {
+                let bytes_ty = self
+                    .type_pool_read()
+                    .bytes_type()
+                    .ok_or(VmError::TypeError)?;
+                let v = self.alloc_bytes_from_slice(&data)?;
+                Ok((v, bytes_ty))
+            }
             NativeValue::OptI64(opt) => {
                 let ty = self.intern_optional_type(Intrinsic::I64.type_index());
                 let v = match opt {
@@ -2790,6 +2799,9 @@ impl Vm {
         }
         if let Some(s) = heap_string_to_owned(val) {
             return Ok(NativeValue::Str(s));
+        }
+        if let Ok(layout) = self.bytes_layout(val) {
+            return Ok(NativeValue::Bytes(layout.as_slice().to_vec()));
         }
         if let Ok(elems) = self.snapshot_list_elements(val) {
             let mut items = Vec::with_capacity(elems.len());

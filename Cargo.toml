@@ -12,6 +12,8 @@ itoa = "1.0.17"
 regex = "1.12.3"
 regex-automata = "0.4.14"
 regex-syntax = "0.8.10"
+wasm-encoder = "0.244.0"
+wasmparser = "0.244.0"
 
 # Independent verification trees share one target directory. Full debug data
 # and per-tree incremental caches otherwise consume tens of GiB between runs.

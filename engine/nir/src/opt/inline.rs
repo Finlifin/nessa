@@ -106,12 +106,25 @@ fn is_inline_candidate(
     }
     for block in &func.blocks {
         for stmt in &block.stmts {
-            if stmt_uses_handlers_or_defer(stmt) {
+            if stmt_uses_handlers_or_defer(stmt) || stmt_has_wasm_bind_marker(stmt) {
                 return false;
             }
         }
     }
     true
+}
+
+fn stmt_has_wasm_bind_marker(stmt: &NirStmt) -> bool {
+    let mut found = false;
+    let mut cloned = stmt.clone();
+    for_each_stmt_value_mut(&mut cloned, |val: &mut NirValue| {
+        if let NirValue::ConstStr(sid) = *val
+            && str_interner::get(sid).contains("__nessa_wasm_bind:")
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 fn inline_into_caller(

@@ -138,12 +138,14 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
         .map(|schema| schema.slots.len())
         .max()
         .unwrap_or(0);
+    let wasm_binding_arities = validate_wasm_modules(artifact)?;
     let func_len = functions.len();
     let validator = Validator {
         artifact,
         pool: &artifact.type_pool,
         functions,
         max_trait_slots,
+        wasm_binding_arities,
         has_list_roles: artifact.type_pool.list_type().is_some()
             && artifact.type_pool.list_buffer_type().is_some(),
         has_map_roles: artifact.type_pool.map_type().is_some()
@@ -212,6 +214,268 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
     Ok(())
 }
 
+fn validate_wasm_modules(artifact: &CompiledArtifact) -> Result<Vec<u8>, ArtifactError> {
+    use type_pool::{CollectionRole, Intrinsic};
+    use wasmparser::{
+        ExternalKind, Parser, Payload, TypeRef, ValType, Validator as WpValidator, WasmFeatures,
+    };
+
+    const MAX_WASM_MODULES: usize = 4096;
+    const MAX_WASM_BINDINGS: usize = 1 << 14;
+
+    if artifact.wasm_modules.len() > MAX_WASM_MODULES {
+        return Err(ArtifactError::new(
+            "wasm section",
+            "embedded wasm module limit exceeded",
+        ));
+    }
+
+    let pool = &artifact.type_pool;
+    let mut mod_names = BTreeSet::new();
+    let mut arities = Vec::new();
+
+    for (midx, wmod) in artifact.wasm_modules.iter().enumerate() {
+        let ctx = format!("wasm module {midx}");
+        if wmod.name.is_empty() || !mod_names.insert(wmod.name.as_str()) {
+            return Err(ArtifactError::new(
+                &ctx,
+                "empty or duplicate embedded wasm module name",
+            ));
+        }
+
+        let features = WasmFeatures::SIMD
+            | WasmFeatures::BULK_MEMORY
+            | WasmFeatures::MULTI_VALUE
+            | WasmFeatures::TAIL_CALL
+            | WasmFeatures::REFERENCE_TYPES
+            | WasmFeatures::SIGN_EXTENSION
+            | WasmFeatures::SATURATING_FLOAT_TO_INT
+            | WasmFeatures::MUTABLE_GLOBAL
+            | WasmFeatures::MULTI_MEMORY;
+        let mut wp = WpValidator::new_with_features(features);
+        wp.validate_all(&wmod.wasm_bytes)
+            .map_err(|e| ArtifactError::new(&ctx, format!("invalid embedded wasm binary: {e}")))?;
+
+        let mut func_sigs: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
+        let mut func_type_indices: Vec<u32> = Vec::new();
+        let mut exported_funcs = std::collections::HashMap::new();
+        let mut has_exported_memory = false;
+
+        for payload in Parser::new(0).parse_all(&wmod.wasm_bytes) {
+            let payload =
+                payload.map_err(|e| ArtifactError::new(&ctx, format!("wasm parse error: {e}")))?;
+            match payload {
+                Payload::TypeSection(reader) => {
+                    for rec_group in reader {
+                        let rec_group =
+                            rec_group.map_err(|e| ArtifactError::new(&ctx, e.to_string()))?;
+                        for sub_ty in rec_group.into_types() {
+                            if let wasmparser::CompositeInnerType::Func(ft) =
+                                sub_ty.composite_type.inner
+                            {
+                                func_sigs.push((ft.params().to_vec(), ft.results().to_vec()));
+                            }
+                        }
+                    }
+                }
+                Payload::ImportSection(reader) => {
+                    for imports_group in reader {
+                        let imports_group =
+                            imports_group.map_err(|e| ArtifactError::new(&ctx, e.to_string()))?;
+                        for imp in imports_group {
+                            let (_offset, imp) =
+                                imp.map_err(|e| ArtifactError::new(&ctx, e.to_string()))?;
+                            if let TypeRef::Func(tidx) | TypeRef::FuncExact(tidx) = imp.ty {
+                                func_type_indices.push(tidx);
+                            }
+                        }
+                    }
+                }
+                Payload::FunctionSection(reader) => {
+                    for tidx in reader {
+                        let tidx = tidx.map_err(|e| ArtifactError::new(&ctx, e.to_string()))?;
+                        func_type_indices.push(tidx);
+                    }
+                }
+                Payload::ExportSection(reader) => {
+                    for exp in reader {
+                        let exp = exp.map_err(|e| ArtifactError::new(&ctx, e.to_string()))?;
+                        match exp.kind {
+                            ExternalKind::Func | ExternalKind::FuncExact => {
+                                exported_funcs.insert(exp.name.to_owned(), exp.index);
+                            }
+                            ExternalKind::Memory => {
+                                has_exported_memory = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut binding_names = BTreeSet::new();
+        for binding in &wmod.bindings {
+            if arities.len() >= MAX_WASM_BINDINGS {
+                return Err(ArtifactError::new(
+                    &ctx,
+                    "embedded wasm binding limit exceeded",
+                ));
+            }
+            if binding.nessa_name.is_empty()
+                || binding.wasm_export.is_empty()
+                || !binding_names.insert(binding.nessa_name.as_str())
+            {
+                return Err(ArtifactError::new(
+                    &ctx,
+                    "empty or duplicate wasm binding name",
+                ));
+            }
+            let Some(&fidx) = exported_funcs.get(&binding.wasm_export) else {
+                return Err(ArtifactError::new(
+                    &ctx,
+                    format!(
+                        "wasm export `{}` not found in module `{}`",
+                        binding.wasm_export, wmod.name
+                    ),
+                ));
+            };
+            let Some(&tidx) = func_type_indices.get(fidx as usize) else {
+                return Err(ArtifactError::new(
+                    &ctx,
+                    "invalid wasm export function index",
+                ));
+            };
+            let Some((wasm_params, wasm_results)) = func_sigs.get(tidx as usize) else {
+                return Err(ArtifactError::new(&ctx, "invalid wasm export type index"));
+            };
+
+            let canon_sig = pool.canonical_type(binding.signature).ok_or_else(|| {
+                ArtifactError::new(&ctx, "invalid wasm binding signature TypeIndex")
+            })?;
+            let (params, ret) = match &pool.get(canon_sig).kind {
+                TypeKind::Function { params, ret } => (params.clone(), *ret),
+                _ => {
+                    return Err(ArtifactError::new(
+                        &ctx,
+                        "wasm binding signature must be a function type",
+                    ));
+                }
+            };
+            if params.len() > crate::Reg::MAX_GP as usize {
+                return Err(ArtifactError::new(
+                    &ctx,
+                    "wasm binding parameter count exceeds register limit",
+                ));
+            }
+
+            let mut expected_wasm_params = Vec::new();
+            let mut needs_linear_mem = false;
+            for &pty in &params {
+                let cp = pool
+                    .canonical_type(pty)
+                    .ok_or_else(|| ArtifactError::new(&ctx, "invalid wasm parameter type"))?;
+                match &pool.get(cp).kind {
+                    TypeKind::Intrinsic(intr) => match intr {
+                        Intrinsic::I32
+                        | Intrinsic::U32
+                        | Intrinsic::I16
+                        | Intrinsic::U16
+                        | Intrinsic::I8
+                        | Intrinsic::U8
+                        | Intrinsic::Bool
+                        | Intrinsic::Char => expected_wasm_params.push(ValType::I32),
+                        Intrinsic::I64 | Intrinsic::U64 | Intrinsic::Isize | Intrinsic::Usize => {
+                            expected_wasm_params.push(ValType::I64)
+                        }
+                        Intrinsic::F32 => expected_wasm_params.push(ValType::F32),
+                        Intrinsic::F64 => expected_wasm_params.push(ValType::F64),
+                        Intrinsic::Str => {
+                            needs_linear_mem = true;
+                            expected_wasm_params.push(ValType::I32);
+                            expected_wasm_params.push(ValType::I32);
+                        }
+                        _ => {
+                            return Err(ArtifactError::new(
+                                &ctx,
+                                format!("unsupported wasm parameter type `{}`", intr.name()),
+                            ));
+                        }
+                    },
+                    _ if pool.checked_collection_role(cp).ok().flatten()
+                        == Some(CollectionRole::Bytes) =>
+                    {
+                        needs_linear_mem = true;
+                        expected_wasm_params.push(ValType::I32);
+                        expected_wasm_params.push(ValType::I32);
+                    }
+                    _ => {
+                        return Err(ArtifactError::new(
+                            &ctx,
+                            "unsupported non-scalar wasm binding parameter type",
+                        ));
+                    }
+                }
+            }
+
+            let cr = pool
+                .canonical_type(ret)
+                .ok_or_else(|| ArtifactError::new(&ctx, "invalid wasm return type"))?;
+            let expected_wasm_results = match &pool.get(cr).kind {
+                TypeKind::Intrinsic(intr) => match intr {
+                    Intrinsic::Unit => vec![],
+                    Intrinsic::I32
+                    | Intrinsic::U32
+                    | Intrinsic::I16
+                    | Intrinsic::U16
+                    | Intrinsic::I8
+                    | Intrinsic::U8
+                    | Intrinsic::Bool
+                    | Intrinsic::Char => vec![ValType::I32],
+                    Intrinsic::I64 | Intrinsic::U64 | Intrinsic::Isize | Intrinsic::Usize => {
+                        vec![ValType::I64]
+                    }
+                    Intrinsic::F32 => vec![ValType::F32],
+                    Intrinsic::F64 => vec![ValType::F64],
+                    _ => {
+                        return Err(ArtifactError::new(
+                            &ctx,
+                            format!("unsupported wasm return type `{}`", intr.name()),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(ArtifactError::new(
+                        &ctx,
+                        "unsupported non-scalar wasm binding return type",
+                    ));
+                }
+            };
+
+            if needs_linear_mem && !has_exported_memory {
+                return Err(ArtifactError::new(
+                    &ctx,
+                    "wasm binding passing String/Bytes requires module to export linear memory",
+                ));
+            }
+            if wasm_params != &expected_wasm_params || wasm_results != &expected_wasm_results {
+                return Err(ArtifactError::new(
+                    &ctx,
+                    format!(
+                        "wasm export `{}` signature mismatch against declared Nessa binding `{}`",
+                        binding.wasm_export, binding.nessa_name
+                    ),
+                ));
+            }
+
+            arities.push(params.len() as u8);
+        }
+    }
+
+    Ok(arities)
+}
+
 fn decode(word: u32, context: VContext) -> Result<Instruction, ArtifactError> {
     let instruction = Instruction::decode(word)
         .ok_or_else(|| ctx_err(context, format!("invalid instruction {word:#010x}")))?;
@@ -226,6 +490,7 @@ struct Validator<'a> {
     pool: &'a TypePool,
     functions: Vec<&'a CompiledFunction>,
     max_trait_slots: usize,
+    wasm_binding_arities: Vec<u8>,
     has_list_roles: bool,
     has_map_roles: bool,
     validated_runtime_types: RefCell<Vec<Option<TypeIndex>>>,
@@ -1096,6 +1361,16 @@ impl Validator<'_> {
                         self.call(id, count, context)?;
                     }
                 }
+                CallWasm => {
+                    let (count, binding_id) = Instruction::c_arg_count_func_id(payload);
+                    arguments(count)?;
+                    let Some(&expected) = self.wasm_binding_arities.get(binding_id as usize) else {
+                        return Err(fail("CallWasm binding index outside WASM section"));
+                    };
+                    if count != expected {
+                        return Err(fail("CallWasm argument count mismatch"));
+                    }
+                }
                 CallIndirect | CallIndirectProof => {
                     let (count, closure) = Instruction::c_call_indirect(payload);
                     arguments(count)?;
@@ -1262,6 +1537,7 @@ mod tests {
             entry: Some(FuncId(0)),
             builtin_abi_version: 9,
             builtins: vec![],
+            wasm_modules: vec![],
         };
         refresh_scopes(&mut artifact);
         artifact

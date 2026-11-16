@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 interpreter = { path = "../interpreter" }
+runtime = { path = "../runtime" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc.workspace = true
 libloading.workspace = true
-runtime = { path = "../runtime" }

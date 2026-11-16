@@ -3,5 +3,5 @@ name = "stack_pool"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
 libc = "0.2"

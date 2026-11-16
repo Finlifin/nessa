@@ -53,11 +53,47 @@ pub fn disassemble_artifact(artifact: &CompiledArtifact) -> String {
     let _ = writeln!(out, "constants: {}", codegen.constants.len());
     let _ = writeln!(out, "functions: {}", codegen.functions.len());
     let _ = writeln!(out, "builtins: {}", builtins.len());
+    if !artifact.wasm_modules.is_empty() {
+        let _ = writeln!(out, "wasm_modules: {}", artifact.wasm_modules.len());
+    }
 
     // Builtin import table
     let _ = writeln!(out, "\nsection .builtins ({}):", builtins.len());
     for builtin in &builtins {
         let _ = writeln!(out, "  [{}] {}", builtin.id, builtin.name);
+    }
+
+    // Embedded WASM module & binding table
+    let mut wasm_bindings = Vec::new();
+    if !artifact.wasm_modules.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nsection .wasm ({} modules):",
+            artifact.wasm_modules.len()
+        );
+        for (midx, wmod) in artifact.wasm_modules.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "  module [{midx}] {:?} ({} bytes, {} bindings):",
+                wmod.name,
+                wmod.wasm_bytes.len(),
+                wmod.bindings.len()
+            );
+            for binding in &wmod.bindings {
+                let bid = wasm_bindings.len();
+                let sig = format_type(pool, binding.signature);
+                let _ = writeln!(
+                    out,
+                    "    binding [{bid}] {} -> {}::{} ({sig})",
+                    binding.nessa_name, wmod.name, binding.wasm_export
+                );
+                wasm_bindings.push((
+                    wmod.name.as_str(),
+                    binding.nessa_name.as_str(),
+                    binding.wasm_export.as_str(),
+                ));
+            }
+        }
     }
 
     // Globals table
@@ -108,6 +144,7 @@ pub fn disassemble_artifact(artifact: &CompiledArtifact) -> String {
         constants: &codegen.constants,
         func_names: &func_names,
         builtin_names: &builtin_names,
+        wasm_bindings: &wasm_bindings,
     };
     for (i, func) in functions.iter().enumerate() {
         if i > 0 {
@@ -124,6 +161,7 @@ struct DisasmContext<'a> {
     constants: &'a [Constant],
     func_names: &'a BTreeMap<u32, String>,
     builtin_names: &'a BTreeMap<u32, &'a str>,
+    wasm_bindings: &'a [(&'a str, &'a str, &'a str)],
 }
 
 fn resolve_str_id(id: str_interner::StrId) -> String {
@@ -469,6 +507,15 @@ fn format_instruction(pc: usize, word: u32, ctx: &DisasmContext<'_>) -> String {
                     .unwrap_or_default();
                 format!("{op} const[{const_idx}], argc={argc}{target}")
             }
+            Opcode::CallWasm => {
+                let (argc, bid) = Instruction::c_arg_count_func_id(payload);
+                match ctx.wasm_bindings.get(bid as usize) {
+                    Some((mname, nname, ename)) => {
+                        format!("{op} wasm[{bid}] ({nname} -> {mname}::{ename}), argc={argc}")
+                    }
+                    None => format!("{op} wasm[{bid}], argc={argc}"),
+                }
+            }
             Opcode::CallBuiltin => {
                 let (argc, bid) = Instruction::c_arg_count_func_id(payload);
                 match ctx.builtin_names.get(&bid) {
@@ -635,6 +682,7 @@ mod tests {
                 id: 1,
                 name: "println".into(),
             }],
+            wasm_modules: Vec::new(),
         };
 
         let first = disassemble_artifact(&artifact);
@@ -715,6 +763,7 @@ mod tests {
             entry: Some(FuncId(0)),
             builtin_abi_version: 9,
             builtins: Vec::new(),
+            wasm_modules: Vec::new(),
         };
         let bytes = crate::write_artifact(&artifact).unwrap();
         let text = disassemble_bytes(&bytes).unwrap();
@@ -763,6 +812,7 @@ mod tests {
             entry: Some(FuncId(0)),
             builtin_abi_version: 9,
             builtins: Vec::new(),
+            wasm_modules: Vec::new(),
         };
         let text = disassemble_artifact(&artifact);
         assert!(

@@ -16,6 +16,13 @@ private const _fs_read_dir_entries: fn(String) -> (i64, List, String) = .__fs_re
 private const _fs_walk_dir: fn(String, i64, bool) -> (i64, List, String) = .__fs_walk_dir'builtin
 private const _fs_canonicalize: fn(String) -> (i64, String) = .__fs_canonicalize'builtin
 private const _fs_temp_path: fn(String) -> (i64, String) = .__fs_temp_path'builtin
+private const _list_len: fn(List) -> i64 = .__list_len'builtin
+private const _bytes_new: fn(usize) -> Bytes = .__bytes_new'builtin
+private const _bytes_len: fn(Bytes) -> usize = .__bytes_len'builtin
+private const _bytes_slice: fn(Bytes, usize, usize) -> Bytes = .__bytes_slice'builtin
+private const _bytes_extend: fn(Bytes, Any) -> Unit = .__bytes_extend'builtin
+private const _bytes_from_list: fn(List) -> Bytes = .__bytes_from_list'builtin
+private const _bytes_to_list: fn(Bytes) -> List = .__bytes_to_list'builtin
 
 pub struct FileMetadata {
     pub size: i64,
@@ -49,6 +56,20 @@ pub fn read_bytes(path: String) -> !IoError List {
     file.read_bytes(max_bytes = -1)!
 }
 
+pub fn read_raw_bytes(path: String) -> !IoError Bytes {
+    let file = File.open(path, mode = "rb")!
+    defer { let _ = file.close() }
+    let out = _bytes_new(0)
+    while true {
+        let chunk = file.read_bytes(max_bytes = 16384)!
+        if _list_len(chunk) == 0 {
+            break
+        }
+        _bytes_extend(out, _bytes_from_list(chunk))
+    }
+    out
+}
+
 pub fn write_string(path: String, content: String) -> !IoError Unit {
     let file = File.open(path, mode = "w")!
     defer { let _ = file.close() }
@@ -60,6 +81,21 @@ pub fn write_bytes(path: String, data: List) -> !IoError Unit {
     let file = File.open(path, mode = "wb")!
     defer { let _ = file.close() }
     file.write_bytes(data)!
+    file.close()!
+}
+
+pub fn write_raw_bytes(path: String, data: Bytes) -> !IoError Unit {
+    let file = File.open(path, mode = "wb")!
+    defer { let _ = file.close() }
+    let total = _bytes_len(data)
+    var offset: usize = 0
+    while offset < total {
+        let rem = total - offset
+        let step: usize = if rem > 16384 { 16384 } else { rem }
+        let next = offset + step
+        file.write_bytes(_bytes_to_list(_bytes_slice(data, offset, next)))!
+        offset = next
+    }
     file.close()!
 }
 

@@ -22,5 +22,6 @@ pub mod bytes
 pub mod rand
 pub mod sync
 pub mod net
+pub mod wasm
 pub mod task
 pub mod prelude

@@ -8,7 +8,7 @@ pub type BuiltinFnId = u32;
 
 /// Version of the stable builtin IDs and calling semantics stored in artifacts.
 /// Increment when an ID changes meaning or compilation requires new native capabilities.
-pub const BUILTIN_ABI_VERSION: u32 = 12;
+pub const BUILTIN_ABI_VERSION: u32 = 13;
 
 // ---------------------------------------------------------------------------
 // Stable builtin function IDs (sparse ranges by domain)
@@ -1268,6 +1268,26 @@ pub mod ids {
     pub const NET_UDP_LOCAL_ADDR: BuiltinFnId = 862;
     pub const NET_UDP_CLOSE: BuiltinFnId = 863;
     pub const NET_RESOLVE_HOST: BuiltinFnId = 864;
+
+    // ── `std.wasm` embedded WebAssembly 2.0 + WASI host builtins (865..=882) ──
+    pub const WASM_VALIDATE: BuiltinFnId = 865;
+    pub const WASM_INSPECT: BuiltinFnId = 866;
+    pub const WASM_COMPILE: BuiltinFnId = 867;
+    pub const WASM_MODULE_EXPORTS: BuiltinFnId = 868;
+    pub const WASM_MODULE_IMPORTS: BuiltinFnId = 869;
+    pub const WASM_INSTANTIATE: BuiltinFnId = 870;
+    pub const WASM_CALL: BuiltinFnId = 871;
+    pub const WASM_MEM_PAGES: BuiltinFnId = 872;
+    pub const WASM_MEM_GROW: BuiltinFnId = 873;
+    pub const WASM_MEM_READ: BuiltinFnId = 874;
+    pub const WASM_MEM_WRITE: BuiltinFnId = 875;
+    pub const WASM_MEM_READ_STR: BuiltinFnId = 876;
+    pub const WASM_MEM_WRITE_STR: BuiltinFnId = 877;
+    pub const WASM_GLOBAL_GET: BuiltinFnId = 878;
+    pub const WASM_GLOBAL_SET: BuiltinFnId = 879;
+    pub const WASM_FUEL: BuiltinFnId = 880;
+    pub const WASM_RUN_WASI: BuiltinFnId = 881;
+    pub const WASM_CLOSE: BuiltinFnId = 882;
 }
 
 /// Static metadata for a builtin function (no function pointer).
@@ -3947,6 +3967,78 @@ pub const BUILTIN_FN_META: &[BuiltinFnMeta] = &[
         id: ids::NET_RESOLVE_HOST,
         name: "__net_resolve_host",
     },
+    BuiltinFnMeta {
+        id: ids::WASM_VALIDATE,
+        name: "__wasm_validate",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_INSPECT,
+        name: "__wasm_inspect",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_COMPILE,
+        name: "__wasm_compile",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MODULE_EXPORTS,
+        name: "__wasm_module_exports",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MODULE_IMPORTS,
+        name: "__wasm_module_imports",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_INSTANTIATE,
+        name: "__wasm_instantiate",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_CALL,
+        name: "__wasm_call",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MEM_PAGES,
+        name: "__wasm_mem_pages",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MEM_GROW,
+        name: "__wasm_mem_grow",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MEM_READ,
+        name: "__wasm_mem_read",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MEM_WRITE,
+        name: "__wasm_mem_write",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MEM_READ_STR,
+        name: "__wasm_mem_read_str",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_MEM_WRITE_STR,
+        name: "__wasm_mem_write_str",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_GLOBAL_GET,
+        name: "__wasm_global_get",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_GLOBAL_SET,
+        name: "__wasm_global_set",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_FUEL,
+        name: "__wasm_fuel",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_RUN_WASI,
+        name: "__wasm_run_wasi",
+    },
+    BuiltinFnMeta {
+        id: ids::WASM_CLOSE,
+        name: "__wasm_close",
+    },
 ];
 
 /// Look up a builtin function id by its language-facing name.
@@ -3969,7 +4061,7 @@ mod tests {
 
     #[test]
     fn fn_ids_are_stable_and_named() {
-        assert_eq!(BUILTIN_ABI_VERSION, 12);
+        assert_eq!(BUILTIN_ABI_VERSION, 13);
         assert!(lookup_builtin_fn_meta(120).is_none());
         assert_eq!(lookup_builtin_fn_id("print"), Some(ids::PRINT));
         assert_eq!(lookup_builtin_fn_id("str_concat"), Some(ids::STR_CONCAT));
@@ -3986,16 +4078,20 @@ mod tests {
             assert!(
                 seen_names.insert(meta.name),
                 "duplicate builtin name {}",
-                meta.name
+                name_str(meta.name)
             );
             assert_eq!(lookup_builtin_fn_id(meta.name), Some(meta.id));
         }
-        for id in (ids::SCALAR_HASH..=ids::RT_JIT_DEOPT_COUNT)
-            .chain(ids::DEFER_PUSH..=ids::NET_RESOLVE_HOST)
+        for id in
+            (ids::SCALAR_HASH..=ids::RT_JIT_DEOPT_COUNT).chain(ids::DEFER_PUSH..=ids::WASM_CLOSE)
         {
             let meta = lookup_builtin_fn_meta(id)
                 .unwrap_or_else(|| panic!("missing metadata for builtin id {id}"));
             assert_eq!(lookup_builtin_fn_id(meta.name), Some(id));
         }
+    }
+
+    fn name_str(name: &str) -> &str {
+        name
     }
 }

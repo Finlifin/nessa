@@ -41,6 +41,7 @@ const MODULES: &[(&str, &str)] = &[
     ("task", include_str!("../../../library/std/task.ns")),
     ("sync", include_str!("../../../library/std/sync.ns")),
     ("net", include_str!("../../../library/std/net.ns")),
+    ("wasm", include_str!("../../../library/std/wasm.ns")),
     ("prelude", include_str!("../../../library/std/prelude.ns")),
 ];
 

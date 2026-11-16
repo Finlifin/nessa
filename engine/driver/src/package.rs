@@ -133,6 +133,70 @@ impl Driver {
         std::fs::write(output, bytes)
     }
 
+    /// Compile a disk package to a standalone `.wasm` binary (`wasm32-wasi` or `wasm32-freestanding`).
+    pub fn compile_package_to_wasm(
+        &self,
+        root: &Path,
+        output: &Path,
+        options: crate::WasmCompileOptions,
+    ) -> std::io::Result<()> {
+        let workspace = pkg_manager::load_package_workspace(root).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let artifact = self
+            .compile_package_sources_with_privileged_cached(
+                &workspace.root,
+                &workspace.dependencies,
+                &BTreeSet::new(),
+            )
+            .map_err(|diagnostics| compilation_error(&diagnostics))?;
+        let bytes = wasm::compile_artifact_to_wasm(&artifact, &options).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("wasm compilation failed: {err}"),
+            )
+        })?;
+        let has_local_deps = workspace
+            .dependencies
+            .iter()
+            .any(|dep| !pkg_manager::is_bundled_package_root(&dep.root));
+        if has_local_deps || workspace.existing_lockfile.is_some() {
+            let lockfile = pkg_manager::Lockfile::from_workspace(&workspace);
+            if workspace.existing_lockfile.as_ref() != Some(&lockfile) {
+                lockfile.write(&workspace.root.root.join("package.lock"))?;
+            }
+        }
+        std::fs::write(output, bytes)
+    }
+
+    /// Compile a disk package to a standalone `.wasm` binary while strictly enforcing `package.lock`.
+    pub fn compile_package_to_wasm_locked(
+        &self,
+        root: &Path,
+        output: &Path,
+        options: crate::WasmCompileOptions,
+    ) -> std::io::Result<()> {
+        let workspace = pkg_manager::load_package_workspace(root).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        verify_workspace_lockfile(&workspace, true)
+            .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+        let artifact = self
+            .compile_package_sources_with_privileged_cached(
+                &workspace.root,
+                &workspace.dependencies,
+                &BTreeSet::new(),
+            )
+            .map_err(|diagnostics| compilation_error(&diagnostics))?;
+        let bytes = wasm::compile_artifact_to_wasm(&artifact, &options).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("wasm compilation failed: {err}"),
+            )
+        })?;
+        std::fs::write(output, bytes)
+    }
+
     /// Compile a disk package to an `.nsbc` archive while strictly enforcing `package.lock`
     /// without modifying or creating `package.lock`.
     pub fn compile_package_to_archive_locked(
@@ -397,6 +461,55 @@ impl Driver {
             }
         }
         members[0].extend(generated[0].iter().rev().copied());
+        if !sources.manifest.ffi().wasm.is_empty() {
+            let qpkg = sources.manifest.manifest().qualified_name();
+            let mut synth = String::new();
+            for spec in &sources.manifest.ffi().wasm {
+                let conflict = members[0].iter().any(|&item| {
+                    binding_name(&ast, item).is_some_and(|id| str_interner::get(id) == spec.name)
+                });
+                if conflict {
+                    return Err(self.package_errors(format!(
+                        "[[ffi.wasm]] module `{}` conflicts with an existing declaration",
+                        spec.name
+                    )));
+                }
+                synth.push_str(&format!(
+                    "pub mod {} {{\n    use std.prelude.*\n",
+                    spec.name
+                ));
+                for exp in &spec.exports {
+                    let params_src = exp
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ty)| format!("_p{i}: {ty}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let body_src = if exp.ret == "Unit" {
+                        format!(
+                            "let _ = std.runtime.backtrace(message = \"__nessa_wasm_bind:{qpkg}::{}::{}\"); ()",
+                            spec.name, exp.nessa_name
+                        )
+                    } else {
+                        format!(
+                            "let _m: Any = std.runtime.backtrace(message = \"__nessa_wasm_bind:{qpkg}::{}::{}\"); _m.as({})",
+                            spec.name, exp.nessa_name, exp.ret
+                        )
+                    };
+                    synth.push_str(&format!(
+                        "    pub fn {}({}) -> {} {{ {body_src} }}\n",
+                        exp.nessa_name, params_src, exp.ret
+                    ));
+                }
+                synth.push_str("}\n");
+            }
+            let (synth_ast, warnings) =
+                self.parse_source_named(&synth, "ffi-wasm-generated-wrappers")?;
+            diagnostics.extend(warnings);
+            let appended = self.append_source_units(&mut ast, vec![synth_ast])?[0];
+            members[0].extend_from_slice(ast.multi_children(appended));
+        }
         let root_span = ast.node(roots[0]).span;
         ast.root = self.package_node(
             &mut ast,
