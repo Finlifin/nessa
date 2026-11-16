@@ -79,18 +79,91 @@ impl Vm {
 
     pub(crate) fn dispatch_numeric(&mut self, task: TaskId, instr: Instruction) -> DispatchResult {
         let (destination, left, right) = r_regs(&instr);
+        let (a_val, b_val) = {
+            let Some(t) = self.task_ref(task) else {
+                return DispatchResult::Error(VmError::InvalidTask);
+            };
+            (t.registers.get(left), t.registers.get(right))
+        };
+
+        // Fast path 1: 57-bit signed SMI (`IMM_I_SMALL`)
+        if let Some(a) = a_val.as_i64() {
+            if instr.opcode == Opcode::Neg {
+                if let Some(res) = a.checked_neg().and_then(TaggedValue::try_from_i64) {
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(destination, res);
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
+                }
+            } else if instr.opcode == Opcode::BitNot {
+                if let Some(res) = TaggedValue::try_from_i64(!a) {
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(destination, res);
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
+                }
+            } else if let Some(b) = b_val.as_i64() {
+                let fast = match instr.opcode {
+                    Opcode::Add => a.checked_add(b).and_then(TaggedValue::try_from_i64),
+                    Opcode::Sub => a.checked_sub(b).and_then(TaggedValue::try_from_i64),
+                    Opcode::Mul => a.checked_mul(b).and_then(TaggedValue::try_from_i64),
+                    Opcode::Div if b != 0 => a.checked_div(b).and_then(TaggedValue::try_from_i64),
+                    Opcode::Mod if b != 0 => a.checked_rem(b).and_then(TaggedValue::try_from_i64),
+                    Opcode::BitAnd => TaggedValue::try_from_i64(a & b),
+                    Opcode::BitOr => TaggedValue::try_from_i64(a | b),
+                    Opcode::BitXor => TaggedValue::try_from_i64(a ^ b),
+                    _ => None,
+                };
+                if let Some(res) = fast {
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(destination, res);
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
+                }
+            }
+        }
+
+        // Fast path 2: inline `f64`
+        if let Some(a) = a_val.as_f64() {
+            if instr.opcode == Opcode::Neg {
+                if let Some(res) = TaggedValue::try_from_f64(-a) {
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(destination, res);
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
+                }
+            } else if let Some(b) = b_val.as_f64() {
+                let fast = match instr.opcode {
+                    Opcode::Add => TaggedValue::try_from_f64(a + b),
+                    Opcode::Sub => TaggedValue::try_from_f64(a - b),
+                    Opcode::Mul => TaggedValue::try_from_f64(a * b),
+                    Opcode::Div if b != 0.0 => TaggedValue::try_from_f64(a / b),
+                    Opcode::Mod if b != 0.0 => TaggedValue::try_from_f64(a % b),
+                    _ => None,
+                };
+                if let Some(res) = fast {
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(destination, res);
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
+                }
+            }
+        }
+
         let result = (|| {
-            let registers = &self.task_ref(task).ok_or(VmError::InvalidTask)?.registers;
             // SAFETY: execution owns the mutator operation; register values are
             // rooted, and both reads finish before the next managed allocation.
-            let a =
-                unsafe { Number::from_tagged(registers.get(left)) }.ok_or(VmError::TypeError)?;
+            let a = unsafe { Number::from_tagged(a_val) }.ok_or(VmError::TypeError)?;
             let result = match instr.opcode {
                 Opcode::Neg => a.checked_neg()?,
                 Opcode::BitNot => a.bit_not()?,
                 operation => {
-                    let b = unsafe { Number::from_tagged(registers.get(right)) }
-                        .ok_or(VmError::TypeError)?;
+                    let b = unsafe { Number::from_tagged(b_val) }.ok_or(VmError::TypeError)?;
                     a.binary(b, operation)?
                 }
             };
@@ -116,19 +189,26 @@ impl Vm {
         left: TaggedValue,
         right: TaggedValue,
     ) -> Result<bool, VmError> {
+        if let (Some(a), Some(b)) = (left.as_i64(), right.as_i64()) {
+            return Ok(a == b);
+        }
+        if let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) {
+            return Ok(a == b);
+        }
         // SAFETY: callers retain rooted, initialized values and hold an operation.
         if let (Some(left), Some(right)) =
             unsafe { (Number::from_tagged(left), Number::from_tagged(right)) }
         {
             return Ok(left.partial_cmp_numeric(right) == Some(Ordering::Equal));
         }
-        if let (Some(left), Some(right)) = (
-            crate::builtin_ctx::heap_string_to_owned(left),
-            crate::builtin_ctx::heap_string_to_owned(right),
-        ) {
-            return Ok(left == right);
-        }
         if left.is_heap() && right.is_heap() {
+            if let Some(eq) = crate::builtin_ctx::with_heap_string_str(left, |ls| {
+                crate::builtin_ctx::with_heap_string_str(right, |rs| ls == rs)
+            })
+            .flatten()
+            {
+                return Ok(eq);
+            }
             return Err(VmError::UnsupportedEquality);
         }
         Ok(left == right)
@@ -140,6 +220,12 @@ impl Vm {
         left: TaggedValue,
         right: TaggedValue,
     ) -> Result<Option<Ordering>, VmError> {
+        if let (Some(a), Some(b)) = (left.as_i64(), right.as_i64()) {
+            return Ok(Some(a.cmp(&b)));
+        }
+        if let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) {
+            return Ok(a.partial_cmp(&b));
+        }
         // SAFETY: callers retain rooted, initialized operands under an operation.
         if let (Some(left), Some(right)) =
             unsafe { (Number::from_tagged(left), Number::from_tagged(right)) }
@@ -155,11 +241,12 @@ impl Vm {
         if left.is_unit() && right.is_unit() {
             return Ok(Some(Ordering::Equal));
         }
-        if let (Some(left), Some(right)) = (
-            crate::builtin_ctx::heap_string_to_owned(left),
-            crate::builtin_ctx::heap_string_to_owned(right),
-        ) {
-            return Ok(Some(left.cmp(&right)));
+        if let Some(ord) = crate::builtin_ctx::with_heap_string_str(left, |ls| {
+            crate::builtin_ctx::with_heap_string_str(right, |rs| ls.cmp(rs))
+        })
+        .flatten()
+        {
+            return Ok(Some(ord));
         }
         Err(VmError::TypeError)
     }
@@ -174,7 +261,59 @@ impl Vm {
             return DispatchResult::Error(VmError::InvalidTask);
         };
         let (a, b) = (task_ref.registers.get(left), task_ref.registers.get(right));
+
+        // Fast path 1: 57-bit signed SMI (`IMM_I_SMALL`)
+        if let (Some(la), Some(rb)) = (a.as_i64(), b.as_i64()) {
+            let res = match instr.opcode {
+                Opcode::CmpEq => la == rb,
+                Opcode::CmpNe => la != rb,
+                Opcode::CmpLt => la < rb,
+                Opcode::CmpLe => la <= rb,
+                Opcode::CmpGt => la > rb,
+                Opcode::CmpGe => la >= rb,
+                _ => return DispatchResult::Error(VmError::InvalidInstruction(instr.encode())),
+            };
+            if let Some(t) = self.task_mut(task) {
+                t.registers.set(destination, TaggedValue::from_bool(res));
+                return DispatchResult::Continue;
+            }
+            return DispatchResult::Error(VmError::InvalidTask);
+        }
+
+        // Fast path 2: inline `f64`
+        if let (Some(la), Some(rb)) = (a.as_f64(), b.as_f64()) {
+            let res = match instr.opcode {
+                Opcode::CmpEq => la == rb,
+                Opcode::CmpNe => la != rb,
+                Opcode::CmpLt => la < rb,
+                Opcode::CmpLe => la <= rb,
+                Opcode::CmpGt => la > rb,
+                Opcode::CmpGe => la >= rb,
+                _ => return DispatchResult::Error(VmError::InvalidInstruction(instr.encode())),
+            };
+            if let Some(t) = self.task_mut(task) {
+                t.registers.set(destination, TaggedValue::from_bool(res));
+                return DispatchResult::Continue;
+            }
+            return DispatchResult::Error(VmError::InvalidTask);
+        }
+
         if matches!(instr.opcode, Opcode::CmpEq | Opcode::CmpNe) {
+            if !a.is_heap() && !b.is_heap() && a.as_enum().is_none() && b.as_enum().is_none() {
+                match self.scalar_equal(a, b) {
+                    Ok(equal) => {
+                        if let Some(t) = self.task_mut(task) {
+                            t.registers.set(
+                                destination,
+                                TaggedValue::from_bool(equal == (instr.opcode == Opcode::CmpEq)),
+                            );
+                            return DispatchResult::Continue;
+                        }
+                        return DispatchResult::Error(VmError::InvalidTask);
+                    }
+                    Err(error) => return DispatchResult::Error(error),
+                }
+            }
             match self.error_equal(a, b, 0) {
                 Ok(Some(equal)) => {
                     if let Some(t) = self.task_mut(task) {
@@ -271,8 +410,10 @@ impl Vm {
         if let Some(number) = unsafe { Number::from_tagged(value) } {
             return Ok(hash_canonical_number(number));
         }
-        if let Some(s) = crate::builtin_ctx::heap_string_to_owned(value) {
-            return Ok(hash_string_bytes(s.as_bytes()));
+        if let Some(h) =
+            crate::builtin_ctx::with_heap_string_str(value, |s| hash_string_bytes(s.as_bytes()))
+        {
+            return Ok(h);
         }
         if let Ok(layout) = self.bytes_layout(value) {
             return Ok(hash_raw_bytes(layout.as_slice()));

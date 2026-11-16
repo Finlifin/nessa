@@ -283,37 +283,44 @@ pub fn optimize_module(module: &mut NirModule, type_pool: &mut TypePool, level: 
     match level {
         OptLevel::O0 => {}
         OptLevel::O1 => {
+            dfe::eliminate_dead_functions(module, type_pool);
             for func in &mut module.functions {
                 cfg::simplify_cfg(func);
                 const_fold::fold_constants_and_identities(func, type_pool);
                 copy_prop::propagate_copies(func);
                 cfg::simplify_cfg(func);
-                dce::eliminate_dead_code_and_compact_slots(func);
+                dce::eliminate_dead_code_and_compact_slots(func, type_pool);
             }
             dfe::eliminate_dead_functions(module, type_pool);
         }
         OptLevel::O2 => {
+            dfe::eliminate_dead_functions(module, type_pool);
             for func in &mut module.functions {
                 cfg::simplify_cfg(func);
                 sccp::run_sccp(func, type_pool);
                 const_fold::fold_constants_and_identities(func, type_pool);
                 copy_prop::propagate_copies(func);
                 gvn::run_dominator_gvn(func, type_pool);
-                dce::eliminate_dead_code(func);
+                dce::eliminate_dead_code(func, type_pool);
                 cfg::simplify_cfg(func);
             }
-            inline::inline_functions(module, inline::InlineConfig::O2);
+            inline::inline_functions(module, type_pool, inline::InlineConfig::O2);
             for func in &mut module.functions {
+                cfg::simplify_cfg(func);
                 sccp::run_sccp(func, type_pool);
                 const_fold::fold_constants_and_identities(func, type_pool);
                 copy_prop::propagate_copies(func);
                 gvn::run_dominator_gvn(func, type_pool);
+                copy_prop::propagate_copies(func);
+                const_fold::fold_constants_and_identities(func, type_pool);
+                sccp::run_sccp(func, type_pool);
                 cfg::simplify_cfg(func);
-                dce::eliminate_dead_code_and_compact_slots(func);
+                dce::eliminate_dead_code_and_compact_slots(func, type_pool);
             }
             dfe::eliminate_dead_functions(module, type_pool);
         }
         OptLevel::O3 => {
+            dfe::eliminate_dead_functions(module, type_pool);
             for func in &mut module.functions {
                 tailrec::eliminate_self_tail_recursion(func, type_pool);
                 cfg::simplify_cfg(func);
@@ -321,21 +328,24 @@ pub fn optimize_module(module: &mut NirModule, type_pool: &mut TypePool, level: 
                 const_fold::fold_constants_and_identities(func, type_pool);
                 copy_prop::propagate_copies(func);
                 gvn::run_dominator_gvn(func, type_pool);
-                dce::eliminate_dead_code(func);
+                dce::eliminate_dead_code(func, type_pool);
                 cfg::simplify_cfg(func);
             }
-            inline::inline_functions(module, inline::InlineConfig::O3);
+            inline::inline_functions(module, type_pool, inline::InlineConfig::O3);
             for func in &mut module.functions {
                 tailrec::eliminate_self_tail_recursion(func, type_pool);
+                cfg::simplify_cfg(func);
                 sccp::run_sccp(func, type_pool);
                 const_fold::fold_constants_and_identities(func, type_pool);
                 copy_prop::propagate_copies(func);
                 gvn::run_dominator_gvn(func, type_pool);
                 licm::hoist_loop_invariants(func);
                 copy_prop::propagate_copies(func);
+                const_fold::fold_constants_and_identities(func, type_pool);
                 gvn::run_dominator_gvn(func, type_pool);
+                sccp::run_sccp(func, type_pool);
                 cfg::simplify_cfg(func);
-                dce::eliminate_dead_code_and_compact_slots(func);
+                dce::eliminate_dead_code_and_compact_slots(func, type_pool);
             }
             dfe::eliminate_dead_functions(module, type_pool);
         }

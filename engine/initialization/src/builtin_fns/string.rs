@@ -5,22 +5,14 @@ use runtime::{Number, TaggedValue};
 
 pub fn str_len(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    let len = ctx.arg_string(0)?.len() as i64;
+    let len = ctx.with_arg_str(0, |s| s.len() as i64)?;
     ctx.return_i64(len)?;
     Ok(())
 }
 
 pub fn str_concat(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let mut s = ctx.arg_string(0)?;
-    let right = ctx.arg_string(1)?;
-    let bytes = s
-        .len()
-        .checked_add(right.len())
-        .ok_or(VmError::DisplaySizeExceeded)?;
-    ctx.check_display_size(bytes)?;
-    s.push_str(&right);
-    ctx.return_string(&s)
+    ctx.return_concat_arg_strings(0, 1)
 }
 
 fn string_predicate(
@@ -28,9 +20,8 @@ fn string_predicate(
     predicate: fn(&str, &str) -> bool,
 ) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let text = ctx.arg_string(0)?;
-    let pattern = ctx.arg_string(1)?;
-    ctx.return_bool(predicate(&text, &pattern));
+    let res = ctx.with_arg_str_pair(0, 1, predicate)?;
+    ctx.return_bool(res);
     Ok(())
 }
 
@@ -725,23 +716,16 @@ pub fn str_count_char(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     Ok(())
 }
 
-/// Byte offset of scalar `index`, or `None` when `index` is past the end.
-/// `index == char_len` is the offset just after the last scalar.
-fn scalar_offset(text: &str, index: usize) -> Option<usize> {
-    let mut count = 0;
-    for (offset, _) in text.char_indices() {
-        if count == index {
-            return Some(offset);
-        }
-        count += 1;
-    }
-    (count == index).then_some(text.len())
-}
-
 pub fn str_char_len(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    let text = ctx.arg_string(0)?;
-    let count = i64::try_from(text.chars().count()).map_err(|_| VmError::NumericOverflow)?;
+    let count = ctx.with_arg_str(0, |text| {
+        if text.is_ascii() {
+            text.len()
+        } else {
+            text.chars().count()
+        }
+    })?;
+    let count = i64::try_from(count).map_err(|_| VmError::NumericOverflow)?;
     ctx.return_i64(count)?;
     Ok(())
 }
@@ -800,9 +784,8 @@ fn byte_index(index: usize) -> Result<i64, VmError> {
 
 pub fn str_byte_find(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let text = ctx.arg_string(0)?;
-    let pattern = ctx.arg_string(1)?;
-    let Some(index) = text.find(pattern.as_str()) else {
+    let found = ctx.with_arg_str_pair(0, 1, |text, pattern| text.find(pattern))?;
+    let Some(index) = found else {
         ctx.return_null();
         return Ok(());
     };
@@ -811,9 +794,8 @@ pub fn str_byte_find(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 
 pub fn str_byte_rfind(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let text = ctx.arg_string(0)?;
-    let pattern = ctx.arg_string(1)?;
-    let Some(index) = text.rfind(pattern.as_str()) else {
+    let found = ctx.with_arg_str_pair(0, 1, |text, pattern| text.rfind(pattern))?;
+    let Some(index) = found else {
         ctx.return_null();
         return Ok(());
     };
@@ -822,26 +804,27 @@ pub fn str_byte_rfind(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 
 pub fn str_byte_count(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let text = ctx.arg_string(0)?;
-    let pattern = ctx.arg_string(1)?;
-    let count = if pattern.is_empty() {
-        text.len().checked_add(1).ok_or(VmError::NumericOverflow)?
-    } else {
-        text.matches(pattern.as_str()).count()
-    };
+    let count = ctx.with_arg_str_pair(0, 1, |text, pattern| {
+        if pattern.is_empty() {
+            text.len().checked_add(1).ok_or(VmError::NumericOverflow)
+        } else {
+            Ok(text.matches(pattern).count())
+        }
+    })??;
     ctx.return_i64(i64::try_from(count).map_err(|_| VmError::NumericOverflow)?)
 }
 
 pub fn str_is_ascii(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    ctx.return_bool(ctx.arg_string(0)?.is_ascii());
+    let ok = ctx.with_arg_str(0, str::is_ascii)?;
+    ctx.return_bool(ok);
     Ok(())
 }
 
 fn ascii_bytes(ctx: &mut BuiltinCtx<'_>, predicate: fn(u8) -> bool) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    let text = ctx.arg_string(0)?;
-    ctx.return_bool(text.bytes().all(predicate));
+    let ok = ctx.with_arg_str(0, |text| text.bytes().all(predicate))?;
+    ctx.return_bool(ok);
     Ok(())
 }
 
@@ -887,8 +870,8 @@ pub fn str_is_ascii_control(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 
 fn scalar_all(ctx: &mut BuiltinCtx<'_>, predicate: fn(char) -> bool) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    let text = ctx.arg_string(0)?;
-    ctx.return_bool(text.chars().all(predicate));
+    let ok = ctx.with_arg_str(0, |text| text.chars().all(predicate))?;
+    ctx.return_bool(ok);
     Ok(())
 }
 
@@ -945,21 +928,26 @@ pub fn char_into_string(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 
 pub fn str_find(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let text = ctx.arg_string(0)?;
-    let pattern = ctx.arg_string(1)?;
-    let Some(byte) = text.find(pattern.as_str()) else {
+    let found = ctx.with_arg_str_pair(0, 1, |text, pattern| {
+        text.find(pattern).map(|byte| {
+            if text.is_ascii() {
+                byte
+            } else {
+                text[..byte].chars().count()
+            }
+        })
+    })?;
+    let Some(char_idx) = found else {
         ctx.return_null();
         return Ok(());
     };
-    let index =
-        i64::try_from(text[..byte].chars().count()).map_err(|_| VmError::NumericOverflow)?;
+    let index = i64::try_from(char_idx).map_err(|_| VmError::NumericOverflow)?;
     ctx.return_i64(index)?;
     Ok(())
 }
 
 pub fn str_slice(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(3)?;
-    let text = ctx.arg_string(0)?;
     let start = ctx.arg_i64(1)?;
     let end = ctx.arg_i64(2)?;
     let out_of_range = || Err(VmError::InvalidArgument("string slice is out of range"));
@@ -969,12 +957,31 @@ pub fn str_slice(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     if end < start {
         return out_of_range();
     }
-    let (Some(start_byte), Some(end_byte)) =
-        (scalar_offset(&text, start), scalar_offset(&text, end))
-    else {
+    let bounds = ctx.with_arg_str(0, |text| -> Option<(usize, usize)> {
+        if text.is_ascii() {
+            if end <= text.len() {
+                return Some((start, end));
+            }
+            return None;
+        }
+        let mut iter = text.char_indices();
+        let start_byte = if start == 0 {
+            0
+        } else {
+            iter.nth(start - 1).map(|(b, ch)| b + ch.len_utf8())?
+        };
+        let delta = end - start;
+        let end_byte = if delta == 0 {
+            start_byte
+        } else {
+            iter.nth(delta - 1).map(|(b, ch)| b + ch.len_utf8())?
+        };
+        Some((start_byte, end_byte))
+    })?;
+    let Some((start_byte, end_byte)) = bounds else {
         return out_of_range();
     };
-    ctx.return_string(&text[start_byte..end_byte])
+    ctx.return_subrange_arg_string(0, start_byte, end_byte)
 }
 
 fn char_predicate(
@@ -1464,7 +1471,7 @@ fn parse_f64_text(text: &str) -> Result<Option<f64>, VmError> {
 
 pub fn str_parse_i64(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    match parse_i64_text(&ctx.arg_string(0)?)? {
+    match ctx.with_arg_str(0, parse_i64_text)?? {
         Some(value) => ctx.return_i64(value),
         None => {
             ctx.return_null();
@@ -1475,7 +1482,7 @@ pub fn str_parse_i64(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 
 pub fn str_parse_f64(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(1)?;
-    match parse_f64_text(&ctx.arg_string(0)?)? {
+    match ctx.with_arg_str(0, parse_f64_text)?? {
         Some(value) => ctx.return_f64(value),
         None => {
             ctx.return_null();

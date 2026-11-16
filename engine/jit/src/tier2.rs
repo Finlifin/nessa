@@ -42,13 +42,21 @@ const LOOP_GP_POOL: [GpReg; 7] = [
 
 /// Dedicated SSE2 registers reserved exclusively for unboxed `F64` loop values.
 /// `Xmm6` and `Xmm7` remain free as instruction-level SSE2 scratch registers.
-const LOOP_XMM_POOL: [XmmReg; 6] = [
+const LOOP_XMM_POOL: [XmmReg; 14] = [
     XmmReg::Xmm0,
     XmmReg::Xmm1,
     XmmReg::Xmm2,
     XmmReg::Xmm3,
     XmmReg::Xmm4,
     XmmReg::Xmm5,
+    XmmReg::Xmm8,
+    XmmReg::Xmm9,
+    XmmReg::Xmm10,
+    XmmReg::Xmm11,
+    XmmReg::Xmm12,
+    XmmReg::Xmm13,
+    XmmReg::Xmm14,
+    XmmReg::Xmm15,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1638,6 +1646,84 @@ fn compute_upward_exposed_regs_from(decoded: &[Instruction], start_pc: usize) ->
     exposed
 }
 
+/// Conservative $O(N)$ upward-exposed bitmask over `slot_map` (`0..64`) starting from `start_pc`.
+fn compute_upward_exposed_slot_mask_from(
+    decoded: &[Instruction],
+    start_pc: usize,
+    slot_map: &BTreeMap<u32, usize>,
+) -> u64 {
+    if start_pc >= decoded.len() || slot_map.is_empty() {
+        return 0;
+    }
+    let mut seen = vec![false; decoded.len()];
+    let mut killed_in = vec![u64::MAX; decoded.len()];
+    let mut queue = VecDeque::new();
+    seen[start_pc] = true;
+    killed_in[start_pc] = 0;
+    queue.push_back(start_pc);
+    let mut exposed = 0u64;
+
+    while let Some(pc) = queue.pop_front() {
+        let mut killed = killed_in[pc];
+        let instr = &decoded[pc];
+        let (use_s, def_s, _, _) = instr_use_def(instr);
+        if let Some(us) = use_s
+            && let Some(&bit) = slot_map.get(&us)
+        {
+            exposed |= (1u64 << bit) & !killed;
+        }
+        if matches!(
+            instr.opcode,
+            Opcode::EffectCallDyn
+                | Opcode::PushHandlerClosure
+                | Opcode::PushCapturingHandler
+                | Opcode::ResetClosure
+                | Opcode::AwaitFuture
+        ) {
+            exposed |= !killed;
+        }
+        if let Some(ds) = def_s
+            && let Some(&bit) = slot_map.get(&ds)
+        {
+            killed |= 1u64 << bit;
+        }
+
+        if matches!(
+            instr.opcode,
+            Opcode::Return | Opcode::ReturnUnit | Opcode::Unreachable | Opcode::MatchFail
+        ) {
+            continue;
+        }
+
+        let mut propagate = |tgt: usize| {
+            if tgt < decoded.len() {
+                if !seen[tgt] {
+                    seen[tgt] = true;
+                    killed_in[tgt] = killed;
+                    queue.push_back(tgt);
+                } else {
+                    let merged = killed_in[tgt] & killed;
+                    if merged != killed_in[tgt] {
+                        killed_in[tgt] = merged;
+                        queue.push_back(tgt);
+                    }
+                }
+            }
+        };
+
+        if let InstructionData::J { offset, .. } = instr.data {
+            let tgt = ((pc as i64) + (offset as i64)) as isize;
+            if tgt >= 0 {
+                propagate(tgt as usize);
+            }
+        }
+        if can_fall_through(instr) {
+            propagate(pc + 1);
+        }
+    }
+    exposed
+}
+
 fn instr_use_def(instr: &Instruction) -> (Option<u32>, Option<u32>, u32, u32) {
     let rbit = |r: Reg| -> u32 {
         if (r.0 as usize) < GP_REGISTER_COUNT {
@@ -2387,14 +2473,19 @@ fn emit_specialized_loop(
         }
     }
 
-    // 5. Emit cold Exit Stubs (box modified state back to `StackContext`, then jump to baseline!).
+    // 5. Emit cold Exit Stubs (box live modified state back to `StackContext`, then jump to baseline!).
     for stub in exit_stubs.values() {
         asm.bind(stub.lbl);
+        let live_slots =
+            compute_upward_exposed_slot_mask_from(decoded, stub.target_pc, &plan.slot_map);
+        let live_regs = compute_upward_exposed_regs_from(decoded, stub.target_pc);
         emit_box_state_to_stack_context(
             asm,
             input,
             plan,
             &stub.reg_state,
+            live_slots,
+            live_regs,
             stub.target_pc as u32,
             epilogue_lbl,
         );
@@ -2408,11 +2499,16 @@ fn emit_specialized_loop(
     // 6. Emit cold Deopt Stubs (box state as of `deopt_pc`, bump `deopt_count`, exit `InterpretAt`).
     for stub in &deopt_stubs {
         asm.bind(stub.lbl);
+        let live_slots =
+            compute_upward_exposed_slot_mask_from(decoded, stub.deopt_pc, &plan.slot_map);
+        let live_regs = compute_upward_exposed_regs_from(decoded, stub.deopt_pc);
         emit_box_state_to_stack_context(
             asm,
             input,
             plan,
             &stub.reg_state,
+            live_slots,
+            live_regs,
             stub.deopt_pc as u32,
             epilogue_lbl,
         );
@@ -2441,6 +2537,8 @@ fn emit_specialized_loop(
             input,
             plan,
             &stub.reg_state,
+            u64::MAX,
+            u32::MAX,
             stub.resume_pc as u32,
             epilogue_lbl,
         );
@@ -2566,8 +2664,12 @@ fn emit_guard_and_unbox_value(
             }
         }
         ScalarType::F64 => {
+            let rot_lbl = asm.new_label();
             let imm_lbl = asm.new_label();
             let done_lbl = asm.new_label();
+
+            asm.test_ri32(GpReg::Rax, crate::layout::ROT_F64_TAG_MASK as i32);
+            asm.jcc(Cond::Ne, rot_lbl);
 
             asm.mov_rr(GpReg::Rcx, GpReg::Rax);
             asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
@@ -2596,6 +2698,15 @@ fn emit_guard_and_unbox_value(
             }
             asm.jmp(done_lbl);
 
+            asm.bind(rot_lbl);
+            asm.ror_ri8(GpReg::Rax, 4);
+            match dst_loc {
+                PhysLoc::Xmm(x) => asm.movq_xr(x, GpReg::Rax),
+                PhysLoc::Spill(disp) => asm.mov_mr64(GpReg::Rbp, disp, GpReg::Rax),
+                PhysLoc::Gp(_) => unreachable!(),
+            }
+            asm.jmp(done_lbl);
+
             asm.bind(imm_lbl);
             asm.and_ri32(GpReg::Rax, !(IMM_LOW7_MASK as i32));
             match dst_loc {
@@ -2620,25 +2731,32 @@ fn emit_test_dirty_bit(asm: &mut Assembler, mask_reg: GpReg, bit_idx: usize, zer
     asm.jcc(Cond::E, zero_lbl);
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn emit_box_state_to_stack_context(
     asm: &mut Assembler,
     input: &CompilationInput<'_>,
     plan: &LoopPlan,
     reg_state: &[Option<ScalarType>; GP_REGISTER_COUNT],
+    live_slot_mask: u64,
+    live_reg_mask: u32,
     exit_pc: u32,
     epilogue_lbl: Label,
 ) {
+    let slot_needed =
+        |idx: usize, sv: &SlotVar| -> bool { sv.modified && ((live_slot_mask >> idx) & 1) != 0 };
+    let reg_needed = |r: usize| -> bool { plan.reg_modified[r] && ((live_reg_mask >> r) & 1) != 0 };
+
     // Phase A (no C calls: all `LOOP_GP_POOL` and `LOOP_XMM_POOL` registers remain intact):
     // 1. Box dirty modified `I64` & `Bool` local slots directly into `[r14 + slot*8]`.
     if plan
         .slots
         .iter()
-        .any(|s| s.modified && matches!(s.ty, ScalarType::I64 | ScalarType::Bool))
+        .enumerate()
+        .any(|(idx, s)| slot_needed(idx, s) && matches!(s.ty, ScalarType::I64 | ScalarType::Bool))
     {
         asm.mov_rm64(GpReg::Rdx, GpReg::Rbp, plan.slot_dirty_disp);
         for (idx, sv) in plan.slots.iter().enumerate() {
-            if !sv.modified || !matches!(sv.ty, ScalarType::I64 | ScalarType::Bool) {
+            if !slot_needed(idx, sv) || !matches!(sv.ty, ScalarType::I64 | ScalarType::Bool) {
                 continue;
             }
             let skip_lbl = asm.new_label();
@@ -2664,14 +2782,14 @@ fn emit_box_state_to_stack_context(
     if reg_state
         .iter()
         .enumerate()
-        .any(|(r, t)| plan.reg_modified[r] && matches!(t, Some(ScalarType::I64 | ScalarType::Bool)))
+        .any(|(r, t)| reg_needed(r) && matches!(t, Some(ScalarType::I64 | ScalarType::Bool)))
     {
         asm.mov_rm64(GpReg::Rdx, GpReg::Rbp, plan.reg_dirty_disp);
         for (r, slot) in reg_state.iter().enumerate() {
             let Some(ty @ (ScalarType::I64 | ScalarType::Bool)) = *slot else {
                 continue;
             };
-            if !plan.reg_modified[r] {
+            if !reg_needed(r) {
                 continue;
             }
             let skip_lbl = asm.new_label();
@@ -2694,9 +2812,9 @@ fn emit_box_state_to_stack_context(
         }
     }
 
-    // 3. Spill all modified `F64` slots and registers onto native stack save slots BEFORE any C call!
-    for sv in &plan.slots {
-        if sv.modified && sv.ty == ScalarType::F64 {
+    // 3. Spill all needed modified `F64` slots and registers onto native stack save slots BEFORE any C call!
+    for (idx, sv) in plan.slots.iter().enumerate() {
+        if slot_needed(idx, sv) && sv.ty == ScalarType::F64 {
             let save_disp = sv.f64_save_disp.unwrap();
             match sv.loc {
                 PhysLoc::Xmm(x) => asm.movsd_mx(GpReg::Rbp, save_disp, x),
@@ -2709,7 +2827,7 @@ fn emit_box_state_to_stack_context(
         }
     }
     for (r, slot) in reg_state.iter().enumerate() {
-        if plan.reg_modified[r] && *slot == Some(ScalarType::F64) {
+        if reg_needed(r) && *slot == Some(ScalarType::F64) {
             let rl = plan.reg_locs[&(r as u8, ScalarType::F64)];
             let save_disp = rl.f64_save_disp.unwrap();
             match rl.loc {
@@ -2723,17 +2841,26 @@ fn emit_box_state_to_stack_context(
         }
     }
 
-    // Phase B: Box each dirty modified `F64` via `IMM_F64` fast path or `store_boxed_f64` helper.
+    // Phase B: Box each needed dirty modified `F64` via rotated inline `F64`, `IMM_F64`, or `store_boxed_f64`.
     for (idx, sv) in plan.slots.iter().enumerate() {
-        if !sv.modified || sv.ty != ScalarType::F64 {
+        if !slot_needed(idx, sv) || sv.ty != ScalarType::F64 {
             continue;
         }
         let skip_lbl = asm.new_label();
+        let try_imm_lbl = asm.new_label();
         let slow_lbl = asm.new_label();
         asm.mov_rm64(GpReg::Rdx, GpReg::Rbp, plan.slot_dirty_disp);
         emit_test_dirty_bit(asm, GpReg::Rdx, idx, skip_lbl);
 
         asm.mov_rm64(GpReg::Rax, GpReg::Rbp, sv.f64_save_disp.unwrap());
+        asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+        asm.rol_ri8(GpReg::Rcx, 4);
+        asm.test_ri32(GpReg::Rcx, crate::layout::ROT_F64_TAG_MASK as i32);
+        asm.jcc(Cond::E, try_imm_lbl);
+        asm.mov_mr64(GpReg::R14, ((sv.slot_idx as usize) * 8) as i32, GpReg::Rcx);
+        asm.jmp(skip_lbl);
+
+        asm.bind(try_imm_lbl);
         asm.test_ri32(GpReg::Rax, IMM_LOW7_MASK as i32);
         asm.jcc(Cond::Ne, slow_lbl);
         asm.or_ri32(GpReg::Rax, IMM_F64_TAG as i32);
@@ -2753,16 +2880,25 @@ fn emit_box_state_to_stack_context(
     }
 
     for (r, slot) in reg_state.iter().enumerate() {
-        if !plan.reg_modified[r] || *slot != Some(ScalarType::F64) {
+        if !reg_needed(r) || *slot != Some(ScalarType::F64) {
             continue;
         }
         let rl = plan.reg_locs[&(r as u8, ScalarType::F64)];
         let skip_lbl = asm.new_label();
+        let try_imm_lbl = asm.new_label();
         let slow_lbl = asm.new_label();
         asm.mov_rm64(GpReg::Rdx, GpReg::Rbp, plan.reg_dirty_disp);
         emit_test_dirty_bit(asm, GpReg::Rdx, r, skip_lbl);
 
         asm.mov_rm64(GpReg::Rax, GpReg::Rbp, rl.f64_save_disp.unwrap());
+        asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+        asm.rol_ri8(GpReg::Rcx, 4);
+        asm.test_ri32(GpReg::Rcx, crate::layout::ROT_F64_TAG_MASK as i32);
+        asm.jcc(Cond::E, try_imm_lbl);
+        asm.mov_mr64(GpReg::R13, (r * 8) as i32, GpReg::Rcx);
+        asm.jmp(skip_lbl);
+
+        asm.bind(try_imm_lbl);
         asm.test_ri32(GpReg::Rax, IMM_LOW7_MASK as i32);
         asm.jcc(Cond::Ne, slow_lbl);
         asm.or_ri32(GpReg::Rax, IMM_F64_TAG as i32);

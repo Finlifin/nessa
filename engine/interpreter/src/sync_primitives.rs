@@ -369,12 +369,20 @@ impl SyncRegistry {
                     if let Some(rw) = shard.rwlocks.get_mut(&id) {
                         rw.read_waiters.retain(|&w| w != tid);
                         rw.write_waiters.retain(|&w| w != tid);
-                        rw.woken_readers.remove(&tid);
-                        if rw.woken_writer == Some(tid) {
+                        let removed_reader = rw.woken_readers.remove(&tid);
+                        let removed_writer = if rw.woken_writer == Some(tid) {
                             rw.woken_writer = None;
-                            if rw.writer.is_none() && rw.readers.is_empty() {
-                                schedule_next_rwlock_turn(sched, rw, &mut to_wake);
-                            }
+                            true
+                        } else {
+                            false
+                        };
+                        if (removed_reader || removed_writer)
+                            && rw.writer.is_none()
+                            && rw.readers.is_empty()
+                            && rw.woken_readers.is_empty()
+                            && rw.woken_writer.is_none()
+                        {
+                            schedule_next_rwlock_turn(sched, rw, &mut to_wake);
                         }
                     }
                 }
@@ -764,11 +772,11 @@ impl SyncRegistry {
                     "re-entrant Mutex lock on the same task would deadlock",
                 ));
             }
+            if mu.woken == Some(task_id) {
+                mu.woken = None;
+            }
             if mu.locked_by.is_none() {
                 mu.locked_by = Some(task_id);
-                if mu.woken == Some(task_id) {
-                    mu.woken = None;
-                }
                 SyncPoll::Ready(mu.value)
             } else {
                 push_unique(&mut mu.waiters, task_id);
@@ -969,7 +977,17 @@ impl SyncRegistry {
                 *cnt -= 1;
             } else {
                 rw.readers.remove(&task_id);
-                if rw.readers.is_empty() && rw.writer.is_none() && rw.woken_writer.is_none() {
+                rw.woken_readers.retain(|&r| is_live_un_cancelled(sched, r));
+                if let Some(w) = rw.woken_writer
+                    && !is_live_un_cancelled(sched, w)
+                {
+                    rw.woken_writer = None;
+                }
+                if rw.readers.is_empty()
+                    && rw.woken_readers.is_empty()
+                    && rw.writer.is_none()
+                    && rw.woken_writer.is_none()
+                {
                     if let Some(w) = pop_live_waiter(sched, &mut rw.write_waiters) {
                         rw.woken_writer = Some(w);
                         to_wake.push(w);
@@ -1006,11 +1024,11 @@ impl SyncRegistry {
                     "re-entrant or upgraded RwLock write_lock on same task would deadlock",
                 ));
             }
-            if rw.writer.is_none() && rw.readers.is_empty() {
+            if rw.woken_writer == Some(task_id) {
+                rw.woken_writer = None;
+            }
+            if rw.writer.is_none() && rw.readers.is_empty() && rw.woken_readers.is_empty() {
                 rw.writer = Some(task_id);
-                if rw.woken_writer == Some(task_id) {
-                    rw.woken_writer = None;
-                }
                 SyncPoll::Ready(rw.value)
             } else {
                 push_unique(&mut rw.write_waiters, task_id);
@@ -1030,7 +1048,7 @@ impl SyncRegistry {
             .rwlocks
             .get_mut(&id)
             .ok_or(VmError::InvalidArgument("invalid RwLock handle"))?;
-        if rw.writer.is_none() && rw.readers.is_empty() {
+        if rw.writer.is_none() && rw.readers.is_empty() && rw.woken_readers.is_empty() {
             rw.writer = Some(task_id);
             if rw.woken_writer == Some(task_id) {
                 rw.woken_writer = None;
@@ -1241,13 +1259,13 @@ impl SyncRegistry {
                 .onces
                 .get_mut(&id)
                 .ok_or(VmError::InvalidArgument("invalid Once handle"))?;
+            if once.woken_runner == Some(task_id) {
+                once.woken_runner = None;
+            }
             match once.state {
                 OnceState::Complete(val) => SyncPoll::Ready((0, val)),
                 OnceState::Uninit => {
                     once.state = OnceState::Running(task_id);
-                    if once.woken_runner == Some(task_id) {
-                        once.woken_runner = None;
-                    }
                     SyncPoll::Ready((1, TaggedValue::UNIT))
                 }
                 OnceState::Running(owner) => {
@@ -1523,5 +1541,81 @@ fn schedule_next_rwlock_turn(sched: &Scheduler, rw: &mut RwLockEntry, to_wake: &
     if !woke_any_reader && let Some(w) = pop_live_waiter(sched, &mut rw.write_waiters) {
         rw.woken_writer = Some(w);
         to_wake.push(w);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nsbc::FuncId;
+    use runtime::{TaggedValue, TaskStatus};
+    use scheduler::Scheduler;
+
+    use super::{SyncPoll, SyncRegistry};
+
+    #[test]
+    fn rwlock_reader_batch_early_unlock_preserves_writer_handoff() {
+        let sched = Scheduler::with_workers(Arc::new(stack_pool::StackPool::new()), 2);
+        let sync = SyncRegistry::new();
+        let rw = sync.rwlock_new(TaggedValue::try_from_i64(10).unwrap());
+
+        let w1 = sched.spawn(FuncId(0), None);
+        let r0 = sched.spawn(FuncId(0), None);
+        let r1 = sched.spawn(FuncId(0), None);
+        let w0 = sched.spawn(FuncId(0), None);
+
+        // `w1` acquires write lock; `r0`, `r1`, and `w0` suspend behind it.
+        assert!(matches!(
+            sync.rwlock_write_lock(rw, w1).unwrap(),
+            SyncPoll::Ready(_)
+        ));
+        assert!(matches!(
+            sync.rwlock_read_lock(rw, r0).unwrap(),
+            SyncPoll::SuspendRetry
+        ));
+        sched.set_running(r0);
+        sched.suspend(r0);
+        assert!(matches!(
+            sync.rwlock_read_lock(rw, r1).unwrap(),
+            SyncPoll::SuspendRetry
+        ));
+        sched.set_running(r1);
+        sched.suspend(r1);
+        assert!(matches!(
+            sync.rwlock_write_lock(rw, w0).unwrap(),
+            SyncPoll::SuspendRetry
+        ));
+        sched.set_running(w0);
+        sched.suspend(w0);
+
+        // `w1` unlocks -> wakes reader batch `{r0, r1}`; `w0` must remain suspended.
+        sync.rwlock_write_unlock(&sched, rw, w1).unwrap();
+        assert_eq!(sched.task_status(r0), Some(TaskStatus::Ready));
+        assert_eq!(sched.task_status(r1), Some(TaskStatus::Ready));
+        assert_eq!(sched.task_status(w0), Some(TaskStatus::Suspended));
+
+        // `r0` runs and unlocks BEFORE `r1` has even polled `rwlock_read_lock`!
+        assert!(matches!(
+            sync.rwlock_read_lock(rw, r0).unwrap(),
+            SyncPoll::Ready(_)
+        ));
+        sync.rwlock_read_unlock(&sched, rw, r0).unwrap();
+        // `r1` is still in `woken_readers`, so `w0` must NOT be woken prematurely.
+        assert_eq!(sched.task_status(w0), Some(TaskStatus::Suspended));
+
+        // Now `r1` acquires and unlocks -> must hand off to `w0` cleanly!
+        assert!(matches!(
+            sync.rwlock_read_lock(rw, r1).unwrap(),
+            SyncPoll::Ready(_)
+        ));
+        sync.rwlock_read_unlock(&sched, rw, r1).unwrap();
+        assert_eq!(sched.task_status(w0), Some(TaskStatus::Ready));
+
+        assert!(matches!(
+            sync.rwlock_write_lock(rw, w0).unwrap(),
+            SyncPoll::Ready(_)
+        ));
+        sync.rwlock_write_unlock(&sched, rw, w0).unwrap();
     }
 }

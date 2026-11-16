@@ -1,0 +1,41 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+fn mandelbrot(size: i64, max_iter: i64) -> i64 {
+    var total_iters: i64 = 0
+    let fsize = size.as(f64)
+    var y: i64 = 0
+    while y < size {
+        let ci = 2.0 * y.as(f64) / fsize - 1.0
+        var x: i64 = 0
+        while x < size {
+            let cr = 2.0 * x.as(f64) / fsize - 1.5
+            var zr: f64 = 0.0
+            var zi: f64 = 0.0
+            var iter: i64 = 0
+            while iter < max_iter {
+                let zr2 = zr * zr
+                let zi2 = zi * zi
+                if zr2 + zi2 > 4.0 {
+                    break
+                }
+                zi = 2.0 * zr * zi + ci
+                zr = zr2 - zi2 + cr
+                iter += 1
+            }
+            total_iters += iter
+            x += 1
+        }
+        y += 1
+    }
+    total_iters
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    let ans = mandelbrot(400, 100)
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ ans.to_string())
+}

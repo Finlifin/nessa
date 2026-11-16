@@ -1,0 +1,18 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n
+    }
+    fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    let ans = fib(34)
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ ans.to_string())
+}

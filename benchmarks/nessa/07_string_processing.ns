@@ -1,0 +1,45 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+fn run_string_bench(lines: i64) -> i64 {
+    var total_latency: i64 = 0
+    var total_bytes: i64 = 0
+    var matched_ok: i64 = 0
+    var i: i64 = 0
+    while i < lines {
+        let lat = (i * 37 + 13) % 997
+        let code = if i % 5 == 0 { "500" } else { "200" }
+        let line = "2026-11-17T12:00:00Z service=gateway req=" ++ i.to_string() ++ " latency=" ++ lat.to_string() ++ "ms status=" ++ code
+        total_bytes += line.len()
+        if line.ends_with("status=200") {
+            matched_ok += 1
+        }
+        line.byte_find("latency=") match {
+            pos? => {
+                let start = pos + 8
+                line.byte_find("ms status=") match {
+                    end_pos? => {
+                        let num_str = line.slice(start, end_pos)
+                        num_str.parse_i64() match {
+                            parsed? => total_latency += parsed,
+                            _ => {},
+                        }
+                    },
+                    _ => {},
+                }
+            },
+            _ => {},
+        }
+        i += 1
+    }
+    total_latency * 100 + matched_ok + (total_bytes % 100000)
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    let ans = run_string_bench(25000)
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ ans.to_string())
+}

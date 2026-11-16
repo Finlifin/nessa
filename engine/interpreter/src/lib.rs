@@ -371,19 +371,37 @@ pub(crate) enum CachedHeapTypeMeta {
     Slow,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CachedTypeOpKind {
+    Any,
+    NoReturn,
+    Intrinsic(Intrinsic),
+    Optional(TypeIndex),
+    EffectQualified(TypeIndex),
+    ErrorQualified,
+    PlainStruct { expected_words: u16 },
+    Collection3Word,
+    Slow,
+}
+
 #[derive(Default)]
 pub(crate) struct WorkerMetaCache {
     pub(crate) epoch: u64,
+    pub(crate) pool_len: usize,
+    pub(crate) has_scopes: Option<bool>,
     pub(crate) validated_funcs: Vec<bool>,
     pub(crate) method_ic:
         runtime::FastHashMap<(FuncId, u32, TypeIndex, StrId), Option<type_pool::MethodSlot>>,
     pub(crate) list_roles: Option<Option<(TypeIndex, TypeIndex)>>,
+    pub(crate) map_roles: Option<Option<(TypeIndex, TypeIndex)>>,
     pub(crate) future_by_inner: runtime::FastHashMap<TypeIndex, TypeIndex>,
     pub(crate) is_future_type: Vec<Option<bool>>,
     pub(crate) effect_meta: runtime::FastHashMap<TypeIndex, (TypeIndex, bool)>,
     pub(crate) indirect_contracts: runtime::FastHashMap<FuncId, Arc<[(usize, TypeIndex)]>>,
     pub(crate) canonical_types: Vec<Option<TypeIndex>>,
     pub(crate) heap_type_meta: Vec<Option<CachedHeapTypeMeta>>,
+    pub(crate) type_op_kinds: Vec<Option<CachedTypeOpKind>>,
+    pub(crate) has_error_shape: Vec<Option<Result<bool, TypeIndex>>>,
 }
 
 /// Per-worker execution state owned exclusively by one OS thread.
@@ -395,6 +413,7 @@ pub(crate) struct WorkerState {
     pub(crate) native_frame_depth: u32,
     pub(crate) local_queue_ptr: Option<NonNull<WorkerQueue>>,
     pub(crate) meta_cache: RefCell<WorkerMetaCache>,
+    pub(crate) slot_vec_pool: Vec<Vec<TaggedValue>>,
     pub(crate) jit: jit::JitEngine,
     pub(crate) jit_synced_epoch: u64,
     pub(crate) jit_reported_fns: usize,
@@ -543,6 +562,7 @@ impl Vm {
             native_frame_depth: 0,
             local_queue_ptr: None,
             meta_cache: RefCell::new(WorkerMetaCache::default()),
+            slot_vec_pool: Vec::with_capacity(64),
             jit: Self::new_default_jit(),
             jit_synced_epoch: 0,
             jit_reported_fns: 0,
@@ -724,15 +744,20 @@ impl Vm {
         let mut cache = self.worker.meta_cache.borrow_mut();
         if cache.epoch != cur {
             cache.epoch = cur;
+            cache.pool_len = 0;
+            cache.has_scopes = None;
             cache.validated_funcs.clear();
             cache.method_ic.clear();
             cache.list_roles = None;
+            cache.map_roles = None;
             cache.future_by_inner.clear();
             cache.is_future_type.clear();
             cache.effect_meta.clear();
             cache.indirect_contracts.clear();
             cache.canonical_types.clear();
             cache.heap_type_meta.clear();
+            cache.type_op_kinds.clear();
+            cache.has_error_shape.clear();
         }
         cache
     }
@@ -799,18 +824,64 @@ impl Vm {
     pub(crate) fn stripe_read(
         &self,
         value: TaggedValue,
-    ) -> Result<RwLockReadGuard<'_, ()>, VmError> {
+    ) -> Result<Option<RwLockReadGuard<'_, ()>>, VmError> {
         let idx = Self::stripe_index_of(value)?;
-        Ok(self.shared.container_stripes[idx].0.read())
+        if !self.shared.aux_started.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(self.shared.container_stripes[idx].0.read()))
     }
 
     #[inline]
     pub(crate) fn stripe_write(
         &self,
         value: TaggedValue,
-    ) -> Result<RwLockWriteGuard<'_, ()>, VmError> {
+    ) -> Result<Option<RwLockWriteGuard<'_, ()>>, VmError> {
         let idx = Self::stripe_index_of(value)?;
-        Ok(self.shared.container_stripes[idx].0.write())
+        if !self.shared.aux_started.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(self.shared.container_stripes[idx].0.write()))
+    }
+
+    #[inline]
+    pub(crate) fn recycle_frame_slots(&mut self, mut old_slots: Vec<TaggedValue>) {
+        let cap = old_slots.capacity();
+        if cap > 0 && cap <= 256 && self.worker.slot_vec_pool.len() < 128 {
+            old_slots.clear();
+            self.worker.slot_vec_pool.push(old_slots);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn alloc_task_frame_slots(
+        &mut self,
+        task_id: TaskId,
+        count: usize,
+    ) -> Result<(), VmError> {
+        if count == 0 {
+            let task = self.task_mut(task_id).ok_or(VmError::InvalidTask)?;
+            let old = std::mem::take(&mut task.local_slots);
+            self.recycle_frame_slots(old);
+            return Ok(());
+        }
+        let recycled = if count <= 256 {
+            self.worker.slot_vec_pool.pop()
+        } else {
+            None
+        };
+        let mut slots = recycled.unwrap_or_default();
+        if slots.capacity() < count {
+            let target = if count <= 16 { 16 } else { count };
+            if slots.try_reserve_exact(target - slots.len()).is_err() {
+                return Err(VmError::OutOfMemory);
+            }
+        }
+        slots.resize(count, TaggedValue::UNIT);
+        let task = self.task_mut(task_id).ok_or(VmError::InvalidTask)?;
+        let old = std::mem::replace(&mut task.local_slots, slots);
+        self.recycle_frame_slots(old);
+        Ok(())
     }
 
     /// Lazily start auxiliary OS worker threads (`1..configured_workers`) the first time
@@ -843,6 +914,9 @@ impl Vm {
             }
             return;
         }
+        // Publish `aux_started = true` BEFORE spawning auxiliary mutator threads so
+        // Worker 0 transitions into striped container locking prior to any concurrent access.
+        self.shared.aux_started.store(true, Ordering::Release);
         for worker_id in 1..self.shared.configured_workers {
             let weak_shared: Weak<SharedVm> = Arc::downgrade(&self.shared);
             let gc_config = self.shared.gc_config.clone();
@@ -856,7 +930,6 @@ impl Vm {
                 .expect("failed to spawn Nessa worker thread");
             handles.push(handle);
         }
-        self.shared.aux_started.store(true, Ordering::Release);
         drop(handles);
         self.shared.epoch_sync.start_cv.notify_all();
     }
@@ -1230,6 +1303,14 @@ impl Vm {
         });
     }
 
+    /// Enable direct interpreter fast-paths for standard builtins registered during initialization.
+    pub fn enable_standard_builtin_fast_paths(&mut self) {
+        let _operation = self.operation();
+        self.with_exclusive_shared_mut(|shared| {
+            shared.builtins.enable_fast_paths();
+        });
+    }
+
     /// Add a compiled function to the VM.
     pub fn add_function(&mut self, code: FunctionCode) -> FuncId {
         let _operation = self.operation();
@@ -1253,7 +1334,7 @@ impl Vm {
     pub(crate) fn alloc_string(&mut self, s: &str) -> Result<TaggedValue, VmError> {
         let bytes = s.as_bytes();
         let payload_words = Self::string_payload_words(bytes.len())?;
-        let str_type = self.type_pool_read().intrinsic(Intrinsic::Str);
+        let str_type = Intrinsic::Str.type_index();
         // SAFETY: callers hold an operation, and publish the initialized value
         // before ending it. No lock is held across allocation.
         match unsafe { self.worker.heap.alloc_object(str_type, payload_words) } {
@@ -1264,6 +1345,86 @@ impl Vm {
             },
             None => Err(VmError::OutOfMemory),
         }
+    }
+
+    pub(crate) fn alloc_string_concat(
+        &mut self,
+        task_id: TaskId,
+        left: TaggedValue,
+        right: TaggedValue,
+    ) -> Result<TaggedValue, VmError> {
+        let len_a = builtin_ctx::with_heap_string_str(left, str::len).ok_or(VmError::TypeError)?;
+        let len_b = builtin_ctx::with_heap_string_str(right, str::len).ok_or(VmError::TypeError)?;
+        let total = len_a
+            .checked_add(len_b)
+            .ok_or(VmError::DisplaySizeExceeded)?;
+        self.check_display_bytes(task_id, total)?;
+        if len_a == 0 {
+            return Ok(right);
+        }
+        if len_b == 0 {
+            return Ok(left);
+        }
+        let payload_words = Self::string_payload_words(total)?;
+        let root = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&[left, right], |vm| {
+            let str_type = Intrinsic::Str.type_index();
+            // SAFETY: active mutator operation; `left` and `right` are rooted in
+            // `temporary_values[root..root+2]` across `alloc_object` and reloaded below.
+            let ptr = unsafe { vm.worker.heap.alloc_object(str_type, payload_words) }
+                .ok_or(VmError::OutOfMemory)?;
+            let (la, rb) = {
+                let roots = vm.worker_roots().temporary_values.borrow();
+                (roots[root], roots[root + 1])
+            };
+            let pa = la.as_heap_ptr().ok_or(VmError::TypeError)?;
+            let pb = rb.as_heap_ptr().ok_or(VmError::TypeError)?;
+            // SAFETY: `ptr` has `8 + total` bytes allocated; `pa` and `pb` are live
+            // non-overlapping `Str` objects whose lengths `len_a` and `len_b` were verified.
+            unsafe {
+                *(ptr.as_ptr() as *mut u64) = total as u64;
+                std::ptr::copy_nonoverlapping(pa.add(8), ptr.as_ptr().add(8), len_a);
+                std::ptr::copy_nonoverlapping(pb.add(8), ptr.as_ptr().add(8 + len_a), len_b);
+                Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+            }
+        })
+    }
+
+    pub(crate) fn alloc_string_subrange(
+        &mut self,
+        task_id: TaskId,
+        src: TaggedValue,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<TaggedValue, VmError> {
+        let src_len = builtin_ctx::with_heap_string_str(src, str::len).ok_or(VmError::TypeError)?;
+        let slice_len = end_byte.saturating_sub(start_byte);
+        self.check_display_bytes(task_id, slice_len)?;
+        if start_byte == 0 && end_byte == src_len {
+            return Ok(src);
+        }
+        let payload_words = Self::string_payload_words(slice_len)?;
+        let root = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&[src], |vm| {
+            let str_type = Intrinsic::Str.type_index();
+            // SAFETY: active mutator operation; `src` is rooted across `alloc_object`.
+            let ptr = unsafe { vm.worker.heap.alloc_object(str_type, payload_words) }
+                .ok_or(VmError::OutOfMemory)?;
+            let reloaded = vm.worker_roots().temporary_values.borrow()[root];
+            let ps = reloaded.as_heap_ptr().ok_or(VmError::TypeError)?;
+            // SAFETY: `[start_byte..end_byte]` was verified on UTF-8 character boundaries of `src`.
+            unsafe {
+                *(ptr.as_ptr() as *mut u64) = slice_len as u64;
+                if slice_len > 0 {
+                    std::ptr::copy_nonoverlapping(
+                        ps.add(8 + start_byte),
+                        ptr.as_ptr().add(8),
+                        slice_len,
+                    );
+                }
+                Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+            }
+        })
     }
 
     /// Spawn a root task that starts executing the given function.
@@ -1532,7 +1693,7 @@ impl Vm {
 
     /// Execute one task until it finishes, suspends, errors, or yields.
     fn execute_task(&mut self, task_id: TaskId) -> ExecOutcome {
-        const SLICE_SAFEPOINT_BUDGET: u32 = 4096;
+        const SLICE_SAFEPOINT_BUDGET: u32 = 32_768;
         self.worker.slice_safepoints = SLICE_SAFEPOINT_BUDGET;
         self.shared.worker_slices[self.worker.worker_id]
             .0
@@ -1546,9 +1707,12 @@ impl Vm {
         // entry contract only needs revalidation when control changes function.
         let mut validated_func = None;
         let mut last_entered_frame: Option<(FuncId, usize, usize)> = None;
+        let jit_enabled = self.worker.jit.is_enabled();
+        self.worker.heap.safe_point();
         loop {
-            // No instruction temporaries or mutable task borrows survive here.
-            self.worker.heap.safe_point();
+            if GC_FLAGS.gc_requested.load(Ordering::Relaxed) {
+                self.worker.heap.safe_point();
+            }
             // Get current task's PC, function, active frame identity, and cooperative unwind flags.
             let (mut pc, func_id, is_cancelled, unwinding_cancel, paused_in_unwind_step, frame_sig) = {
                 let task = match self.task_ref(task_id) {
@@ -1610,63 +1774,78 @@ impl Vm {
                 return ExecOutcome::Finished;
             }
 
-            if !unwinding_cancel && last_entered_frame != Some(frame_sig) {
-                last_entered_frame = Some(frame_sig);
-                if pc == 0 {
-                    self.maybe_compile_on_hotness(func_id, jit::ENTRY_HOTNESS_INCREMENT);
+            if jit_enabled && !unwinding_cancel {
+                if last_entered_frame != Some(frame_sig) {
+                    last_entered_frame = Some(frame_sig);
+                    if pc == 0 {
+                        self.maybe_compile_on_hotness(func_id, jit::ENTRY_HOTNESS_INCREMENT);
+                    }
+                }
+
+                if let Some(jit_outcome) = self.try_run_jit(task_id, func_id, pc) {
+                    match jit_outcome {
+                        jit_bridge::JitStepOutcome::Finished => return ExecOutcome::Finished,
+                        jit_bridge::JitStepOutcome::Return { ret_pc, val } => {
+                            if let Some(outcome) =
+                                self.complete_return(task_id, ret_pc, val, &mut validated_func)
+                            {
+                                return outcome;
+                            }
+                            continue;
+                        }
+                        jit_bridge::JitStepOutcome::TierUp(osr_pc) => {
+                            self.compile_jit_function(func_id, true);
+                            if let Some(task) = self.task_mut(task_id) {
+                                task.pc = osr_pc;
+                            }
+                            continue;
+                        }
+                        jit_bridge::JitStepOutcome::Yield(resume_pc) => {
+                            if let Some(task) = self.task_mut(task_id) {
+                                task.pc = resume_pc;
+                            }
+                            return ExecOutcome::Yield;
+                        }
+                        jit_bridge::JitStepOutcome::SuspendRetry(retry_pc) => {
+                            if let Some(task) = self.task_mut(task_id) {
+                                task.pc = retry_pc;
+                            }
+                            return ExecOutcome::Suspend;
+                        }
+                        jit_bridge::JitStepOutcome::ContinueTaskLoop => {
+                            validated_func = None;
+                            continue;
+                        }
+                        jit_bridge::JitStepOutcome::YieldAtTaskPc => {
+                            return ExecOutcome::Yield;
+                        }
+                        jit_bridge::JitStepOutcome::SuspendAtTaskPc => {
+                            return ExecOutcome::Suspend;
+                        }
+                        jit_bridge::JitStepOutcome::Cancelled => {
+                            if let Some(task) = self.task_mut(task_id) {
+                                task.cancelled = true;
+                            }
+                            continue;
+                        }
+                        jit_bridge::JitStepOutcome::Error(err) => return ExecOutcome::Error(err),
+                        jit_bridge::JitStepOutcome::InterpretOne(interp_pc) => {
+                            pc = interp_pc;
+                            if pc as usize >= func_len {
+                                return ExecOutcome::Finished;
+                            }
+                        }
+                    }
                 }
             }
 
-            if !unwinding_cancel && let Some(jit_outcome) = self.try_run_jit(task_id, func_id, pc) {
-                match jit_outcome {
-                    jit_bridge::JitStepOutcome::Finished => return ExecOutcome::Finished,
-                    jit_bridge::JitStepOutcome::Return { ret_pc, val } => {
-                        if let Some(outcome) =
-                            self.complete_return(task_id, ret_pc, val, &mut validated_func)
-                        {
-                            return outcome;
-                        }
-                        continue;
-                    }
-                    jit_bridge::JitStepOutcome::TierUp(osr_pc) => {
-                        self.compile_jit_function(func_id, true);
-                        if let Some(task) = self.task_mut(task_id) {
-                            task.pc = osr_pc;
-                        }
-                        continue;
-                    }
-                    jit_bridge::JitStepOutcome::Yield(resume_pc) => {
-                        if let Some(task) = self.task_mut(task_id) {
-                            task.pc = resume_pc;
-                        }
-                        return ExecOutcome::Yield;
-                    }
-                    jit_bridge::JitStepOutcome::SuspendRetry(retry_pc) => {
-                        if let Some(task) = self.task_mut(task_id) {
-                            task.pc = retry_pc;
-                        }
-                        return ExecOutcome::Suspend;
-                    }
-                    jit_bridge::JitStepOutcome::Cancelled => {
-                        if let Some(task) = self.task_mut(task_id) {
-                            task.cancelled = true;
-                        }
-                        continue;
-                    }
-                    jit_bridge::JitStepOutcome::Error(err) => return ExecOutcome::Error(err),
-                    jit_bridge::JitStepOutcome::InterpretOne(interp_pc) => {
-                        pc = interp_pc;
-                        if pc as usize >= func_len {
-                            return ExecOutcome::Finished;
-                        }
-                    }
-                }
-            }
-
-            let instr_word = self.shared.bytecode.get_function(func_id).instructions[pc as usize];
-            let instr = match Instruction::decode(instr_word) {
+            let instr = match self.shared.bytecode.get_meta(func_id).decoded[pc as usize] {
                 Some(i) => i,
-                None => return ExecOutcome::Error(VmError::InvalidInstruction(instr_word)),
+                None => {
+                    let instr_word =
+                        self.shared.bytecode.get_function(func_id).instructions[pc as usize];
+                    return ExecOutcome::Error(VmError::InvalidInstruction(instr_word));
+                }
             };
 
             // Advance PC before executing (jumps will override).
@@ -1720,7 +1899,7 @@ impl Vm {
         }
     }
 
-    fn complete_return(
+    pub(crate) fn complete_return(
         &mut self,
         task_id: TaskId,
         ret_pc: u32,
@@ -1748,7 +1927,7 @@ impl Vm {
         }
         let at_root = self
             .task_ref(task_id)
-            .is_some_and(|t| t.stacks.is_at_task_root());
+            .is_some_and(|t| t.call_stack.is_empty() && t.stacks.is_at_task_root());
         if at_root {
             match self.check_task_root_return(task_id, val) {
                 Ok(Some(_)) => {
@@ -1762,17 +1941,20 @@ impl Vm {
             }
         }
         // Pop call frame.
+        let mut recycled_slots = None;
         let should_finish = {
             let task = self.task_mut(task_id).unwrap();
             if let Some(frame) = task.call_stack.pop() {
                 task.pc = frame.return_pc;
                 task.current_func = frame.func_id;
-                task.local_slots = frame.local_slots;
+                recycled_slots = Some(std::mem::replace(&mut task.local_slots, frame.local_slots));
                 task.display_state = frame.display_state;
                 task.unwind_stack = frame.unwind_stack;
                 task.is_unwind_target = frame.is_unwind_target;
-                for (reg, saved_val) in &frame.saved_regs {
-                    task.registers.set(*reg, *saved_val);
+                if !frame.saved_regs.is_empty() {
+                    for (reg, saved_val) in &frame.saved_regs {
+                        task.registers.set(*reg, *saved_val);
+                    }
                 }
                 task.registers.set(Reg(0), val);
                 false
@@ -1781,12 +1963,15 @@ impl Vm {
             } else {
                 task.registers.regs.fill(TaggedValue::UNIT);
                 task.registers.set(Reg(0), val);
-                task.local_slots = Vec::new();
+                recycled_slots = Some(std::mem::take(&mut task.local_slots));
                 task.display_state = None;
                 task.unwind_stack.clear();
                 true
             }
         };
+        if let Some(old) = recycled_slots {
+            self.recycle_frame_slots(old);
+        }
         if should_finish {
             Some(ExecOutcome::Finished)
         } else {
@@ -1822,6 +2007,16 @@ impl Vm {
         DispatchResult::Continue
     }
 
+    #[inline]
+    fn cached_has_scopes(&self) -> bool {
+        if let Some(v) = self.sync_meta_cache().has_scopes {
+            return v;
+        }
+        let has = !self.type_pool_read().scopes().is_empty();
+        self.sync_meta_cache().has_scopes = Some(has);
+        has
+    }
+
     /// Dispatch a single instruction.
     fn dispatch(&mut self, task_id: TaskId, instr: Instruction) -> DispatchResult {
         let scope = if nsbc::instruction_requires_scope(instr.opcode) {
@@ -1833,8 +2028,7 @@ impl Vm {
                         .copied()
                 })
             });
-            let has_scopes = !self.type_pool_read().scopes().is_empty();
-            if found.is_none() && has_scopes {
+            if found.is_none() && self.cached_has_scopes() {
                 return DispatchResult::Error(VmError::MissingMethodContext);
             }
             found
@@ -1916,14 +2110,10 @@ impl Vm {
                 if count > (1 << 17) {
                     return DispatchResult::Error(VmError::InvalidInstruction(instr.encode()));
                 }
-                let task = task!();
-                let mut slots = Vec::new();
-                if slots.try_reserve_exact(count as usize).is_err() {
-                    return DispatchResult::Error(VmError::OutOfMemory);
+                match self.alloc_task_frame_slots(task_id, count as usize) {
+                    Ok(()) => DispatchResult::Continue,
+                    Err(err) => DispatchResult::Error(err),
                 }
-                slots.resize(count as usize, TaggedValue::UNIT);
-                task.local_slots = slots;
-                DispatchResult::Continue
             }
             Opcode::Load => {
                 let (dst, _, imm12) = a_fields(&instr);
@@ -2516,10 +2706,17 @@ impl Vm {
             Ok(state) => state,
             Err(error) => return DispatchResult::Error(error),
         };
+        let clobbers_cs = self
+            .shared
+            .bytecode
+            .try_get_function(target)
+            .is_none_or(|_| self.shared.bytecode.get_meta(target).clobbers_callee_saved);
         let t = self.task_mut(task_id).unwrap();
         let mut saved = runtime::SavedRegs::new();
-        for &r in Reg::CALLEE_SAVED {
-            saved.push(Reg(r), t.registers.get(Reg(r)));
+        if clobbers_cs {
+            for &r in Reg::CALLEE_SAVED {
+                saved.push(Reg(r), t.registers.get(Reg(r)));
+            }
         }
         let frame = CallFrame {
             display_state: t.display_state.take(),
@@ -2755,19 +2952,19 @@ impl Vm {
         func_id: FuncId,
         capture_count: u16,
     ) -> DispatchResult {
-        if capture_count as usize > runtime::GP_REGISTER_COUNT {
+        let cap_len = capture_count as usize;
+        if cap_len > runtime::GP_REGISTER_COUNT {
             return DispatchResult::Error(VmError::TypeError);
         }
-        if let Err(error) = self.check_capture_abi(func_id, capture_count as usize) {
+        if let Err(error) = self.check_capture_abi(func_id, cap_len) {
             return DispatchResult::Error(error);
         }
-        let captures = self
-            .task_ref(task_id)
-            .expect("dispatched task exists")
-            .registers
-            .regs[..capture_count as usize]
-            .to_vec();
-        if let Err(error) = self.check_capture_proofs(func_id, &captures) {
+        let mut captures = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+        {
+            let t = self.task_ref(task_id).expect("dispatched task exists");
+            captures[..cap_len].copy_from_slice(&t.registers.regs[..cap_len]);
+        }
+        if let Err(error) = self.check_capture_proofs(func_id, &captures[..cap_len]) {
             return DispatchResult::Error(error);
         }
         let payload_words = ClosureEnv::payload_words(capture_count);
@@ -2778,12 +2975,9 @@ impl Vm {
         match unsafe { self.worker.heap.alloc_object(closure_type, payload_words) } {
             Some(ptr) => {
                 let t = self.task_mut(task_id).unwrap();
-                let mut captures = Vec::with_capacity(capture_count as usize);
-                for i in 0..capture_count {
-                    captures.push(t.registers.get(Reg(i as u8)));
-                }
+                captures[..cap_len].copy_from_slice(&t.registers.regs[..cap_len]);
                 unsafe {
-                    ClosureEnv::write(ptr.as_ptr(), func_id, &captures);
+                    ClosureEnv::write(ptr.as_ptr(), func_id, &captures[..cap_len]);
                 }
                 let val = unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) };
                 t.registers.set(dst, val);
@@ -2791,6 +2985,139 @@ impl Vm {
             }
             None => DispatchResult::Error(VmError::OutOfMemory),
         }
+    }
+
+    /// Fast inline execution for the hottest collection/string builtins without constructing `BuiltinCtx`.
+    #[inline]
+    fn try_dispatch_fast_builtin(
+        &mut self,
+        task_id: TaskId,
+        builtin_id: u32,
+        arg_count: u8,
+    ) -> Option<DispatchResult> {
+        use runtime::ids;
+        macro_rules! check_arity {
+            ($exp:expr) => {
+                if arg_count != $exp {
+                    return Some(DispatchResult::Error(VmError::ArityError {
+                        expected: $exp,
+                        got: arg_count,
+                    }));
+                }
+            };
+        }
+        let res: Result<TaggedValue, VmError> = match builtin_id {
+            ids::STR_LEN => {
+                check_arity!(1);
+                let s = self.task_ref(task_id)?.registers.get(Reg(0));
+                builtin_ctx::with_heap_string_str(s, |text| text.len() as i64)
+                    .ok_or(VmError::TypeError)
+                    .and_then(|n| self.number_value(runtime::Number::I64(n)))
+            }
+            ids::STR_CONCAT => {
+                check_arity!(2);
+                let (a, b) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)))
+                };
+                self.alloc_string_concat(task_id, a, b)
+            }
+            ids::LIST_INIT => {
+                check_arity!(0);
+                self.new_list(0)
+            }
+            ids::LIST_LEN => {
+                check_arity!(1);
+                let list = self.task_ref(task_id)?.registers.get(Reg(0));
+                self.list_len(list)
+                    .and_then(|n| i64::try_from(n).map_err(|_| VmError::NumericOverflow))
+                    .and_then(|n| self.number_value(runtime::Number::I64(n)))
+            }
+            ids::LIST_GET => {
+                check_arity!(2);
+                let (list, idx) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)))
+                };
+                self.list_get(list, idx)
+            }
+            ids::LIST_SET => {
+                check_arity!(3);
+                let (list, idx, val) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)), r.get(Reg(2)))
+                };
+                self.list_set(list, idx, val).map(|()| TaggedValue::UNIT)
+            }
+            ids::LIST_PUSH => {
+                check_arity!(2);
+                let (list, val) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)))
+                };
+                self.list_push(list, val).map(|()| TaggedValue::UNIT)
+            }
+            ids::LIST_POP => {
+                check_arity!(1);
+                let list = self.task_ref(task_id)?.registers.get(Reg(0));
+                self.list_pop(list)
+            }
+            ids::MAP_INIT => {
+                check_arity!(0);
+                self.new_map(0)
+            }
+            ids::MAP_LEN => {
+                check_arity!(1);
+                let map = self.task_ref(task_id)?.registers.get(Reg(0));
+                self.map_len(map)
+                    .and_then(|n| i64::try_from(n).map_err(|_| VmError::NumericOverflow))
+                    .and_then(|n| self.number_value(runtime::Number::I64(n)))
+            }
+            ids::MAP_GET => {
+                check_arity!(2);
+                let (map, key) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)))
+                };
+                self.map_get(map, key)
+            }
+            ids::MAP_SET => {
+                check_arity!(3);
+                let (map, key, val) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)), r.get(Reg(2)))
+                };
+                self.map_set(map, key, val).map(|()| TaggedValue::UNIT)
+            }
+            ids::MAP_CONTAINS => {
+                check_arity!(2);
+                let (map, key) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)))
+                };
+                self.map_contains(map, key).map(TaggedValue::from_bool)
+            }
+            ids::SCALAR_EQ => {
+                check_arity!(2);
+                let (a, b) = {
+                    let r = &self.task_ref(task_id)?.registers;
+                    (r.get(Reg(0)), r.get(Reg(1)))
+                };
+                self.scalar_equal(a, b).map(TaggedValue::from_bool)
+            }
+            _ => return None,
+        };
+        Some(match res {
+            Ok(val) => {
+                if let Some(t) = self.task_mut(task_id) {
+                    t.registers.set(Reg(0), val);
+                    DispatchResult::Continue
+                } else {
+                    DispatchResult::Error(VmError::InvalidTask)
+                }
+            }
+            Err(err) => DispatchResult::Error(err),
+        })
     }
 
     /// Dispatch a builtin function call.
@@ -2804,6 +3131,11 @@ impl Vm {
         let Some(f) = self.shared.builtins.get(builtin_id) else {
             return DispatchResult::Error(VmError::UnknownBuiltin(builtin_id));
         };
+        if self.shared.builtins.can_fast_path(builtin_id)
+            && let Some(fast) = self.try_dispatch_fast_builtin(task_id, builtin_id, arg_count)
+        {
+            return fast;
+        }
         let mut ctx = BuiltinCtx::new(self, task_id, arg_count);
         if let Err(e) = f(&mut ctx) {
             return DispatchResult::Error(e);
@@ -2837,6 +3169,7 @@ fn aux_worker_thread_main(
         native_frame_depth: 0,
         local_queue_ptr: None,
         meta_cache: RefCell::new(WorkerMetaCache::default()),
+        slot_vec_pool: Vec::with_capacity(64),
         jit: Vm::new_default_jit(),
         jit_synced_epoch: 0,
         jit_reported_fns: 0,
@@ -2979,7 +3312,7 @@ enum DispatchResult {
 }
 
 /// Outcome of executing a task.
-enum ExecOutcome {
+pub(crate) enum ExecOutcome {
     Finished,
     Yield,
     Suspend,

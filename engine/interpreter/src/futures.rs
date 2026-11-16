@@ -725,13 +725,15 @@ impl Vm {
                         if let Some(frame) = task.call_stack.pop() {
                             task.pc = frame.return_pc;
                             task.current_func = frame.func_id;
-                            task.local_slots = frame.local_slots;
+                            let old_slots =
+                                std::mem::replace(&mut task.local_slots, frame.local_slots);
                             task.display_state = frame.display_state;
                             task.unwind_stack = frame.unwind_stack;
                             task.is_unwind_target = false;
                             for (reg, saved_val) in &frame.saved_regs {
                                 task.registers.set(*reg, *saved_val);
                             }
+                            self.recycle_frame_slots(old_slots);
                             true
                         } else if task.stacks.return_from_delimiter(TaggedValue::UNIT) {
                             task.is_unwind_target = false;

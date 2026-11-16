@@ -83,6 +83,10 @@ pub enum Cond {
     Be = 0x6,
     /// Unsigned above (`CF = 0 && ZF = 0`).
     A = 0x7,
+    /// Sign / negative (`SF = 1`).
+    S = 0x8,
+    /// Not sign / non-negative (`SF = 0`).
+    Ns = 0x9,
     /// Parity / unordered NaN (`PF = 1`).
     P = 0xA,
     /// Not parity / ordered (`PF = 0`).
@@ -540,6 +544,38 @@ impl Assembler {
         self.emit_u8(0xC1);
         self.emit_modrm(0b11, 7, dst.idx());
         self.emit_u8(count);
+    }
+
+    pub fn rol_ri8(&mut self, dst: GpReg, count: u8) {
+        self.emit_rex_w(0, dst.idx());
+        self.emit_u8(0xC1);
+        self.emit_modrm(0b11, 0, dst.idx());
+        self.emit_u8(count);
+    }
+
+    pub fn ror_ri8(&mut self, dst: GpReg, count: u8) {
+        self.emit_rex_w(0, dst.idx());
+        self.emit_u8(0xC1);
+        self.emit_modrm(0b11, 1, dst.idx());
+        self.emit_u8(count);
+    }
+
+    pub fn shl_cl(&mut self, dst: GpReg) {
+        self.emit_rex_w(0, dst.idx());
+        self.emit_u8(0xD3);
+        self.emit_modrm(0b11, 4, dst.idx());
+    }
+
+    pub fn shr_cl(&mut self, dst: GpReg) {
+        self.emit_rex_w(0, dst.idx());
+        self.emit_u8(0xD3);
+        self.emit_modrm(0b11, 5, dst.idx());
+    }
+
+    pub fn sar_cl(&mut self, dst: GpReg) {
+        self.emit_rex_w(0, dst.idx());
+        self.emit_u8(0xD3);
+        self.emit_modrm(0b11, 7, dst.idx());
     }
 
     /// Compare `lhs` and `rhs` (`EFLAGS` from `lhs - rhs`).

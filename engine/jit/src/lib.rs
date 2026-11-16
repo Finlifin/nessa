@@ -43,9 +43,13 @@ pub mod layout {
     use super::*;
 
     pub const TAG_MASK: u64 = 0b111;
+    pub const ROT_F64_TAG_MASK: u64 = 0b110;
     pub const IMM_LOW7_MASK: u64 = 0x7f;
     pub const IMM_I_SMALL_TAG: u64 = 0x01;
+    pub const IMM_U_SMALL_TAG: u64 = 0x09;
     pub const IMM_F64_TAG: u64 = 0x11;
+    pub const IMM_USIZE_TAG: u64 = 0x59;
+    pub const IMM_ISIZE_TAG: u64 = 0x61;
     pub const IMM_BOOL_MASK_NO_BIT7: i32 = !0x80;
     pub const TAG_FALSE: u64 = 0x19;
     pub const TAG_TRUE: u64 = 0x99;
@@ -61,10 +65,15 @@ pub mod layout {
     pub const GC_META_ROLE_AND_WORDS_MASK: i32 = 0x003F_FFF8;
     /// Expected `(gc_meta & GC_META_ROLE_AND_WORDS_MASK)` for a 1-word `Ordinary` box (`1 << 3`).
     pub const GC_META_ORDINARY_1WORD: i32 = 1 << 3;
+    /// Expected `(gc_meta & GC_META_ROLE_AND_WORDS_MASK)` for a 3-word `Ordinary` wrapper (`3 << 3`).
+    pub const GC_META_ORDINARY_3WORDS: i32 = 3 << 3;
     /// Mask extracting only `PayloadRole` bits `19..=21` (`0` == `Ordinary`).
     pub const GC_META_ROLE_MASK: i32 = 0x0038_0000;
 
     pub const INTRINSIC_I64_RAW: u32 = Intrinsic::I64.type_index().as_u32();
+    pub const INTRINSIC_U64_RAW: u32 = Intrinsic::U64.type_index().as_u32();
+    pub const INTRINSIC_USIZE_RAW: u32 = Intrinsic::Usize.type_index().as_u32();
+    pub const INTRINSIC_ISIZE_RAW: u32 = Intrinsic::Isize.type_index().as_u32();
     pub const INTRINSIC_F64_RAW: u32 = Intrinsic::F64.type_index().as_u32();
     pub const INTRINSIC_BOOL_RAW: u32 = Intrinsic::Bool.type_index().as_u32();
 
@@ -85,10 +94,13 @@ pub mod layout {
         debug_assert_eq!(TaggedValue::UNIT.raw(), TAG_UNIT);
         debug_assert_eq!(TaggedValue::from_i64(0).raw(), IMM_I_SMALL_TAG);
         debug_assert_eq!(TaggedValue::from_i64(1).raw(), (1 << 7) | IMM_I_SMALL_TAG);
+        debug_assert_eq!(TaggedValue::from_f64(0.0).raw(), IMM_F64_TAG);
         debug_assert_eq!(
             TaggedValue::from_f64(1.5).raw(),
-            (1.5_f64.to_bits() & !0x7f) | IMM_F64_TAG
+            1.5_f64.to_bits().rotate_left(4)
         );
+        debug_assert_eq!(TaggedValue::try_from_usize(0).unwrap().raw(), IMM_USIZE_TAG);
+        debug_assert_eq!(TaggedValue::try_from_isize(0).unwrap().raw(), IMM_ISIZE_TAG);
     }
 }
 
@@ -101,9 +113,9 @@ pub const ENTRY_HOTNESS_INCREMENT: u64 = 16;
 /// Hotness added per taken backward jump (`offset <= 0`).
 pub const BACKEDGE_HOTNESS_INCREMENT: u64 = 1;
 /// Hotness threshold for Tier-1 compilation + immediate loop OSR in `Auto` mode.
-pub const TIER1_HOTNESS_THRESHOLD: u64 = 4_096;
+pub const TIER1_HOTNESS_THRESHOLD: u64 = 64;
 /// Hotness threshold for Tier-2 loop specialization in `Auto` mode.
-pub const TIER2_HOTNESS_THRESHOLD: u64 = 65_536;
+pub const TIER2_HOTNESS_THRESHOLD: u64 = 512;
 /// Maximum cumulative Tier-2 deoptimizations per function before disabling Tier-2 for that function.
 pub const MAX_DEOPTS_PER_FUNCTION: u32 = 8;
 
@@ -208,6 +220,12 @@ pub enum JitExitKind {
     Cancelled = 6,
     /// Runtime error (`VmError`) stored in the bridge's `pending_error` slot.
     Trap = 7,
+    /// Nested call/helper already positioned `task.current_func` and `task.pc`; resume `execute_task` loop.
+    ContinueTaskLoop = 8,
+    /// Nested call/helper already recorded `task.pc` and yielded the slice.
+    YieldAtTaskPc = 9,
+    /// Nested call/helper already recorded `task.pc` and suspended the task.
+    SuspendAtTaskPc = 10,
 }
 
 /// Structured exit descriptor written via `out_exit: *mut JitExit` on return from native code.
@@ -237,10 +255,16 @@ pub enum FieldStoreFastKind {
     SmallI64 = 2,
     /// `Intrinsic::Bool`: inline hit when `(val & !0x80) == 0x19`.
     Bool = 3,
-    /// `Intrinsic::F64`: inline hit when `(val & 0x7f) == 0x11` or 1-word `Ordinary` `F64` box.
+    /// `Intrinsic::F64`: inline hit when `(val & 6) != 0`, `(val & 0x7f) == 0x11`, or 1-word `F64` box.
     CanonicalF64 = 4,
     /// Nominal `Struct`: inline hit when `val` is heap `Ordinary` with `type_index == expected_val_type`.
     ExactHeapNominal = 5,
+    /// `?Struct`: inline hit when `val == TAG_NULL` or heap `Ordinary` with `type_index == expected_val_type`.
+    OptionalNominal = 6,
+    /// `?i64`: inline hit when `val == TAG_NULL` or `(val & 0x7f) == 0x01`.
+    OptionalSmallI64 = 7,
+    /// `usize`: inline hit when `(val & 0x7f) == 0x59` (`IMM_USIZE`).
+    Usize = 8,
 }
 
 /// Per-site monomorphic inline cache for `LoadField` and `StoreField`.
@@ -306,11 +330,13 @@ pub struct JitRuntimeCtx {
     pub gc_requested_ptr: *const u8,
     /// Pointer to `GC_FLAGS.preempt_requested` byte.
     pub preempt_requested_ptr: *const u8,
+    /// Pointer to `SharedVm::aux_started` byte (`0` in single-worker mode).
+    pub aux_started_ptr: *const u8,
     /// Remaining safepoint budget in the current task slice.
     pub slice_safepoints: u32,
     /// `1` if scheduler currently has other ready tasks, `0` otherwise.
     pub has_other_ready: u8,
-    /// `1` if Tier-1 backward jumps should exit with `TierUp` once `hotness >= 65_536`.
+    /// `1` if Tier-1 backward jumps should exit with `TierUp` once `hotness >= TIER2_HOTNESS_THRESHOLD`.
     pub allow_tier_up: u8,
     /// `1` if Tier-2 unboxed loops are enabled for this invocation (`0` after deopt cap).
     pub allow_tier2_loops: u8,
@@ -324,6 +350,7 @@ impl JitRuntimeCtx {
     pub const OFF_CONSTS_PTR: i32 = std::mem::offset_of!(Self, consts_ptr) as i32;
     pub const OFF_GC_REQ_PTR: i32 = std::mem::offset_of!(Self, gc_requested_ptr) as i32;
     pub const OFF_PREEMPT_REQ_PTR: i32 = std::mem::offset_of!(Self, preempt_requested_ptr) as i32;
+    pub const OFF_AUX_STARTED_PTR: i32 = std::mem::offset_of!(Self, aux_started_ptr) as i32;
     pub const OFF_SLICE_SAFEPOINTS: i32 = std::mem::offset_of!(Self, slice_safepoints) as i32;
     pub const OFF_HAS_OTHER_READY: i32 = std::mem::offset_of!(Self, has_other_ready) as i32;
     pub const OFF_ALLOW_TIER_UP: i32 = std::mem::offset_of!(Self, allow_tier_up) as i32;
@@ -384,6 +411,25 @@ pub struct JitHelpers {
     ) -> u32,
     pub step_inline_op:
         unsafe extern "sysv64" fn(vm_opaque: *mut c_void, pc: u32, instr_word: u32) -> u32,
+    pub alloc_object_fast: unsafe extern "sysv64" fn(
+        vm_opaque: *mut c_void,
+        dst_reg: u32,
+        canon_ty_raw: u32,
+        words: u32,
+    ) -> u32,
+    pub call_builtin: unsafe extern "sysv64" fn(
+        vm_opaque: *mut c_void,
+        pc: u32,
+        builtin_id: u32,
+        arg_count: u32,
+    ) -> u32,
+    pub call_op: unsafe extern "sysv64" fn(vm_opaque: *mut c_void, pc: u32, instr_word: u32) -> u32,
+    pub call_direct_fast: unsafe extern "sysv64" fn(
+        vm_opaque: *mut c_void,
+        return_pc: u32,
+        callee_raw: u32,
+        packed_slots_and_cs: u32,
+    ) -> u32,
 }
 
 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -417,6 +463,25 @@ pub struct JitHelpers {
     ) -> u32,
     pub step_inline_op:
         unsafe extern "C" fn(vm_opaque: *mut c_void, pc: u32, instr_word: u32) -> u32,
+    pub alloc_object_fast: unsafe extern "C" fn(
+        vm_opaque: *mut c_void,
+        dst_reg: u32,
+        canon_ty_raw: u32,
+        words: u32,
+    ) -> u32,
+    pub call_builtin: unsafe extern "C" fn(
+        vm_opaque: *mut c_void,
+        pc: u32,
+        builtin_id: u32,
+        arg_count: u32,
+    ) -> u32,
+    pub call_op: unsafe extern "C" fn(vm_opaque: *mut c_void, pc: u32, instr_word: u32) -> u32,
+    pub call_direct_fast: unsafe extern "C" fn(
+        vm_opaque: *mut c_void,
+        return_pc: u32,
+        callee_raw: u32,
+        packed_slots_and_cs: u32,
+    ) -> u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +518,17 @@ pub struct CompilationInput<'a> {
     pub hotness_ptr: *mut u64,
     pub global_deopt_ptr: *mut u64,
     pub func_deopt_ptr: *mut u32,
+    /// Number of local slots statically guaranteed allocated for all `pc > 0`.
+    pub guaranteed_slots: u32,
+    /// Canonical `TypeIndex` of `std.collection.List`, when registered.
+    pub list_type_raw: Option<u32>,
+    /// Canonical `TypeIndex` of `List`'s backing `Buffer`, when registered.
+    pub list_buf_type_raw: Option<u32>,
+    /// `true` when `LIST_LEN` / `LIST_GET` / `LIST_SET` have not been overridden by host hooks.
+    pub fast_list_builtins: bool,
+    /// Returns `Some((guaranteed_slots, clobbers_callee_saved))` when `callee` is a plain
+    /// non-closure, non-display, value-only function with `param_count == arg_count`.
+    pub fast_direct_callee_slots: &'a dyn Fn(FuncId, u8) -> Option<(u32, bool)>,
 }
 
 /// Output produced by a backend compiler before sealing in [`CodeCache`].

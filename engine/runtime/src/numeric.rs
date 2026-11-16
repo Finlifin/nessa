@@ -32,15 +32,10 @@ impl Number {
     /// # Safety
     /// A heap value must reference a live, initialized GC object. The caller
     /// must hold a mutator operation and keep the value rooted across GC.
+    #[inline]
     pub unsafe fn from_tagged(value: TaggedValue) -> Option<Self> {
-        if let Some(value) = value.as_i64() {
-            return Some(Self::I64(value));
-        }
-        if let Some(value) = value.as_u64() {
-            return Some(Self::U64(value));
-        }
-        if let Some(value) = value.as_f64() {
-            return Some(Self::F64(value));
+        if let Some(number) = value.as_inline_number() {
+            return Some(number);
         }
         let pointer = value.as_heap_ptr()?;
         // SAFETY: the caller guarantees a live object with its aligned header.
@@ -51,10 +46,7 @@ impl Number {
         let kind = header.type_index;
         let words = header.payload_words();
         if words == 1 {
-            let intrinsic = Intrinsic::ALL
-                .iter()
-                .copied()
-                .find(|intrinsic| intrinsic.type_index() == kind)?;
+            let intrinsic = Intrinsic::from_type_index(kind)?;
             if let Some(width) = signed_width(intrinsic)
                 && width <= 64
             {
@@ -205,6 +197,20 @@ impl Number {
         }
         match (self, other) {
             (Self::I64(left), Self::I64(right)) => {
+                let fast = match opcode {
+                    Opcode::Add => left.checked_add(right),
+                    Opcode::Sub => left.checked_sub(right),
+                    Opcode::Mul => left.checked_mul(right),
+                    Opcode::Div => left.checked_div(right),
+                    Opcode::Mod => left.checked_rem(right),
+                    Opcode::BitAnd => Some(left & right),
+                    Opcode::BitOr => Some(left | right),
+                    Opcode::BitXor => Some(left ^ right),
+                    _ => None,
+                };
+                if let Some(v) = fast {
+                    return Ok(Self::I64(v));
+                }
                 let result = signed_binary(i128::from(left), i128::from(right), opcode)?;
                 Ok(match i64::try_from(result) {
                     Ok(result) => Self::I64(result),
@@ -212,6 +218,20 @@ impl Number {
                 })
             }
             (Self::U64(left), Self::U64(right)) => {
+                let fast = match opcode {
+                    Opcode::Add => left.checked_add(right),
+                    Opcode::Sub => left.checked_sub(right),
+                    Opcode::Mul => left.checked_mul(right),
+                    Opcode::Div => left.checked_div(right),
+                    Opcode::Mod => left.checked_rem(right),
+                    Opcode::BitAnd => Some(left & right),
+                    Opcode::BitOr => Some(left | right),
+                    Opcode::BitXor => Some(left ^ right),
+                    _ => None,
+                };
+                if let Some(v) = fast {
+                    return Ok(Self::U64(v));
+                }
                 let result = unsigned_binary(u128::from(left), u128::from(right), opcode)?;
                 Ok(match u64::try_from(result) {
                     Ok(result) => Self::U64(result),

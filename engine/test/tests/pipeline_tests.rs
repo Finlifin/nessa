@@ -624,7 +624,12 @@ fn tagged_value_int() {
 fn tagged_value_float() {
     let v = runtime::TaggedValue::from_f64(1.25);
     assert_eq!(v.as_f64().unwrap().to_bits(), 1.25_f64.to_bits());
-    assert!(runtime::TaggedValue::try_from_f64(std::f64::consts::PI).is_none());
+    let pi = runtime::TaggedValue::from_f64(std::f64::consts::PI);
+    assert_eq!(
+        pi.as_f64().unwrap().to_bits(),
+        std::f64::consts::PI.to_bits()
+    );
+    assert!(runtime::TaggedValue::try_from_f64(f64::from_bits(1)).is_none());
 }
 
 #[test]

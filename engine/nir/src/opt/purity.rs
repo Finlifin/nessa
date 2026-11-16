@@ -34,7 +34,16 @@ pub(crate) fn is_pure_and_trap_free(expr: &NirExpr) -> bool {
             NirValue::ConstBool(_),
             NirValue::ConstBool(_),
         ) => true,
-        NirExpr::CallBuiltin(id, args) => is_trap_free_pure_builtin(*id, args.len()),
+        NirExpr::CallBuiltin(id, args) => {
+            is_trap_free_pure_builtin(*id, args.len())
+                || matches!(
+                    (*id, args.as_slice()),
+                    (
+                        ids::STR_LEN | ids::STR_BYTE_COUNT | ids::STR_IS_EMPTY,
+                        [NirValue::ConstStr(_)]
+                    )
+                )
+        }
         _ => false,
     }
 }
@@ -42,8 +51,35 @@ pub(crate) fn is_pure_and_trap_free(expr: &NirExpr) -> bool {
 /// Allocations of fresh unescaped containers have no observable side effects when their
 /// destination local is never read, so Dead Assignment Elimination may remove them
 /// (though GVN/LICM must not merge distinct mutable allocations).
-pub(crate) fn is_removable_when_unused(expr: &NirExpr) -> bool {
+pub(crate) fn is_removable_when_unused(expr: &NirExpr, type_pool: &type_pool::TypePool) -> bool {
     if is_pure_and_trap_free(expr) {
+        return true;
+    }
+    if let NirExpr::TypeCast(NirValue::ConstInt(v), ty) = expr.unscoped()
+        && (0..=127).contains(v)
+        && type_pool
+            .canonical_type(*ty)
+            .and_then(type_pool::Intrinsic::from_type_index)
+            .is_some_and(|intr| {
+                matches!(
+                    intr,
+                    type_pool::Intrinsic::I8
+                        | type_pool::Intrinsic::I16
+                        | type_pool::Intrinsic::I32
+                        | type_pool::Intrinsic::I64
+                        | type_pool::Intrinsic::I128
+                        | type_pool::Intrinsic::Isize
+                        | type_pool::Intrinsic::U8
+                        | type_pool::Intrinsic::U16
+                        | type_pool::Intrinsic::U32
+                        | type_pool::Intrinsic::U64
+                        | type_pool::Intrinsic::U128
+                        | type_pool::Intrinsic::Usize
+                        | type_pool::Intrinsic::F32
+                        | type_pool::Intrinsic::F64
+                )
+            })
+    {
         return true;
     }
     matches!(

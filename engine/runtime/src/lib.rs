@@ -62,14 +62,14 @@ pub type FastHashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDef
 // TaggedValue — the universal 64-bit runtime value
 // ---------------------------------------------------------------------------
 
-/// A 64-bit tagged value.  The low 3 bits encode the tag.
+/// A 64-bit tagged value.  The low 3 bits encode the primary tag:
 ///
 /// ```text
 /// [Payload 61 bits][Tag 3 bits]
-///   000  HeapObject   — payload is 8-byte-aligned pointer
-///   001  Immediate    — payload encodes an inline value
-///   01x  Reserved
-///   1xx  Reserved
+///   000        HeapObject   — payload is 8-byte-aligned pointer (0 = invalid/uninit)
+///   001        Immediate    — payload bits [6:3] hold sub-tag, [63:7] hold 57-bit data
+///   010..=111  RotatedF64   — raw == f64::to_bits().rotate_left(4) for any IEEE-754 f64
+///                             whose exponent bits [62:60] >= 0b010 ([2^-511, +Inf], +-Inf, NaN)
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -79,10 +79,12 @@ pub struct TaggedValue(u64);
 const TAG_MASK: u64 = 0b111;
 const TAG_HEAP: u64 = 0b000;
 const TAG_IMM: u64 = 0b001;
+const ROT_F64_TAG_MASK: u64 = 0b110;
 
 // Immediate sub-tag (bits [6:3] of the value, i.e. bits [3:0] of payload)
 const IMM_SUB_SHIFT: u32 = 3;
 const IMM_SUB_MASK: u64 = 0xF << IMM_SUB_SHIFT;
+const IMM_LOW7_MASK: u64 = TAG_MASK | IMM_SUB_MASK;
 const IMM_DATA_SHIFT: u32 = 7; // payload data starts at bit 7
 
 const IMM_I_SMALL: u64 = 0x0;
@@ -95,6 +97,18 @@ const IMM_CHAR: u64 = 0x7;
 const IMM_TYPE: u64 = 0x8;
 const IMM_ENUM: u64 = 0x9;
 const IMM_TRAIT_PROOF: u64 = 0xA;
+const IMM_USIZE: u64 = 0xB;
+const IMM_ISIZE: u64 = 0xC;
+const IMM_NARROW: u64 = 0xD;
+
+// Narrow scalar sub-kinds stored in bits [35:32] of IMM_NARROW's 57-bit data payload.
+const NARROW_U8: u64 = 0;
+const NARROW_U16: u64 = 1;
+const NARROW_U32: u64 = 2;
+const NARROW_I8: u64 = 3;
+const NARROW_I16: u64 = 4;
+const NARROW_I32: u64 = 5;
+const NARROW_F32: u64 = 6;
 
 impl TaggedValue {
     pub const UNIT: Self = Self::make_imm(IMM_UNIT, 0);
@@ -106,9 +120,15 @@ impl TaggedValue {
         Self(TAG_IMM | (sub << IMM_SUB_SHIFT) | (data << IMM_DATA_SHIFT))
     }
 
+    #[inline]
+    const fn has_imm_sub(self, sub: u64) -> bool {
+        (self.0 & IMM_LOW7_MASK) == (TAG_IMM | (sub << IMM_SUB_SHIFT))
+    }
+
     // -- Constructors --------------------------------------------------------
 
     /// Encode an immediate integer, or return None when heap storage is needed.
+    #[inline]
     pub fn try_from_i64(v: i64) -> Option<Self> {
         (-(1_i64 << 56)..(1_i64 << 56))
             .contains(&v)
@@ -116,14 +136,80 @@ impl TaggedValue {
     }
 
     /// Encode an immediate unsigned integer without truncation.
+    #[inline]
     pub fn try_from_u64(v: u64) -> Option<Self> {
         (v < (1_u64 << 57)).then(|| Self::make_imm(IMM_U_SMALL, v))
     }
 
-    /// Encode a float only when all bits survive immediate compression.
+    /// Encode a 57-bit immediate `usize` preserving `Intrinsic::Usize` identity.
+    #[inline]
+    pub fn try_from_usize(v: u64) -> Option<Self> {
+        (v < (1_u64 << 57)).then(|| Self::make_imm(IMM_USIZE, v))
+    }
+
+    /// Encode a 57-bit immediate `isize` preserving `Intrinsic::Isize` identity.
+    #[inline]
+    pub fn try_from_isize(v: i64) -> Option<Self> {
+        (-(1_i64 << 56)..(1_i64 << 56))
+            .contains(&v)
+            .then(|| Self::make_imm(IMM_ISIZE, (v as u64) & ((1_u64 << 57) - 1)))
+    }
+
+    /// Encode an inline `f64` using either rotated primary tags `0b010..=0b111`
+    /// (covering all floats with magnitude `>= 2^-511`, `+-Inf`, and all `NaN` bit patterns)
+    /// or `IMM_F64` (covering `+0.0`, `-0.0`, and dyadic tiny floats with zero low 7 bits).
+    #[inline]
     pub fn try_from_f64(v: f64) -> Option<Self> {
         let bits = v.to_bits();
+        let rot = bits.rotate_left(4);
+        if (rot & ROT_F64_TAG_MASK) != 0 {
+            return Some(Self(rot));
+        }
         (bits & 0x7f == 0).then(|| Self::make_imm(IMM_F64, bits >> 7))
+    }
+
+    /// Encode any concrete numeric scalar inline when representable without heap boxing,
+    /// preserving its exact runtime `Intrinsic` identity (`usize`, `isize`, `i8..u32`, `f32`, `f64`, `i64`, `u64`).
+    #[inline]
+    pub fn try_from_typed_scalar(kind: type_pool::Intrinsic, number: Number) -> Option<Self> {
+        use type_pool::Intrinsic;
+        match (kind, number) {
+            (Intrinsic::I64, Number::I64(v)) => Self::try_from_i64(v),
+            (Intrinsic::U64, Number::U64(v)) => Self::try_from_u64(v),
+            (Intrinsic::F64, Number::F64(v)) => Self::try_from_f64(v),
+            (Intrinsic::Usize, Number::U64(v)) => Self::try_from_usize(v),
+            (Intrinsic::Isize, Number::I64(v)) => Self::try_from_isize(v),
+            (Intrinsic::U8, Number::U64(v)) if v <= u8::MAX as u64 => {
+                Some(Self::make_imm(IMM_NARROW, (NARROW_U8 << 32) | v))
+            }
+            (Intrinsic::U16, Number::U64(v)) if v <= u16::MAX as u64 => {
+                Some(Self::make_imm(IMM_NARROW, (NARROW_U16 << 32) | v))
+            }
+            (Intrinsic::U32, Number::U64(v)) if v <= u32::MAX as u64 => {
+                Some(Self::make_imm(IMM_NARROW, (NARROW_U32 << 32) | v))
+            }
+            (Intrinsic::I8, Number::I64(v)) if v >= i8::MIN as i64 && v <= i8::MAX as i64 => {
+                let raw32 = (v as i32 as u32) as u64;
+                Some(Self::make_imm(IMM_NARROW, (NARROW_I8 << 32) | raw32))
+            }
+            (Intrinsic::I16, Number::I64(v)) if v >= i16::MIN as i64 && v <= i16::MAX as i64 => {
+                let raw32 = (v as i32 as u32) as u64;
+                Some(Self::make_imm(IMM_NARROW, (NARROW_I16 << 32) | raw32))
+            }
+            (Intrinsic::I32, Number::I64(v)) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => {
+                let raw32 = (v as i32 as u32) as u64;
+                Some(Self::make_imm(IMM_NARROW, (NARROW_I32 << 32) | raw32))
+            }
+            (Intrinsic::F32, Number::F64(v)) => {
+                let v32 = v as f32;
+                if !v.is_nan() && f64::from(v32) != v {
+                    return None;
+                }
+                let raw32 = v32.to_bits() as u64;
+                Some(Self::make_imm(IMM_NARROW, (NARROW_F32 << 32) | raw32))
+            }
+            _ => None,
+        }
     }
 
     /// Encode a known small integer. Use the VM numeric factory for arbitrary values.
@@ -176,8 +262,9 @@ impl TaggedValue {
     }
 
     /// Decode enum representation only; non-enum immediates are rejected.
+    #[inline]
     pub fn as_enum(self) -> Option<(TypeIndex, u32)> {
-        if !self.is_immediate() || self.imm_sub() != IMM_ENUM {
+        if !self.has_imm_sub(IMM_ENUM) {
             return None;
         }
         let data = self.imm_data();
@@ -191,8 +278,9 @@ impl TaggedValue {
         (id != 0 && id < (1 << 57)).then(|| Self::make_imm(IMM_TRAIT_PROOF, id))
     }
 
+    #[inline]
     pub fn as_trait_proof(self) -> Option<u64> {
-        (self.is_immediate() && self.imm_sub() == IMM_TRAIT_PROOF)
+        self.has_imm_sub(IMM_TRAIT_PROOF)
             .then(|| self.imm_data())
             .filter(|&id| id != 0)
     }
@@ -201,6 +289,7 @@ impl TaggedValue {
     ///
     /// # Safety
     /// `ptr` must be 8-byte aligned and point to a valid GC-managed object payload.
+    #[inline]
     pub unsafe fn from_heap_ptr(ptr: *const u8) -> Self {
         debug_assert!((ptr as u64) & TAG_MASK == 0, "heap pointer not aligned");
         Self(ptr as u64 | TAG_HEAP)
@@ -208,88 +297,202 @@ impl TaggedValue {
 
     // -- Tag queries ---------------------------------------------------------
 
+    #[inline]
     pub const fn tag(self) -> u64 {
         self.0 & TAG_MASK
     }
 
+    #[inline]
     pub const fn is_heap(self) -> bool {
         self.tag() == TAG_HEAP && self.0 != 0
     }
 
+    #[inline]
     pub const fn is_immediate(self) -> bool {
-        self.tag() == TAG_IMM
+        self.tag() != TAG_HEAP
     }
 
-    fn imm_sub(self) -> u64 {
+    #[inline]
+    const fn imm_sub(self) -> u64 {
         (self.0 & IMM_SUB_MASK) >> IMM_SUB_SHIFT
     }
 
-    fn imm_data(self) -> u64 {
+    #[inline]
+    const fn imm_data(self) -> u64 {
         self.0 >> IMM_DATA_SHIFT
     }
 
-    pub fn is_null(self) -> bool {
-        self.is_immediate() && self.imm_sub() == IMM_NULL
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.has_imm_sub(IMM_NULL)
     }
 
-    pub fn is_unit(self) -> bool {
-        self.is_immediate() && self.imm_sub() == IMM_UNIT
+    #[inline]
+    pub const fn is_unit(self) -> bool {
+        self.has_imm_sub(IMM_UNIT)
     }
 
     // -- Extractors ----------------------------------------------------------
 
+    #[inline]
+    fn sign_extend_57(raw: u64) -> i64 {
+        ((raw << 7) as i64) >> 7
+    }
+
+    #[inline]
     pub fn as_i64(self) -> Option<i64> {
-        if self.is_immediate() && self.imm_sub() == IMM_I_SMALL {
-            let raw = self.imm_data();
-            // sign-extend from 57 bits
-            let val = if raw & (1 << 56) != 0 {
-                (raw | !((1u64 << 57) - 1)) as i64
-            } else {
-                raw as i64
-            };
-            Some(val)
+        if self.has_imm_sub(IMM_I_SMALL) {
+            Some(Self::sign_extend_57(self.imm_data()))
         } else {
             None
         }
     }
 
+    #[inline]
     pub fn as_u64(self) -> Option<u64> {
-        if self.is_immediate() && self.imm_sub() == IMM_U_SMALL {
+        if self.has_imm_sub(IMM_U_SMALL) {
             Some(self.imm_data())
         } else {
             None
         }
     }
 
-    pub fn as_f64(self) -> Option<f64> {
-        if self.is_immediate() && self.imm_sub() == IMM_F64 {
-            let bits = self.imm_data() << 7;
-            Some(f64::from_bits(bits))
+    #[inline]
+    pub fn as_usize_imm(self) -> Option<u64> {
+        if self.has_imm_sub(IMM_USIZE) {
+            Some(self.imm_data())
         } else {
             None
         }
     }
 
+    #[inline]
+    pub fn as_isize_imm(self) -> Option<i64> {
+        if self.has_imm_sub(IMM_ISIZE) {
+            Some(Self::sign_extend_57(self.imm_data()))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn as_f64(self) -> Option<f64> {
+        if (self.0 & ROT_F64_TAG_MASK) != 0 {
+            Some(f64::from_bits(self.0.rotate_right(4)))
+        } else if self.has_imm_sub(IMM_F64) {
+            Some(f64::from_bits(self.0 & !IMM_LOW7_MASK))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     pub fn as_bool(self) -> Option<bool> {
-        if self.is_immediate() && self.imm_sub() == IMM_BOOL {
+        if self.has_imm_sub(IMM_BOOL) {
             Some(self.imm_data() != 0)
         } else {
             None
         }
     }
 
+    #[inline]
     pub fn as_char(self) -> Option<char> {
-        if self.is_immediate() && self.imm_sub() == IMM_CHAR {
+        if self.has_imm_sub(IMM_CHAR) {
             char::from_u32(self.imm_data() as u32)
         } else {
             None
         }
     }
 
+    /// Decode an `IMM_NARROW` scalar into `(Intrinsic, Number)`, validating exact domain bounds.
+    #[inline]
+    pub fn as_narrow_scalar(self) -> Option<(type_pool::Intrinsic, Number)> {
+        use type_pool::Intrinsic;
+        if !self.has_imm_sub(IMM_NARROW) {
+            return None;
+        }
+        let data = self.imm_data();
+        if (data >> 36) != 0 {
+            return None;
+        }
+        let kind = (data >> 32) & 0xF;
+        let raw32 = (data & 0xFFFF_FFFF) as u32;
+        match kind {
+            NARROW_U8 if raw32 <= u8::MAX as u32 => {
+                Some((Intrinsic::U8, Number::U64(raw32 as u64)))
+            }
+            NARROW_U16 if raw32 <= u16::MAX as u32 => {
+                Some((Intrinsic::U16, Number::U64(raw32 as u64)))
+            }
+            NARROW_U32 => Some((Intrinsic::U32, Number::U64(raw32 as u64))),
+            NARROW_I8 => {
+                let s = raw32 as i32;
+                (s >= i8::MIN as i32 && s <= i8::MAX as i32)
+                    .then_some((Intrinsic::I8, Number::I64(s as i64)))
+            }
+            NARROW_I16 => {
+                let s = raw32 as i32;
+                (s >= i16::MIN as i32 && s <= i16::MAX as i32)
+                    .then_some((Intrinsic::I16, Number::I64(s as i64)))
+            }
+            NARROW_I32 => Some((Intrinsic::I32, Number::I64((raw32 as i32) as i64))),
+            NARROW_F32 => Some((
+                Intrinsic::F32,
+                Number::F64(f64::from(f32::from_bits(raw32))),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Decode any inline immediate number (`f64`, `i64`, `u64`, `usize`, `isize`, `i8..u32`, `f32`)
+    /// in a single tag dispatch without dereferencing heap pointers.
+    #[inline]
+    pub fn as_inline_number(self) -> Option<Number> {
+        if (self.0 & ROT_F64_TAG_MASK) != 0 {
+            return Some(Number::F64(f64::from_bits(self.0.rotate_right(4))));
+        }
+        if self.tag() != TAG_IMM {
+            return None;
+        }
+        match self.imm_sub() {
+            IMM_I_SMALL | IMM_ISIZE => Some(Number::I64(Self::sign_extend_57(self.imm_data()))),
+            IMM_U_SMALL | IMM_USIZE => Some(Number::U64(self.imm_data())),
+            IMM_F64 => Some(Number::F64(f64::from_bits(self.0 & !IMM_LOW7_MASK))),
+            IMM_NARROW => self.as_narrow_scalar().map(|(_, n)| n),
+            _ => None,
+        }
+    }
+
+    /// Return the exact runtime [`type_pool::Intrinsic`] for any inline scalar immediate
+    /// (`i64`, `u64`, `usize`, `isize`, `i8..u32`, `f32`, `f64`, `bool`, `char`, `Unit`).
+    #[inline]
+    pub fn fast_scalar_intrinsic(self) -> Option<type_pool::Intrinsic> {
+        use type_pool::Intrinsic;
+        if (self.0 & ROT_F64_TAG_MASK) != 0 {
+            return Some(Intrinsic::F64);
+        }
+        if self.tag() != TAG_IMM {
+            return None;
+        }
+        match self.imm_sub() {
+            IMM_I_SMALL => Some(Intrinsic::I64),
+            IMM_U_SMALL => Some(Intrinsic::U64),
+            IMM_F64 => Some(Intrinsic::F64),
+            IMM_BOOL => Some(Intrinsic::Bool),
+            IMM_UNIT => Some(Intrinsic::Unit),
+            IMM_CHAR => self.as_char().map(|_| Intrinsic::Char),
+            IMM_USIZE => Some(Intrinsic::Usize),
+            IMM_ISIZE => Some(Intrinsic::Isize),
+            IMM_NARROW => self.as_narrow_scalar().map(|(k, _)| k),
+            _ => None,
+        }
+    }
+
     /// Decode a type value, rejecting malformed raw payloads and INVALID.
     /// This validates the representation; the VM validates pool membership.
+    #[inline]
     pub fn as_type(self) -> Option<TypeIndex> {
-        if !self.is_immediate() || self.imm_sub() != IMM_TYPE {
+        if !self.has_imm_sub(IMM_TYPE) {
             return None;
         }
         let raw = u32::try_from(self.imm_data()).ok()?;
@@ -298,6 +501,7 @@ impl TaggedValue {
     }
 
     /// Get the raw heap pointer (payload pointer, after ObjectHeader).
+    #[inline]
     pub fn as_heap_ptr(self) -> Option<*const u8> {
         if self.is_heap() {
             Some((self.0 & !TAG_MASK) as *const u8)
@@ -326,12 +530,20 @@ impl std::fmt::Debug for TaggedValue {
             write!(f, "{v}i")
         } else if let Some(v) = self.as_u64() {
             write!(f, "{v}u")
+        } else if let Some(v) = self.as_f64() {
+            write!(f, "{v}f")
         } else if let Some(v) = self.as_bool() {
             write!(f, "{v}")
         } else if let Some(v) = self.as_char() {
             write!(f, "'{v}'")
         } else if let Some(ty) = self.as_type() {
             write!(f, "Type({ty:?})")
+        } else if let Some((k, n)) = self.as_narrow_scalar() {
+            write!(f, "{n}({k:?})")
+        } else if let Some(v) = self.as_usize_imm() {
+            write!(f, "{v}usize")
+        } else if let Some(v) = self.as_isize_imm() {
+            write!(f, "{v}isize")
         } else if self.is_heap() {
             write!(f, "HeapObj({:#x})", self.0 & !TAG_MASK)
         } else {
@@ -387,20 +599,23 @@ pub enum UnwindEntry {
     HandlerScope(u64),
 }
 
-/// Inline fixed-capacity buffer for callee-saved registers (`Reg::CALLEE_SAVED`),
-/// avoiding a heap allocation on every function call frame push/pop.
-#[derive(Clone, Copy)]
-pub struct SavedRegs {
+#[derive(Clone)]
+struct SavedRegsBuf {
     entries: [(Reg, TaggedValue); Reg::CALLEE_SAVED.len()],
     len: u8,
 }
 
+/// Compact lazy-allocated buffer for callee-saved registers (`Reg::CALLEE_SAVED`).
+/// Occupies a single 8-byte null pointer (`None`) with zero heap allocation and zero
+/// copy overhead when no callee-saved registers are spilled (100% of compiled functions).
+#[derive(Clone, Default)]
+pub struct SavedRegs {
+    inner: Option<Box<SavedRegsBuf>>,
+}
+
 impl SavedRegs {
     pub const fn new() -> Self {
-        Self {
-            entries: [(Reg(0), TaggedValue::UNIT); Reg::CALLEE_SAVED.len()],
-            len: 0,
-        }
+        Self { inner: None }
     }
 
     pub fn from_slice(items: &[(Reg, TaggedValue)]) -> Self {
@@ -412,27 +627,38 @@ impl SavedRegs {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    #[inline]
     pub fn push(&mut self, reg: Reg, val: TaggedValue) {
-        let idx = self.len as usize;
-        assert!(idx < self.entries.len(), "SavedRegs capacity exceeded");
-        self.entries[idx] = (reg, val);
-        self.len += 1;
+        let buf = self.inner.get_or_insert_with(|| {
+            Box::new(SavedRegsBuf {
+                entries: [(Reg(0), TaggedValue::UNIT); Reg::CALLEE_SAVED.len()],
+                len: 0,
+            })
+        });
+        let idx = buf.len as usize;
+        assert!(idx < buf.entries.len(), "SavedRegs capacity exceeded");
+        buf.entries[idx] = (reg, val);
+        buf.len += 1;
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[(Reg, TaggedValue)] {
-        &self.entries[..self.len as usize]
+        match &self.inner {
+            Some(buf) => &buf.entries[..buf.len as usize],
+            None => &[],
+        }
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [(Reg, TaggedValue)] {
-        &mut self.entries[..self.len as usize]
-    }
-}
-
-impl Default for SavedRegs {
-    fn default() -> Self {
-        Self::new()
+        match &mut self.inner {
+            Some(buf) => &mut buf.entries[..buf.len as usize],
+            None => &mut [],
+        }
     }
 }
 
@@ -717,10 +943,53 @@ impl EffectHandler {
 // BytecodeStore — holds all compiled function bytecode
 // ---------------------------------------------------------------------------
 
+/// Precomputed per-function execution metadata derived once at `add_function` time.
+pub struct FunctionExecMeta {
+    pub decoded: Box<[Option<nsbc::Instruction>]>,
+    pub clobbers_callee_saved: bool,
+}
+
+impl FunctionExecMeta {
+    fn from_code(code: &FunctionCode) -> Self {
+        let mut decoded = Vec::with_capacity(code.instructions.len());
+        let mut clobbers_callee_saved = false;
+        for &word in &code.instructions {
+            let instr = nsbc::Instruction::decode(word);
+            if let Some(ref ins) = instr {
+                let check_reg = |r: Reg| (19..=28).contains(&r.0);
+                match ins.data {
+                    nsbc::InstructionData::R { dst, src1, .. }
+                        if check_reg(dst)
+                            || (ins.opcode == nsbc::Opcode::Swap && check_reg(src1)) =>
+                    {
+                        clobbers_callee_saved = true;
+                    }
+                    nsbc::InstructionData::A { dst, .. }
+                        if ins.opcode != nsbc::Opcode::StoreSlot
+                            && ins.opcode != nsbc::Opcode::StoreField
+                            && ins.opcode != nsbc::Opcode::StoreGlobal
+                            && ins.opcode != nsbc::Opcode::StoreGlobalWide
+                            && check_reg(dst) =>
+                    {
+                        clobbers_callee_saved = true;
+                    }
+                    _ => {}
+                }
+            }
+            decoded.push(instr);
+        }
+        Self {
+            decoded: decoded.into_boxed_slice(),
+            clobbers_callee_saved,
+        }
+    }
+}
+
 /// Stores compiled bytecode for all functions in the program.
 pub struct BytecodeStore {
     /// Per-function instruction sequences, indexed by FuncId.
     functions: Vec<FunctionCode>,
+    meta: Vec<FunctionExecMeta>,
 }
 
 pub struct FunctionCode {
@@ -739,20 +1008,30 @@ impl BytecodeStore {
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
+            meta: Vec::new(),
         }
     }
 
     pub fn add_function(&mut self, code: FunctionCode) -> FuncId {
         let id = FuncId(self.functions.len() as u32);
         debug_assert_eq!(code.func_id, id);
+        let exec_meta = FunctionExecMeta::from_code(&code);
         self.functions.push(code);
+        self.meta.push(exec_meta);
         id
     }
 
+    #[inline]
     pub fn get_function(&self, id: FuncId) -> &FunctionCode {
         &self.functions[id.0 as usize]
     }
 
+    #[inline]
+    pub fn get_meta(&self, id: FuncId) -> &FunctionExecMeta {
+        &self.meta[id.0 as usize]
+    }
+
+    #[inline]
     pub fn try_get_function(&self, id: FuncId) -> Option<&FunctionCode> {
         self.functions.get(id.0 as usize)
     }

@@ -3,12 +3,14 @@
 
 use std::collections::HashSet;
 
+use type_pool::{Intrinsic, TypeIndex, TypePool};
+
 use crate::opt::purity::is_removable_when_unused;
 use crate::opt::{for_each_stmt_value_mut, for_each_terminator_value_mut, terminator_successors};
 use crate::{NirFunction, NirLocal, NirStmt, NirValue};
 
 /// Eliminate dead pure/unused-allocation assignments to a fixed point.
-pub(crate) fn eliminate_dead_code(func: &mut NirFunction) {
+pub(crate) fn eliminate_dead_code(func: &mut NirFunction, type_pool: &TypePool) {
     if func.blocks.is_empty() || func.local_count == 0 {
         return;
     }
@@ -30,7 +32,7 @@ pub(crate) fn eliminate_dead_code(func: &mut NirFunction) {
                     continue;
                 }
                 if let NirStmt::Assign(dst, expr) = stmt.unscoped() {
-                    if !live.contains(&dst.0) && is_removable_when_unused(expr) {
+                    if !live.contains(&dst.0) && is_removable_when_unused(expr, type_pool) {
                         keep[s_idx] = false;
                         removed_any = true;
                         continue;
@@ -54,12 +56,12 @@ pub(crate) fn eliminate_dead_code(func: &mut NirFunction) {
 
 /// Eliminate dead assignments and compact `NirLocal` frame slots via live-range
 /// interference graph coloring (keeping parameter slots pinned in `0..param_ceiling`).
-pub(crate) fn eliminate_dead_code_and_compact_slots(func: &mut NirFunction) {
-    eliminate_dead_code(func);
-    compact_local_slots(func);
+pub(crate) fn eliminate_dead_code_and_compact_slots(func: &mut NirFunction, type_pool: &TypePool) {
+    eliminate_dead_code(func, type_pool);
+    compact_local_slots(func, type_pool);
 }
 
-fn compact_local_slots(func: &mut NirFunction) {
+fn compact_local_slots(func: &mut NirFunction, type_pool: &TypePool) {
     let total = func.local_count as usize;
     let param_ceiling = func.params.iter().map(|p| p.local.0 + 1).max().unwrap_or(0) as usize;
     if total <= param_ceiling {
@@ -104,6 +106,123 @@ fn compact_local_slots(func: &mut NirFunction) {
     if active_temps.is_empty() {
         func.local_count = param_ceiling as u32;
         return;
+    }
+
+    // Partition temporaries by scalar representation class so Tier-2 loop specialization
+    // never sees a single slot shared between incompatible scalar types (e.g. `bool` and `f64`).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SlotClass {
+        Unknown,
+        I64,
+        U64,
+        F64,
+        Bool,
+        Other,
+        Mixed,
+    }
+    let classify_type = |ty: TypeIndex| -> SlotClass {
+        let canon = type_pool.canonical_type(ty).unwrap_or(ty);
+        match Intrinsic::from_type_index(canon) {
+            Some(Intrinsic::I64 | Intrinsic::Isize) => SlotClass::I64,
+            Some(Intrinsic::U64 | Intrinsic::Usize) => SlotClass::U64,
+            Some(Intrinsic::F64) => SlotClass::F64,
+            Some(Intrinsic::Bool) => SlotClass::Bool,
+            Some(_) | None => SlotClass::Other,
+        }
+    };
+    let mut temp_class = vec![SlotClass::Unknown; total];
+    for p in &func.params {
+        let idx = p.local.0 as usize;
+        if idx < total {
+            temp_class[idx] = classify_type(p.type_index);
+        }
+    }
+    for _pass in 0..2 {
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                let NirStmt::Assign(dst, expr) = stmt.unscoped() else {
+                    continue;
+                };
+                let d = dst.0 as usize;
+                if d >= total {
+                    continue;
+                }
+                let inferred = match expr.unscoped() {
+                    crate::NirExpr::Use(v) => match *v {
+                        NirValue::ConstInt(_) => SlotClass::I64,
+                        NirValue::ConstUInt(_) => SlotClass::U64,
+                        NirValue::ConstFloat(_) => SlotClass::F64,
+                        NirValue::ConstBool(_) => SlotClass::Bool,
+                        NirValue::Local(src) => temp_class
+                            .get(src.0 as usize)
+                            .copied()
+                            .unwrap_or(SlotClass::Other),
+                        _ => SlotClass::Other,
+                    },
+                    crate::NirExpr::BinOp(op, a, b) => match op {
+                        crate::BinOp::Eq
+                        | crate::BinOp::Ne
+                        | crate::BinOp::Lt
+                        | crate::BinOp::Le
+                        | crate::BinOp::Gt
+                        | crate::BinOp::Ge => SlotClass::Bool,
+                        _ => {
+                            let ca = match *a {
+                                NirValue::ConstFloat(_) => SlotClass::F64,
+                                NirValue::ConstInt(_) => SlotClass::I64,
+                                NirValue::ConstUInt(_) => SlotClass::U64,
+                                NirValue::Local(l) => temp_class
+                                    .get(l.0 as usize)
+                                    .copied()
+                                    .unwrap_or(SlotClass::Unknown),
+                                _ => SlotClass::Other,
+                            };
+                            let cb = match *b {
+                                NirValue::ConstFloat(_) => SlotClass::F64,
+                                NirValue::ConstInt(_) => SlotClass::I64,
+                                NirValue::ConstUInt(_) => SlotClass::U64,
+                                NirValue::Local(l) => temp_class
+                                    .get(l.0 as usize)
+                                    .copied()
+                                    .unwrap_or(SlotClass::Unknown),
+                                _ => SlotClass::Other,
+                            };
+                            if ca == SlotClass::F64 || cb == SlotClass::F64 {
+                                SlotClass::F64
+                            } else if ca != SlotClass::Unknown {
+                                ca
+                            } else {
+                                cb
+                            }
+                        }
+                    },
+                    crate::NirExpr::UnaryOp(crate::UnaryOp::Not, _)
+                    | crate::NirExpr::TypeCheck(_, _)
+                    | crate::NirExpr::EnumIs(_, _, _)
+                    | crate::NirExpr::ErrorIsOk(_) => SlotClass::Bool,
+                    crate::NirExpr::UnaryOp(_, a) => match *a {
+                        NirValue::ConstFloat(_) => SlotClass::F64,
+                        NirValue::ConstInt(_) => SlotClass::I64,
+                        NirValue::Local(l) => temp_class
+                            .get(l.0 as usize)
+                            .copied()
+                            .unwrap_or(SlotClass::Unknown),
+                        _ => SlotClass::Other,
+                    },
+                    crate::NirExpr::TypeCast(_, ty) | crate::NirExpr::TypeAssert(_, ty) => {
+                        classify_type(*ty)
+                    }
+                    _ => SlotClass::Other,
+                };
+                if inferred != SlotClass::Unknown {
+                    temp_class[d] = match temp_class[d] {
+                        SlotClass::Unknown => inferred,
+                        prev if prev == inferred => prev,
+                        _ => SlotClass::Mixed,
+                    };
+                }
+            }
+        }
     }
 
     // For very large functions (>1024 temporaries), perform linear dense compaction `O(L)`
@@ -169,6 +288,8 @@ fn compact_local_slots(func: &mut NirFunction) {
     order.sort_by(|&a, &b| adj[b].len().cmp(&adj[a].len()).then_with(|| a.cmp(&b)));
 
     let mut color_of: Vec<Option<u32>> = vec![None; total];
+    let mut color_class: std::collections::HashMap<u32, SlotClass> =
+        std::collections::HashMap::new();
     let mut max_color: Option<u32> = None;
     let mut forbidden = HashSet::new();
     for loc in order {
@@ -178,11 +299,18 @@ fn compact_local_slots(func: &mut NirFunction) {
                 forbidden.insert(c);
             }
         }
+        let my_class = temp_class[loc];
         let mut c = param_ceiling as u32;
-        while forbidden.contains(&c) {
+        while forbidden.contains(&c)
+            || (my_class == SlotClass::Mixed && color_class.contains_key(&c))
+            || color_class
+                .get(&c)
+                .is_some_and(|&cc| cc == SlotClass::Mixed || cc != my_class)
+        {
             c += 1;
         }
         color_of[loc] = Some(c);
+        color_class.insert(c, my_class);
         max_color = Some(max_color.map_or(c, |m| m.max(c)));
     }
 

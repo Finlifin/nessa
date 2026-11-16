@@ -10,16 +10,17 @@
 use std::pin::Pin;
 
 use nsbc::{AddrMode, Instruction, InstructionData, Opcode, Reg};
-use runtime::GP_REGISTER_COUNT;
-use type_pool::{Intrinsic, TypeIndex};
+use runtime::{GP_REGISTER_COUNT, ids};
+use type_pool::{Intrinsic, TypeIndex, TypeKind};
 
 use crate::code_cache::JitError;
 use crate::layout::{
-    GC_META_ORDINARY_1WORD, GC_META_ROLE_AND_WORDS_MASK, GC_META_ROLE_MASK, HDR_GC_META_DISP,
-    HDR_TYPE_INDEX_DISP, IMM_BOOL_MASK_NO_BIT7, IMM_F64_TAG, IMM_I_SMALL_TAG, IMM_LOW7_MASK,
-    INTRINSIC_F64_RAW, TAG_FALSE, TAG_NULL, TAG_TRUE, TAG_UNIT,
+    GC_META_ORDINARY_1WORD, GC_META_ORDINARY_3WORDS, GC_META_ROLE_AND_WORDS_MASK,
+    GC_META_ROLE_MASK, HDR_GC_META_DISP, HDR_TYPE_INDEX_DISP, IMM_BOOL_MASK_NO_BIT7, IMM_F64_TAG,
+    IMM_I_SMALL_TAG, IMM_LOW7_MASK, IMM_U_SMALL_TAG, IMM_USIZE_TAG, INTRINSIC_F64_RAW,
+    ROT_F64_TAG_MASK, TAG_FALSE, TAG_NULL, TAG_TRUE, TAG_UNIT,
 };
-use crate::x86_64::{Assembler, Cond, GpReg, Label};
+use crate::x86_64::{Assembler, Cond, GpReg, Label, XmmReg};
 use crate::{
     CompilationInput, CompileConstant, EmittedCode, FieldStoreFastKind, JitExit, JitExitKind,
     JitRuntimeCtx, MonomorphicIc, TIER2_HOTNESS_THRESHOLD,
@@ -281,6 +282,7 @@ pub(crate) fn emit_baseline_instruction(
             let InstructionData::R { dst, src1, src2 } = instr.data else {
                 unreachable!()
             };
+            let not_small_i64_lbl = asm.new_label();
             let slow_lbl = asm.new_label();
             let done_lbl = asm.new_label();
 
@@ -294,7 +296,7 @@ pub(crate) fn emit_baseline_instruction(
             asm.xor_ri32(GpReg::Rsi, IMM_I_SMALL_TAG as i32);
             asm.or_rr(GpReg::Rdx, GpReg::Rsi);
             asm.test_ri32(GpReg::Rdx, IMM_LOW7_MASK as i32);
-            asm.jcc(Cond::Ne, slow_lbl);
+            asm.jcc(Cond::Ne, not_small_i64_lbl);
 
             match instr.opcode {
                 Opcode::Add => {
@@ -341,6 +343,21 @@ pub(crate) fn emit_baseline_instruction(
             asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rdx);
             asm.jmp(done_lbl);
 
+            asm.bind(not_small_i64_lbl);
+            if matches!(instr.opcode, Opcode::Add | Opcode::Sub | Opcode::Mul) {
+                emit_try_unbox_inline_f64(asm, GpReg::Rax, GpReg::Rdx, XmmReg::Xmm0, slow_lbl);
+                emit_try_unbox_inline_f64(asm, GpReg::Rcx, GpReg::Rdx, XmmReg::Xmm1, slow_lbl);
+                match instr.opcode {
+                    Opcode::Add => asm.addsd(XmmReg::Xmm0, XmmReg::Xmm1),
+                    Opcode::Sub => asm.subsd(XmmReg::Xmm0, XmmReg::Xmm1),
+                    Opcode::Mul => asm.mulsd(XmmReg::Xmm0, XmmReg::Xmm1),
+                    _ => unreachable!(),
+                }
+                emit_box_inline_f64_or_slow(asm, XmmReg::Xmm0, GpReg::Rdx, slow_lbl);
+                asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rdx);
+                asm.jmp(done_lbl);
+            }
+
             asm.bind(slow_lbl);
             emit_numeric_slow_call(asm, input, pc as u32, word, epilogue_lbl);
             asm.bind(done_lbl);
@@ -385,6 +402,7 @@ pub(crate) fn emit_baseline_instruction(
             let InstructionData::R { dst, src1, .. } = instr.data else {
                 unreachable!()
             };
+            let not_small_i64_lbl = asm.new_label();
             let slow_lbl = asm.new_label();
             let done_lbl = asm.new_label();
 
@@ -392,7 +410,7 @@ pub(crate) fn emit_baseline_instruction(
             asm.mov_rr(GpReg::Rcx, GpReg::Rax);
             asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
             asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
-            asm.jcc(Cond::Ne, slow_lbl);
+            asm.jcc(Cond::Ne, not_small_i64_lbl);
 
             if instr.opcode == Opcode::Neg {
                 asm.sub_ri32(GpReg::Rax, 1);
@@ -407,12 +425,72 @@ pub(crate) fn emit_baseline_instruction(
             asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
             asm.jmp(done_lbl);
 
+            asm.bind(not_small_i64_lbl);
+            if instr.opcode == Opcode::Neg {
+                emit_try_unbox_inline_f64(asm, GpReg::Rax, GpReg::Rcx, XmmReg::Xmm0, slow_lbl);
+                asm.movq_rx(GpReg::Rdx, XmmReg::Xmm0);
+                asm.mov_ri64(GpReg::Rcx, 1_u64 << 63);
+                asm.xor_rr(GpReg::Rdx, GpReg::Rcx);
+                asm.movq_xr(XmmReg::Xmm0, GpReg::Rdx);
+                emit_box_inline_f64_or_slow(asm, XmmReg::Xmm0, GpReg::Rdx, slow_lbl);
+                asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rdx);
+                asm.jmp(done_lbl);
+            }
+
             asm.bind(slow_lbl);
             emit_numeric_slow_call(asm, input, pc as u32, word, epilogue_lbl);
             asm.bind(done_lbl);
         }
 
-        Opcode::Div | Opcode::Shl | Opcode::Shr | Opcode::UShr => {
+        Opcode::Div => {
+            let InstructionData::R { dst, src1, src2 } = instr.data else {
+                unreachable!()
+            };
+            let not_small_i64_lbl = asm.new_label();
+            let slow_lbl = asm.new_label();
+            let done_lbl = asm.new_label();
+
+            asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(src1));
+            asm.mov_rm64(GpReg::Rcx, GpReg::R13, reg_disp(src2));
+
+            asm.mov_rr(GpReg::Rdx, GpReg::Rax);
+            asm.xor_ri32(GpReg::Rdx, IMM_I_SMALL_TAG as i32);
+            asm.mov_rr(GpReg::Rsi, GpReg::Rcx);
+            asm.xor_ri32(GpReg::Rsi, IMM_I_SMALL_TAG as i32);
+            asm.or_rr(GpReg::Rdx, GpReg::Rsi);
+            asm.test_ri32(GpReg::Rdx, IMM_LOW7_MASK as i32);
+            asm.jcc(Cond::Ne, not_small_i64_lbl);
+
+            asm.sar_ri8(GpReg::Rax, 7);
+            asm.sar_ri8(GpReg::Rcx, 7);
+            asm.test_rr(GpReg::Rcx, GpReg::Rcx);
+            asm.jcc(Cond::E, slow_lbl);
+            asm.cmp_ri32(GpReg::Rcx, -1);
+            asm.jcc(Cond::E, slow_lbl);
+            asm.cqo();
+            asm.idiv_r(GpReg::Rcx);
+            asm.shl_ri8(GpReg::Rax, 7);
+            asm.or_ri32(GpReg::Rax, 1);
+            asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
+            asm.jmp(done_lbl);
+
+            asm.bind(not_small_i64_lbl);
+            emit_try_unbox_inline_f64(asm, GpReg::Rax, GpReg::Rdx, XmmReg::Xmm0, slow_lbl);
+            emit_try_unbox_inline_f64(asm, GpReg::Rcx, GpReg::Rdx, XmmReg::Xmm1, slow_lbl);
+            asm.xorpd(XmmReg::Xmm2, XmmReg::Xmm2);
+            asm.ucomisd(XmmReg::Xmm1, XmmReg::Xmm2);
+            asm.jcc(Cond::E, slow_lbl);
+            asm.divsd(XmmReg::Xmm0, XmmReg::Xmm1);
+            emit_box_inline_f64_or_slow(asm, XmmReg::Xmm0, GpReg::Rdx, slow_lbl);
+            asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rdx);
+            asm.jmp(done_lbl);
+
+            asm.bind(slow_lbl);
+            emit_numeric_slow_call(asm, input, pc as u32, word, epilogue_lbl);
+            asm.bind(done_lbl);
+        }
+
+        Opcode::Shl | Opcode::Shr | Opcode::UShr => {
             emit_numeric_slow_call(asm, input, pc as u32, word, epilogue_lbl);
         }
 
@@ -426,6 +504,9 @@ pub(crate) fn emit_baseline_instruction(
             let InstructionData::R { dst, src1, src2 } = instr.data else {
                 unreachable!()
             };
+            let check_usize_lbl = asm.new_label();
+            let check_u64_lbl = asm.new_label();
+            let check_f64_lbl = asm.new_label();
             let slow_lbl = asm.new_label();
             let done_lbl = asm.new_label();
 
@@ -438,9 +519,9 @@ pub(crate) fn emit_baseline_instruction(
             asm.xor_ri32(GpReg::Rsi, IMM_I_SMALL_TAG as i32);
             asm.or_rr(GpReg::Rdx, GpReg::Rsi);
             asm.test_ri32(GpReg::Rdx, IMM_LOW7_MASK as i32);
-            asm.jcc(Cond::Ne, slow_lbl);
+            asm.jcc(Cond::Ne, check_usize_lbl);
 
-            let cond = match instr.opcode {
+            let signed_cond = match instr.opcode {
                 Opcode::CmpEq => Cond::E,
                 Opcode::CmpNe => Cond::Ne,
                 Opcode::CmpLt => Cond::L,
@@ -452,7 +533,56 @@ pub(crate) fn emit_baseline_instruction(
             asm.cmp_rr(GpReg::Rax, GpReg::Rcx);
             asm.mov_ri64(GpReg::Rdx, TAG_FALSE);
             asm.mov_ri64(GpReg::Rsi, TAG_TRUE);
-            asm.cmovcc(cond, GpReg::Rdx, GpReg::Rsi);
+            asm.cmovcc(signed_cond, GpReg::Rdx, GpReg::Rsi);
+            asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rdx);
+            asm.jmp(done_lbl);
+
+            // Fast unsigned compare when both are `IMM_USIZE` or both are `IMM_U_SMALL`
+            let unsigned_cond = match instr.opcode {
+                Opcode::CmpEq => Cond::E,
+                Opcode::CmpNe => Cond::Ne,
+                Opcode::CmpLt => Cond::B,
+                Opcode::CmpLe => Cond::Be,
+                Opcode::CmpGt => Cond::A,
+                Opcode::CmpGe => Cond::Ae,
+                _ => unreachable!(),
+            };
+            let do_unsigned_cmp_lbl = asm.new_label();
+            asm.bind(check_usize_lbl);
+            asm.mov_rr(GpReg::Rdx, GpReg::Rax);
+            asm.xor_ri32(GpReg::Rdx, IMM_USIZE_TAG as i32);
+            asm.mov_rr(GpReg::Rsi, GpReg::Rcx);
+            asm.xor_ri32(GpReg::Rsi, IMM_USIZE_TAG as i32);
+            asm.or_rr(GpReg::Rdx, GpReg::Rsi);
+            asm.test_ri32(GpReg::Rdx, IMM_LOW7_MASK as i32);
+            asm.jcc(Cond::E, do_unsigned_cmp_lbl);
+
+            asm.bind(check_u64_lbl);
+            asm.mov_rr(GpReg::Rdx, GpReg::Rax);
+            asm.xor_ri32(GpReg::Rdx, IMM_U_SMALL_TAG as i32);
+            asm.mov_rr(GpReg::Rsi, GpReg::Rcx);
+            asm.xor_ri32(GpReg::Rsi, IMM_U_SMALL_TAG as i32);
+            asm.or_rr(GpReg::Rdx, GpReg::Rsi);
+            asm.test_ri32(GpReg::Rdx, IMM_LOW7_MASK as i32);
+            asm.jcc(Cond::Ne, check_f64_lbl);
+
+            asm.bind(do_unsigned_cmp_lbl);
+            asm.cmp_rr(GpReg::Rax, GpReg::Rcx);
+            asm.mov_ri64(GpReg::Rdx, TAG_FALSE);
+            asm.mov_ri64(GpReg::Rsi, TAG_TRUE);
+            asm.cmovcc(unsigned_cond, GpReg::Rdx, GpReg::Rsi);
+            asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rdx);
+            asm.jmp(done_lbl);
+
+            // Fast inline SSE2 `f64` compare (`ucomisd`, delegating unordered NaN `PF=1` to slow path)
+            asm.bind(check_f64_lbl);
+            emit_try_unbox_inline_f64(asm, GpReg::Rax, GpReg::Rdx, XmmReg::Xmm0, slow_lbl);
+            emit_try_unbox_inline_f64(asm, GpReg::Rcx, GpReg::Rdx, XmmReg::Xmm1, slow_lbl);
+            asm.ucomisd(XmmReg::Xmm0, XmmReg::Xmm1);
+            asm.jcc(Cond::P, slow_lbl);
+            asm.mov_ri64(GpReg::Rdx, TAG_FALSE);
+            asm.mov_ri64(GpReg::Rsi, TAG_TRUE);
+            asm.cmovcc(unsigned_cond, GpReg::Rdx, GpReg::Rsi);
             asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rdx);
             asm.jmp(done_lbl);
 
@@ -495,24 +625,34 @@ pub(crate) fn emit_baseline_instruction(
             let index = ((base.0 as usize) << 12) | (imm12 as usize);
             let byte_off = index.checked_mul(8).and_then(|b| i32::try_from(b).ok());
             if let Some(disp) = byte_off {
-                let slow_lbl = asm.new_label();
-                let done_lbl = asm.new_label();
-                asm.mov_rm64(GpReg::Rcx, GpReg::R12, JitRuntimeCtx::OFF_SLOTS_LEN);
-                asm.mov_ri64(GpReg::Rax, index as u64);
-                asm.cmp_rr(GpReg::Rax, GpReg::Rcx);
-                asm.jcc(Cond::Ae, slow_lbl);
-                if instr.opcode == Opcode::LoadSlot {
-                    asm.mov_rm64(GpReg::Rax, GpReg::R14, disp);
-                    asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
+                if pc > 0 && index < (input.guaranteed_slots as usize) {
+                    if instr.opcode == Opcode::LoadSlot {
+                        asm.mov_rm64(GpReg::Rax, GpReg::R14, disp);
+                        asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
+                    } else {
+                        asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(dst));
+                        asm.mov_mr64(GpReg::R14, disp, GpReg::Rax);
+                    }
                 } else {
-                    asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(dst));
-                    asm.mov_mr64(GpReg::R14, disp, GpReg::Rax);
-                }
-                asm.jmp(done_lbl);
+                    let slow_lbl = asm.new_label();
+                    let done_lbl = asm.new_label();
+                    asm.mov_rm64(GpReg::Rcx, GpReg::R12, JitRuntimeCtx::OFF_SLOTS_LEN);
+                    asm.mov_ri64(GpReg::Rax, index as u64);
+                    asm.cmp_rr(GpReg::Rax, GpReg::Rcx);
+                    asm.jcc(Cond::Ae, slow_lbl);
+                    if instr.opcode == Opcode::LoadSlot {
+                        asm.mov_rm64(GpReg::Rax, GpReg::R14, disp);
+                        asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
+                    } else {
+                        asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(dst));
+                        asm.mov_mr64(GpReg::R14, disp, GpReg::Rax);
+                    }
+                    asm.jmp(done_lbl);
 
-                asm.bind(slow_lbl);
-                emit_step_inline_call(asm, input, pc as u32, word, epilogue_lbl);
-                asm.bind(done_lbl);
+                    asm.bind(slow_lbl);
+                    emit_step_inline_call(asm, input, pc as u32, word, epilogue_lbl);
+                    asm.bind(done_lbl);
+                }
             } else {
                 emit_step_inline_call(asm, input, pc as u32, word, epilogue_lbl);
             }
@@ -522,11 +662,24 @@ pub(crate) fn emit_baseline_instruction(
             let InstructionData::E { payload } = instr.data else {
                 unreachable!()
             };
-            asm.mov_rr(GpReg::Rdi, GpReg::R12);
-            asm.mov_ri64(GpReg::Rsi, payload as u64);
-            asm.mov_ri64(GpReg::Rax, input.helpers.alloc_slots as usize as u64);
-            asm.call_r(GpReg::Rax);
-            emit_after_helper_check(asm, pc as u32, epilogue_lbl);
+            if payload <= (1 << 17) {
+                let done_lbl = asm.new_label();
+                asm.mov_rm64(GpReg::Rcx, GpReg::R12, JitRuntimeCtx::OFF_SLOTS_LEN);
+                asm.cmp_ri32(GpReg::Rcx, payload as i32);
+                asm.jcc(Cond::E, done_lbl);
+                asm.mov_rr(GpReg::Rdi, GpReg::R12);
+                asm.mov_ri64(GpReg::Rsi, payload as u64);
+                asm.mov_ri64(GpReg::Rax, input.helpers.alloc_slots as usize as u64);
+                asm.call_r(GpReg::Rax);
+                emit_after_helper_check(asm, pc as u32, epilogue_lbl);
+                asm.bind(done_lbl);
+            } else {
+                asm.mov_rr(GpReg::Rdi, GpReg::R12);
+                asm.mov_ri64(GpReg::Rsi, payload as u64);
+                asm.mov_ri64(GpReg::Rax, input.helpers.alloc_slots as usize as u64);
+                asm.call_r(GpReg::Rax);
+                emit_after_helper_check(asm, pc as u32, epilogue_lbl);
+            }
         }
 
         // ── Immediate & Constant Loads ───────────────────────────────────
@@ -598,63 +751,179 @@ pub(crate) fn emit_baseline_instruction(
                 unreachable!()
             };
             let has_scope = (input.has_scope)(pc);
-            let fast_intrinsic = if instr.opcode == Opcode::TypeAssert && has_scope {
-                let ty = TypeIndex::from_raw(imm12 as u32);
+            let canon_ty = if has_scope && instr.amode == AddrMode::Imm {
                 input
                     .type_pool
-                    .canonical_type(ty)
-                    .and_then(|c| input.type_pool.as_intrinsic(c))
-                    .filter(|k| matches!(k, Intrinsic::I64 | Intrinsic::F64 | Intrinsic::Bool))
+                    .canonical_type(TypeIndex::from_raw(imm12 as u32))
             } else {
                 None
             };
 
-            if let Some(kind) = fast_intrinsic {
-                let slow_lbl = asm.new_label();
-                let ok_lbl = asm.new_label();
-                let done_lbl = asm.new_label();
-                asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(src));
-                match kind {
-                    Intrinsic::I64 => {
-                        asm.mov_rr(GpReg::Rcx, GpReg::Rax);
-                        asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
-                        asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
-                        asm.jcc(Cond::Ne, slow_lbl);
+            if instr.opcode == Opcode::TypeAssert
+                && let Some(ct) = canon_ty
+                && let Some(fast_assert) = classify_fast_type_assert(input.type_pool, ct)
+            {
+                if matches!(fast_assert, FastTypeAssert::Any) {
+                    if dst != src {
+                        asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(src));
+                        asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
                     }
-                    Intrinsic::Bool => {
-                        asm.mov_rr(GpReg::Rcx, GpReg::Rax);
-                        asm.and_ri32(GpReg::Rcx, IMM_BOOL_MASK_NO_BIT7);
-                        asm.cmp_ri32(GpReg::Rcx, TAG_FALSE as i32);
-                        asm.jcc(Cond::Ne, slow_lbl);
+                } else {
+                    let slow_lbl = asm.new_label();
+                    let ok_lbl = asm.new_label();
+                    let done_lbl = asm.new_label();
+                    asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(src));
+                    match fast_assert {
+                        FastTypeAssert::Any => unreachable!(),
+                        FastTypeAssert::Unit => {
+                            asm.cmp_ri32(GpReg::Rax, TAG_UNIT as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
+                        FastTypeAssert::I64 => {
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
+                        FastTypeAssert::Usize => {
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_USIZE_TAG as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
+                        FastTypeAssert::U64 => {
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_U_SMALL_TAG as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
+                        FastTypeAssert::Bool => {
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_BOOL_MASK_NO_BIT7);
+                            asm.cmp_ri32(GpReg::Rcx, TAG_FALSE as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
+                        FastTypeAssert::F64 => {
+                            asm.test_ri32(GpReg::Rax, ROT_F64_TAG_MASK as i32);
+                            asm.jcc(Cond::Ne, ok_lbl);
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_F64_TAG as i32);
+                            asm.jcc(Cond::E, ok_lbl);
+                            asm.test_rr(GpReg::Rax, GpReg::Rax);
+                            asm.jcc(Cond::E, slow_lbl);
+                            asm.test_ri32(GpReg::Rax, 0b111);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                            asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_TYPE_INDEX_DISP);
+                            asm.cmp_ri32(GpReg::Rcx, INTRINSIC_F64_RAW as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                            asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_GC_META_DISP);
+                            asm.and_ri32(GpReg::Rcx, GC_META_ROLE_AND_WORDS_MASK);
+                            asm.cmp_ri32(GpReg::Rcx, GC_META_ORDINARY_1WORD);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
+                        FastTypeAssert::Struct {
+                            raw_ty,
+                            expected_gc_meta,
+                            nullable,
+                        } => {
+                            if nullable {
+                                asm.cmp_ri32(GpReg::Rax, TAG_NULL as i32);
+                                asm.jcc(Cond::E, ok_lbl);
+                            }
+                            asm.test_rr(GpReg::Rax, GpReg::Rax);
+                            asm.jcc(Cond::E, slow_lbl);
+                            asm.test_ri32(GpReg::Rax, 0b111);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                            asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_TYPE_INDEX_DISP);
+                            asm.cmp_ri32(GpReg::Rcx, raw_ty as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                            asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_GC_META_DISP);
+                            asm.and_ri32(GpReg::Rcx, GC_META_ROLE_AND_WORDS_MASK);
+                            asm.cmp_ri32(GpReg::Rcx, expected_gc_meta);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
                     }
-                    Intrinsic::F64 => {
-                        asm.mov_rr(GpReg::Rcx, GpReg::Rax);
-                        asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
-                        asm.cmp_ri32(GpReg::Rcx, IMM_F64_TAG as i32);
-                        asm.jcc(Cond::E, ok_lbl);
-                        asm.test_rr(GpReg::Rax, GpReg::Rax);
-                        asm.jcc(Cond::E, slow_lbl);
-                        asm.test_ri32(GpReg::Rax, 0b111);
-                        asm.jcc(Cond::Ne, slow_lbl);
-                        asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_TYPE_INDEX_DISP);
-                        asm.cmp_ri32(GpReg::Rcx, INTRINSIC_F64_RAW as i32);
-                        asm.jcc(Cond::Ne, slow_lbl);
-                        asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_GC_META_DISP);
-                        asm.and_ri32(GpReg::Rcx, GC_META_ROLE_AND_WORDS_MASK);
-                        asm.cmp_ri32(GpReg::Rcx, GC_META_ORDINARY_1WORD);
-                        asm.jcc(Cond::Ne, slow_lbl);
+                    asm.bind(ok_lbl);
+                    if dst != src {
+                        asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
                     }
-                    _ => unreachable!(),
-                }
-                asm.bind(ok_lbl);
-                if dst != src {
-                    asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
-                }
-                asm.jmp(done_lbl);
+                    asm.jmp(done_lbl);
 
-                asm.bind(slow_lbl);
-                emit_type_op_call(asm, input, pc as u32, word, epilogue_lbl);
-                asm.bind(done_lbl);
+                    asm.bind(slow_lbl);
+                    emit_type_op_call(asm, input, pc as u32, word, epilogue_lbl);
+                    asm.bind(done_lbl);
+                }
+            } else if instr.opcode == Opcode::TypeCast
+                && let Some(ct) = canon_ty
+                && let Some(intr) = input.type_pool.as_intrinsic(ct)
+                && matches!(
+                    intr,
+                    Intrinsic::Any | Intrinsic::Usize | Intrinsic::I64 | Intrinsic::F64
+                )
+            {
+                if intr == Intrinsic::Any {
+                    if dst != src {
+                        asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(src));
+                        asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
+                    }
+                } else {
+                    let slow_lbl = asm.new_label();
+                    let ok_lbl = asm.new_label();
+                    let done_lbl = asm.new_label();
+                    asm.mov_rm64(GpReg::Rax, GpReg::R13, reg_disp(src));
+                    match intr {
+                        Intrinsic::Usize => {
+                            let check_usize_lbl = asm.new_label();
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
+                            asm.jcc(Cond::Ne, check_usize_lbl);
+                            asm.test_rr(GpReg::Rax, GpReg::Rax);
+                            asm.jcc(Cond::S, slow_lbl);
+                            asm.xor_ri32(GpReg::Rax, (IMM_I_SMALL_TAG ^ IMM_USIZE_TAG) as i32);
+                            asm.jmp(ok_lbl);
+                            asm.bind(check_usize_lbl);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_USIZE_TAG as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                        }
+                        Intrinsic::I64 => {
+                            let check_usize_lbl = asm.new_label();
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
+                            asm.jcc(Cond::E, ok_lbl);
+                            asm.bind(check_usize_lbl);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_USIZE_TAG as i32);
+                            asm.jcc(Cond::Ne, slow_lbl);
+                            asm.test_rr(GpReg::Rax, GpReg::Rax);
+                            asm.jcc(Cond::S, slow_lbl);
+                            asm.xor_ri32(GpReg::Rax, (IMM_I_SMALL_TAG ^ IMM_USIZE_TAG) as i32);
+                        }
+                        Intrinsic::F64 => {
+                            let check_f64_lbl = asm.new_label();
+                            asm.mov_rr(GpReg::Rcx, GpReg::Rax);
+                            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                            asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
+                            asm.jcc(Cond::Ne, check_f64_lbl);
+                            asm.sar_ri8(GpReg::Rax, 7);
+                            asm.cvtsi2sd(XmmReg::Xmm0, GpReg::Rax);
+                            emit_box_inline_f64_or_slow(asm, XmmReg::Xmm0, GpReg::Rax, slow_lbl);
+                            asm.jmp(ok_lbl);
+                            asm.bind(check_f64_lbl);
+                            asm.test_ri32(GpReg::Rax, ROT_F64_TAG_MASK as i32);
+                            asm.jcc(Cond::E, slow_lbl);
+                        }
+                        _ => unreachable!(),
+                    }
+                    asm.bind(ok_lbl);
+                    asm.mov_mr64(GpReg::R13, reg_disp(dst), GpReg::Rax);
+                    asm.jmp(done_lbl);
+
+                    asm.bind(slow_lbl);
+                    emit_type_op_call(asm, input, pc as u32, word, epilogue_lbl);
+                    asm.bind(done_lbl);
+                }
             } else {
                 emit_type_op_call(asm, input, pc as u32, word, epilogue_lbl);
             }
@@ -780,6 +1049,8 @@ pub(crate) fn emit_baseline_instruction(
                 asm.bind(check_f64_lbl);
                 asm.cmp_ri32(GpReg::Rdi, FieldStoreFastKind::CanonicalF64 as i32);
                 asm.jcc(Cond::Ne, check_bool_lbl);
+                asm.test_ri32(GpReg::Rsi, crate::layout::ROT_F64_TAG_MASK as i32);
+                asm.jcc(Cond::Ne, store_ok_lbl);
                 asm.mov_rr(GpReg::Rcx, GpReg::Rsi);
                 asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
                 asm.cmp_ri32(GpReg::Rcx, IMM_F64_TAG as i32);
@@ -812,10 +1083,23 @@ pub(crate) fn emit_baseline_instruction(
                 asm.cmp_ri32(GpReg::Rdi, FieldStoreFastKind::Any as i32);
                 asm.jcc(Cond::E, store_ok_lbl);
 
-                // ExactHeapNominal
+                // ExactHeapNominal & OptionalNominal
+                let check_opt_nominal_lbl = asm.new_label();
+                let check_opt_i64_lbl = asm.new_label();
+                let check_usize_lbl = asm.new_label();
+                let check_heap_nominal_body_lbl = asm.new_label();
+
                 asm.bind(check_nominal_lbl);
                 asm.cmp_ri32(GpReg::Rdi, FieldStoreFastKind::ExactHeapNominal as i32);
-                asm.jcc(Cond::Ne, slow_lbl);
+                asm.jcc(Cond::E, check_heap_nominal_body_lbl);
+
+                asm.bind(check_opt_nominal_lbl);
+                asm.cmp_ri32(GpReg::Rdi, FieldStoreFastKind::OptionalNominal as i32);
+                asm.jcc(Cond::Ne, check_opt_i64_lbl);
+                asm.cmp_ri32(GpReg::Rsi, TAG_NULL as i32);
+                asm.jcc(Cond::E, store_ok_lbl);
+
+                asm.bind(check_heap_nominal_body_lbl);
                 asm.test_rr(GpReg::Rsi, GpReg::Rsi);
                 asm.jcc(Cond::E, slow_lbl);
                 asm.test_ri32(GpReg::Rsi, 0b111);
@@ -826,6 +1110,26 @@ pub(crate) fn emit_baseline_instruction(
                 asm.jcc(Cond::Ne, slow_lbl);
                 asm.mov_rm32(GpReg::Rcx, GpReg::Rsi, HDR_GC_META_DISP);
                 asm.test_ri32(GpReg::Rcx, GC_META_ROLE_MASK);
+                asm.jcc(Cond::E, store_ok_lbl);
+                asm.jmp(slow_lbl);
+
+                asm.bind(check_opt_i64_lbl);
+                asm.cmp_ri32(GpReg::Rdi, FieldStoreFastKind::OptionalSmallI64 as i32);
+                asm.jcc(Cond::Ne, check_usize_lbl);
+                asm.cmp_ri32(GpReg::Rsi, TAG_NULL as i32);
+                asm.jcc(Cond::E, store_ok_lbl);
+                asm.mov_rr(GpReg::Rcx, GpReg::Rsi);
+                asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
+                asm.jcc(Cond::E, store_ok_lbl);
+                asm.jmp(slow_lbl);
+
+                asm.bind(check_usize_lbl);
+                asm.cmp_ri32(GpReg::Rdi, FieldStoreFastKind::Usize as i32);
+                asm.jcc(Cond::Ne, slow_lbl);
+                asm.mov_rr(GpReg::Rcx, GpReg::Rsi);
+                asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+                asm.cmp_ri32(GpReg::Rcx, IMM_USIZE_TAG as i32);
                 asm.jcc(Cond::Ne, slow_lbl);
 
                 asm.bind(store_ok_lbl);
@@ -968,18 +1272,61 @@ pub(crate) fn emit_baseline_instruction(
 
         Opcode::Nop => {}
 
-        // ── Calls, builtins, effects, continuations & futures ────────────
-        // Return cleanly to `Vm::execute_task` at `pc` so no native C frame sits on the
-        // host stack across call-stack mutation, delimiter boundaries, or continuation capture.
-        Opcode::Call
-        | Opcode::CallFar
+        // ── In-place native function, closure, method & trait calls ──────
+        Opcode::Call => {
+            let InstructionData::C { payload } = instr.data else {
+                unreachable!()
+            };
+            let (arg_count, func_id_raw) = Instruction::c_arg_count_func_id(payload);
+            let callee_id = nsbc::FuncId(func_id_raw);
+            if (arg_count as usize) <= GP_REGISTER_COUNT
+                && let Some((slots, clobbers_cs)) =
+                    (input.fast_direct_callee_slots)(callee_id, arg_count)
+                && slots < (1 << 30)
+            {
+                let packed = (slots << 1) | u32::from(clobbers_cs);
+                asm.mov_rr(GpReg::Rdi, GpReg::R12);
+                asm.mov_ri64(GpReg::Rsi, (pc + 1) as u64);
+                asm.mov_ri64(GpReg::Rdx, func_id_raw as u64);
+                asm.mov_ri64(GpReg::Rcx, packed as u64);
+                asm.mov_ri64(GpReg::Rax, input.helpers.call_direct_fast as usize as u64);
+                asm.call_r(GpReg::Rax);
+                emit_after_helper_check(asm, pc as u32, epilogue_lbl);
+            } else {
+                asm.mov_rr(GpReg::Rdi, GpReg::R12);
+                asm.mov_ri64(GpReg::Rsi, pc as u64);
+                asm.mov_ri64(GpReg::Rdx, word as u64);
+                asm.mov_ri64(GpReg::Rax, input.helpers.call_op as usize as u64);
+                asm.call_r(GpReg::Rax);
+                emit_after_helper_check(asm, pc as u32, epilogue_lbl);
+            }
+        }
+
+        Opcode::CallFar
         | Opcode::CallIndirect
         | Opcode::CallIndirectProof
         | Opcode::CallMethod
         | Opcode::CallMethodFar
-        | Opcode::TraitCall
-        | Opcode::CallBuiltin
-        | Opcode::EffectCallDyn
+        | Opcode::TraitCall => {
+            asm.mov_rr(GpReg::Rdi, GpReg::R12);
+            asm.mov_ri64(GpReg::Rsi, pc as u64);
+            asm.mov_ri64(GpReg::Rdx, word as u64);
+            asm.mov_ri64(GpReg::Rax, input.helpers.call_op as usize as u64);
+            asm.call_r(GpReg::Rax);
+            emit_after_helper_check(asm, pc as u32, epilogue_lbl);
+        }
+
+        // ── Builtin calls (inline List fast paths + in-place helper) ─────
+        Opcode::CallBuiltin => {
+            let InstructionData::C { payload } = instr.data else {
+                unreachable!()
+            };
+            let (arg_count, builtin_id) = Instruction::c_arg_count_func_id(payload);
+            emit_call_builtin(asm, input, pc as u32, builtin_id, arg_count, epilogue_lbl);
+        }
+
+        // ── Effects, continuations & futures (exit cleanly to interpreter) ──
+        Opcode::EffectCallDyn
         | Opcode::PushHandlerClosure
         | Opcode::PushCapturingHandler
         | Opcode::PopHandler
@@ -991,6 +1338,37 @@ pub(crate) fn emit_baseline_instruction(
             emit_exit(asm, JitExitKind::InterpretAt, pc as u32, None, epilogue_lbl);
         }
 
+        // ── Fast pre-resolved struct/tuple/newtype allocation ────────────
+        Opcode::NewObject => {
+            let InstructionData::A { dst, imm12, .. } = instr.data else {
+                unreachable!()
+            };
+            let fast_obj = input
+                .type_pool
+                .canonical_type(TypeIndex::from_raw(imm12 as u32))
+                .filter(|&ct| !input.type_pool.is_reserved_collection_role(ct))
+                .and_then(|ct| {
+                    let words = match &input.type_pool.get(ct).kind {
+                        TypeKind::Struct { fields, .. } => fields.len(),
+                        TypeKind::Tuple { elements } => elements.len(),
+                        TypeKind::Newtype { .. } => 1,
+                        _ => return None,
+                    };
+                    u16::try_from(words).ok().map(|w| (ct.as_u32(), w as u32))
+                });
+            if let Some((canon_raw, words)) = fast_obj {
+                asm.mov_rr(GpReg::Rdi, GpReg::R12);
+                asm.mov_ri64(GpReg::Rsi, dst.0 as u64);
+                asm.mov_ri64(GpReg::Rdx, canon_raw as u64);
+                asm.mov_ri64(GpReg::Rcx, words as u64);
+                asm.mov_ri64(GpReg::Rax, input.helpers.alloc_object_fast as usize as u64);
+                asm.call_r(GpReg::Rax);
+                emit_after_helper_check(asm, pc as u32, epilogue_lbl);
+            } else {
+                emit_step_inline_call(asm, input, pc as u32, word, epilogue_lbl);
+            }
+        }
+
         // ── Single-frame heap / collection / global / enum / error ops ───
         Opcode::LoadIndex
         | Opcode::StoreIndex
@@ -998,7 +1376,6 @@ pub(crate) fn emit_baseline_instruction(
         | Opcode::StoreGlobal
         | Opcode::LoadGlobalWide
         | Opcode::StoreGlobalWide
-        | Opcode::NewObject
         | Opcode::NewList
         | Opcode::NewMap
         | Opcode::NewClosure
@@ -1020,6 +1397,231 @@ pub(crate) fn emit_baseline_instruction(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum FastTypeAssert {
+    Any,
+    Unit,
+    I64,
+    Usize,
+    U64,
+    Bool,
+    F64,
+    Struct {
+        raw_ty: u32,
+        expected_gc_meta: i32,
+        nullable: bool,
+    },
+}
+
+fn classify_fast_type_assert(
+    type_pool: &type_pool::TypePool,
+    canon_ty: TypeIndex,
+) -> Option<FastTypeAssert> {
+    if type_pool.contains_associated_type(canon_ty) {
+        return None;
+    }
+    if let Some(intr) = type_pool.as_intrinsic(canon_ty) {
+        return match intr {
+            Intrinsic::Any => Some(FastTypeAssert::Any),
+            Intrinsic::Unit => Some(FastTypeAssert::Unit),
+            Intrinsic::I64 => Some(FastTypeAssert::I64),
+            Intrinsic::Usize => Some(FastTypeAssert::Usize),
+            Intrinsic::U64 => Some(FastTypeAssert::U64),
+            Intrinsic::Bool => Some(FastTypeAssert::Bool),
+            Intrinsic::F64 => Some(FastTypeAssert::F64),
+            _ => None,
+        };
+    }
+    match &type_pool.get(canon_ty).kind {
+        TypeKind::Struct { fields, .. } => {
+            if type_pool.is_reserved_collection_role(canon_ty) {
+                if type_pool.list_type() == Some(canon_ty) || type_pool.map_type() == Some(canon_ty)
+                {
+                    return Some(FastTypeAssert::Struct {
+                        raw_ty: canon_ty.as_u32(),
+                        expected_gc_meta: GC_META_ORDINARY_3WORDS,
+                        nullable: false,
+                    });
+                }
+                return None;
+            }
+            let words = u16::try_from(fields.len()).ok()?;
+            Some(FastTypeAssert::Struct {
+                raw_ty: canon_ty.as_u32(),
+                expected_gc_meta: (words as i32) << 3,
+                nullable: false,
+            })
+        }
+        TypeKind::Optional { inner } => {
+            let ci = type_pool.canonical_type(*inner)?;
+            if type_pool.contains_associated_type(ci) || type_pool.is_reserved_collection_role(ci) {
+                return None;
+            }
+            if let TypeKind::Struct { fields, .. } = &type_pool.get(ci).kind {
+                let words = u16::try_from(fields.len()).ok()?;
+                Some(FastTypeAssert::Struct {
+                    raw_ty: ci.as_u32(),
+                    expected_gc_meta: (words as i32) << 3,
+                    nullable: true,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn emit_try_unbox_inline_f64(
+    asm: &mut Assembler,
+    gp: GpReg,
+    scratch: GpReg,
+    xmm: XmmReg,
+    fail_lbl: Label,
+) {
+    let try_imm_lbl = asm.new_label();
+    let ok_lbl = asm.new_label();
+    asm.test_ri32(gp, ROT_F64_TAG_MASK as i32);
+    asm.jcc(Cond::E, try_imm_lbl);
+    asm.ror_ri8(gp, 4);
+    asm.movq_xr(xmm, gp);
+    asm.jmp(ok_lbl);
+
+    asm.bind(try_imm_lbl);
+    asm.mov_rr(scratch, gp);
+    asm.and_ri32(scratch, IMM_LOW7_MASK as i32);
+    asm.cmp_ri32(scratch, IMM_F64_TAG as i32);
+    asm.jcc(Cond::Ne, fail_lbl);
+    asm.and_ri32(gp, !(IMM_LOW7_MASK as i32));
+    asm.movq_xr(xmm, gp);
+    asm.bind(ok_lbl);
+}
+
+fn emit_box_inline_f64_or_slow(asm: &mut Assembler, xmm: XmmReg, out_gp: GpReg, slow_lbl: Label) {
+    let ok_lbl = asm.new_label();
+    asm.movq_rx(out_gp, xmm);
+    asm.rol_ri8(out_gp, 4);
+    asm.test_ri32(out_gp, ROT_F64_TAG_MASK as i32);
+    asm.jcc(Cond::Ne, ok_lbl);
+    asm.ror_ri8(out_gp, 4);
+    asm.test_ri32(out_gp, IMM_LOW7_MASK as i32);
+    asm.jcc(Cond::Ne, slow_lbl);
+    asm.or_ri32(out_gp, IMM_F64_TAG as i32);
+    asm.bind(ok_lbl);
+}
+
+fn emit_call_builtin(
+    asm: &mut Assembler,
+    input: &CompilationInput<'_>,
+    pc: u32,
+    builtin_id: u32,
+    arg_count: u8,
+    epilogue_lbl: Label,
+) {
+    let slow_lbl = asm.new_label();
+    let done_lbl = asm.new_label();
+
+    if input.fast_list_builtins
+        && let (Some(list_ty), Some(buf_ty)) = (input.list_type_raw, input.list_buf_type_raw)
+        && matches!(
+            (builtin_id, arg_count),
+            (ids::LIST_LEN, 1) | (ids::LIST_GET, 2) | (ids::LIST_SET, 3)
+        )
+    {
+        // Guard single-worker lock-free mode (`*aux_started_ptr == 0`).
+        asm.mov_rm64(GpReg::Rax, GpReg::R12, JitRuntimeCtx::OFF_AUX_STARTED_PTR);
+        asm.movzx_rm8(GpReg::Rax, GpReg::Rax, 0);
+        asm.test_rr(GpReg::Rax, GpReg::Rax);
+        asm.jcc(Cond::Ne, slow_lbl);
+
+        // Validate `r0` is a 3-word Ordinary `List` wrapper.
+        asm.mov_rm64(GpReg::Rax, GpReg::R13, 0);
+        asm.test_rr(GpReg::Rax, GpReg::Rax);
+        asm.jcc(Cond::E, slow_lbl);
+        asm.test_ri32(GpReg::Rax, 0b111);
+        asm.jcc(Cond::Ne, slow_lbl);
+        asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_TYPE_INDEX_DISP);
+        asm.cmp_ri32(GpReg::Rcx, list_ty as i32);
+        asm.jcc(Cond::Ne, slow_lbl);
+        asm.mov_rm32(GpReg::Rcx, GpReg::Rax, HDR_GC_META_DISP);
+        asm.and_ri32(GpReg::Rcx, GC_META_ROLE_AND_WORDS_MASK);
+        asm.cmp_ri32(GpReg::Rcx, GC_META_ORDINARY_3WORDS);
+        asm.jcc(Cond::Ne, slow_lbl);
+
+        // Read `wrapper[0]` = `length_tagged` (`IMM_U_SMALL_TAG` == `0x09`).
+        asm.mov_rm64(GpReg::Rdx, GpReg::Rax, 0);
+        asm.mov_rr(GpReg::Rcx, GpReg::Rdx);
+        asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+        asm.cmp_ri32(GpReg::Rcx, IMM_U_SMALL_TAG as i32);
+        asm.jcc(Cond::Ne, slow_lbl);
+        asm.shr_ri8(GpReg::Rdx, 7);
+
+        if builtin_id == ids::LIST_LEN {
+            // `length <= 65535 < 2^56`, so `(length << 7) | 0x01` is always valid `IMM_I_SMALL`.
+            asm.shl_ri8(GpReg::Rdx, 7);
+            asm.or_ri32(GpReg::Rdx, IMM_I_SMALL_TAG as i32);
+            asm.mov_mr64(GpReg::R13, 0, GpReg::Rdx);
+            asm.jmp(done_lbl);
+        } else {
+            // Validate `r1` = `index` (`IMM_USIZE` or non-negative `IMM_I_SMALL`) and `index < length`.
+            let idx_ok_lbl = asm.new_label();
+            asm.mov_rm64(GpReg::Rsi, GpReg::R13, 8);
+            asm.test_rr(GpReg::Rsi, GpReg::Rsi);
+            asm.jcc(Cond::S, slow_lbl);
+            asm.mov_rr(GpReg::Rcx, GpReg::Rsi);
+            asm.and_ri32(GpReg::Rcx, IMM_LOW7_MASK as i32);
+            asm.cmp_ri32(GpReg::Rcx, IMM_USIZE_TAG as i32);
+            asm.jcc(Cond::E, idx_ok_lbl);
+            asm.cmp_ri32(GpReg::Rcx, IMM_I_SMALL_TAG as i32);
+            asm.jcc(Cond::Ne, slow_lbl);
+            asm.bind(idx_ok_lbl);
+            asm.shr_ri8(GpReg::Rsi, 7);
+            asm.cmp_rr(GpReg::Rsi, GpReg::Rdx);
+            asm.jcc(Cond::Ae, slow_lbl);
+
+            // Load `wrapper[2]` = `buffer` and check `type_index == buf_ty` & `index < capacity`.
+            asm.mov_rm64(GpReg::Rdi, GpReg::Rax, 16);
+            asm.test_rr(GpReg::Rdi, GpReg::Rdi);
+            asm.jcc(Cond::E, slow_lbl);
+            asm.test_ri32(GpReg::Rdi, 0b111);
+            asm.jcc(Cond::Ne, slow_lbl);
+            asm.mov_rm32(GpReg::Rcx, GpReg::Rdi, HDR_TYPE_INDEX_DISP);
+            asm.cmp_ri32(GpReg::Rcx, buf_ty as i32);
+            asm.jcc(Cond::Ne, slow_lbl);
+            asm.mov_rm32(GpReg::Rcx, GpReg::Rdi, HDR_GC_META_DISP);
+            asm.test_ri32(GpReg::Rcx, GC_META_ROLE_MASK);
+            asm.jcc(Cond::Ne, slow_lbl);
+            asm.shr_ri8(GpReg::Rcx, 3);
+            asm.and_ri32(GpReg::Rcx, 0xFFFF);
+            asm.cmp_rr(GpReg::Rsi, GpReg::Rcx);
+            asm.jcc(Cond::Ae, slow_lbl);
+
+            asm.shl_ri8(GpReg::Rsi, 3);
+            asm.add_rr(GpReg::Rdi, GpReg::Rsi);
+            if builtin_id == ids::LIST_GET {
+                asm.mov_rm64(GpReg::Rax, GpReg::Rdi, 0);
+                asm.mov_mr64(GpReg::R13, 0, GpReg::Rax);
+            } else {
+                asm.mov_rm64(GpReg::Rax, GpReg::R13, 16);
+                asm.mov_mr64(GpReg::Rdi, 0, GpReg::Rax);
+                asm.mov_ri64(GpReg::Rax, TAG_UNIT);
+                asm.mov_mr64(GpReg::R13, 0, GpReg::Rax);
+            }
+            asm.jmp(done_lbl);
+        }
+    }
+
+    asm.bind(slow_lbl);
+    asm.mov_rr(GpReg::Rdi, GpReg::R12);
+    asm.mov_ri64(GpReg::Rsi, pc as u64);
+    asm.mov_ri64(GpReg::Rdx, builtin_id as u64);
+    asm.mov_ri64(GpReg::Rcx, arg_count as u64);
+    asm.mov_ri64(GpReg::Rax, input.helpers.call_builtin as usize as u64);
+    asm.call_r(GpReg::Rax);
+    emit_after_helper_check(asm, pc, epilogue_lbl);
+    asm.bind(done_lbl);
 }
 
 fn emit_numeric_slow_call(

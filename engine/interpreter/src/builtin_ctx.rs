@@ -4,8 +4,9 @@
 //! return in r0) but do not push a call frame.  Implementations go through
 //! this context instead of touching registers directly.
 
-use std::rc::{Rc, Weak};
+use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use gc::ObjectHeader;
 use nsbc::Reg;
@@ -22,6 +23,8 @@ pub type BuiltinFn = fn(&mut BuiltinCtx<'_>) -> Result<(), VmError>;
 #[derive(Default)]
 pub struct BuiltinFnTable {
     entries: Vec<Option<BuiltinFn>>,
+    overridden: Vec<bool>,
+    fast_paths_enabled: bool,
 }
 
 impl BuiltinFnTable {
@@ -33,10 +36,24 @@ impl BuiltinFnTable {
         let idx = id as usize;
         if idx >= self.entries.len() {
             self.entries.resize(idx + 1, None);
+            self.overridden.resize(idx + 1, false);
+        }
+        if self.fast_paths_enabled {
+            self.overridden[idx] = true;
         }
         self.entries[idx] = Some(f);
     }
 
+    pub fn enable_fast_paths(&mut self) {
+        self.fast_paths_enabled = true;
+    }
+
+    #[inline]
+    pub fn can_fast_path(&self, id: BuiltinFnId) -> bool {
+        self.fast_paths_enabled && !self.overridden.get(id as usize).copied().unwrap_or(false)
+    }
+
+    #[inline]
     pub fn get(&self, id: BuiltinFnId) -> Option<BuiltinFn> {
         self.entries.get(id as usize).copied().flatten()
     }
@@ -65,9 +82,11 @@ pub enum BuiltinOutcome {
 /// or collection; handles from other or completed invocations are rejected.
 #[derive(Clone)]
 pub struct BuiltinRoot {
-    context: Weak<()>,
+    context_id: u64,
     index: usize,
 }
+
+static NEXT_BUILTIN_CTX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Host-owned value specification converted into GC-managed values with every
 /// intermediate heap reference rooted across moving Immix allocations.
@@ -139,18 +158,23 @@ pub struct BuiltinCtx<'vm> {
     pub(crate) outcome: BuiltinOutcome,
     root_base: usize,
     pin_base: usize,
-    root_context: Rc<()>,
+    context_id: u64,
+    dirty_roots: Cell<bool>,
 }
 
 impl Drop for BuiltinCtx<'_> {
+    #[inline]
     fn drop(&mut self) {
-        let wr = self.vm.worker_roots();
-        wr.temporary_values.borrow_mut().truncate(self.root_base);
-        wr.native_pins.borrow_mut().truncate(self.pin_base);
+        if self.dirty_roots.get() {
+            let wr = self.vm.worker_roots();
+            wr.temporary_values.borrow_mut().truncate(self.root_base);
+            wr.native_pins.borrow_mut().truncate(self.pin_base);
+        }
     }
 }
 
 impl<'vm> BuiltinCtx<'vm> {
+    #[inline]
     pub(crate) fn new(vm: &'vm mut Vm, task_id: TaskId, arg_count: u8) -> Self {
         let (root_base, pin_base) = {
             let wr = vm.worker_roots();
@@ -166,7 +190,8 @@ impl<'vm> BuiltinCtx<'vm> {
             outcome: BuiltinOutcome::Continue,
             root_base,
             pin_base,
-            root_context: Rc::new(()),
+            context_id: NEXT_BUILTIN_CTX_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            dirty_roots: Cell::new(false),
         }
     }
 
@@ -186,6 +211,7 @@ impl<'vm> BuiltinCtx<'vm> {
 
     fn retain_collection_result(&self, value: TaggedValue) -> TaggedValue {
         if value.is_heap() {
+            self.dirty_roots.set(true);
             let wr = self.vm.worker_roots();
             let mut roots = wr.temporary_values.borrow_mut();
             if !roots.contains(&value) {
@@ -682,11 +708,12 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     fn push_movable_root(&self, value: TaggedValue) -> Result<BuiltinRoot, VmError> {
+        self.dirty_roots.set(true);
         let mut roots = self.vm.worker_roots().temporary_values.borrow_mut();
         let index = roots.len();
         roots.push(value);
         Ok(BuiltinRoot {
-            context: Rc::downgrade(&self.root_context),
+            context_id: self.context_id,
             index,
         })
     }
@@ -694,8 +721,7 @@ impl<'vm> BuiltinCtx<'vm> {
     /// Snapshot a movable root for immediate inspection. Do not reuse the
     /// returned heap address across allocation or collection; reload the handle.
     pub fn load_rooted(&self, root: &BuiltinRoot) -> Result<TaggedValue, VmError> {
-        let owner = root.context.upgrade().ok_or(VmError::TypeError)?;
-        if !Rc::ptr_eq(&owner, &self.root_context) || root.index < self.root_base {
+        if root.context_id != self.context_id || root.index < self.root_base {
             return Err(VmError::TypeError);
         }
         self.vm
@@ -724,44 +750,67 @@ impl<'vm> BuiltinCtx<'vm> {
         self.push_movable_root(elem)
     }
 
+    #[inline]
     pub fn arg_i64(&self, i: u8) -> Result<i64, VmError> {
-        self.arg_number(i)?
+        let v = self.argument_snapshot(i)?;
+        if let Some(n) = v.as_i64() {
+            return Ok(n);
+        }
+        self.number_of(v)?
             .to_i64_checked()
             .ok_or(VmError::NumericOverflow)
     }
 
+    #[inline]
     pub fn arg_u64(&self, i: u8) -> Result<u64, VmError> {
-        self.arg_number(i)?
+        let v = self.argument_snapshot(i)?;
+        if let Some(n) = v.as_u64() {
+            return Ok(n);
+        }
+        if let Some(n) = v.as_usize_imm() {
+            return Ok(n);
+        }
+        self.number_of(v)?
             .to_u64_checked()
             .ok_or(VmError::NumericOverflow)
     }
 
+    #[inline]
     pub fn arg_f64(&self, i: u8) -> Result<f64, VmError> {
-        Ok(self.arg_number(i)?.to_f64())
+        let v = self.argument_snapshot(i)?;
+        if let Some(f) = v.as_f64() {
+            return Ok(f);
+        }
+        Ok(self.number_of(v)?.to_f64())
     }
 
     /// Copy numeric data out of a live argument, retaining no managed pointer.
+    #[inline]
     pub fn arg_number(&self, i: u8) -> Result<Number, VmError> {
-        let value = self.arg(i)?;
+        let value = self.argument_snapshot(i)?;
         self.number_of(value)
     }
 
     /// Read an immediate number. Heap values that are not numbers are `TypeError`.
+    #[inline]
     pub fn number_of(&self, value: TaggedValue) -> Result<Number, VmError> {
         // SAFETY: `value` was copied from a rooted VM slot. Number payloads are
-        // immediates, so this read does not follow a movable heap pointer.
+        // immediates or 1/2-word scalar boxes read synchronously without allocation.
         unsafe { Number::from_tagged(value) }.ok_or(VmError::TypeError)
     }
 
     /// Read an immutable Type descriptor, rejecting foreign or malformed indices.
     pub fn arg_type(&self, i: u8) -> Result<TypeIndex, VmError> {
-        let ty = self.arg(i)?.as_type().ok_or(VmError::TypeError)?;
+        let ty = self
+            .argument_snapshot(i)?
+            .as_type()
+            .ok_or(VmError::TypeError)?;
         self.vm.type_value(ty)?.as_type().ok_or(VmError::TypeError)
     }
 
     /// Inspect the actual dynamic type of a rooted argument.
     pub fn arg_value_type(&self, i: u8) -> Result<TypeIndex, VmError> {
-        self.vm.reflected_type(self.arg(i)?)
+        self.vm.reflected_type(self.argument_snapshot(i)?)
     }
 
     pub fn return_type(&mut self, ty: TypeIndex) -> Result<(), VmError> {
@@ -770,13 +819,63 @@ impl<'vm> BuiltinCtx<'vm> {
         Ok(())
     }
 
+    #[inline]
     pub fn arg_char(&self, i: u8) -> Result<char, VmError> {
-        self.arg(i)?.as_char().ok_or(VmError::TypeError)
+        self.argument_snapshot(i)?
+            .as_char()
+            .ok_or(VmError::TypeError)
     }
 
+    #[inline]
     pub fn arg_bool(&self, i: u8) -> Result<bool, VmError> {
-        let v = self.arg(i)?;
+        let v = self.argument_snapshot(i)?;
         v.as_bool().ok_or(VmError::TypeError)
+    }
+
+    /// Zero-copy borrow of a heap string argument as `&str` for synchronous inspection.
+    #[inline]
+    pub fn with_arg_str<R>(&self, i: u8, f: impl FnOnce(&str) -> R) -> Result<R, VmError> {
+        let v = self.argument_snapshot(i)?;
+        with_heap_string_str(v, f).ok_or(VmError::TypeError)
+    }
+
+    /// Zero-copy borrow of two heap string arguments `(i, j)` as `(&str, &str)`.
+    #[inline]
+    pub fn with_arg_str_pair<R>(
+        &self,
+        i: u8,
+        j: u8,
+        f: impl FnOnce(&str, &str) -> R,
+    ) -> Result<R, VmError> {
+        let va = self.argument_snapshot(i)?;
+        let vb = self.argument_snapshot(j)?;
+        with_heap_string_str(va, |sa| with_heap_string_str(vb, |sb| f(sa, sb)))
+            .flatten()
+            .ok_or(VmError::TypeError)
+    }
+
+    /// Single-allocation concatenation of string arguments `(i, j)`.
+    pub fn return_concat_arg_strings(&mut self, i: u8, j: u8) -> Result<(), VmError> {
+        let va = self.argument_snapshot(i)?;
+        let vb = self.argument_snapshot(j)?;
+        let val = self.vm.alloc_string_concat(self.task_id, va, vb)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    /// Single-allocation byte-subrange slice `[start_byte..end_byte]` of string argument `i`.
+    pub fn return_subrange_arg_string(
+        &mut self,
+        i: u8,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<(), VmError> {
+        let va = self.argument_snapshot(i)?;
+        let val = self
+            .vm
+            .alloc_string_subrange(self.task_id, va, start_byte, end_byte)?;
+        self.write_return(val);
+        Ok(())
     }
 
     /// Read a heap string argument as owned UTF-8.
@@ -2790,7 +2889,12 @@ pub(crate) fn with_heap_string_str<R>(val: TaggedValue, f: impl FnOnce(&str) -> 
     }
     // SAFETY: `len` was bounds-checked against `header.payload_words()`.
     let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
-    let s = std::str::from_utf8(bytes).ok()?;
+    let s = if bytes.is_ascii() {
+        // SAFETY: `bytes.is_ascii()` verifies every byte is `< 0x80`, which is valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    } else {
+        std::str::from_utf8(bytes).ok()?
+    };
     Some(f(s))
 }
 

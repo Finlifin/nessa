@@ -1,0 +1,1659 @@
+{
+  "timestamp": "2026-11-17T00:33:45+0800",
+  "runs": 1,
+  "scenarios": {
+    "01_fib_rec": {
+      "nessa_default": {
+        "kernel_ms": 4986.618,
+        "kernel_min_ms": 4986.618,
+        "wall_ms": 5311.781,
+        "rss_mib": 45.25,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 29878619529.0,
+          "instructions": 107206517066.0,
+          "branches": 19535105892.0,
+          "branch_misses": 22838155.0,
+          "ipc": 3.5880679481174167,
+          "branch_miss_pct": 0.11690827337338705
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 16115.185,
+        "kernel_min_ms": 16115.185,
+        "wall_ms": 16442.377,
+        "rss_mib": 44.93,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 89529565883.0,
+          "instructions": 348852497021.0,
+          "branches": 64848687313.0,
+          "branch_misses": 102268358.0,
+          "ipc": 3.8965060712669066,
+          "branch_miss_pct": 0.15770305034300763
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 11786.562,
+        "kernel_min_ms": 11786.562,
+        "wall_ms": 12330.752,
+        "rss_mib": 49.07,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 68816430938.0,
+          "instructions": 259279129266.0,
+          "branches": 48086401215.0,
+          "branch_misses": 58868286.0,
+          "ipc": 3.767692188215877,
+          "branch_miss_pct": 0.12242189998122945
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 3941.902,
+        "kernel_min_ms": 3941.902,
+        "wall_ms": 4485.549,
+        "rss_mib": 49.15,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 24291162506.0,
+          "instructions": 87569165926.0,
+          "branches": 15827798924.0,
+          "branch_misses": 31946619.0,
+          "ipc": 3.6049804493453173,
+          "branch_miss_pct": 0.20183867102050884
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 3794.55,
+        "kernel_min_ms": 3794.55,
+        "wall_ms": 3813.517,
+        "rss_mib": 23.46,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 21726652159.0,
+          "instructions": 78065768307.0,
+          "branches": 14162866968.0,
+          "branch_misses": 19499397.0,
+          "ipc": 3.5930877769708394,
+          "branch_miss_pct": 0.1376797299872795
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 29.628,
+        "kernel_min_ms": 29.628,
+        "wall_ms": 45.504,
+        "rss_mib": 56.13,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 225998442.0,
+          "instructions": 1041483224.0,
+          "branches": 191744398.0,
+          "branch_misses": 703938.0,
+          "ipc": 4.608364618726,
+          "branch_miss_pct": 0.36712311146633864
+        }
+      },
+      "lua": {
+        "kernel_ms": 174.327,
+        "kernel_min_ms": 174.327,
+        "wall_ms": 175.593,
+        "rss_mib": 17.91,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 988381389.0,
+          "instructions": 4586672537.0,
+          "branches": 655274268.0,
+          "branch_misses": 2921411.0,
+          "ipc": 4.640589744046668,
+          "branch_miss_pct": 0.4458302641604721
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 118.419,
+        "kernel_min_ms": 118.419,
+        "wall_ms": 119.937,
+        "rss_mib": 17.91,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 670829172.0,
+          "instructions": 2243000477.0,
+          "branches": 323097803.0,
+          "branch_misses": 874662.0,
+          "ipc": 3.3436239367956406,
+          "branch_miss_pct": 0.270711218670837
+        }
+      },
+      "luajit": {
+        "kernel_ms": 22.279,
+        "kernel_min_ms": 22.279,
+        "wall_ms": 23.225,
+        "rss_mib": 17.91,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 113013469.0,
+          "instructions": 610093103.0,
+          "branches": 106264146.0,
+          "branch_misses": 138949.0,
+          "ipc": 5.398410546976485,
+          "branch_miss_pct": 0.13075812042944382
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 3316.709,
+        "kernel_min_ms": 3316.709,
+        "wall_ms": 3348.23,
+        "rss_mib": 59.0,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 18309973431.0,
+          "instructions": 66859572232.0,
+          "branches": 12713578279.0,
+          "branch_misses": 135925770.0,
+          "ipc": 3.6515384625737526,
+          "branch_miss_pct": 1.0691385778032225
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 196.744,
+        "kernel_min_ms": 196.744,
+        "wall_ms": 229.025,
+        "rss_mib": 56.69,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 1155446969.0,
+          "instructions": 5576500140.0,
+          "branches": 853939860.0,
+          "branch_misses": 3694510.0,
+          "ipc": 4.8262709493506835,
+          "branch_miss_pct": 0.43264287955828645
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 197.889,
+        "kernel_min_ms": 197.889,
+        "wall_ms": 230.1,
+        "rss_mib": 56.67,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 1210950110.0,
+          "instructions": 6323145717.0,
+          "branches": 1121375407.0,
+          "branch_misses": 1654885.0,
+          "ipc": 5.221640152458469,
+          "branch_miss_pct": 0.14757635932352847
+        }
+      },
+      "cpython": {
+        "kernel_ms": 301.596,
+        "kernel_min_ms": 301.596,
+        "wall_ms": 308.918,
+        "rss_mib": 17.91,
+        "checksum": "5702887",
+        "perf": {
+          "cycles": 1736375675.0,
+          "instructions": 9791658529.0,
+          "branches": 1274302336.0,
+          "branch_misses": 4171805.0,
+          "ipc": 5.63913597154026,
+          "branch_miss_pct": 0.32737953012745635
+        }
+      }
+    },
+    "02_int_sieve_lcg": {
+      "nessa_default": {
+        "kernel_ms": 10043.133,
+        "kernel_min_ms": 10043.133,
+        "wall_ms": 10373.631,
+        "rss_mib": 124.05,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 56760901522.0,
+          "instructions": 186356706140.0,
+          "branches": 32604799264.0,
+          "branch_misses": 48024193.0,
+          "ipc": 3.283187918848855,
+          "branch_miss_pct": 0.14729179165051645
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 18965.951,
+        "kernel_min_ms": 18965.951,
+        "wall_ms": 19301.433,
+        "rss_mib": 125.36,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 108408950261.0,
+          "instructions": 396968863580.0,
+          "branches": 72527079476.0,
+          "branch_misses": 105931716.0,
+          "ipc": 3.6617720457976715,
+          "branch_miss_pct": 0.1460581575397007
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 9609.984,
+        "kernel_min_ms": 9609.984,
+        "wall_ms": 10145.16,
+        "rss_mib": 126.85,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 57568810165.0,
+          "instructions": 216562103704.0,
+          "branches": 39569205614.0,
+          "branch_misses": 21822938.0,
+          "ipc": 3.761795720344119,
+          "branch_miss_pct": 0.05515131694298866
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 5088.2,
+        "kernel_min_ms": 5088.2,
+        "wall_ms": 5627.107,
+        "rss_mib": 127.64,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 31382465201.0,
+          "instructions": 106604146041.0,
+          "branches": 18527159748.0,
+          "branch_misses": 12295779.0,
+          "ipc": 3.3969334581657744,
+          "branch_miss_pct": 0.0663662383616427
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 5103.573,
+        "kernel_min_ms": 5103.573,
+        "wall_ms": 5122.646,
+        "rss_mib": 100.84,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 29104005616.0,
+          "instructions": 96783562908.0,
+          "branches": 16791446685.0,
+          "branch_misses": 7385299.0,
+          "ipc": 3.325437885938044,
+          "branch_miss_pct": 0.04398250572773682
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 40.115,
+        "kernel_min_ms": 40.115,
+        "wall_ms": 60.101,
+        "rss_mib": 57.68,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 285294043.0,
+          "instructions": 433933922.0,
+          "branches": 94034550.0,
+          "branch_misses": 1016661.0,
+          "ipc": 1.5210058977642236,
+          "branch_miss_pct": 1.081156872660102
+        }
+      },
+      "lua": {
+        "kernel_ms": 55.602,
+        "kernel_min_ms": 55.602,
+        "wall_ms": 56.622,
+        "rss_mib": 17.91,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 297412954.0,
+          "instructions": 1700393484.0,
+          "branches": 265108093.0,
+          "branch_misses": 237124.0,
+          "ipc": 5.717281178008138,
+          "branch_miss_pct": 0.08944427056777932
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 59.331,
+        "kernel_min_ms": 59.331,
+        "wall_ms": 60.38,
+        "rss_mib": 17.91,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 318525286.0,
+          "instructions": 1131750034.0,
+          "branches": 179174061.0,
+          "branch_misses": 248869.0,
+          "ipc": 3.55309321973264,
+          "branch_miss_pct": 0.1388978954939242
+        }
+      },
+      "luajit": {
+        "kernel_ms": 18.797,
+        "kernel_min_ms": 18.797,
+        "wall_ms": 19.797,
+        "rss_mib": 17.91,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 93347901.0,
+          "instructions": 168757971.0,
+          "branches": 30675655.0,
+          "branch_misses": 91977.0,
+          "ipc": 1.8078389464804356,
+          "branch_miss_pct": 0.299837118392419
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 611.564,
+        "kernel_min_ms": 611.564,
+        "wall_ms": 641.247,
+        "rss_mib": 61.06,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 3457504303.0,
+          "instructions": 21340960932.0,
+          "branches": 4295687281.0,
+          "branch_misses": 2306607.0,
+          "ipc": 6.172359905230753,
+          "branch_miss_pct": 0.05369587796118718
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 93.12,
+        "kernel_min_ms": 93.12,
+        "wall_ms": 123.934,
+        "rss_mib": 60.07,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 610625728.0,
+          "instructions": 2502683689.0,
+          "branches": 393214160.0,
+          "branch_misses": 2677254.0,
+          "ipc": 4.098555914434054,
+          "branch_miss_pct": 0.6808640868884274
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 98.508,
+        "kernel_min_ms": 98.508,
+        "wall_ms": 128.546,
+        "rss_mib": 60.62,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 632336569.0,
+          "instructions": 2767108881.0,
+          "branches": 544707911.0,
+          "branch_misses": 2654123.0,
+          "ipc": 4.376006412812731,
+          "branch_miss_pct": 0.48725618747255534
+        }
+      },
+      "cpython": {
+        "kernel_ms": 255.718,
+        "kernel_min_ms": 255.718,
+        "wall_ms": 263.491,
+        "rss_mib": 17.91,
+        "checksum": "205320702",
+        "perf": {
+          "cycles": 1375797430.0,
+          "instructions": 6980067526.0,
+          "branches": 1124847833.0,
+          "branch_misses": 610955.0,
+          "ipc": 5.0734703916404325,
+          "branch_miss_pct": 0.054314457660514515
+        }
+      }
+    },
+    "03_float_mandelbrot": {
+      "nessa_default": {
+        "kernel_ms": 369.921,
+        "kernel_min_ms": 369.921,
+        "wall_ms": 693.565,
+        "rss_mib": 113.54,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 3854651616.0,
+          "instructions": 13025137512.0,
+          "branches": 1995347873.0,
+          "branch_misses": 4873619.0,
+          "ipc": 3.3790699678110676,
+          "branch_miss_pct": 0.24424908889057662
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 19819.862,
+        "kernel_min_ms": 19819.862,
+        "wall_ms": 20142.723,
+        "rss_mib": 115.47,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 113621290437.0,
+          "instructions": 411071211569.0,
+          "branches": 75663971717.0,
+          "branch_misses": 192979972.0,
+          "ipc": 3.617906555963014,
+          "branch_miss_pct": 0.25504869440608774
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 12069.037,
+        "kernel_min_ms": 12069.037,
+        "wall_ms": 12608.935,
+        "rss_mib": 118.62,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 69330280751.0,
+          "instructions": 251922590602.0,
+          "branches": 46319137262.0,
+          "branch_misses": 120305094.0,
+          "ipc": 3.633658884301667,
+          "branch_miss_pct": 0.2597308609603524
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 5865.111,
+        "kernel_min_ms": 5865.111,
+        "wall_ms": 6398.568,
+        "rss_mib": 118.69,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 36001728322.0,
+          "instructions": 115371852307.0,
+          "branches": 20120914087.0,
+          "branch_misses": 14072374.0,
+          "ipc": 3.204619824779311,
+          "branch_miss_pct": 0.06993903924619446
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 5978.07,
+        "kernel_min_ms": 5978.07,
+        "wall_ms": 5997.477,
+        "rss_mib": 92.1,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 33749790867.0,
+          "instructions": 105581165026.0,
+          "branches": 18389435691.0,
+          "branch_misses": 4112938.0,
+          "ipc": 3.128350200511481,
+          "branch_miss_pct": 0.022365765155115222
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 12.173,
+        "kernel_min_ms": 12.173,
+        "wall_ms": 28.531,
+        "rss_mib": 56.95,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 137365787.0,
+          "instructions": 274092584.0,
+          "branches": 54236551.0,
+          "branch_misses": 772668.0,
+          "ipc": 1.9953482594614333,
+          "branch_miss_pct": 1.4246259870027502
+        }
+      },
+      "lua": {
+        "kernel_ms": 90.896,
+        "kernel_min_ms": 90.896,
+        "wall_ms": 91.896,
+        "rss_mib": 17.91,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 531471760.0,
+          "instructions": 2977992671.0,
+          "branches": 544302390.0,
+          "branch_misses": 172372.0,
+          "ipc": 5.603294276632873,
+          "branch_miss_pct": 0.03166842607470454
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 71.178,
+        "kernel_min_ms": 71.178,
+        "wall_ms": 72.408,
+        "rss_mib": 17.91,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 394425168.0,
+          "instructions": 1642209088.0,
+          "branches": 258026086.0,
+          "branch_misses": 221884.0,
+          "ipc": 4.16355045578633,
+          "branch_miss_pct": 0.08599285577660547
+        }
+      },
+      "luajit": {
+        "kernel_ms": 11.587,
+        "kernel_min_ms": 11.587,
+        "wall_ms": 12.46,
+        "rss_mib": 17.91,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 64471602.0,
+          "instructions": 136618284.0,
+          "branches": 16320700.0,
+          "branch_misses": 39552.0,
+          "ipc": 2.1190459017909933,
+          "branch_miss_pct": 0.24234254658194807
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 4961.406,
+        "kernel_min_ms": 4961.406,
+        "wall_ms": 4992.547,
+        "rss_mib": 59.34,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 27908075513.0,
+          "instructions": 109864061793.0,
+          "branches": 22367057643.0,
+          "branch_misses": 173866288.0,
+          "ipc": 3.9366405520088144,
+          "branch_miss_pct": 0.7773319619195117
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 1849.261,
+        "kernel_min_ms": 1849.261,
+        "wall_ms": 1880.842,
+        "rss_mib": 59.36,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 10533684593.0,
+          "instructions": 34007418568.0,
+          "branches": 6246399985.0,
+          "branch_misses": 90762123.0,
+          "ipc": 3.2284447353397225,
+          "branch_miss_pct": 1.4530309172956364
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 1765.335,
+        "kernel_min_ms": 1765.335,
+        "wall_ms": 1798.283,
+        "rss_mib": 58.12,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 9842704376.0,
+          "instructions": 31675593849.0,
+          "branches": 6027471802.0,
+          "branch_misses": 87692535.0,
+          "ipc": 3.2181799471938137,
+          "branch_miss_pct": 1.4548808834062463
+        }
+      },
+      "cpython": {
+        "kernel_ms": 514.606,
+        "kernel_min_ms": 514.606,
+        "wall_ms": 523.591,
+        "rss_mib": 17.91,
+        "checksum": "7030556",
+        "perf": {
+          "cycles": 2718546503.0,
+          "instructions": 12019763610.0,
+          "branches": 1865107101.0,
+          "branch_misses": 760293.0,
+          "ipc": 4.421393416200834,
+          "branch_miss_pct": 0.04076403974829969
+        }
+      }
+    },
+    "04_struct_binary_trees": {
+      "nessa_default": {
+        "kernel_ms": 4145.826,
+        "kernel_min_ms": 4145.826,
+        "wall_ms": 4484.137,
+        "rss_mib": 114.63,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 25242758649.0,
+          "instructions": 82482014548.0,
+          "branches": 14652921227.0,
+          "branch_misses": 12997279.0,
+          "ipc": 3.2675515261588712,
+          "branch_miss_pct": 0.0887009409158001
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 8325.605,
+        "kernel_min_ms": 8325.605,
+        "wall_ms": 8658.581,
+        "rss_mib": 114.67,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 48558747061.0,
+          "instructions": 176445686884.0,
+          "branches": 32065254153.0,
+          "branch_misses": 46816325.0,
+          "ipc": 3.633654028641783,
+          "branch_miss_pct": 0.14600328684941954
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 6772.946,
+        "kernel_min_ms": 6772.946,
+        "wall_ms": 7313.468,
+        "rss_mib": 118.6,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 41901483582.0,
+          "instructions": 148229094234.0,
+          "branches": 26495870907.0,
+          "branch_misses": 39454398.0,
+          "ipc": 3.5375619563426657,
+          "branch_miss_pct": 0.1489077227862567
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 3967.558,
+        "kernel_min_ms": 3967.558,
+        "wall_ms": 4500.379,
+        "rss_mib": 118.3,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 25200802216.0,
+          "instructions": 83112721504.0,
+          "branches": 14418747271.0,
+          "branch_misses": 21152449.0,
+          "ipc": 3.2980188801780166,
+          "branch_miss_pct": 0.14670101779606953
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 3932.71,
+        "kernel_min_ms": 3932.71,
+        "wall_ms": 3952.925,
+        "rss_mib": 91.24,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 22504770243.0,
+          "instructions": 73288457134.0,
+          "branches": 12678800643.0,
+          "branch_misses": 8165665.0,
+          "ipc": 3.256574332581601,
+          "branch_miss_pct": 0.06440408071648548
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 20.731,
+        "kernel_min_ms": 20.731,
+        "wall_ms": 37.487,
+        "rss_mib": 66.54,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 185824350.0,
+          "instructions": 580839533.0,
+          "branches": 103715109.0,
+          "branch_misses": 987243.0,
+          "ipc": 3.1257450005879206,
+          "branch_miss_pct": 0.951879634046376
+        }
+      },
+      "lua": {
+        "kernel_ms": 197.774,
+        "kernel_min_ms": 197.774,
+        "wall_ms": 201.792,
+        "rss_mib": 25.25,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 1081465308.0,
+          "instructions": 5811772452.0,
+          "branches": 1084576234.0,
+          "branch_misses": 2561058.0,
+          "ipc": 5.373979552564621,
+          "branch_miss_pct": 0.2361344384759956
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 145.567,
+        "kernel_min_ms": 145.567,
+        "wall_ms": 148.421,
+        "rss_mib": 28.01,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 806022959.0,
+          "instructions": 3047403828.0,
+          "branches": 520514166.0,
+          "branch_misses": 2466443.0,
+          "ipc": 3.7807903533924025,
+          "branch_miss_pct": 0.4738474303118198
+        }
+      },
+      "luajit": {
+        "kernel_ms": 119.051,
+        "kernel_min_ms": 119.051,
+        "wall_ms": 122.877,
+        "rss_mib": 29.14,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 532424103.0,
+          "instructions": 2338433836.0,
+          "branches": 440507667.0,
+          "branch_misses": 1443643.0,
+          "ipc": 4.3920510413105776,
+          "branch_miss_pct": 0.3277225592534352
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 1059.411,
+        "kernel_min_ms": 1059.411,
+        "wall_ms": 1089.955,
+        "rss_mib": 63.66,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 5917427044.0,
+          "instructions": 25565509193.0,
+          "branches": 4945472150.0,
+          "branch_misses": 31603883.0,
+          "ipc": 4.3203759003538975,
+          "branch_miss_pct": 0.6390468299371578
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 185.079,
+        "kernel_min_ms": 185.079,
+        "wall_ms": 215.466,
+        "rss_mib": 63.09,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 1129478834.0,
+          "instructions": 3941952113.0,
+          "branches": 683413428.0,
+          "branch_misses": 7273361.0,
+          "ipc": 3.4900628452148577,
+          "branch_miss_pct": 1.0642695478321798
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 155.522,
+        "kernel_min_ms": 155.522,
+        "wall_ms": 184.998,
+        "rss_mib": 65.88,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 960889607.0,
+          "instructions": 3602418121.0,
+          "branches": 677013023.0,
+          "branch_misses": 5519331.0,
+          "ipc": 3.749044733918118,
+          "branch_miss_pct": 0.8152473900047857
+        }
+      },
+      "cpython": {
+        "kernel_ms": 284.197,
+        "kernel_min_ms": 284.197,
+        "wall_ms": 292.056,
+        "rss_mib": 17.91,
+        "checksum": "-21826",
+        "perf": {
+          "cycles": 1591469869.0,
+          "instructions": 7615397055.0,
+          "branches": 1245518825.0,
+          "branch_misses": 3656774.0,
+          "ipc": 4.785134298386142,
+          "branch_miss_pct": 0.2935944384461632
+        }
+      }
+    },
+    "05_list_quicksort": {
+      "nessa_default": {
+        "kernel_ms": 9165.589,
+        "kernel_min_ms": 9165.589,
+        "wall_ms": 9492.511,
+        "rss_mib": 125.5,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 53738330178.0,
+          "instructions": 172937362175.0,
+          "branches": 30420886971.0,
+          "branch_misses": 49012549.0,
+          "ipc": 3.2181379957689686,
+          "branch_miss_pct": 0.16111479276302262
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 14208.619,
+        "kernel_min_ms": 14208.619,
+        "wall_ms": 14541.104,
+        "rss_mib": 124.59,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 81754651191.0,
+          "instructions": 290378683657.0,
+          "branches": 52942501826.0,
+          "branch_misses": 88958842.0,
+          "ipc": 3.551830745122994,
+          "branch_miss_pct": 0.1680291616976673
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 8349.696,
+        "kernel_min_ms": 8349.696,
+        "wall_ms": 8884.047,
+        "rss_mib": 125.32,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 49823889116.0,
+          "instructions": 177906365030.0,
+          "branches": 32137069979.0,
+          "branch_misses": 38369303.0,
+          "ipc": 3.570704097702978,
+          "branch_miss_pct": 0.11939266095220398
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 5842.168,
+        "kernel_min_ms": 5842.168,
+        "wall_ms": 6384.893,
+        "rss_mib": 124.52,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 34925069115.0,
+          "instructions": 114748884101.0,
+          "branches": 19907723638.0,
+          "branch_misses": 21895495.0,
+          "ipc": 3.285573572471941,
+          "branch_miss_pct": 0.10998492543972094
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 5727.561,
+        "kernel_min_ms": 5727.561,
+        "wall_ms": 5747.752,
+        "rss_mib": 97.19,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 32057280430.0,
+          "instructions": 104924512359.0,
+          "branches": 18169494575.0,
+          "branch_misses": 11459725.0,
+          "ipc": 3.273032239528623,
+          "branch_miss_pct": 0.06307123708200342
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 16.855,
+        "kernel_min_ms": 16.855,
+        "wall_ms": 32.623,
+        "rss_mib": 59.9,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 180272504.0,
+          "instructions": 323526307.0,
+          "branches": 67027830.0,
+          "branch_misses": 2421029.0,
+          "ipc": 1.794651429482557,
+          "branch_miss_pct": 3.611975801693118
+        }
+      },
+      "lua": {
+        "kernel_ms": 37.117,
+        "kernel_min_ms": 37.117,
+        "wall_ms": 37.889,
+        "rss_mib": 17.91,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 208397493.0,
+          "instructions": 851847443.0,
+          "branches": 132140045.0,
+          "branch_misses": 1333058.0,
+          "ipc": 4.087608880208554,
+          "branch_miss_pct": 1.008822117473927
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 45.954,
+        "kernel_min_ms": 45.954,
+        "wall_ms": 46.914,
+        "rss_mib": 17.91,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 257030189.0,
+          "instructions": 510631089.0,
+          "branches": 84838183.0,
+          "branch_misses": 2755066.0,
+          "ipc": 1.9866580302751908,
+          "branch_miss_pct": 3.2474363577541494
+        }
+      },
+      "luajit": {
+        "kernel_ms": 20.388,
+        "kernel_min_ms": 20.388,
+        "wall_ms": 21.373,
+        "rss_mib": 17.91,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 99000287.0,
+          "instructions": 129546770.0,
+          "branches": 33674293.0,
+          "branch_misses": 1260083.0,
+          "ipc": 1.3085494388516268,
+          "branch_miss_pct": 3.741973142539325
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 399.274,
+        "kernel_min_ms": 399.274,
+        "wall_ms": 429.904,
+        "rss_mib": 60.82,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 2367402378.0,
+          "instructions": 11764938950.0,
+          "branches": 2376069992.0,
+          "branch_misses": 9799864.0,
+          "ipc": 4.969556108978446,
+          "branch_miss_pct": 0.4124400389296276
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 45.483,
+        "kernel_min_ms": 45.483,
+        "wall_ms": 76.325,
+        "rss_mib": 61.25,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 347601711.0,
+          "instructions": 1102691234.0,
+          "branches": 178903331.0,
+          "branch_misses": 2324110.0,
+          "ipc": 3.172283677280288,
+          "branch_miss_pct": 1.2990870471830398
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 31.943,
+        "kernel_min_ms": 31.943,
+        "wall_ms": 62.451,
+        "rss_mib": 59.43,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 286288474.0,
+          "instructions": 864836364.0,
+          "branches": 173398639.0,
+          "branch_misses": 2165732.0,
+          "ipc": 3.0208563827826334,
+          "branch_miss_pct": 1.2489901953613374
+        }
+      },
+      "cpython": {
+        "kernel_ms": 90.421,
+        "kernel_min_ms": 90.421,
+        "wall_ms": 97.947,
+        "rss_mib": 17.91,
+        "checksum": "12010927",
+        "perf": {
+          "cycles": 512454869.0,
+          "instructions": 2234642830.0,
+          "branches": 324993169.0,
+          "branch_misses": 1763361.0,
+          "ipc": 4.36066269476698,
+          "branch_miss_pct": 0.5425840196659641
+        }
+      }
+    },
+    "06_map_word_freq": {
+      "nessa_default": {
+        "kernel_ms": 775.162,
+        "kernel_min_ms": 775.162,
+        "wall_ms": 1106.083,
+        "rss_mib": 69.65,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 6148235713.0,
+          "instructions": 19532165444.0,
+          "branches": 3790525119.0,
+          "branch_misses": 8570301.0,
+          "ipc": 3.176873229290908,
+          "branch_miss_pct": 0.22609798724301766
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 1276.439,
+        "kernel_min_ms": 1276.439,
+        "wall_ms": 1604.284,
+        "rss_mib": 69.43,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 9077511545.0,
+          "instructions": 31430559335.0,
+          "branches": 6063352672.0,
+          "branch_misses": 14420198.0,
+          "ipc": 3.4624642644836205,
+          "branch_miss_pct": 0.23782548665841485
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 773.864,
+        "kernel_min_ms": 773.864,
+        "wall_ms": 1304.43,
+        "rss_mib": 62.11,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 7276006184.0,
+          "instructions": 25944461425.0,
+          "branches": 4708541386.0,
+          "branch_misses": 14826931.0,
+          "ipc": 3.5657558238545883,
+          "branch_miss_pct": 0.3148943544190821
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 499.409,
+        "kernel_min_ms": 499.409,
+        "wall_ms": 1032.987,
+        "rss_mib": 62.18,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 5764241726.0,
+          "instructions": 19357067750.0,
+          "branches": 3434779126.0,
+          "branch_misses": 13037977.0,
+          "ipc": 3.3581290775313333,
+          "branch_miss_pct": 0.37958705703395496
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 501.377,
+        "kernel_min_ms": 501.377,
+        "wall_ms": 520.398,
+        "rss_mib": 35.2,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 2935199532.0,
+          "instructions": 9539055409.0,
+          "branches": 1698390367.0,
+          "branch_misses": 2731560.0,
+          "ipc": 3.249883118678557,
+          "branch_miss_pct": 0.16083228291178833
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 2.355,
+        "kernel_min_ms": 2.355,
+        "wall_ms": 17.665,
+        "rss_mib": 56.64,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 80945161.0,
+          "instructions": 181023062.0,
+          "branches": 35985466.0,
+          "branch_misses": 835852.0,
+          "ipc": 2.236366692753876,
+          "branch_miss_pct": 2.322748856441098
+        }
+      },
+      "lua": {
+        "kernel_ms": 2.277,
+        "kernel_min_ms": 2.277,
+        "wall_ms": 2.854,
+        "rss_mib": 17.91,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 13134998.0,
+          "instructions": 54354211.0,
+          "branches": 9562844.0,
+          "branch_misses": 75888.0,
+          "ipc": 4.138120995526608,
+          "branch_miss_pct": 0.7935714521746878
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 1.269,
+        "kernel_min_ms": 1.269,
+        "wall_ms": 2.007,
+        "rss_mib": 17.91,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 8078593.0,
+          "instructions": 29254224.0,
+          "branches": 5430256.0,
+          "branch_misses": 33577.0,
+          "ipc": 3.621202850545881,
+          "branch_miss_pct": 0.6183318060879635
+        }
+      },
+      "luajit": {
+        "kernel_ms": 0.346,
+        "kernel_min_ms": 0.346,
+        "wall_ms": 0.958,
+        "rss_mib": 17.91,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 2593590.0,
+          "instructions": 5834307.0,
+          "branches": 1123516.0,
+          "branch_misses": 27512.0,
+          "ipc": 2.2495101384567335,
+          "branch_miss_pct": 2.4487412729324727
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 51.027,
+        "kernel_min_ms": 51.027,
+        "wall_ms": 79.802,
+        "rss_mib": 57.97,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 388926388.0,
+          "instructions": 1445330215.0,
+          "branches": 291357563.0,
+          "branch_misses": 2504972.0,
+          "ipc": 3.716205070148133,
+          "branch_miss_pct": 0.8597587013727185
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 5.192,
+        "kernel_min_ms": 5.192,
+        "wall_ms": 31.881,
+        "rss_mib": 57.67,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 134271858.0,
+          "instructions": 368181982.0,
+          "branches": 66470673.0,
+          "branch_misses": 841805.0,
+          "ipc": 2.7420636571514487,
+          "branch_miss_pct": 1.2664306859056473
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 2.854,
+        "kernel_min_ms": 2.854,
+        "wall_ms": 31.284,
+        "rss_mib": 57.67,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 119990645.0,
+          "instructions": 294044143.0,
+          "branches": 55259790.0,
+          "branch_misses": 840218.0,
+          "ipc": 2.4505588998208987,
+          "branch_miss_pct": 1.520487139020977
+        }
+      },
+      "cpython": {
+        "kernel_ms": 6.023,
+        "kernel_min_ms": 6.023,
+        "wall_ms": 13.027,
+        "rss_mib": 17.91,
+        "checksum": "3550970",
+        "perf": {
+          "cycles": 59873568.0,
+          "instructions": 205981731.0,
+          "branches": 34711798.0,
+          "branch_misses": 423449.0,
+          "ipc": 3.4402782042319577,
+          "branch_miss_pct": 1.2198993552566768
+        }
+      }
+    },
+    "07_string_processing": {
+      "nessa_default": {
+        "kernel_ms": 240.343,
+        "kernel_min_ms": 240.343,
+        "wall_ms": 567.925,
+        "rss_mib": 61.88,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 3134724237.0,
+          "instructions": 9935780484.0,
+          "branches": 2103960983.0,
+          "branch_misses": 6317060.0,
+          "ipc": 3.169586774723368,
+          "branch_miss_pct": 0.3002460621200598
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 451.759,
+        "kernel_min_ms": 451.759,
+        "wall_ms": 780.524,
+        "rss_mib": 61.37,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 4324809945.0,
+          "instructions": 14916867318.0,
+          "branches": 3054000371.0,
+          "branch_misses": 8846249.0,
+          "ipc": 3.4491382298187903,
+          "branch_miss_pct": 0.28966103226449147
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 259.424,
+        "kernel_min_ms": 259.424,
+        "wall_ms": 793.018,
+        "rss_mib": 65.68,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 4406433495.0,
+          "instructions": 15684756877.0,
+          "branches": 2845505077.0,
+          "branch_misses": 12283147.0,
+          "ipc": 3.5595129019415737,
+          "branch_miss_pct": 0.43166842678594175
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 154.899,
+        "kernel_min_ms": 154.899,
+        "wall_ms": 687.003,
+        "rss_mib": 65.11,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 3799221865.0,
+          "instructions": 13144567245.0,
+          "branches": 2355946985.0,
+          "branch_misses": 11557538.0,
+          "ipc": 3.4598051159089125,
+          "branch_miss_pct": 0.49056867890429207
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 156.82,
+        "kernel_min_ms": 156.82,
+        "wall_ms": 175.423,
+        "rss_mib": 39.14,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 944142469.0,
+          "instructions": 3332235833.0,
+          "branches": 619861075.0,
+          "branch_misses": 1520832.0,
+          "ipc": 3.529378184342643,
+          "branch_miss_pct": 0.24535046018174314
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 10.14,
+        "kernel_min_ms": 10.14,
+        "wall_ms": 29.198,
+        "rss_mib": 59.07,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 100774977.0,
+          "instructions": 243764592.0,
+          "branches": 48452662.0,
+          "branch_misses": 906218.0,
+          "ipc": 2.4189000013366413,
+          "branch_miss_pct": 1.870316227413883
+        }
+      },
+      "lua": {
+        "kernel_ms": 7.208,
+        "kernel_min_ms": 7.208,
+        "wall_ms": 8.034,
+        "rss_mib": 17.91,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 41705515.0,
+          "instructions": 169795004.0,
+          "branches": 30924441.0,
+          "branch_misses": 200377.0,
+          "ipc": 4.071284193469377,
+          "branch_miss_pct": 0.6479567407540204
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 8.413,
+        "kernel_min_ms": 8.413,
+        "wall_ms": 9.131,
+        "rss_mib": 17.91,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 48752206.0,
+          "instructions": 126006994.0,
+          "branches": 21115714.0,
+          "branch_misses": 618492.0,
+          "ipc": 2.584641892922753,
+          "branch_miss_pct": 2.92906031972208
+        }
+      },
+      "luajit": {
+        "kernel_ms": 5.36,
+        "kernel_min_ms": 5.36,
+        "wall_ms": 6.118,
+        "rss_mib": 17.91,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 29018881.0,
+          "instructions": 62377099.0,
+          "branches": 10542626.0,
+          "branch_misses": 449767.0,
+          "ipc": 2.149534952777814,
+          "branch_miss_pct": 4.2661761879820075
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 55.595,
+        "kernel_min_ms": 55.595,
+        "wall_ms": 87.724,
+        "rss_mib": 59.58,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 399643368.0,
+          "instructions": 1177231975.0,
+          "branches": 234306402.0,
+          "branch_misses": 2958591.0,
+          "ipc": 2.945706270296471,
+          "branch_miss_pct": 1.2627017336043596
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 27.115,
+        "kernel_min_ms": 27.115,
+        "wall_ms": 59.363,
+        "rss_mib": 59.43,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 272546632.0,
+          "instructions": 636714152.0,
+          "branches": 121781222.0,
+          "branch_misses": 2127187.0,
+          "ipc": 2.336165915269868,
+          "branch_miss_pct": 1.746728243538236
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 26.968,
+        "kernel_min_ms": 26.968,
+        "wall_ms": 60.657,
+        "rss_mib": 58.35,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 257932237.0,
+          "instructions": 609812935.0,
+          "branches": 117627152.0,
+          "branch_misses": 2132439.0,
+          "ipc": 2.3642369875619695,
+          "branch_miss_pct": 1.8128799037827592
+        }
+      },
+      "cpython": {
+        "kernel_ms": 7.278,
+        "kernel_min_ms": 7.278,
+        "wall_ms": 14.768,
+        "rss_mib": 17.91,
+        "checksum": "1244831831",
+        "perf": {
+          "cycles": 69546298.0,
+          "instructions": 243244812.0,
+          "branches": 47156043.0,
+          "branch_misses": 461765.0,
+          "ipc": 3.4975954004050656,
+          "branch_miss_pct": 0.9792276251847509
+        }
+      }
+    },
+    "08_closure_pipeline": {
+      "nessa_default": {
+        "kernel_ms": 1828.869,
+        "kernel_min_ms": 1828.869,
+        "wall_ms": 2160.921,
+        "rss_mib": 116.21,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 12189855888.0,
+          "instructions": 39433682330.0,
+          "branches": 7240109821.0,
+          "branch_misses": 14397121.0,
+          "ipc": 3.2349588618860956,
+          "branch_miss_pct": 0.19885224611153035
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 3129.209,
+        "kernel_min_ms": 3129.209,
+        "wall_ms": 3454.751,
+        "rss_mib": 116.28,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 19132981043.0,
+          "instructions": 69558096512.0,
+          "branches": 12981022830.0,
+          "branch_misses": 24275171.0,
+          "ipc": 3.635507522621445,
+          "branch_miss_pct": 0.1870050713099316
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 1973.006,
+        "kernel_min_ms": 1973.006,
+        "wall_ms": 2512.803,
+        "rss_mib": 122.16,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 14031551991.0,
+          "instructions": 50762104812.0,
+          "branches": 9218638627.0,
+          "branch_misses": 18996492.0,
+          "ipc": 3.617711344016642,
+          "branch_miss_pct": 0.20606613154747322
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 1221.44,
+        "kernel_min_ms": 1221.44,
+        "wall_ms": 1760.907,
+        "rss_mib": 122.78,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 9729978079.0,
+          "instructions": 32449981666.0,
+          "branches": 5705602774.0,
+          "branch_misses": 13395035.0,
+          "ipc": 3.335051878075254,
+          "branch_miss_pct": 0.23476984870100248
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 1200.723,
+        "kernel_min_ms": 1200.723,
+        "wall_ms": 1219.765,
+        "rss_mib": 95.69,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 6875062307.0,
+          "instructions": 22692732495.0,
+          "branches": 3987724766.0,
+          "branch_misses": 3344023.0,
+          "ipc": 3.300731176195288,
+          "branch_miss_pct": 0.08385791889429513
+        }
+      },
+      "nodejs": {
+        "kernel_ms": 7.701,
+        "kernel_min_ms": 7.701,
+        "wall_ms": 24.213,
+        "rss_mib": 60.21,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 112733708.0,
+          "instructions": 235787486.0,
+          "branches": 47386638.0,
+          "branch_misses": 1073167.0,
+          "ipc": 2.0915437820957687,
+          "branch_miss_pct": 2.2647038179834578
+        }
+      },
+      "lua": {
+        "kernel_ms": 10.615,
+        "kernel_min_ms": 10.615,
+        "wall_ms": 11.37,
+        "rss_mib": 17.91,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 54802153.0,
+          "instructions": 316253319.0,
+          "branches": 46485092.0,
+          "branch_misses": 25386.0,
+          "ipc": 5.770819241353529,
+          "branch_miss_pct": 0.054611056809352986
+        }
+      },
+      "luajit_interp": {
+        "kernel_ms": 9.856,
+        "kernel_min_ms": 9.856,
+        "wall_ms": 10.55,
+        "rss_mib": 17.91,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 49885870.0,
+          "instructions": 168899952.0,
+          "branches": 26604303.0,
+          "branch_misses": 26145.0,
+          "ipc": 3.385727301137577,
+          "branch_miss_pct": 0.09827357627072583
+        }
+      },
+      "luajit": {
+        "kernel_ms": 3.171,
+        "kernel_min_ms": 3.171,
+        "wall_ms": 3.863,
+        "rss_mib": 17.91,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 15166644.0,
+          "instructions": 42682206.0,
+          "branches": 9518586.0,
+          "branch_misses": 36454.0,
+          "ipc": 2.8142155904760475,
+          "branch_miss_pct": 0.38297705142339417
+        }
+      },
+      "elisp_interp": {
+        "kernel_ms": 213.165,
+        "kernel_min_ms": 213.165,
+        "wall_ms": 245.241,
+        "rss_mib": 59.5,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 1250329509.0,
+          "instructions": 4909019177.0,
+          "branches": 951423592.0,
+          "branch_misses": 6585980.0,
+          "ipc": 3.926180372185393,
+          "branch_miss_pct": 0.6922237429655833
+        }
+      },
+      "elisp_byte": {
+        "kernel_ms": 29.689,
+        "kernel_min_ms": 29.689,
+        "wall_ms": 56.992,
+        "rss_mib": 58.67,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 278530785.0,
+          "instructions": 799432805.0,
+          "branches": 140253987.0,
+          "branch_misses": 1841347.0,
+          "ipc": 2.8701775460834607,
+          "branch_miss_pct": 1.3128660649055204
+        }
+      },
+      "elisp_native": {
+        "kernel_ms": 27.104,
+        "kernel_min_ms": 27.104,
+        "wall_ms": 56.329,
+        "rss_mib": 59.43,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 264402052.0,
+          "instructions": 742372771.0,
+          "branches": 134618852.0,
+          "branch_misses": 1642157.0,
+          "ipc": 2.807742093469078,
+          "branch_miss_pct": 1.2198566364241465
+        }
+      },
+      "cpython": {
+        "kernel_ms": 25.434,
+        "kernel_min_ms": 25.434,
+        "wall_ms": 33.509,
+        "rss_mib": 17.91,
+        "checksum": "425345750",
+        "perf": {
+          "cycles": 162075173.0,
+          "instructions": 708913693.0,
+          "branches": 110044006.0,
+          "branch_misses": 448260.0,
+          "ipc": 4.373980788531998,
+          "branch_miss_pct": 0.40734613023811583
+        }
+      }
+    },
+    "09_nessa_effects": {
+      "nessa_default": {
+        "kernel_ms": 121.516,
+        "kernel_min_ms": 121.516,
+        "wall_ms": 492.585,
+        "rss_mib": 103.72,
+        "checksum": "265825003",
+        "perf": {
+          "cycles": 2238099024.0,
+          "instructions": 6581295883.0,
+          "branches": 1470928101.0,
+          "branch_misses": 4614921.0,
+          "ipc": 2.9405740373532283,
+          "branch_miss_pct": 0.3137421194729082
+        }
+      },
+      "nessa_interp_O0": {
+        "kernel_ms": 204.822,
+        "kernel_min_ms": 204.822,
+        "wall_ms": 573.827,
+        "rss_mib": 104.17,
+        "checksum": "265825003",
+        "perf": {
+          "cycles": 2706652213.0,
+          "instructions": 8369613753.0,
+          "branches": 1804929819.0,
+          "branch_misses": 5383285.0,
+          "ipc": 3.0922383425550213,
+          "branch_miss_pct": 0.2982545328539447
+        }
+      },
+      "nessa_interp_O3": {
+        "kernel_ms": 158.17,
+        "kernel_min_ms": 158.17,
+        "wall_ms": 731.8,
+        "rss_mib": 93.53,
+        "checksum": "265825003",
+        "perf": {
+          "cycles": 3629528361.0,
+          "instructions": 12143523412.0,
+          "branches": 2164482904.0,
+          "branch_misses": 10855649.0,
+          "ipc": 3.3457579619667834,
+          "branch_miss_pct": 0.5015354466389447
+        }
+      },
+      "nessa_jit_O3": {
+        "kernel_ms": 100.55,
+        "kernel_min_ms": 100.55,
+        "wall_ms": 674.971,
+        "rss_mib": 94.2,
+        "checksum": "265825003",
+        "perf": {
+          "cycles": 3313531684.0,
+          "instructions": 10954094801.0,
+          "branches": 1943496383.0,
+          "branch_misses": 10508313.0,
+          "ipc": 3.3058669255809052,
+          "branch_miss_pct": 0.5406911529096475
+        }
+      },
+      "nessa_nsbc_jit": {
+        "kernel_ms": 105.126,
+        "kernel_min_ms": 105.126,
+        "wall_ms": 157.217,
+        "rss_mib": 90.07,
+        "checksum": "265825003",
+        "perf": {
+          "cycles": 414619645.0,
+          "instructions": 1172600795.0,
+          "branches": 212880708.0,
+          "branch_misses": 626811.0,
+          "ipc": 2.8281361222042434,
+          "branch_miss_pct": 0.29444236910373295
+        }
+      }
+    }
+  }
+}

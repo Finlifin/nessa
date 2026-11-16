@@ -1,0 +1,57 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+fn run_sieve(limit: i64) -> i64 {
+    let flags = List()
+    flags.resize((limit + 1).as(usize), true)
+    flags.set(0, false)
+    flags.set(1, false)
+    var p: i64 = 2
+    while p * p <= limit {
+        if flags.get(p.as(usize)).as(bool) {
+            var k = p * p
+            while k <= limit {
+                flags.set(k.as(usize), false)
+                k += p
+            }
+        }
+        p += 1
+    }
+    var count: i64 = 0
+    var i: i64 = 2
+    while i <= limit {
+        if flags.get(i.as(usize)).as(bool) {
+            count += 1
+        }
+        i += 1
+    }
+    count
+}
+
+fn run_lcg(steps: i64, seed: i64) -> i64 {
+    var state = seed
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < steps {
+        state = (state * 48271 + 12345) % 1000000007
+        acc = (acc + (state % 65536)) % 1000000007
+        i += 1
+    }
+    acc
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    var prime_sum: i64 = 0
+    var r: i64 = 0
+    while r < 40 {
+        prime_sum += run_sieve(50000)
+        r += 1
+    }
+    let lcg_acc = run_lcg(2000000, 42)
+    let checksum = prime_sum * 1000 + (lcg_acc % 1000)
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ checksum.to_string())
+}

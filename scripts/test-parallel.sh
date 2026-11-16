@@ -96,6 +96,9 @@ failures = []
 completed = 0
 total = len(binaries)
 
+def is_exclusive_timing_suite(label):
+    return ("multicore" in label) or ("reactor" in label) or ("release_gates" in label)
+
 def run_one(index_and_item):
     idx, (label, exe, cwd) = index_and_item
     cache_dir = os.path.join(tmp_root, f"cache-{idx}")
@@ -104,9 +107,10 @@ def run_one(index_and_item):
     env["NESSA_CACHE_DIR"] = cache_dir
     if os.path.isfile(nessa_bin):
         env.setdefault("CARGO_BIN_EXE_nessa", nessa_bin)
+    threads = 1 if is_exclusive_timing_suite(label) else test_threads
     t0 = time.monotonic()
     proc = subprocess.run(
-        [exe, f"--test-threads={test_threads}"],
+        [exe, f"--test-threads={threads}"],
         cwd=cwd,
         env=env,
         stdout=subprocess.PIPE,
@@ -117,10 +121,20 @@ def run_one(index_and_item):
     shutil.rmtree(cache_dir, ignore_errors=True)
     return label, exe, proc.returncode, dt, proc.stdout
 
-def is_exclusive_timing_suite(label):
-    return ("multicore" in label) or ("reactor" in label)
+def lpt_priority(item):
+    _, (label, _, _) = item
+    if "pipeline_tests" in label:
+        return 0
+    if "archive_execution" in label:
+        return 1
+    if label.startswith("test::") or "archive" in label:
+        return 2
+    return 3
 
-parallel_bins = [(i, b) for i, b in enumerate(binaries) if not is_exclusive_timing_suite(b[0])]
+parallel_bins = sorted(
+    [(i, b) for i, b in enumerate(binaries) if not is_exclusive_timing_suite(b[0])],
+    key=lpt_priority,
+)
 serial_bins = [(i, b) for i, b in enumerate(binaries) if is_exclusive_timing_suite(b[0])]
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=max_jobs) as pool:

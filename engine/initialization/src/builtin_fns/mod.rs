@@ -788,4 +788,5 @@ pub fn register_all(vm: &mut Vm) {
     vm.register_builtin(ids::NET_UDP_LOCAL_ADDR, net::udp_local_addr);
     vm.register_builtin(ids::NET_UDP_CLOSE, net::udp_close);
     vm.register_builtin(ids::NET_RESOLVE_HOST, net::resolve_host);
+    vm.enable_standard_builtin_fast_paths();
 }

@@ -90,6 +90,30 @@ impl Vm {
         Ok(false)
     }
 
+    #[inline]
+    fn cached_has_error_shape(&self, ty: TypeIndex) -> Result<bool, VmError> {
+        if ty.as_u32() < Intrinsic::COUNT as u32 {
+            return Ok(false);
+        }
+        let raw = ty.as_u32() as usize;
+        if let Some(Some(res)) = self.sync_meta_cache().has_error_shape.get(raw).copied() {
+            return res.map_err(VmError::InvalidType);
+        }
+        let computed = self
+            .type_pool_read()
+            .error_shape(ty)
+            .map(|opt| opt.is_some())
+            .map_err(|_| ty);
+        if raw < 1_048_576 {
+            let mut cache = self.sync_meta_cache();
+            if cache.has_error_shape.len() <= raw {
+                cache.has_error_shape.resize(raw + 1, None);
+            }
+            cache.has_error_shape[raw] = Some(computed);
+        }
+        computed.map_err(VmError::InvalidType)
+    }
+
     pub(super) fn error_layout(
         &self,
         value: TaggedValue,
@@ -105,13 +129,11 @@ impl Vm {
         let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
         match header.payload_role() {
             Some(PayloadRole::Ordinary) => {
+                if header.type_index.as_u32() < Intrinsic::COUNT as u32 {
+                    return Ok(None);
+                }
                 let ty = self.canonical_type(header.type_index)?;
-                if self
-                    .type_pool_read()
-                    .error_shape(ty)
-                    .map_err(|_| VmError::InvalidType(ty))?
-                    .is_some()
-                {
+                if self.cached_has_error_shape(ty)? {
                     return Err(VmError::TypeError);
                 }
                 return Ok(None);

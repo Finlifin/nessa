@@ -1,0 +1,73 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+struct TreeNode {
+    item: i64,
+    left: ?TreeNode,
+    right: ?TreeNode,
+}
+
+fn make_tree(item: i64, depth: i64) -> TreeNode {
+    if depth <= 0 {
+        TreeNode { item: item, left: null, right: null }
+    } else {
+        let next_depth = depth - 1
+        TreeNode {
+            item: item,
+            left: make_tree(2 * item - 1, next_depth),
+            right: make_tree(2 * item, next_depth),
+        }
+    }
+}
+
+fn check_tree(node: TreeNode) -> i64 {
+    node.left match {
+        l? => {
+            let r = node.right.as(TreeNode)
+            node.item + check_tree(l) - check_tree(r)
+        },
+        _ => node.item,
+    }
+}
+
+fn pow2(n: i64) -> i64 {
+    var res: i64 = 1
+    var i: i64 = 0
+    while i < n {
+        res *= 2
+        i += 1
+    }
+    res
+}
+
+fn run_trees() -> i64 {
+    let min_depth: i64 = 4
+    let max_depth: i64 = 13
+    let stretch = make_tree(0, max_depth + 1)
+    var total_check = check_tree(stretch)
+    let long_lived = make_tree(0, max_depth)
+
+    var depth = min_depth
+    while depth <= max_depth {
+        let iterations = pow2(max_depth - depth + min_depth)
+        var chk: i64 = 0
+        var i: i64 = 1
+        while i <= iterations {
+            chk += check_tree(make_tree(i, depth))
+            chk += check_tree(make_tree(-i, depth))
+            i += 1
+        }
+        total_check += chk
+        depth += 2
+    }
+    total_check + check_tree(long_lived)
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    let ans = run_trees()
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ ans.to_string())
+}

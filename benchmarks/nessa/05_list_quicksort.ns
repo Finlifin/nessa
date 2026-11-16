@@ -1,0 +1,63 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+fn quicksort(arr: List, lo: i64, hi: i64) -> Unit {
+    if lo >= hi {
+        return ()
+    }
+    let mid = lo + (hi - lo) / 2
+    let pivot = arr.get(mid.as(usize)).as(i64)
+    var i = lo
+    var j = hi
+    while i <= j {
+        while arr.get(i.as(usize)).as(i64) < pivot {
+            i += 1
+        }
+        while arr.get(j.as(usize)).as(i64) > pivot {
+            j -= 1
+        }
+        if i <= j {
+            let tmp = arr.get(i.as(usize))
+            arr.set(i.as(usize), arr.get(j.as(usize)))
+            arr.set(j.as(usize), tmp)
+            i += 1
+            j -= 1
+        }
+    }
+    if lo < j {
+        quicksort(arr, lo, j)
+    }
+    if i < hi {
+        quicksort(arr, i, hi)
+    }
+}
+
+fn run_quicksort_bench(n: i64, rounds: i64) -> i64 {
+    var seed: i64 = 1234567
+    var checksum: i64 = 0
+    var r: i64 = 0
+    while r < rounds {
+        let arr = List()
+        var k: i64 = 0
+        while k < n {
+            seed = (seed * 48271 + 12345) % 1000000007
+            arr.push(seed % 1000000)
+            k += 1
+        }
+        quicksort(arr, 0, n - 1)
+        checksum += arr.get(0).as(i64)
+        checksum += arr.get((n / 2).as(usize)).as(i64)
+        checksum += arr.get((n - 1).as(usize)).as(i64)
+        r += 1
+    }
+    checksum
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    let ans = run_quicksort_bench(20000, 8)
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ ans.to_string())
+}

@@ -717,6 +717,127 @@ fn resolved_symbol(resolved: &ResolvedAst, node: NodeIndex) -> Option<resolution
     })
 }
 
+fn lower_direct_builtin_call(
+    resolved: &ResolvedAst,
+    callee_node: NodeIndex,
+    sym_id: resolution::SymbolId,
+    builtin_id: u32,
+    args: Vec<NirValue>,
+    builder: &mut FunctionBuilder,
+    block: &mut BlockId,
+) -> NirValue {
+    let Some(signature) = declared_function_type(resolved, callee_node, sym_id, builder) else {
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            local,
+            NirExpr::CallBuiltin(builtin_id, args),
+        ));
+        return NirValue::Local(local);
+    };
+
+    let type_pool::TypeKind::Function { params, ret } = &resolved.type_pool.get(signature).kind
+    else {
+        unreachable!("declared_function_type guarantees TypeKind::Function");
+    };
+
+    if args.len() != params.len()
+        || params
+            .iter()
+            .any(|&p| crate::trait_parameters::bare_trait(resolved, p).is_some())
+    {
+        let function = callable_function(resolved, callee_node, sym_id, builder)
+            .expect("typed native symbol produces an adapter");
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(local, NirExpr::Call(function, args)));
+        return NirValue::Local(local);
+    }
+
+    let definition = &resolved.symbols[sym_id.0 as usize];
+    let def_scope = if definition.def_node.is_null() {
+        resolved.node_scopes.get(&callee_node).map(|s| s.0)
+    } else {
+        Some(definition.scope.0)
+    };
+    let ret_ty = *ret;
+
+    let mut checked_args = Vec::with_capacity(args.len());
+    for (arg_val, &param_ty) in args.into_iter().zip(params.iter()) {
+        let canon_param = resolved
+            .type_pool
+            .canonical_type(param_ty)
+            .unwrap_or(param_ty);
+        let already_checked = resolved.type_pool.as_intrinsic(canon_param)
+            == Some(type_pool::Intrinsic::Any)
+            || match arg_val {
+                NirValue::ConstInt(_) => {
+                    resolved.type_pool.as_intrinsic(canon_param) == Some(type_pool::Intrinsic::I64)
+                }
+                NirValue::ConstUInt(_) => {
+                    resolved.type_pool.as_intrinsic(canon_param) == Some(type_pool::Intrinsic::U64)
+                }
+                NirValue::ConstFloat(_) => {
+                    resolved.type_pool.as_intrinsic(canon_param) == Some(type_pool::Intrinsic::F64)
+                }
+                NirValue::ConstBool(_) => {
+                    resolved.type_pool.as_intrinsic(canon_param) == Some(type_pool::Intrinsic::Bool)
+                }
+                NirValue::ConstChar(_) => {
+                    resolved.type_pool.as_intrinsic(canon_param) == Some(type_pool::Intrinsic::Char)
+                }
+                NirValue::ConstStr(_) => {
+                    resolved.type_pool.as_intrinsic(canon_param) == Some(type_pool::Intrinsic::Str)
+                }
+                NirValue::Local(loc) => {
+                    builder.params.iter().any(|p| {
+                        p.local == loc
+                            && p.type_index != type_pool::TypeIndex::INVALID
+                            && resolved.type_pool.canonical_type(p.type_index) == Some(canon_param)
+                    }) && builder.blocks.iter().all(|b| {
+                        b.stmts
+                            .iter()
+                            .all(|st| !matches!(st.unscoped(), NirStmt::Assign(d, _) if *d == loc))
+                    })
+                }
+                _ => false,
+            };
+
+        if already_checked {
+            checked_args.push(arg_val);
+        } else {
+            let tmp = builder.alloc_local();
+            let assert_expr = match def_scope {
+                Some(sc) => NirExpr::TypeAssert(arg_val, param_ty).in_scope(sc),
+                None => NirExpr::TypeAssert(arg_val, param_ty),
+            };
+            builder.blocks[block.0 as usize]
+                .stmts
+                .push(NirStmt::Assign(tmp, assert_expr));
+            checked_args.push(NirValue::Local(tmp));
+        }
+    }
+
+    let result = builder.alloc_local();
+    builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+        result,
+        NirExpr::CallBuiltin(builtin_id, checked_args),
+    ));
+
+    let canon_ret = resolved.type_pool.canonical_type(ret_ty).unwrap_or(ret_ty);
+    if resolved.type_pool.as_intrinsic(canon_ret) != Some(type_pool::Intrinsic::Any) {
+        let assert_ret = match def_scope {
+            Some(sc) => NirExpr::TypeAssert(NirValue::Local(result), ret_ty).in_scope(sc),
+            None => NirExpr::TypeAssert(NirValue::Local(result), ret_ty),
+        };
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(result, assert_ret));
+    }
+
+    NirValue::Local(result)
+}
+
 fn callable_function(
     resolved: &ResolvedAst,
     node: NodeIndex,
@@ -965,10 +1086,17 @@ mod function_value_tests {
         builder.next_func_id = 1;
         let mut block = builder.new_block();
         lower_expr(&resolved, call, &mut builder, &mut block);
-        assert!(
-            matches!(builder.blocks[0].stmts.last(), Some(NirStmt::Assign(_, NirExpr::Call(FuncId(1), args))) if args == &[NirValue::ConstInt(42)])
-        );
-        assert_eq!(builder.lambda_functions[0].function_type, signature);
+        assert!(builder.blocks[0].stmts.iter().any(|stmt| matches!(
+            stmt,
+            NirStmt::Assign(_, NirExpr::CallBuiltin(runtime::ids::TO_I64, args))
+                if args == &[NirValue::ConstInt(42)]
+        )));
+        assert!(matches!(
+            builder.blocks[0].stmts.last(),
+            Some(NirStmt::Assign(_, expr))
+                if matches!(expr.unscoped(), NirExpr::TypeAssert(_, ty) if *ty == Intrinsic::I64.type_index())
+        ));
+        assert!(builder.lambda_functions.is_empty());
     }
 
     #[test]
@@ -1647,19 +1775,15 @@ fn lower_call(
     {
         // Check if this symbol is a builtin function.
         if let Some(&builtin_id) = resolved.builtin_fns.get(&sym_id) {
-            let expression =
-                if declared_function_type(resolved, callee_node, sym_id, builder).is_some() {
-                    let function = callable_function(resolved, callee_node, sym_id, builder)
-                        .expect("typed native symbol produces an adapter");
-                    NirExpr::Call(function, args)
-                } else {
-                    NirExpr::CallBuiltin(builtin_id, args)
-                };
-            let local = builder.alloc_local();
-            builder.blocks[block.0 as usize]
-                .stmts
-                .push(NirStmt::Assign(local, expression));
-            return NirValue::Local(local);
+            return lower_direct_builtin_call(
+                resolved,
+                callee_node,
+                sym_id,
+                builtin_id,
+                args,
+                builder,
+                block,
+            );
         }
         // Check if this is a user-defined function referenced by symbol.
         let sym = &resolved.symbols[sym_id.0 as usize];
@@ -1860,18 +1984,9 @@ fn lower_infix_call(
         crate::arguments::lower_arguments_with_first(resolved, node_idx, Some(lhs), builder, block);
 
     if let Some(&builtin_id) = resolved.builtin_fns.get(&sym_id) {
-        let expression = if declared_function_type(resolved, node_idx, sym_id, builder).is_some() {
-            let function = callable_function(resolved, node_idx, sym_id, builder)
-                .expect("typed native symbol produces an adapter");
-            NirExpr::Call(function, args)
-        } else {
-            NirExpr::CallBuiltin(builtin_id, args)
-        };
-        let local = builder.alloc_local();
-        builder.blocks[block.0 as usize]
-            .stmts
-            .push(NirStmt::Assign(local, expression));
-        return NirValue::Local(local);
+        return lower_direct_builtin_call(
+            resolved, node_idx, sym_id, builtin_id, args, builder, block,
+        );
     }
 
     let sym = &resolved.symbols[sym_id.0 as usize];

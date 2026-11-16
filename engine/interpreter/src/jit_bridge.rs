@@ -20,17 +20,23 @@ pub(crate) enum JitStepOutcome {
     Finished,
     Return { ret_pc: u32, val: TaggedValue },
     InterpretOne(u32),
+    ContinueTaskLoop,
     TierUp(u32),
     Yield(u32),
+    YieldAtTaskPc,
     SuspendRetry(u32),
+    SuspendAtTaskPc,
     Cancelled,
     Error(VmError),
 }
+
+const MAX_NATIVE_JIT_CALL_DEPTH: u32 = 96;
 
 struct BridgeSession {
     vm: *mut Vm,
     task_id: TaskId,
     pending_error: Option<VmError>,
+    jit_call_depth: u32,
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -46,6 +52,10 @@ static JIT_HELPERS: JitHelpers = JitHelpers {
     store_field_ic: helper_store_field_ic,
     store_boxed_f64: helper_store_boxed_f64,
     step_inline_op: helper_step_inline_op,
+    alloc_object_fast: helper_alloc_object_fast,
+    call_builtin: helper_call_builtin,
+    call_op: helper_call_op,
+    call_direct_fast: helper_call_direct_fast,
 };
 
 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -61,6 +71,10 @@ static JIT_HELPERS: JitHelpers = JitHelpers {
     store_field_ic: helper_store_field_ic,
     store_boxed_f64: helper_store_boxed_f64,
     step_inline_op: helper_step_inline_op,
+    alloc_object_fast: helper_alloc_object_fast,
+    call_builtin: helper_call_builtin,
+    call_op: helper_call_op,
+    call_direct_fast: helper_call_direct_fast,
 };
 
 impl Vm {
@@ -189,6 +203,25 @@ impl Vm {
         let constants = self.classify_constants_for_jit();
         let (hotness_ptr, global_deopt_ptr, func_deopt_ptr) = self.worker.jit.counter_ptrs(func_id);
 
+        // Pre-validate direct `Opcode::Call` targets before borrowing `type_pool` so
+        // `fast_direct_callee_slots` can classify value-only non-closure callees lock-free.
+        let mut validated_direct_callees = std::collections::HashSet::new();
+        {
+            let instrs = &self.shared.bytecode.get_function(func_id).instructions;
+            for &w in instrs {
+                if let Some(ins) = Instruction::decode(w)
+                    && ins.opcode == Opcode::Call
+                    && let nsbc::InstructionData::C { payload } = ins.data
+                {
+                    let (_, cid_raw) = Instruction::c_arg_count_func_id(payload);
+                    let cid = FuncId(cid_raw);
+                    if self.checked_function(cid).is_ok() {
+                        validated_direct_callees.insert(cid);
+                    }
+                }
+            }
+        }
+
         {
             let shared = &*self.shared;
             let instructions = &shared.bytecode.get_function(func_id).instructions;
@@ -197,6 +230,55 @@ impl Vm {
             let scopes_required = !tp_guard.scopes().is_empty();
             let has_scope =
                 |pc: usize| -> bool { !scopes_required || scopes.contains_key(&(func_id, pc)) };
+
+            let compute_guaranteed_slots = |code_words: &[u32]| -> u32 {
+                match code_words.first().copied().and_then(Instruction::decode) {
+                    Some(first)
+                        if first.opcode == Opcode::AllocateSlots
+                            && matches!(first.data, nsbc::InstructionData::E { payload } if payload <= (1 << 17))
+                            && code_words[1..].iter().all(|&w| {
+                                Instruction::decode(w)
+                                    .is_none_or(|i| i.opcode != Opcode::AllocateSlots)
+                            }) =>
+                    {
+                        let nsbc::InstructionData::E { payload } = first.data else {
+                            unreachable!()
+                        };
+                        payload
+                    }
+                    _ => 0,
+                }
+            };
+            let guaranteed_slots = compute_guaranteed_slots(instructions);
+            let list_type_raw = tp_guard.list_type().map(|t| t.as_u32());
+            let list_buf_type_raw = tp_guard.list_buffer_type().map(|t| t.as_u32());
+            let fast_list_builtins = shared.builtins.can_fast_path(runtime::ids::LIST_LEN)
+                && shared.builtins.can_fast_path(runtime::ids::LIST_GET)
+                && shared.builtins.can_fast_path(runtime::ids::LIST_SET);
+
+            let fast_direct_callee_slots = |cid: FuncId, arg_count: u8| -> Option<(u32, bool)> {
+                if !validated_direct_callees.contains(&cid) {
+                    return None;
+                }
+                let code = shared.bytecode.try_get_function(cid)?;
+                if code.is_closure
+                    || code.display_owner.is_some()
+                    || code.instructions.is_empty()
+                    || code.param_count != arg_count
+                    || !code.abi.captures.is_empty()
+                    || code.abi.parameters.len() != arg_count as usize
+                    || code
+                        .abi
+                        .parameters
+                        .iter()
+                        .any(|p| *p != nsbc::ParameterAbi::Value)
+                {
+                    return None;
+                }
+                let slots = compute_guaranteed_slots(&code.instructions);
+                let clobbers_cs = shared.bytecode.get_meta(cid).clobbers_callee_saved;
+                Some((slots, clobbers_cs))
+            };
 
             let input = CompilationInput {
                 func_id,
@@ -208,6 +290,11 @@ impl Vm {
                 hotness_ptr,
                 global_deopt_ptr,
                 func_deopt_ptr,
+                guaranteed_slots,
+                list_type_raw,
+                list_buf_type_raw,
+                fast_list_builtins,
+                fast_direct_callee_slots: &fast_direct_callee_slots,
             };
             self.worker.jit.compile_function(&input, request_tier2);
         }
@@ -236,11 +323,7 @@ impl Vm {
                 } else {
                     None
                 };
-                let f64_bits = if (raw & 0x7f) == 0x11 {
-                    val.as_f64().map(f64::to_bits)
-                } else {
-                    None
-                };
+                let f64_bits = val.as_f64().map(f64::to_bits);
                 out.push(CompileConstant::ImmediateValidated {
                     raw,
                     i64_val,
@@ -281,6 +364,13 @@ impl Vm {
             vm: std::ptr::from_mut(self),
             task_id,
             pending_error: None,
+            jit_call_depth: 0,
+        };
+
+        let (consts_ptr, consts_len) = {
+            let consts_guard = self.constants_read();
+            let consts = consts_guard.values();
+            (consts.as_ptr().cast::<u64>(), consts.len())
         };
 
         let mut rt_ctx = JitRuntimeCtx {
@@ -288,10 +378,11 @@ impl Vm {
             regs_ptr: std::ptr::null_mut(),
             slots_ptr: std::ptr::null_mut(),
             slots_len: 0,
-            consts_ptr: std::ptr::null(),
-            consts_len: 0,
+            consts_ptr,
+            consts_len,
             gc_requested_ptr: GC_FLAGS.gc_requested.as_ptr().cast::<u8>(),
             preempt_requested_ptr: GC_FLAGS.preempt_requested.as_ptr().cast::<u8>(),
+            aux_started_ptr: self.shared.aux_started.as_ptr().cast::<u8>(),
             slice_safepoints: self.worker.slice_safepoints,
             has_other_ready: 0,
             allow_tier_up: u8::from(allow_tier_up),
@@ -327,9 +418,12 @@ impl Vm {
                 val: TaggedValue::from_raw(exit.value),
             },
             x if x == JitExitKind::InterpretAt as u32 => JitStepOutcome::InterpretOne(exit.pc),
+            x if x == JitExitKind::ContinueTaskLoop as u32 => JitStepOutcome::ContinueTaskLoop,
             x if x == JitExitKind::TierUp as u32 => JitStepOutcome::TierUp(exit.pc),
             x if x == JitExitKind::Yield as u32 => JitStepOutcome::Yield(exit.pc),
+            x if x == JitExitKind::YieldAtTaskPc as u32 => JitStepOutcome::YieldAtTaskPc,
             x if x == JitExitKind::SuspendRetry as u32 => JitStepOutcome::SuspendRetry(exit.pc),
+            x if x == JitExitKind::SuspendAtTaskPc as u32 => JitStepOutcome::SuspendAtTaskPc,
             x if x == JitExitKind::Cancelled as u32 => JitStepOutcome::Cancelled,
             _ => JitStepOutcome::Error(
                 session
@@ -341,14 +435,8 @@ impl Vm {
     }
 }
 
+#[inline]
 fn refresh_runtime_ctx(rt_ctx: &mut JitRuntimeCtx, vm: &mut Vm, task_id: TaskId) {
-    let (consts_ptr, consts_len) = {
-        let consts_guard = vm.constants_read();
-        let consts = consts_guard.values();
-        (consts.as_ptr().cast::<u64>(), consts.len())
-    };
-    rt_ctx.consts_ptr = consts_ptr;
-    rt_ctx.consts_len = consts_len;
     if let Some(task) = vm.task_mut(task_id) {
         rt_ctx.regs_ptr = task.registers.regs.as_mut_ptr().cast::<u64>();
         rt_ctx.slots_len = task.local_slots.len();
@@ -427,17 +515,10 @@ def_jit_helper!(
             ));
             return JitExitKind::Trap as u32;
         }
-        let Some(task) = vm.task_mut(session.task_id) else {
-            session.pending_error = Some(VmError::InvalidTask);
-            return JitExitKind::Trap as u32;
-        };
-        let mut slots = Vec::new();
-        if slots.try_reserve_exact(count as usize).is_err() {
-            session.pending_error = Some(VmError::OutOfMemory);
+        if let Err(err) = vm.alloc_task_frame_slots(session.task_id, count as usize) {
+            session.pending_error = Some(err);
             return JitExitKind::Trap as u32;
         }
-        slots.resize(count as usize, TaggedValue::UNIT);
-        task.local_slots = slots;
         refresh_runtime_ctx(rt_ctx, vm, session.task_id);
         0
     }
@@ -470,8 +551,8 @@ def_jit_helper!(
         }
         vm.worker.slice_safepoints = vm.worker.slice_safepoints.saturating_sub(1);
         if vm.worker.slice_safepoints == 0 {
-            vm.worker.slice_safepoints = 4096;
-            rt_ctx.slice_safepoints = 4096;
+            vm.worker.slice_safepoints = 32_768;
+            rt_ctx.slice_safepoints = 32_768;
             if vm.scheduler().has_other_ready_tasks() {
                 return JitExitKind::Yield as u32;
             }
@@ -689,6 +770,540 @@ def_jit_helper!(
     }
 );
 
+def_jit_helper!(
+    fn helper_alloc_object_fast(
+        vm_opaque: *mut c_void,
+        dst_reg: u32,
+        canon_ty_raw: u32,
+        words: u32,
+    ) -> u32 {
+        // SAFETY: invoked synchronously from compiled JIT code with all live state rooted in `StackContext`.
+        let (rt_ctx, session, vm) = unsafe { unpack_ctx(vm_opaque) };
+        let type_idx = type_pool::TypeIndex::from_raw(canon_ty_raw);
+        let words_u16 = words as u16;
+        // SAFETY: mutator owns an active execution operation; all payload words are initialized
+        // to `TaggedValue::UNIT` before the object reference is published to `task.registers`.
+        let Some(ptr) = (unsafe { vm.worker.heap.alloc_object(type_idx, words_u16) }) else {
+            session.pending_error = Some(VmError::OutOfMemory);
+            return JitExitKind::Trap as u32;
+        };
+        let base = ptr.as_ptr().cast::<u64>();
+        for i in 0..(words as usize) {
+            // SAFETY: `i < words_u16` is within the freshly allocated object payload.
+            unsafe {
+                base.add(i).write(TaggedValue::UNIT.raw());
+            }
+        }
+        // SAFETY: `ptr` is a live, initialized managed object allocation.
+        let val = unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) };
+        let Some(task) = vm.task_mut(session.task_id) else {
+            session.pending_error = Some(VmError::InvalidTask);
+            return JitExitKind::Trap as u32;
+        };
+        task.registers.set(Reg(dst_reg as u8), val);
+        refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+        0
+    }
+);
+
+def_jit_helper!(
+    fn helper_call_builtin(
+        vm_opaque: *mut c_void,
+        pc: u32,
+        builtin_id: u32,
+        arg_count: u32,
+    ) -> u32 {
+        // SAFETY: invoked synchronously from compiled JIT code with arguments in `task.registers`.
+        let (rt_ctx, session, vm) = unsafe { unpack_ctx(vm_opaque) };
+        if let Some(task) = vm.task_mut(session.task_id) {
+            task.pc = pc + 1;
+        }
+        let res = vm.dispatch_builtin(session.task_id, builtin_id, arg_count as u8);
+        refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+        match res {
+            DispatchResult::Continue => 0,
+            DispatchResult::Yield => JitExitKind::YieldAtTaskPc as u32,
+            DispatchResult::SuspendRetry => {
+                if let Some(task) = vm.task_mut(session.task_id) {
+                    task.pc = pc;
+                }
+                JitExitKind::SuspendAtTaskPc as u32
+            }
+            DispatchResult::StartCancelUnwind | DispatchResult::ResumeCancelUnwind => {
+                JitExitKind::Cancelled as u32
+            }
+            DispatchResult::Error(err) => {
+                session.pending_error = Some(err);
+                JitExitKind::Trap as u32
+            }
+            DispatchResult::Return(_) => {
+                session.pending_error = Some(VmError::InvalidInstruction(0));
+                JitExitKind::Trap as u32
+            }
+        }
+    }
+);
+
+fn complete_return_in_jit(
+    rt_ctx: &mut JitRuntimeCtx,
+    session: &mut BridgeSession,
+    vm: &mut Vm,
+    ret_pc: u32,
+    val: TaggedValue,
+) -> u32 {
+    let mut validated_func = None;
+    let outcome = vm.complete_return(session.task_id, ret_pc, val, &mut validated_func);
+    refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+    match outcome {
+        None => 0,
+        Some(crate::ExecOutcome::Finished) => JitExitKind::Finished as u32,
+        Some(crate::ExecOutcome::Yield) => JitExitKind::YieldAtTaskPc as u32,
+        Some(crate::ExecOutcome::Suspend) => JitExitKind::SuspendAtTaskPc as u32,
+        Some(crate::ExecOutcome::Cancelled) => JitExitKind::Cancelled as u32,
+        Some(crate::ExecOutcome::Error(err)) => {
+            session.pending_error = Some(err);
+            JitExitKind::Trap as u32
+        }
+    }
+}
+
+def_jit_helper!(
+    fn helper_call_op(vm_opaque: *mut c_void, pc: u32, instr_word: u32) -> u32 {
+        // SAFETY: invoked synchronously from compiled JIT code with valid `JitRuntimeCtx`.
+        let (rt_ctx, session, vm) = unsafe { unpack_ctx(vm_opaque) };
+        let Some(instr) = Instruction::decode(instr_word) else {
+            session.pending_error = Some(VmError::InvalidInstruction(instr_word));
+            return JitExitKind::Trap as u32;
+        };
+        let Some((caller_func, depth_before, ctx_addr_before)) =
+            vm.task_ref(session.task_id).map(|t| {
+                (
+                    t.current_func,
+                    t.call_stack.len(),
+                    std::ptr::from_ref::<runtime::StackContext>(t) as usize,
+                )
+            })
+        else {
+            session.pending_error = Some(VmError::InvalidTask);
+            return JitExitKind::Trap as u32;
+        };
+
+        if let Some(task) = vm.task_mut(session.task_id) {
+            task.pc = pc + 1;
+        }
+
+        let res = if instr.opcode == Opcode::Call {
+            let nsbc::InstructionData::C { payload } = instr.data else {
+                unreachable!()
+            };
+            let (arg_count, func_id_raw) = Instruction::c_arg_count_func_id(payload);
+            let arg_len = arg_count as usize;
+            if arg_len > runtime::GP_REGISTER_COUNT {
+                DispatchResult::Error(VmError::TypeError)
+            } else {
+                let mut arg_buf = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+                arg_buf[..arg_len].copy_from_slice(
+                    &vm.task_ref(session.task_id).unwrap().registers.regs[..arg_len],
+                );
+                vm.invoke_closure_physical(
+                    session.task_id,
+                    FuncId(func_id_raw),
+                    None,
+                    &arg_buf[..arg_len],
+                )
+            }
+        } else {
+            vm.dispatch(session.task_id, instr)
+        };
+
+        match res {
+            DispatchResult::Error(err) => {
+                refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+                session.pending_error = Some(err);
+                return JitExitKind::Trap as u32;
+            }
+            DispatchResult::Yield => {
+                refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+                return JitExitKind::YieldAtTaskPc as u32;
+            }
+            DispatchResult::SuspendRetry => {
+                if let Some(task) = vm.task_mut(session.task_id) {
+                    task.pc = pc;
+                }
+                refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+                return JitExitKind::SuspendAtTaskPc as u32;
+            }
+            DispatchResult::StartCancelUnwind | DispatchResult::ResumeCancelUnwind => {
+                refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+                return JitExitKind::Cancelled as u32;
+            }
+            DispatchResult::Return(val) => {
+                return complete_return_in_jit(rt_ctx, session, vm, pc, val);
+            }
+            DispatchResult::Continue => {}
+        }
+
+        let Some((cur_func, cur_pc, cur_depth, cur_ctx_addr, unwinding_or_cancelled)) =
+            vm.task_ref(session.task_id).map(|t| {
+                (
+                    t.current_func,
+                    t.pc,
+                    t.call_stack.len(),
+                    std::ptr::from_ref::<runtime::StackContext>(t) as usize,
+                    t.unwinding_cancel || t.cancelled,
+                )
+            })
+        else {
+            session.pending_error = Some(VmError::InvalidTask);
+            return JitExitKind::Trap as u32;
+        };
+
+        // In-place method completion (e.g. `List.apply`/`Map.apply`/`Continuation.clone`).
+        if cur_ctx_addr == ctx_addr_before
+            && cur_depth == depth_before
+            && cur_func == caller_func
+            && cur_pc == pc + 1
+            && !unwinding_or_cancelled
+        {
+            refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+            return 0;
+        }
+
+        // Standard frame push: execute callee directly in native JIT if compiled and within recursion budget!
+        if cur_ctx_addr == ctx_addr_before
+            && cur_depth == depth_before + 1
+            && cur_pc == 0
+            && !unwinding_or_cancelled
+        {
+            let callee_len = match vm.checked_function(cur_func) {
+                Ok(code) => code.instructions.len(),
+                Err(err) => {
+                    session.pending_error = Some(err);
+                    return JitExitKind::Trap as u32;
+                }
+            };
+            if callee_len == 0 {
+                return JitExitKind::Finished as u32;
+            }
+            vm.maybe_compile_on_hotness(cur_func, jit::ENTRY_HOTNESS_INCREMENT);
+
+            let mut callee_pc = 0u32;
+            while session.jit_call_depth < MAX_NATIVE_JIT_CALL_DEPTH {
+                let Some((callee_fn, callee_off, allow_tu, allow_t2)) =
+                    vm.worker.jit.lookup_entry(cur_func, callee_pc)
+                else {
+                    break;
+                };
+
+                let saved_allow_tu = rt_ctx.allow_tier_up;
+                let saved_allow_t2 = rt_ctx.allow_tier2_loops;
+                rt_ctx.allow_tier_up = u8::from(allow_tu);
+                rt_ctx.allow_tier2_loops = u8::from(allow_t2);
+                refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+                if rt_ctx.regs_ptr.is_null() {
+                    rt_ctx.allow_tier_up = saved_allow_tu;
+                    rt_ctx.allow_tier2_loops = saved_allow_t2;
+                    session.pending_error = Some(VmError::InvalidTask);
+                    return JitExitKind::Trap as u32;
+                }
+
+                let mut callee_exit = JitExit::default();
+                session.jit_call_depth += 1;
+                // SAFETY: `callee_fn` points to a sealed W^X `ExecutableBuffer` in `vm.worker.jit`
+                // that is never unmapped during task execution; `rt_ctx` and `session` remain live.
+                unsafe {
+                    callee_fn(
+                        std::ptr::from_mut(rt_ctx).cast::<c_void>(),
+                        rt_ctx.regs_ptr,
+                        callee_off,
+                        std::ptr::from_mut(&mut callee_exit),
+                    );
+                }
+                session.jit_call_depth -= 1;
+                rt_ctx.allow_tier_up = saved_allow_tu;
+                rt_ctx.allow_tier2_loops = saved_allow_t2;
+
+                match callee_exit.kind {
+                    x if x == JitExitKind::Return as u32 => {
+                        let ret_val = TaggedValue::from_raw(callee_exit.value);
+                        return complete_return_in_jit(
+                            rt_ctx,
+                            session,
+                            vm,
+                            callee_exit.pc,
+                            ret_val,
+                        );
+                    }
+                    x if x == JitExitKind::TierUp as u32 => {
+                        vm.compile_jit_function(cur_func, true);
+                        callee_pc = callee_exit.pc;
+                        if let Some(t) = vm.task_mut(session.task_id) {
+                            t.pc = callee_pc;
+                        }
+                        continue;
+                    }
+                    x if x == JitExitKind::InterpretAt as u32 => {
+                        if let Some(t) = vm.task_mut(session.task_id) {
+                            t.pc = callee_exit.pc;
+                        }
+                        return JitExitKind::ContinueTaskLoop as u32;
+                    }
+                    x if x == JitExitKind::ContinueTaskLoop as u32 => {
+                        return JitExitKind::ContinueTaskLoop as u32;
+                    }
+                    x if x == JitExitKind::Yield as u32 => {
+                        if let Some(t) = vm.task_mut(session.task_id) {
+                            t.pc = callee_exit.pc;
+                        }
+                        return JitExitKind::YieldAtTaskPc as u32;
+                    }
+                    x if x == JitExitKind::YieldAtTaskPc as u32 => {
+                        return JitExitKind::YieldAtTaskPc as u32;
+                    }
+                    x if x == JitExitKind::SuspendRetry as u32 => {
+                        if let Some(t) = vm.task_mut(session.task_id) {
+                            t.pc = callee_exit.pc;
+                        }
+                        return JitExitKind::SuspendAtTaskPc as u32;
+                    }
+                    x if x == JitExitKind::SuspendAtTaskPc as u32 => {
+                        return JitExitKind::SuspendAtTaskPc as u32;
+                    }
+                    x if x == JitExitKind::Finished as u32 => {
+                        return JitExitKind::Finished as u32;
+                    }
+                    x if x == JitExitKind::Cancelled as u32 => {
+                        return JitExitKind::Cancelled as u32;
+                    }
+                    _ => {
+                        if session.pending_error.is_none() {
+                            session.pending_error =
+                                Some(VmError::InvalidInstruction(callee_exit.kind));
+                        }
+                        return JitExitKind::Trap as u32;
+                    }
+                }
+            }
+        }
+
+        refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+        JitExitKind::ContinueTaskLoop as u32
+    }
+);
+
+def_jit_helper!(
+    fn helper_call_direct_fast(
+        vm_opaque: *mut c_void,
+        return_pc: u32,
+        callee_raw: u32,
+        packed_slots_and_cs: u32,
+    ) -> u32 {
+        // SAFETY: invoked synchronously from compiled JIT code for a pre-validated, non-closure,
+        // non-display, value-only direct `Opcode::Call` with arguments already in `r0..r{k-1}`.
+        let (rt_ctx, session, vm) = unsafe { unpack_ctx(vm_opaque) };
+        let callee_id = FuncId(callee_raw);
+        let callee_slots = (packed_slots_and_cs >> 1) as usize;
+        let clobbers_cs = (packed_slots_and_cs & 1) != 0;
+
+        // Ensure callee is compiled once hot.
+        if vm.worker.jit.lookup_entry(callee_id, 0).is_none() {
+            vm.maybe_compile_on_hotness(callee_id, jit::ENTRY_HOTNESS_INCREMENT);
+        }
+
+        // Pop a pre-sized slot vector from `slot_vec_pool` before borrowing `task_mut`.
+        let pre_slots = if callee_slots > 0 {
+            let mut v = vm
+                .worker
+                .slot_vec_pool
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(callee_slots));
+            v.resize(callee_slots, TaggedValue::UNIT);
+            v
+        } else {
+            Vec::new()
+        };
+
+        // Single `task_mut` borrow to push `CallFrame` and install `pre_slots` + `current_func`!
+        let (regs_ptr, slots_ptr, slots_len) = {
+            let Some(t) = vm.task_mut(session.task_id) else {
+                if pre_slots.capacity() > 0 {
+                    vm.recycle_frame_slots(pre_slots);
+                }
+                session.pending_error = Some(VmError::InvalidTask);
+                return JitExitKind::Trap as u32;
+            };
+            if t.unwinding_cancel || t.cancelled {
+                if pre_slots.capacity() > 0 {
+                    vm.recycle_frame_slots(pre_slots);
+                }
+                return JitExitKind::Cancelled as u32;
+            }
+            let task: &mut runtime::StackContext = t;
+            let mut saved = runtime::SavedRegs::new();
+            if clobbers_cs {
+                for &r in Reg::CALLEE_SAVED {
+                    saved.push(Reg(r), task.registers.get(Reg(r)));
+                }
+            }
+            let prev_slots = std::mem::replace(&mut task.local_slots, pre_slots);
+            let frame = runtime::CallFrame {
+                display_state: task.display_state.take(),
+                return_pc,
+                func_id: task.current_func,
+                saved_regs: saved,
+                local_slots: prev_slots,
+                unwind_stack: std::mem::take(&mut task.unwind_stack),
+                is_unwind_target: std::mem::replace(&mut task.is_unwind_target, false),
+            };
+            task.call_stack.push(frame);
+            task.current_func = callee_id;
+            task.pc = 0;
+            let s_len = task.local_slots.len();
+            let s_ptr = if s_len == 0 {
+                std::ptr::null_mut()
+            } else {
+                task.local_slots.as_mut_ptr().cast::<u64>()
+            };
+            (task.registers.regs.as_mut_ptr().cast::<u64>(), s_ptr, s_len)
+        };
+
+        rt_ctx.regs_ptr = regs_ptr;
+        rt_ctx.slots_ptr = slots_ptr;
+        rt_ctx.slots_len = slots_len;
+
+        let mut callee_pc = 0u32;
+        while session.jit_call_depth < MAX_NATIVE_JIT_CALL_DEPTH {
+            let Some((callee_fn, callee_off, allow_tu, allow_t2)) =
+                vm.worker.jit.lookup_entry(callee_id, callee_pc)
+            else {
+                break;
+            };
+
+            let saved_allow_tu = rt_ctx.allow_tier_up;
+            let saved_allow_t2 = rt_ctx.allow_tier2_loops;
+            rt_ctx.allow_tier_up = u8::from(allow_tu);
+            rt_ctx.allow_tier2_loops = u8::from(allow_t2);
+
+            let mut callee_exit = JitExit::default();
+            session.jit_call_depth += 1;
+            // SAFETY: `callee_fn` points to a sealed W^X `ExecutableBuffer` in `vm.worker.jit`;
+            // `rt_ctx` and `session` remain live across the synchronous call.
+            unsafe {
+                callee_fn(
+                    std::ptr::from_mut(rt_ctx).cast::<c_void>(),
+                    rt_ctx.regs_ptr,
+                    callee_off,
+                    std::ptr::from_mut(&mut callee_exit),
+                );
+            }
+            session.jit_call_depth -= 1;
+            rt_ctx.allow_tier_up = saved_allow_tu;
+            rt_ctx.allow_tier2_loops = saved_allow_t2;
+
+            if callee_exit.kind == JitExitKind::Return as u32 {
+                let ret_val = TaggedValue::from_raw(callee_exit.value);
+                // Ultra-fast single-borrow frame pop when no unwind/display state is active!
+                let mut fast_popped_slots = None;
+                let fast_ok = if let Some(t) = vm.task_mut(session.task_id) {
+                    if !t.unwinding_cancel && t.display_state.is_none() {
+                        if let Some(frame) = t.call_stack.pop() {
+                            let task: &mut runtime::StackContext = t;
+                            task.pc = frame.return_pc;
+                            task.current_func = frame.func_id;
+                            fast_popped_slots =
+                                Some(std::mem::replace(&mut task.local_slots, frame.local_slots));
+                            task.display_state = frame.display_state;
+                            task.unwind_stack = frame.unwind_stack;
+                            task.is_unwind_target = frame.is_unwind_target;
+                            if !frame.saved_regs.is_empty() {
+                                for (reg, saved_val) in &frame.saved_regs {
+                                    task.registers.set(*reg, *saved_val);
+                                }
+                            }
+                            task.registers.set(Reg(0), ret_val);
+                            rt_ctx.regs_ptr = task.registers.regs.as_mut_ptr().cast::<u64>();
+                            rt_ctx.slots_len = task.local_slots.len();
+                            rt_ctx.slots_ptr = if rt_ctx.slots_len == 0 {
+                                std::ptr::null_mut()
+                            } else {
+                                task.local_slots.as_mut_ptr().cast::<u64>()
+                            };
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if let Some(recycled) = fast_popped_slots {
+                    vm.recycle_frame_slots(recycled);
+                }
+                if fast_ok {
+                    return 0;
+                }
+                return complete_return_in_jit(rt_ctx, session, vm, callee_exit.pc, ret_val);
+            }
+
+            match callee_exit.kind {
+                x if x == JitExitKind::TierUp as u32 => {
+                    vm.compile_jit_function(callee_id, true);
+                    callee_pc = callee_exit.pc;
+                    if let Some(t) = vm.task_mut(session.task_id) {
+                        t.pc = callee_pc;
+                    }
+                    refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+                    continue;
+                }
+                x if x == JitExitKind::InterpretAt as u32 => {
+                    if let Some(t) = vm.task_mut(session.task_id) {
+                        t.pc = callee_exit.pc;
+                    }
+                    return JitExitKind::ContinueTaskLoop as u32;
+                }
+                x if x == JitExitKind::ContinueTaskLoop as u32 => {
+                    return JitExitKind::ContinueTaskLoop as u32;
+                }
+                x if x == JitExitKind::Yield as u32 => {
+                    if let Some(t) = vm.task_mut(session.task_id) {
+                        t.pc = callee_exit.pc;
+                    }
+                    return JitExitKind::YieldAtTaskPc as u32;
+                }
+                x if x == JitExitKind::YieldAtTaskPc as u32 => {
+                    return JitExitKind::YieldAtTaskPc as u32;
+                }
+                x if x == JitExitKind::SuspendRetry as u32 => {
+                    if let Some(t) = vm.task_mut(session.task_id) {
+                        t.pc = callee_exit.pc;
+                    }
+                    return JitExitKind::SuspendAtTaskPc as u32;
+                }
+                x if x == JitExitKind::SuspendAtTaskPc as u32 => {
+                    return JitExitKind::SuspendAtTaskPc as u32;
+                }
+                x if x == JitExitKind::Finished as u32 => {
+                    return JitExitKind::Finished as u32;
+                }
+                x if x == JitExitKind::Cancelled as u32 => {
+                    return JitExitKind::Cancelled as u32;
+                }
+                _ => {
+                    if session.pending_error.is_none() {
+                        session.pending_error = Some(VmError::InvalidInstruction(callee_exit.kind));
+                    }
+                    return JitExitKind::Trap as u32;
+                }
+            }
+        }
+
+        refresh_runtime_ctx(rt_ctx, vm, session.task_id);
+        JitExitKind::ContinueTaskLoop as u32
+    }
+);
+
 fn inspect_ordinary_field(
     vm: &Vm,
     recv_val: TaggedValue,
@@ -746,20 +1361,32 @@ fn try_populate_load_ic(vm: &Vm, recv_val: TaggedValue, field_idx: u32, ic: &mut
     // on already-validated stored values (excluding `ErrorQualified`, `Trait`, `Tuple`, `Newtype`).
     let can_fast_load = {
         let tp = vm.type_pool_read();
-        match &tp.get(canon_field_ty).kind {
-            TypeKind::Intrinsic(
-                Intrinsic::I64
-                | Intrinsic::U64
-                | Intrinsic::I128
-                | Intrinsic::U128
-                | Intrinsic::F64
-                | Intrinsic::Bool
-                | Intrinsic::Char
-                | Intrinsic::Str,
-            ) => true,
-            TypeKind::Struct { .. } => !tp.is_reserved_collection_role(canon_field_ty),
-            TypeKind::Enum { .. } => true,
-            _ => false,
+        let is_identity_leaf = |t: type_pool::TypeIndex| -> bool {
+            match &tp.get(t).kind {
+                TypeKind::Intrinsic(
+                    Intrinsic::Any
+                    | Intrinsic::I64
+                    | Intrinsic::U64
+                    | Intrinsic::Isize
+                    | Intrinsic::Usize
+                    | Intrinsic::I128
+                    | Intrinsic::U128
+                    | Intrinsic::F64
+                    | Intrinsic::Bool
+                    | Intrinsic::Char
+                    | Intrinsic::Str,
+                ) => true,
+                TypeKind::Struct { .. } => !tp.is_reserved_collection_role(t),
+                TypeKind::Enum { .. } => true,
+                _ => false,
+            }
+        };
+        if is_identity_leaf(canon_field_ty) {
+            true
+        } else if let TypeKind::Optional { inner } = &tp.get(canon_field_ty).kind {
+            tp.canonical_type(*inner).is_some_and(is_identity_leaf)
+        } else {
+            false
         }
     };
     if can_fast_load {
@@ -783,15 +1410,36 @@ fn try_populate_store_ic(vm: &Vm, recv_val: TaggedValue, field_idx: u32, ic: &mu
         ic.fast_kind = FieldStoreFastKind::SlowOnly as u32;
         return;
     }
-    let fast_kind = match vm.type_pool_read().as_intrinsic(canon_field_ty) {
-        Some(Intrinsic::I64) => FieldStoreFastKind::SmallI64,
-        Some(Intrinsic::Bool) => FieldStoreFastKind::Bool,
-        Some(Intrinsic::F64) => FieldStoreFastKind::CanonicalF64,
-        _ => FieldStoreFastKind::SlowOnly,
+    let (fast_kind, expected_val_type) = {
+        let tp = vm.type_pool_read();
+        match &tp.get(canon_field_ty).kind {
+            TypeKind::Intrinsic(Intrinsic::I64) => (FieldStoreFastKind::SmallI64, u32::MAX),
+            TypeKind::Intrinsic(Intrinsic::Bool) => (FieldStoreFastKind::Bool, u32::MAX),
+            TypeKind::Intrinsic(Intrinsic::F64) => (FieldStoreFastKind::CanonicalF64, u32::MAX),
+            TypeKind::Intrinsic(Intrinsic::Usize) => (FieldStoreFastKind::Usize, u32::MAX),
+            TypeKind::Struct { .. } if !tp.is_reserved_collection_role(canon_field_ty) => (
+                FieldStoreFastKind::ExactHeapNominal,
+                canon_field_ty.as_u32(),
+            ),
+            TypeKind::Optional { inner } => match tp.canonical_type(*inner) {
+                Some(ci) if tp.as_intrinsic(ci) == Some(Intrinsic::I64) => {
+                    (FieldStoreFastKind::OptionalSmallI64, u32::MAX)
+                }
+                Some(ci)
+                    if matches!(tp.get(ci).kind, TypeKind::Struct { .. })
+                        && !tp.is_reserved_collection_role(ci) =>
+                {
+                    (FieldStoreFastKind::OptionalNominal, ci.as_u32())
+                }
+                _ => (FieldStoreFastKind::SlowOnly, u32::MAX),
+            },
+            _ => (FieldStoreFastKind::SlowOnly, u32::MAX),
+        }
     };
     if fast_kind != FieldStoreFastKind::SlowOnly {
         ic.receiver_type = raw_ty;
         ic.expected_gc_meta_masked = expected_gc_meta_masked;
         ic.fast_kind = fast_kind as u32;
+        ic.expected_val_type = expected_val_type;
     }
 }

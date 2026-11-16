@@ -195,6 +195,18 @@ pub enum Intrinsic {
 impl Intrinsic {
     pub const COUNT: usize = Self::Continuation as usize + 1;
 
+    /// O(1) lookup from a `TypeIndex` to an [`Intrinsic`] if `ty` is one of the
+    /// initial `0..Intrinsic::COUNT` intrinsic entries.
+    #[inline]
+    pub const fn from_type_index(ty: TypeIndex) -> Option<Self> {
+        let idx = ty.as_u32() as usize;
+        if idx < Self::COUNT {
+            Some(Self::ALL[idx])
+        } else {
+            None
+        }
+    }
+
     /// All intrinsic variants in discriminant order.
     pub const ALL: &'static [Intrinsic] = &[
         Self::U8,

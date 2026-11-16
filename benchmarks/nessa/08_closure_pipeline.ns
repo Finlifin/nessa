@@ -1,0 +1,68 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+fn map_i64(src: List, f: fn(i64) -> i64) -> List {
+    let out = List()
+    let n = src.len().as(usize)
+    var i: usize = 0
+    while i < n {
+        out.push(f(src.get(i).as(i64)))
+        i += 1
+    }
+    out
+}
+
+fn filter_i64(src: List, pred: fn(i64) -> bool) -> List {
+    let out = List()
+    let n = src.len().as(usize)
+    var i: usize = 0
+    while i < n {
+        let v = src.get(i).as(i64)
+        if pred(v) {
+            out.push(v)
+        }
+        i += 1
+    }
+    out
+}
+
+fn fold_i64(src: List, init: i64, step: fn(i64, i64) -> i64) -> i64 {
+    var acc = init
+    let n = src.len().as(usize)
+    var i: usize = 0
+    while i < n {
+        acc = step(acc, src.get(i).as(i64))
+        i += 1
+    }
+    acc
+}
+
+fn run_closure_bench(size: i64, rounds: i64) -> i64 {
+    let base = List()
+    var i: i64 = 0
+    while i < size {
+        base.push((i * 17 + 5) % 1000)
+        i += 1
+    }
+    var grand_total: i64 = 0
+    var r: i64 = 0
+    while r < rounds {
+        let offset = r * 3 + 7
+        let scale = (r % 5) + 2
+        let mapped = map_i64(base, |x| x * scale + offset)
+        let filtered = filter_i64(mapped, |x| x % 3 != 0)
+        let folded = fold_i64(filtered, 0, |acc, x| (acc + x + offset) % 1000000007)
+        grand_total = (grand_total + folded) % 1000000007
+        r += 1
+    }
+    grand_total
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    let ans = run_closure_bench(10000, 25)
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ ans.to_string())
+}

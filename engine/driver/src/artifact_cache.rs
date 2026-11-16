@@ -112,7 +112,7 @@ pub(crate) fn single_source_key(
     opt_level: nir::OptLevel,
 ) -> String {
     let mut hasher = new_seeded_hasher();
-    hasher.update(b"single_source\0");
+    hasher.update(b"single_source_v2\0");
     hasher.update([opt_level.as_u8()]);
     feed_str(&mut hasher, source);
     match identity {
@@ -175,7 +175,7 @@ pub(crate) fn package_graph_key(
     opt_level: nir::OptLevel,
 ) -> String {
     let mut hasher = new_seeded_hasher();
-    hasher.update(b"package_graph\0");
+    hasher.update(b"package_graph_v2\0");
     hasher.update([opt_level.as_u8()]);
     feed_package_sources(&mut hasher, root);
     hasher.update((catalog.len() as u64).to_be_bytes());

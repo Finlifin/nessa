@@ -72,6 +72,18 @@ pub(crate) fn try_eval_const_expr(expr: &NirExpr, type_pool: &TypePool) -> Optio
             ids::I128_BITS | ids::U128_BITS => Some(NirValue::ConstInt(128)),
             _ => None,
         },
+        NirExpr::CallBuiltin(ids::STR_LEN | ids::STR_BYTE_COUNT, args) => match args.as_slice() {
+            [NirValue::ConstStr(sid)] => {
+                Some(NirValue::ConstInt(str_interner::get(*sid).len() as i64))
+            }
+            _ => None,
+        },
+        NirExpr::CallBuiltin(ids::STR_IS_EMPTY, args) => match args.as_slice() {
+            [NirValue::ConstStr(sid)] => {
+                Some(NirValue::ConstBool(str_interner::get(*sid).is_empty()))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -319,6 +331,33 @@ fn simplify_expr(
             let r_is_i64 = is_proven_intrinsic(r, Intrinsic::I64, pool, known_types);
             let l_is_bool = is_proven_intrinsic(l, Intrinsic::Bool, pool, known_types);
             let r_is_bool = is_proven_intrinsic(r, Intrinsic::Bool, pool, known_types);
+            let l_intr = match l {
+                NirValue::Local(loc) => known_types
+                    .get(&loc)
+                    .and_then(|&ty| pool.canonical_type(ty))
+                    .and_then(|c| pool.as_intrinsic(c)),
+                other => const_runtime_type(other, pool).and_then(|c| pool.as_intrinsic(c)),
+            };
+            let l_is_reflexive_ord = matches!(
+                l_intr,
+                Some(
+                    Intrinsic::I8
+                        | Intrinsic::I16
+                        | Intrinsic::I32
+                        | Intrinsic::I64
+                        | Intrinsic::I128
+                        | Intrinsic::Isize
+                        | Intrinsic::U8
+                        | Intrinsic::U16
+                        | Intrinsic::U32
+                        | Intrinsic::U64
+                        | Intrinsic::U128
+                        | Intrinsic::Usize
+                        | Intrinsic::Char
+                )
+            );
+            let l_is_reflexive_eq =
+                l_is_reflexive_ord || matches!(l_intr, Some(Intrinsic::Bool | Intrinsic::Str));
             match (op, l, r) {
                 (
                     BinOp::Add | BinOp::Sub | BinOp::BitOr | BinOp::BitXor,
@@ -336,15 +375,20 @@ fn simplify_expr(
                 (BinOp::Sub | BinOp::BitXor, x, y) if l_is_i64 && nir_value_bits_eq(&x, &y) => {
                     NirExpr::Use(NirValue::ConstInt(0))
                 }
-                (BinOp::Eq, x, y) if l_is_i64 && nir_value_bits_eq(&x, &y) => {
+                (BinOp::Eq, x, y) if l_is_reflexive_eq && nir_value_bits_eq(&x, &y) => {
                     NirExpr::Use(NirValue::ConstBool(true))
                 }
-                (BinOp::Ne | BinOp::Lt | BinOp::Gt, x, y)
-                    if l_is_i64 && nir_value_bits_eq(&x, &y) =>
+                (BinOp::Ne, x, y) if l_is_reflexive_eq && nir_value_bits_eq(&x, &y) => {
+                    NirExpr::Use(NirValue::ConstBool(false))
+                }
+                (BinOp::Lt | BinOp::Gt, x, y)
+                    if l_is_reflexive_ord && nir_value_bits_eq(&x, &y) =>
                 {
                     NirExpr::Use(NirValue::ConstBool(false))
                 }
-                (BinOp::Le | BinOp::Ge, x, y) if l_is_i64 && nir_value_bits_eq(&x, &y) => {
+                (BinOp::Le | BinOp::Ge, x, y)
+                    if l_is_reflexive_ord && nir_value_bits_eq(&x, &y) =>
+                {
                     NirExpr::Use(NirValue::ConstBool(true))
                 }
                 (BinOp::Eq, x, NirValue::ConstBool(true))

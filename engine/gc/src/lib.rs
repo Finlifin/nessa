@@ -445,11 +445,9 @@ impl mmtk::vm::Scanning<NessaVM> for NessaScanning {
             return;
         }
         assert!(header.is_ordinary(), "invalid VM payload role");
-        let first_reference_word = if header.type_index == Intrinsic::Str.type_index()
+        let first_reference_word = if header.type_index.as_u32() <= Intrinsic::F64 as u32
+            || header.type_index == Intrinsic::Str.type_index()
             || header.type_index == Intrinsic::Continuation.type_index()
-            || Intrinsic::ALL
-                .iter()
-                .any(|kind| kind.is_numeric() && header.type_index == kind.type_index())
         {
             // Numeric words, string bytes and continuation handles are scalar
             // payloads, even when their low bits resemble aligned pointers.

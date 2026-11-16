@@ -1507,11 +1507,12 @@ fn write_scalar_value(vm: &Vm, val: TaggedValue, buf: &mut Vec<u8>) -> Result<()
     {
         return Ok(());
     }
-    let is_f32_box = val.as_heap_ptr().is_some_and(|ptr| {
-        // SAFETY: `val` is rooted in the active VM operation.
-        let hdr = unsafe { ObjectHeader::from_payload_ptr(ptr) };
-        hdr.is_ordinary() && hdr.type_index == Intrinsic::F32.type_index()
-    });
+    let is_f32_box = val.fast_scalar_intrinsic() == Some(Intrinsic::F32)
+        || val.as_heap_ptr().is_some_and(|ptr| {
+            // SAFETY: `val` is rooted in the active VM operation.
+            let hdr = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+            hdr.is_ordinary() && hdr.type_index == Intrinsic::F32.type_index()
+        });
     // SAFETY: `val` is rooted in the active VM operation; `Number::from_tagged` copies scalar bits.
     if let Some(num) = unsafe { Number::from_tagged(val) } {
         let mut itoa_buf = itoa::Buffer::new();

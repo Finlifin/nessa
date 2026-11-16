@@ -1,0 +1,45 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+fn run_map_bench(num_keys: i64, rounds: i64) -> i64 {
+    let keys = List()
+    var i: i64 = 0
+    while i < num_keys {
+        keys.push("word_key_" ++ i.to_string())
+        i += 1
+    }
+    let mp = Map()
+    var r: i64 = 0
+    while r < rounds {
+        var idx: i64 = 0
+        while idx < num_keys {
+            let k = keys.get(idx.as(usize)).as(String)
+            let prev = mp.get(k)
+            let next_val = if prev == null {
+                1 + (r % 7)
+            } else {
+                prev.as(i64) + 1 + (r % 7)
+            }
+            mp.set(k, next_val)
+            idx += 1
+        }
+        r += 1
+    }
+    var sum: i64 = mp.len()
+    var j: i64 = 0
+    while j < num_keys {
+        let k = keys.get(j.as(usize)).as(String)
+        sum += mp.get(k).as(i64) * ((j % 11) + 1)
+        j += 1
+    }
+    sum
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    let ans = run_map_bench(1500, 100)
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ ans.to_string())
+}

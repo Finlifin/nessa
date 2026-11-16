@@ -240,7 +240,21 @@ fn numeric_resume_preserves_declared_width_including_conversion_allocation() {
         vm.reflected_type(value).unwrap(),
         Intrinsic::I32.type_index()
     );
-    assert!(vm.heap().alloc_count() > allocations);
+    assert_eq!(vm.heap().alloc_count(), allocations);
+
+    // 128-bit widening conversion during resume still allocates cleanly on the GC heap.
+    let (_, owner128) = capture(&mut vm, task, Intrinsic::I128.type_index());
+    let allocations128 = vm.heap().alloc_count();
+    assert!(matches!(
+        vm.resume_language_value(task, owner128, narrow),
+        DispatchResult::Continue
+    ));
+    let value128 = vm.task_ref(task).unwrap().registers.get(Reg(3));
+    assert_eq!(
+        vm.reflected_type(value128).unwrap(),
+        Intrinsic::I128.type_index()
+    );
+    assert!(vm.heap().alloc_count() > allocations128);
 }
 
 #[test]

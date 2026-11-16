@@ -200,7 +200,7 @@ fn main() -> i64 {
 #[test]
 fn nested_task_tree_resolves_ancestor_sync_and_async_handlers() {
     let source = r#"
-global audit_count: i64 = 0
+use std.sync.AtomicInt
 
 effect audit(tag: i64) -> Unit
 async effect inner_step(x: i64) -> i64
@@ -212,8 +212,9 @@ fn top_call() -> #[audit, inner_step, outer_step] i64 {
 }
 
 fn main() -> i64 {
+    let audit_count = AtomicInt.zero()
     let res = top_call() # {
-        audit(tag) => { audit_count += tag },
+        audit(tag) => { let _ = audit_count.fetch_add(tag) },
         async inner_step(x) => {
             audit(2)#
             x + 1
@@ -226,7 +227,7 @@ fn main() -> i64 {
         },
     }
     -- sub1=21, sub2=21 => res=42; audit_count = 5 + 2 + 2 = 9
-    res * 100 + audit_count
+    res * 100 + audit_count.load()
 }
 "#;
     assert_eq!(common::run_value(source).unwrap(), 4209);
@@ -235,9 +236,10 @@ fn main() -> i64 {
 #[test]
 fn structured_concurrency_normal_exit_awaits_unawaited_children() {
     let source = r#"
+use std.sync.AtomicInt
 use std.task
 
-global completed_side_effects: i64 = 0
+global completed_side_effects: AtomicInt = AtomicInt.zero()
 
 async effect fire_and_forget(delta: i64) -> Unit
 
@@ -250,7 +252,7 @@ impl AsyncRunner {
                 task.yield_now()
             }
         }
-        completed_side_effects += delta
+        let _ = completed_side_effects.fetch_add(delta)
     }
 }
 
@@ -273,7 +275,7 @@ fn with_handles_stmt() -> i64 {
                 task.yield_now()
             }
         }
-        completed_side_effects += delta
+        let _ = completed_side_effects.fetch_add(delta)
     }
     let _f3 = fire_and_forget(100)#
     0
@@ -286,7 +288,7 @@ fn with_let_handler() -> i64 {
 }
 
 fn main() -> i64 {
-    -- Normal exit from # block must await both un-awaited child tasks before reading global.
+    -- Normal exit from # block must await both un-awaited child tasks before reading counter.
     let v1 = spawn_for_hash() # {
         async fire_and_forget(delta) => {
             for i in 0..120 {
@@ -294,22 +296,22 @@ fn main() -> i64 {
                     task.yield_now()
                 }
             }
-            completed_side_effects += delta
+            let _ = completed_side_effects.fetch_add(delta)
         },
     }
-    let snap_after_hash = completed_side_effects
+    let snap_after_hash = completed_side_effects.load()
 
     -- Normal exit from .use(provider) must also await both un-awaited child tasks.
     let v2 = spawn_two().use(AsyncRunner {})
-    let snap_after_use = completed_side_effects
+    let snap_after_use = completed_side_effects.load()
 
     -- Normal exit from `handles` statement scope must also await _f3.
     let _ = with_handles_stmt()
-    let snap_after_handles = completed_side_effects
+    let snap_after_handles = completed_side_effects.load()
 
     -- Normal exit from `handles(...) let` scope must also await _f4.
     let _ = with_let_handler()
-    let snap_after_let = completed_side_effects
+    let snap_after_let = completed_side_effects.load()
 
     if snap_after_hash == 7 and snap_after_use == 37 and snap_after_handles == 137 and snap_after_let == 1137 {
         v1 + v2 + snap_after_let

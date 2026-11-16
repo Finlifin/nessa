@@ -94,7 +94,12 @@ impl MapLayout {
         Ok(out)
     }
 
-    fn find(&self, key: &str, hash: u64) -> Result<(Option<usize>, Option<usize>), VmError> {
+    fn find_key(
+        &self,
+        query_key: Option<TaggedValue>,
+        key: &str,
+        hash: u64,
+    ) -> Result<(Option<usize>, Option<usize>), VmError> {
         let mut available = None;
         for offset in 0..self.capacity {
             let bucket = (hash as usize).wrapping_add(offset) & (self.capacity - 1);
@@ -104,16 +109,33 @@ impl MapLayout {
                     available.get_or_insert(bucket);
                 }
                 OCCUPIED => {
-                    if self.slot(bucket, 1).as_u64() == Some(hash)
-                        && string_key(self.slot(bucket, 2))? == key
-                    {
-                        return Ok((Some(bucket), available));
+                    if self.slot(bucket, 1).as_u64() == Some(hash) {
+                        let stored_key = self.slot(bucket, 2);
+                        if query_key == Some(stored_key) {
+                            // Verify valid UTF-8 string invariant without allocating.
+                            if crate::builtin_ctx::with_heap_string_str(stored_key, |_| ())
+                                .is_none()
+                            {
+                                return Err(VmError::TypeError);
+                            }
+                            return Ok((Some(bucket), available));
+                        }
+                        let matched =
+                            crate::builtin_ctx::with_heap_string_str(stored_key, |s| s == key)
+                                .ok_or(VmError::TypeError)?;
+                        if matched {
+                            return Ok((Some(bucket), available));
+                        }
                     }
                 }
                 _ => return Err(VmError::TypeError),
             }
         }
         Ok((None, available))
+    }
+
+    fn find(&self, key: &str, hash: u64) -> Result<(Option<usize>, Option<usize>), VmError> {
+        self.find_key(None, key, hash)
     }
 
     fn write_bucket(&self, bucket: usize, hash: u64, key: TaggedValue, value: TaggedValue) {
@@ -126,20 +148,39 @@ impl MapLayout {
 }
 
 impl Vm {
+    #[inline]
+    fn cached_map_roles(&self) -> Option<(type_pool::TypeIndex, type_pool::TypeIndex)> {
+        {
+            let cache = self.sync_meta_cache();
+            if let Some(cached) = cache.map_roles {
+                return cached;
+            }
+        }
+        let pair = {
+            let tp = self.type_pool_read();
+            tp.map_type().zip(tp.map_buffer_type())
+        };
+        self.sync_meta_cache().map_roles = Some(pair);
+        pair
+    }
+
     pub(super) fn map_layout_unlocked(&self, value: TaggedValue) -> Result<MapLayout, VmError> {
         let pointer = value.as_heap_ptr().ok_or(VmError::TypeError)?;
         // SAFETY: operand is a live managed root in the current mutator operation.
         let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
-        if !header.is_ordinary() {
+        if !header.is_ordinary() || header.payload_words() != 3 {
             return Err(VmError::TypeError);
         }
-        if self
-            .type_pool_read()
-            .checked_collection_role(header.type_index)
-            .map_err(|_| VmError::TypeError)?
-            != Some(CollectionRole::Map)
-            || header.payload_words() != 3
-        {
+        let fast_roles = self.cached_map_roles();
+        let is_map = if fast_roles.is_some_and(|(mt, _)| header.type_index == mt) {
+            true
+        } else {
+            self.type_pool_read()
+                .checked_collection_role(header.type_index)
+                .map_err(|_| VmError::TypeError)?
+                == Some(CollectionRole::Map)
+        };
+        if !is_map {
             return Err(VmError::TypeError);
         }
         let wrapper = pointer.cast_mut().cast::<u64>();
@@ -174,16 +215,18 @@ impl Vm {
         let buffer = buffer.as_heap_ptr().ok_or(VmError::TypeError)?;
         // SAFETY: the reference is reachable from the rooted wrapper.
         let header = unsafe { ObjectHeader::from_payload_ptr(buffer) };
-        if !header.is_ordinary() {
+        if !header.is_ordinary() || header.payload_words() != capacity * 4 {
             return Err(VmError::TypeError);
         }
-        if self
-            .type_pool_read()
-            .checked_collection_role(header.type_index)
-            .map_err(|_| VmError::TypeError)?
-            != Some(CollectionRole::MapBuffer)
-            || header.payload_words() != capacity * 4
-        {
+        let is_buf = if fast_roles.is_some_and(|(_, bt)| header.type_index == bt) {
+            true
+        } else {
+            self.type_pool_read()
+                .checked_collection_role(header.type_index)
+                .map_err(|_| VmError::TypeError)?
+                == Some(CollectionRole::MapBuffer)
+        };
+        if !is_buf {
             return Err(VmError::TypeError);
         }
         Ok(MapLayout {
@@ -426,23 +469,25 @@ impl Vm {
         map: TaggedValue,
         key: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
-        let key = string_key(key)?;
         let _guard = self.stripe_read(map)?;
         let layout = self.map_layout_unlocked(map)?;
-        Ok(layout
-            .find(&key, key_hash(&key))?
-            .0
-            .map_or(TaggedValue::NULL, |bucket| layout.slot(bucket, 3)))
+        crate::builtin_ctx::with_heap_string_str(key, |k_str| {
+            layout
+                .find_key(Some(key), k_str, key_hash(k_str))
+                .map(|(b, _)| b.map_or(TaggedValue::NULL, |bucket| layout.slot(bucket, 3)))
+        })
+        .ok_or(VmError::TypeError)?
     }
 
     pub(super) fn map_contains(&self, map: TaggedValue, key: TaggedValue) -> Result<bool, VmError> {
-        let key = string_key(key)?;
         let _guard = self.stripe_read(map)?;
-        Ok(self
-            .map_layout_unlocked(map)?
-            .find(&key, key_hash(&key))?
-            .0
-            .is_some())
+        let layout = self.map_layout_unlocked(map)?;
+        crate::builtin_ctx::with_heap_string_str(key, |k_str| {
+            layout
+                .find_key(Some(key), k_str, key_hash(k_str))
+                .map(|(b, _)| b.is_some())
+        })
+        .ok_or(VmError::TypeError)?
     }
 
     pub(super) fn map_set(
@@ -462,8 +507,34 @@ impl Vm {
         value: TaggedValue,
         overwrite: bool,
     ) -> Result<(TaggedValue, bool), VmError> {
+        let hash =
+            crate::builtin_ctx::with_heap_string_str(key, key_hash).ok_or(VmError::TypeError)?;
+        // Fast path: in-place update or non-growing insert without allocating a Rust `String`.
+        {
+            let _guard = self.stripe_write(map)?;
+            let old = self.map_layout_unlocked(map)?;
+            if old.capacity > 0 {
+                let found = crate::builtin_ctx::with_heap_string_str(key, |k_str| {
+                    old.find_key(Some(key), k_str, hash)
+                })
+                .ok_or(VmError::TypeError)??;
+                if let Some(bucket) = found.0 {
+                    if overwrite {
+                        old.write_bucket(bucket, hash, key, value);
+                        return Ok((value, false));
+                    }
+                    return Ok((old.slot(bucket, 3), false));
+                }
+                let length = old.length + 1;
+                let grow = length > old.capacity * 3 / 4 && old.capacity < MAX_CAPACITY;
+                if !grow && let Some(bucket) = found.1 {
+                    old.write_bucket(bucket, hash, key, value);
+                    write_u64_atomic(old.wrapper, 0, TaggedValue::from_u64(length as u64).raw());
+                    return Ok((value, true));
+                }
+            }
+        }
         let text = string_key(key)?;
-        let hash = key_hash(&text);
         let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[map, key, value], |vm| {
             loop {
@@ -581,10 +652,13 @@ impl Vm {
         map: TaggedValue,
         key: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
-        let key = string_key(key)?;
         let _guard = self.stripe_write(map)?;
         let layout = self.map_layout_unlocked(map)?;
-        let Some(bucket) = layout.find(&key, key_hash(&key))?.0 else {
+        let found = crate::builtin_ctx::with_heap_string_str(key, |k_str| {
+            layout.find_key(Some(key), k_str, key_hash(k_str))
+        })
+        .ok_or(VmError::TypeError)??;
+        let Some(bucket) = found.0 else {
             return Ok(TaggedValue::NULL);
         };
         let value = layout.slot(bucket, 3);

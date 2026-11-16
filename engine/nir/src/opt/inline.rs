@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nsbc::FuncId;
-use type_pool::{Intrinsic, TypeIndex};
+use type_pool::{Intrinsic, TypeIndex, TypePool};
 
 use crate::opt::cfg::{prune_and_renumber_blocks, remap_terminator_targets};
 use crate::opt::purity::stmt_uses_handlers_or_defer;
@@ -44,7 +44,7 @@ impl InlineConfig {
 
 const MAX_INLINE_LOCALS: u32 = 4000;
 
-pub(crate) fn inline_functions(module: &mut NirModule, config: InlineConfig) {
+pub(crate) fn inline_functions(module: &mut NirModule, type_pool: &TypePool, config: InlineConfig) {
     if module.functions.len() <= 1 {
         return;
     }
@@ -63,7 +63,12 @@ pub(crate) fn inline_functions(module: &mut NirModule, config: InlineConfig) {
 
         let mut any_inlined = false;
         for caller in &mut module.functions {
-            if inline_into_caller(caller, &eligible_callees, config.max_caller_stmts) {
+            if inline_into_caller(
+                caller,
+                &eligible_callees,
+                type_pool,
+                config.max_caller_stmts,
+            ) {
                 any_inlined = true;
             }
         }
@@ -112,6 +117,7 @@ fn is_inline_candidate(
 fn inline_into_caller(
     caller: &mut NirFunction,
     eligible_callees: &HashMap<FuncId, NirFunction>,
+    type_pool: &TypePool,
     max_caller_stmts: usize,
 ) -> bool {
     let mut inlined_any = false;
@@ -135,7 +141,7 @@ fn inline_into_caller(
             break;
         }
 
-        splice_callee_at_site(caller, b_idx, s_idx, dst_local, callee, &args);
+        splice_callee_at_site(caller, b_idx, s_idx, dst_local, callee, &args, type_pool);
         prune_and_renumber_blocks(caller);
         inlined_any = true;
     }
@@ -165,6 +171,50 @@ fn find_next_inline_site(
     None
 }
 
+fn arg_guarantees_type(
+    caller: &NirFunction,
+    prefix_stmts: &[NirStmt],
+    assigned_in_caller: &HashSet<u32>,
+    arg_val: NirValue,
+    param_ty: TypeIndex,
+    type_pool: &TypePool,
+) -> bool {
+    let canon_param = type_pool.canonical_type(param_ty).unwrap_or(param_ty);
+    match arg_val {
+        NirValue::ConstInt(_) => canon_param == Intrinsic::I64.type_index(),
+        NirValue::ConstUInt(_) => canon_param == Intrinsic::U64.type_index(),
+        NirValue::ConstFloat(_) => canon_param == Intrinsic::F64.type_index(),
+        NirValue::ConstBool(_) => canon_param == Intrinsic::Bool.type_index(),
+        NirValue::ConstStr(_) => canon_param == Intrinsic::Str.type_index(),
+        NirValue::Local(loc) => {
+            for stmt in prefix_stmts.iter().rev() {
+                if let NirStmt::Assign(dst, expr) = stmt.unscoped()
+                    && *dst == loc
+                {
+                    return match expr.unscoped() {
+                        NirExpr::TypeCast(_, ty)
+                        | NirExpr::TypeAssert(_, ty)
+                        | NirExpr::NewObject(ty, _) => {
+                            type_pool.canonical_type(*ty).unwrap_or(*ty) == canon_param
+                        }
+                        _ => false,
+                    };
+                }
+            }
+            !assigned_in_caller.contains(&loc.0)
+                && caller.params.iter().any(|cp| {
+                    cp.local == loc
+                        && cp.type_index != TypeIndex::INVALID
+                        && type_pool
+                            .canonical_type(cp.type_index)
+                            .unwrap_or(cp.type_index)
+                            == canon_param
+                })
+        }
+        _ => false,
+    }
+}
+
 fn splice_callee_at_site(
     caller: &mut NirFunction,
     b_idx: usize,
@@ -172,6 +222,7 @@ fn splice_callee_at_site(
     dst_local: NirLocal,
     callee: &NirFunction,
     args: &[NirValue],
+    type_pool: &TypePool,
 ) {
     let local_offset = caller.local_count;
     caller.local_count += callee.local_count;
@@ -188,19 +239,50 @@ fn splice_callee_at_site(
         Terminator::Goto(BlockId(callee_block_base)),
     );
 
+    let mut assigned_in_caller = HashSet::new();
+    for blk in &caller.blocks {
+        for st in &blk.stmts {
+            if let NirStmt::Assign(dst, _) = st.unscoped() {
+                assigned_in_caller.insert(dst.0);
+            }
+        }
+    }
+    for st in &tail_stmts {
+        if let NirStmt::Assign(dst, _) = st.unscoped() {
+            assigned_in_caller.insert(dst.0);
+        }
+    }
+
+    let param_inits: Vec<(NirLocal, NirExpr)> = callee
+        .params
+        .iter()
+        .zip(args)
+        .map(|(param, &arg_val)| {
+            let mapped_param = NirLocal(local_offset + param.local.0);
+            let needs_assert = param.type_index != TypeIndex::INVALID
+                && param.type_index != Intrinsic::Any.type_index()
+                && !arg_guarantees_type(
+                    caller,
+                    &caller.blocks[b_idx].stmts,
+                    &assigned_in_caller,
+                    arg_val,
+                    param.type_index,
+                    type_pool,
+                );
+            let init_expr = if needs_assert {
+                wrap_expr_preserving_scope(
+                    NirExpr::TypeAssert(arg_val, param.type_index),
+                    callee.entry_scope,
+                )
+            } else {
+                NirExpr::Use(arg_val)
+            };
+            (mapped_param, init_expr)
+        })
+        .collect();
+
     // Bind callee parameters in `caller.blocks[b_idx]` before jumping into callee entry block.
-    for (param, &arg_val) in callee.params.iter().zip(args) {
-        let mapped_param = NirLocal(local_offset + param.local.0);
-        let init_expr = if param.type_index != TypeIndex::INVALID
-            && param.type_index != Intrinsic::Any.type_index()
-        {
-            wrap_expr_preserving_scope(
-                NirExpr::TypeAssert(arg_val, param.type_index),
-                callee.entry_scope,
-            )
-        } else {
-            NirExpr::Use(arg_val)
-        };
+    for (mapped_param, init_expr) in param_inits {
         caller.blocks[b_idx]
             .stmts
             .push(NirStmt::Assign(mapped_param, init_expr));

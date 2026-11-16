@@ -63,7 +63,70 @@ impl Vm {
         self.canonical_type(ty)
     }
 
+    #[inline]
+    fn cached_pool_len(&self) -> usize {
+        let len = self.sync_meta_cache().pool_len;
+        if len != 0 {
+            return len;
+        }
+        let actual = self.type_pool_read().len();
+        self.sync_meta_cache().pool_len = actual;
+        actual
+    }
+
+    #[inline]
+    pub(crate) fn cached_type_op_kind(&self, canonical: TypeIndex) -> crate::CachedTypeOpKind {
+        if let Some(intr) = Intrinsic::from_type_index(canonical) {
+            return match intr {
+                Intrinsic::Any => crate::CachedTypeOpKind::Any,
+                Intrinsic::NoReturn => crate::CachedTypeOpKind::NoReturn,
+                other => crate::CachedTypeOpKind::Intrinsic(other),
+            };
+        }
+        let raw = canonical.as_u32() as usize;
+        if let Some(Some(kind)) = self.sync_meta_cache().type_op_kinds.get(raw).copied() {
+            return kind;
+        }
+        let kind = {
+            let tp = self.type_pool_read();
+            match &tp.get(canonical).kind {
+                TypeKind::Intrinsic(Intrinsic::Any) => crate::CachedTypeOpKind::Any,
+                TypeKind::Intrinsic(Intrinsic::NoReturn) => crate::CachedTypeOpKind::NoReturn,
+                TypeKind::Intrinsic(intr) => crate::CachedTypeOpKind::Intrinsic(*intr),
+                TypeKind::Optional { inner } => crate::CachedTypeOpKind::Optional(*inner),
+                TypeKind::EffectQualified { inner, .. } => {
+                    crate::CachedTypeOpKind::EffectQualified(*inner)
+                }
+                TypeKind::ErrorQualified { .. } => crate::CachedTypeOpKind::ErrorQualified,
+                TypeKind::Struct { fields, .. } => match tp.checked_collection_role(canonical) {
+                    Ok(Some(type_pool::CollectionRole::List | type_pool::CollectionRole::Map)) => {
+                        crate::CachedTypeOpKind::Collection3Word
+                    }
+                    Ok(None) => match u16::try_from(fields.len()) {
+                        Ok(expected_words) => {
+                            crate::CachedTypeOpKind::PlainStruct { expected_words }
+                        }
+                        Err(_) => crate::CachedTypeOpKind::Slow,
+                    },
+                    _ => crate::CachedTypeOpKind::Slow,
+                },
+                _ => crate::CachedTypeOpKind::Slow,
+            }
+        };
+        if raw < 1_048_576 {
+            let mut cache = self.sync_meta_cache();
+            if cache.type_op_kinds.len() <= raw {
+                cache.type_op_kinds.resize(raw + 1, None);
+            }
+            cache.type_op_kinds[raw] = Some(kind);
+        }
+        kind
+    }
+
     pub(super) fn canonical_type(&self, ty: TypeIndex) -> Result<TypeIndex, VmError> {
+        if ty.as_u32() < Intrinsic::COUNT as u32 {
+            return Ok(ty);
+        }
         let raw = ty.as_u32() as usize;
         if let Some(Some(cached)) = self.sync_meta_cache().canonical_types.get(raw).copied() {
             return Ok(cached);
@@ -150,31 +213,25 @@ impl Vm {
         if depth >= crate::error_values::MAX_VALUE_DEPTH {
             return Err(VmError::TypeError);
         }
-        if let Some(layout) = self.error_layout(value, depth)? {
-            return Ok(Some(layout.ty));
+        if let Some(intr) = value.fast_scalar_intrinsic() {
+            return Ok(Some(intr.type_index()));
         }
-        let ty = if value.as_i64().is_some() {
-            Intrinsic::I64
-        } else if value.as_u64().is_some() {
-            Intrinsic::U64
-        } else if value.as_f64().is_some() {
-            Intrinsic::F64
-        } else if value.as_bool().is_some() {
-            Intrinsic::Bool
-        } else if value.as_char().is_some() {
-            Intrinsic::Char
-        } else if let Some(ty) = value.as_type() {
+        if value.is_null() {
+            return Ok(None);
+        }
+        if let Some(ty) = value.as_type() {
             self.canonical_type(ty)?;
-            Intrinsic::Type
-        } else if value.as_enum().is_some() {
+            return Ok(Some(Intrinsic::Type.type_index()));
+        }
+        if value.as_enum().is_some() {
             return self
                 .enum_layout(value)
                 .map(|layout| layout.map(|layout| layout.ty));
-        } else if value.is_unit() {
-            Intrinsic::Unit
-        } else if value.is_null() {
-            return Ok(None);
-        } else if let Some(pointer) = value.as_heap_ptr() {
+        }
+        if let Some(layout) = self.error_layout(value, depth)? {
+            return Ok(Some(layout.ty));
+        }
+        if let Some(pointer) = value.as_heap_ptr() {
             // SAFETY: the caller holds the operation and the source register
             // roots this live object. No collection occurs during inspection.
             let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
@@ -242,7 +299,7 @@ impl Vm {
                         return Err(VmError::TypeError);
                     }
                 } else if kind == Intrinsic::Str {
-                    if crate::builtin_ctx::heap_string_to_owned(value).is_none() {
+                    if crate::builtin_ctx::with_heap_string_str(value, |_| ()).is_none() {
                         return Err(VmError::TypeError);
                     }
                 } else if kind == Intrinsic::Continuation {
@@ -263,11 +320,10 @@ impl Vm {
                     .enum_layout(value)
                     .map(|layout| layout.map(|layout| layout.ty));
             }
-            return Ok(Some(heap_type));
+            Ok(Some(heap_type))
         } else {
-            return Err(VmError::TypeError);
-        };
-        Ok(Some(ty.type_index()))
+            Err(VmError::TypeError)
+        }
     }
 
     pub(super) fn value_matches_type(
@@ -276,11 +332,64 @@ impl Vm {
         target: TypeIndex,
         depth: usize,
     ) -> Result<bool, VmError> {
-        let pool_len = self.type_pool_read().len();
+        let pool_len = self.cached_pool_len();
         if depth >= pool_len || depth >= crate::error_values::MAX_VALUE_DEPTH {
             return Err(VmError::InvalidType(target));
         }
         let target = self.canonical_type(target)?;
+        if Self::value_is_exact_intrinsic_fast(value, target) {
+            if target == Intrinsic::Str.type_index()
+                && crate::builtin_ctx::with_heap_string_str(value, |_| ()).is_none()
+            {
+                return Err(VmError::TypeError);
+            }
+            return Ok(true);
+        }
+        match self.cached_type_op_kind(target) {
+            crate::CachedTypeOpKind::NoReturn => {
+                self.error_layout(value, depth)?;
+                return Ok(false);
+            }
+            crate::CachedTypeOpKind::Optional(inner) => {
+                if value.is_null() {
+                    self.canonical_type(inner)?;
+                    return Ok(true);
+                }
+                return self.value_matches_type(value, inner, depth + 1);
+            }
+            crate::CachedTypeOpKind::EffectQualified(inner) => {
+                return self.value_matches_type(value, inner, depth + 1);
+            }
+            crate::CachedTypeOpKind::PlainStruct { expected_words } => {
+                if let Some(ptr) = value.as_heap_ptr() {
+                    // SAFETY: caller holds mutator operation and `value` is rooted.
+                    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+                    if header.is_ordinary()
+                        && (header.type_index == target
+                            || self.canonical_type(header.type_index)? == target)
+                    {
+                        if header.payload_words() != expected_words as usize {
+                            return Err(VmError::TypeError);
+                        }
+                        return Ok(true);
+                    }
+                }
+            }
+            crate::CachedTypeOpKind::Collection3Word => {
+                if let Some(ptr) = value.as_heap_ptr() {
+                    // SAFETY: caller holds mutator operation and `value` is rooted.
+                    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+                    if header.is_ordinary()
+                        && header.payload_words() == 3
+                        && (header.type_index == target
+                            || self.canonical_type(header.type_index)? == target)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
         let envelope = self.error_layout(value, depth)?;
         let target_kind = self.type_pool_read().get(target).kind.clone();
         match target_kind {
@@ -393,30 +502,22 @@ impl Vm {
 
     #[inline]
     pub(crate) fn value_is_exact_intrinsic_fast(value: TaggedValue, target: TypeIndex) -> bool {
-        if target == Intrinsic::I64.type_index() {
-            return value.as_i64().is_some();
+        if let Some(intr) = value.fast_scalar_intrinsic() {
+            return intr.type_index() == target;
         }
-        if target == Intrinsic::U64.type_index() {
-            return value.as_u64().is_some();
-        }
-        if target == Intrinsic::F64.type_index() {
-            return value.as_f64().is_some();
-        }
-        if target == Intrinsic::Bool.type_index() {
-            return value.as_bool().is_some();
-        }
-        if target == Intrinsic::Char.type_index() {
-            return value.as_char().is_some();
-        }
-        if target == Intrinsic::Unit.type_index() {
-            return value.is_unit();
-        }
-        if target == Intrinsic::Str.type_index()
-            && let Some(ptr) = value.as_heap_ptr()
-        {
+        if let Some(ptr) = value.as_heap_ptr() {
             // SAFETY: caller holds a mutator operation and `value` is a live VM value.
             let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
-            return header.is_ordinary() && header.type_index == Intrinsic::Str.type_index();
+            if target == Intrinsic::Str.type_index() {
+                return header.is_ordinary()
+                    && header.type_index == Intrinsic::Str.type_index()
+                    && crate::builtin_ctx::with_heap_string_str(value, |_| ()).is_some();
+            }
+            if target == Intrinsic::F64.type_index() {
+                return header.is_ordinary()
+                    && header.payload_words() == 1
+                    && header.type_index == Intrinsic::F64.type_index();
+            }
         }
         false
     }
@@ -430,27 +531,63 @@ impl Vm {
         if depth >= crate::error_values::MAX_VALUE_DEPTH {
             return Err(VmError::TypeError);
         }
-        if Self::value_is_exact_intrinsic_fast(value, target) {
+        let canonical = self.canonical_type(target)?;
+        if Self::value_is_exact_intrinsic_fast(value, canonical) {
             return Ok(value);
         }
-        let canonical = self.canonical_type(target)?;
-        let kind = self.type_pool_read().get(canonical).kind.clone();
-        if matches!(kind, TypeKind::ErrorQualified { .. }) {
-            return self.assert_error(value, canonical, depth);
-        }
-        match kind {
-            TypeKind::Optional { inner } if !value.is_null() => {
+        match self.cached_type_op_kind(canonical) {
+            crate::CachedTypeOpKind::Any
+                if !value.is_heap() && value.as_enum().is_none() && value.as_type().is_none() =>
+            {
+                if value.fast_scalar_intrinsic().is_some() || value.is_null() {
+                    return Ok(value);
+                }
+            }
+            crate::CachedTypeOpKind::PlainStruct { expected_words } => {
+                if let Some(ptr) = value.as_heap_ptr() {
+                    // SAFETY: caller holds mutator operation and `value` is rooted.
+                    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+                    if header.is_ordinary()
+                        && header.payload_words() == expected_words as usize
+                        && (header.type_index == canonical
+                            || self.canonical_type(header.type_index)? == canonical)
+                    {
+                        return Ok(value);
+                    }
+                }
+            }
+            crate::CachedTypeOpKind::Collection3Word => {
+                if let Some(ptr) = value.as_heap_ptr() {
+                    // SAFETY: caller holds mutator operation and `value` is rooted.
+                    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+                    if header.is_ordinary()
+                        && header.payload_words() == 3
+                        && (header.type_index == canonical
+                            || self.canonical_type(header.type_index)? == canonical)
+                    {
+                        return Ok(value);
+                    }
+                }
+            }
+            crate::CachedTypeOpKind::ErrorQualified => {
+                return self.assert_error(value, canonical, depth);
+            }
+            crate::CachedTypeOpKind::Optional(inner) => {
+                if value.is_null() {
+                    self.canonical_type(inner)?;
+                    return Ok(value);
+                }
                 return self.assert_value_type_depth(value, inner, depth + 1);
             }
-            TypeKind::EffectQualified { inner, .. } => {
+            crate::CachedTypeOpKind::EffectQualified(inner) => {
                 return self.assert_value_type_depth(value, inner, depth + 1);
             }
             _ => {}
         }
-        if !self.value_matches_type(value, target, depth)? {
+        if !self.value_matches_type(value, canonical, depth)? {
             return Err(VmError::TypeError);
         }
-        self.cast_value(value, target, depth)
+        self.cast_value(value, canonical, depth)
     }
 
     pub(super) fn cast_value(
@@ -459,29 +596,62 @@ impl Vm {
         target: TypeIndex,
         depth: usize,
     ) -> Result<TaggedValue, VmError> {
-        if depth < crate::error_values::MAX_VALUE_DEPTH
-            && Self::value_is_exact_intrinsic_fast(value, target)
-        {
-            return Ok(value);
-        }
-        let pool_len = self.type_pool_read().len();
+        let pool_len = self.cached_pool_len();
         if depth >= pool_len || depth >= crate::error_values::MAX_VALUE_DEPTH {
             return Err(VmError::InvalidType(target));
         }
         let target = self.canonical_type(target)?;
-        let target_kind = self.type_pool_read().get(target).kind.clone();
-        if matches!(target_kind, TypeKind::ErrorQualified { .. }) {
-            return self.convert_error(value, target, depth);
+        if Self::value_is_exact_intrinsic_fast(value, target) {
+            return Ok(value);
         }
-        match &target_kind {
-            TypeKind::Optional { inner } if !value.is_null() => {
-                return self.cast_value(value, *inner, depth + 1);
+        match self.cached_type_op_kind(target) {
+            crate::CachedTypeOpKind::Intrinsic(kind) if kind.is_numeric() => {
+                if let Some(number) = value.as_inline_number() {
+                    return self.typed_number_value(number.cast_to(kind)?, kind);
+                }
             }
-            TypeKind::EffectQualified { inner, .. } => {
-                return self.cast_value(value, *inner, depth + 1);
+            crate::CachedTypeOpKind::PlainStruct { expected_words } => {
+                if let Some(ptr) = value.as_heap_ptr() {
+                    // SAFETY: caller holds mutator operation and `value` is rooted.
+                    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+                    if header.is_ordinary()
+                        && header.payload_words() == expected_words as usize
+                        && (header.type_index == target
+                            || self.canonical_type(header.type_index)? == target)
+                    {
+                        return Ok(value);
+                    }
+                }
+            }
+            crate::CachedTypeOpKind::Collection3Word => {
+                if let Some(ptr) = value.as_heap_ptr() {
+                    // SAFETY: caller holds mutator operation and `value` is rooted.
+                    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+                    if header.is_ordinary()
+                        && header.payload_words() == 3
+                        && (header.type_index == target
+                            || self.canonical_type(header.type_index)? == target)
+                    {
+                        return Ok(value);
+                    }
+                }
+            }
+            crate::CachedTypeOpKind::ErrorQualified => {
+                return self.convert_error(value, target, depth);
+            }
+            crate::CachedTypeOpKind::Optional(inner) => {
+                if value.is_null() {
+                    self.canonical_type(inner)?;
+                    return Ok(value);
+                }
+                return self.cast_value(value, inner, depth + 1);
+            }
+            crate::CachedTypeOpKind::EffectQualified(inner) => {
+                return self.cast_value(value, inner, depth + 1);
             }
             _ => {}
         }
+        let target_kind = self.type_pool_read().get(target).kind.clone();
         if let Some(layout) = self.error_layout(value, depth)? {
             if target == Intrinsic::Any.type_index() {
                 return Ok(value);
@@ -547,12 +717,17 @@ impl Vm {
     }
 
     /// Numeric casts preserve the concrete target type even for small values.
-    /// Narrow types currently require a box because immediate subtags erase width.
+    /// Inline immediate tags preserve exact width; out-of-57-bit `usize`/`isize`
+    /// and 128-bit values fall back to heap boxes.
+    #[inline]
     pub(crate) fn typed_number_value(
         &mut self,
         number: Number,
         kind: Intrinsic,
     ) -> Result<TaggedValue, VmError> {
+        if let Some(inline_val) = TaggedValue::try_from_typed_scalar(kind, number) {
+            return Ok(inline_val);
+        }
         if matches!(
             kind,
             Intrinsic::I64 | Intrinsic::U64 | Intrinsic::I128 | Intrinsic::U128 | Intrinsic::F64
@@ -797,7 +972,7 @@ mod tests {
         );
         assert!(matches!(result, DispatchResult::Continue));
         let value = vm.task_ref(task).unwrap().registers.get(Reg(1));
-        assert!(value.is_heap());
+        assert!(value.is_immediate());
         assert_eq!(
             vm.value_type(value).unwrap(),
             Some(Intrinsic::I8.type_index())

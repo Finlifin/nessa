@@ -1,0 +1,30 @@
+use std.io.println
+use std.time.monotonic_nanos
+
+effect step_state(delta: i64, catch k) -> i64
+
+fn run_effect_loop(iters: i64) -> i64 {
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < iters {
+        acc = (acc + step_state(i)#) % 1000000007
+        i += 1
+    }
+    acc
+}
+
+fn main() {
+    let t0 = monotonic_nanos()
+    var state: i64 = 10
+    let ans = run_effect_loop(50000)# {
+        step_state(delta, k) => {
+            state = (state * 31 + delta + 7) % 1000003
+            k(state)
+        }
+    }
+    let checksum = (ans + state) % 1000000007
+    let t1 = monotonic_nanos()
+    let ms = (t1 - t0).as(f64) / 1000000.0
+    println("KERNEL_MS:" ++ ms.to_string())
+    println("CHECKSUM:" ++ checksum.to_string())
+}
