@@ -2,8 +2,9 @@ use ast::{NodeIndex, NodeKind};
 use lexer::token::TokenKind;
 
 use crate::basic::{self, Rule, try_multi_in_block, try_multi_with_bracket};
-use crate::error::{ParseErrorKind, ParseResult};
+use crate::error::{ParseError, ParseErrorKind, ParseResult};
 use crate::expr;
+use crate::heuristics;
 use crate::parser::{NULL, Parser};
 use crate::pattern;
 use crate::statement;
@@ -39,7 +40,7 @@ pub fn try_global_def(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
     p.expect_token(TokenKind::Colon)?;
-    let ty = expr::try_expr_without_extended_call(p)?;
+    let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
     if ty.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -80,7 +81,7 @@ pub fn try_assoc_def(p: &mut Parser) -> ParseResult {
     let inner = if basic::is_ident_token(p.peek_token().kind) {
         let name = basic::try_id(p)?;
         p.expect_token(TokenKind::Colon)?;
-        let ty = expr::try_expr_without_extended_call(p)?;
+        let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
         if ty.is_null() {
             p.err(
                 ParseErrorKind::InvalidSyntax,
@@ -163,6 +164,8 @@ pub fn try_fn_def(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected function name after `fn`",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "function");
     }
 
     let params = try_multi_with_bracket(
@@ -201,13 +204,29 @@ pub fn try_fn_def(p: &mut Parser) -> ParseResult {
     Ok(idx)
 }
 
-/// `-> type_expr`
+/// `-> type_expr` (also diagnoses `: type_expr` when not `: <INDENT>`)
 pub fn try_return_type(p: &mut Parser) -> ParseResult {
     if !p.eat_token(TokenKind::Arrow) {
+        if p.peek_token().kind == TokenKind::Colon
+            && !p.peek(&[TokenKind::Colon, TokenKind::Indent])
+        {
+            let colon = p.next_token();
+            let span = p.token_span(colon);
+            p.push_error(
+                ParseError::new(
+                    ParseErrorKind::InvalidSyntax,
+                    span,
+                    "function return types in Nessa use `->`, not `:`",
+                )
+                .add_help("replace `: <Type>` with `-> <Type>`"),
+            );
+            let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
+            return Ok(ty);
+        }
         return Ok(NULL);
     }
 
-    let ty = expr::try_expr_without_extended_call(p)?;
+    let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
     if ty.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -245,8 +264,11 @@ fn try_capability(p: &mut Parser) -> ParseResult {
 pub fn try_effect_def(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    // Allow optional `async` prefix
-    let is_async = p.eat_token(TokenKind::KwAsync);
+    let is_async = if p.peek(&[TokenKind::KwAsync, TokenKind::KwEffect]) {
+        p.eat_token(TokenKind::KwAsync)
+    } else {
+        false
+    };
 
     if !p.eat_token(TokenKind::KwEffect) {
         return Ok(NULL);
@@ -304,7 +326,7 @@ fn try_effect_parameter(p: &mut Parser) -> ParseResult {
             .map(|()| NULL);
     }
     let ty = if p.eat_token(TokenKind::Colon) {
-        let ty = expr::try_expr_without_extended_call(p)?;
+        let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
         if ty.is_null() {
             return p
                 .err(
@@ -403,7 +425,7 @@ fn parse_let_handler(p: &mut Parser, first_effect: NodeIndex) -> ParseResult {
     }
 
     let type_ann = if p.eat_token(TokenKind::Colon) {
-        let ty = expr::try_expr_without_extended_call(p)?;
+        let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
         if ty.is_null() {
             let _ = p.err(
                 ParseErrorKind::InvalidSyntax,
@@ -561,6 +583,8 @@ pub fn try_struct_def(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected struct name after `struct`",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "struct");
     }
 
     let defs = basic::try_required_block(
@@ -611,7 +635,7 @@ fn try_struct_field(p: &mut Parser) -> ParseResult {
 
     p.expect_token(TokenKind::Colon)?;
 
-    let ty = expr::try_expr_without_extended_call(p)?;
+    let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
     if ty.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -667,6 +691,8 @@ pub fn try_enum_def(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected enum name after `enum`",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "enum");
     }
 
     let variants = basic::try_required_block(
@@ -757,6 +783,8 @@ pub fn try_trait_def(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected trait name after `trait`",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "trait");
     }
 
     // Parse optional parent traits: (Parent1, Parent2, ...)
@@ -825,6 +853,8 @@ fn try_fn_signature(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected function name in signature",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "trait method");
     }
 
     let params = try_multi_with_bracket(
@@ -870,6 +900,8 @@ fn try_trait_derive_fn(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected function name after `derive fn`",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "derived trait method");
     }
 
     let params = try_multi_with_bracket(
@@ -1112,11 +1144,13 @@ pub fn try_type_alias_def(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected name after `typealias`",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "typealias");
     }
 
     p.expect_token(TokenKind::Eq)?;
 
-    let ty = expr::try_expr(p)?;
+    let ty = p.with_type_context(expr::try_expr)?;
     if ty.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -1149,11 +1183,13 @@ pub fn try_newtype_def(p: &mut Parser) -> ParseResult {
             p.next_token_span(),
             "Expected name after `newtype`",
         );
+    } else {
+        heuristics::try_angle_bracket_generics_recovery(p, "newtype");
     }
 
     p.expect_token(TokenKind::Eq)?;
 
-    let ty = expr::try_expr(p)?;
+    let ty = p.with_type_context(expr::try_expr)?;
     if ty.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,

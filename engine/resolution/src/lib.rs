@@ -19,9 +19,11 @@ mod capability;
 pub use capability::{
     CapabilityDecl, HandlerApplicationPlan, HandlerBindingKind, HandlesStmtPlan, LetHandlerPlan,
 };
+mod collection_inference;
 mod collections;
 mod comparison_derivation;
 mod display_derivation;
+mod flow_narrowing;
 pub use display_derivation::DerivedDisplayPlan;
 mod hash_derivation;
 pub use hash_derivation::DerivedHashPlan;
@@ -65,6 +67,7 @@ mod ranges;
 pub(crate) mod resolver;
 mod self_provenance;
 mod structs;
+mod suggestions;
 mod task_combinators;
 mod trait_loops;
 pub use trait_loops::{ForLoopPlan, IteratorCall, StaticForLoop};

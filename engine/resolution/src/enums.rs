@@ -198,15 +198,88 @@ pub(crate) fn descriptor(
     ))
 }
 
-pub(crate) fn record_reference(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) {
-    if let Some((reference, _)) = descriptor(r, ast, node) {
+fn symbol_variant_descriptor(
+    r: &Resolver<'_>,
+    ast: &Ast,
+    symbol_node: NodeIndex,
+    expected: Option<TypeIndex>,
+) -> Option<(EnumVariantRef, VariantInfo, Option<crate::SymbolId>)> {
+    if symbol_node.is_null() || ast.node(symbol_node).kind != NodeKind::Symbol {
+        return None;
+    }
+    let id_node = ast.fixed_children(symbol_node)[0];
+    if id_node.is_null() {
+        return None;
+    }
+    let variant_name = ast.node(id_node).str_id;
+    let target = typing::payload_inner_expected(&r.type_pool, expected)?;
+    let enum_ty = r.type_pool.canonical_type(target)?;
+    let TypeKind::Enum { name, variants } = &r.type_pool.get(enum_ty).kind else {
+        return None;
+    };
+    let Some(variant) = variants.iter().find(|v| v.name == variant_name).cloned() else {
+        let enum_name = str_interner::get(*name);
+        let var_str = str_interner::get(variant_name);
+        let candidates: Vec<String> = variants
+            .iter()
+            .map(|v| format!(".{}", str_interner::get(v.name)))
+            .collect();
+        let query = format!(".{var_str}");
+        let mut builder = r
+            .diag_ctx
+            .error(format!(
+                "unknown variant `.{var_str}` on enum `{enum_name}`"
+            ))
+            .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+            .with_primary_span(ast.node(symbol_node).span);
+        if let Some(hint) =
+            diagnostic::suggest::did_you_mean(&query, candidates.iter().map(String::as_str))
+        {
+            builder = builder.with_help(hint);
+        }
+        builder.emit(r.diag_ctx);
+        return None;
+    };
+    let assoc_sym = r
+        .scopes
+        .iter()
+        .filter(|scope| scope.assoc_type == Some(enum_ty))
+        .find_map(|scope| scope.bindings.get(&variant_name).copied())
+        .filter(|&sym| r.symbols[sym.0 as usize].kind == SymbolKind::EnumVariant);
+    Some((
+        EnumVariantRef {
+            type_index: enum_ty,
+            variant_tag: variant.tag,
+        },
+        variant,
+        assoc_sym,
+    ))
+}
+
+pub(crate) fn record_reference(
+    r: &mut Resolver<'_>,
+    ast: &Ast,
+    node: NodeIndex,
+    expected: Option<TypeIndex>,
+) {
+    let found = descriptor(r, ast, node).or_else(|| {
+        symbol_variant_descriptor(r, ast, node, expected).map(|(r_ref, v, _)| (r_ref, v))
+    });
+    if let Some((reference, _)) = found {
         r.enum_variants.insert(node, reference);
         r.node_types.insert(node, reference.type_index);
     }
 }
 
-pub(crate) fn value(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option<TypeIndex> {
-    let (reference, variant) = descriptor(r, ast, node)?;
+pub(crate) fn value(
+    r: &mut Resolver<'_>,
+    ast: &Ast,
+    node: NodeIndex,
+    expected: Option<TypeIndex>,
+) -> Option<TypeIndex> {
+    let (reference, variant) = descriptor(r, ast, node).or_else(|| {
+        symbol_variant_descriptor(r, ast, node, expected).map(|(r_ref, v, _)| (r_ref, v))
+    })?;
     r.enum_variants.insert(node, reference);
     if !variant.fields.is_empty() && r.current_call_callee != Some(node) {
         report(
@@ -219,9 +292,21 @@ pub(crate) fn value(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option<
     Some(reference.type_index)
 }
 
-pub(crate) fn construction(r: &mut Resolver<'_>, ast: &Ast, call: NodeIndex) -> Option<TypeIndex> {
+pub(crate) fn construction(
+    r: &mut Resolver<'_>,
+    ast: &Ast,
+    call: NodeIndex,
+    expected: Option<TypeIndex>,
+) -> Option<TypeIndex> {
     let callee = ast.fixed_children(call)[0];
-    let (reference, variant) = descriptor(r, ast, callee)?;
+    let (reference, variant, shorthand_sym) = if let Some((r_ref, var)) = descriptor(r, ast, callee)
+    {
+        (r_ref, var, None)
+    } else if let Some((r_ref, var, sym)) = symbol_variant_descriptor(r, ast, callee, expected) {
+        (r_ref, var, sym)
+    } else {
+        return None;
+    };
     if variant.fields.is_empty()
         && r.scopes.iter().any(|scope| {
             scope.assoc_type == Some(reference.type_index)
@@ -233,11 +318,13 @@ pub(crate) fn construction(r: &mut Resolver<'_>, ast: &Ast, call: NodeIndex) -> 
         return None;
     }
     let arguments = ast.multi_children(call);
-    let symbol = r.node_symbols.get(&callee).copied().or_else(|| {
-        (ast.node(callee).kind == NodeKind::Projection)
-            .then(|| r.node_symbols.get(&ast.fixed_children(callee)[1]).copied())
-            .flatten()
-    });
+    let symbol = shorthand_sym
+        .or_else(|| r.node_symbols.get(&callee).copied())
+        .or_else(|| {
+            (ast.node(callee).kind == NodeKind::Projection)
+                .then(|| r.node_symbols.get(&ast.fixed_children(callee)[1]).copied())
+                .flatten()
+        });
     if let Some(declaration) = symbol.and_then(|symbol| {
         let symbol = &r.symbols[symbol.0 as usize];
         (symbol.kind == SymbolKind::EnumVariant && !symbol.def_node.is_null())
@@ -419,6 +506,29 @@ pub(crate) fn pattern(
                 r.symbols[symbol.0 as usize].type_index = expected;
             }
         }
+        NodeKind::Symbol => {
+            if let Some((reference, variant, _)) =
+                symbol_variant_descriptor(r, ast, node, Some(expected))
+            {
+                check_variant(r, ast, node, expected, reference);
+                r.enum_variants.insert(node, reference);
+                if !variant.fields.is_empty() {
+                    report(
+                        r,
+                        ast,
+                        node,
+                        "payload enum patterns must specify field patterns",
+                    );
+                }
+            } else if !matches!(r.type_pool.get(expected).kind, TypeKind::Enum { .. }) {
+                report(
+                    r,
+                    ast,
+                    node,
+                    "shorthand enum pattern `.name` requires a statically known enum scrutinee type",
+                );
+            }
+        }
         NodeKind::Underscore => {}
         NodeKind::PatternError | NodeKind::PatternErrorOk => {
             crate::error_patterns::qualified_pattern(r, ast, node, expected)
@@ -467,7 +577,18 @@ pub(crate) fn pattern(
             } else {
                 node
             };
-            let Some((reference, variant)) = descriptor(r, ast, callee) else {
+            let resolved_variant = descriptor(r, ast, callee).or_else(|| {
+                symbol_variant_descriptor(r, ast, callee, Some(expected))
+                    .map(|(r_ref, var, _)| (r_ref, var))
+            });
+            let Some((reference, variant)) = resolved_variant else {
+                if !callee.is_null()
+                    && ast.node(callee).kind == NodeKind::Symbol
+                    && matches!(r.type_pool.get(expected).kind, TypeKind::Enum { .. })
+                {
+                    // `symbol_variant_descriptor` already emitted an unknown-variant diagnostic.
+                    return;
+                }
                 report(
                     r,
                     ast,
@@ -600,7 +721,18 @@ pub(crate) fn method_signature(
             {
                 return Some(signature);
             }
-            report(r, ast, node, error);
+            let mut builder = r
+                .diag_ctx
+                .error(error.clone())
+                .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                .with_primary_span(ast.node(node).span);
+            if error.starts_with("unknown member") {
+                let member_str = str_interner::get(name);
+                for help in crate::suggestions::unknown_member_helps(r, ty, &member_str) {
+                    builder = builder.with_help(help);
+                }
+            }
+            builder.emit(r.diag_ctx);
             return None;
         }
     };

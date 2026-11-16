@@ -104,7 +104,18 @@ pub(crate) fn checked_method(
     let function = match selected {
         Ok(function) => function,
         Err(error) => {
-            report(r, ast, node, error);
+            let member_str = str_interner::get(name);
+            let mut builder = r
+                .diag_ctx
+                .error(error.clone())
+                .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                .with_primary_span(ast.node(node).span);
+            if error.starts_with("unknown member") {
+                for help in crate::suggestions::unknown_member_helps(r, receiver, &member_str) {
+                    builder = builder.with_help(help);
+                }
+            }
+            builder.emit(r.diag_ctx);
             return None;
         }
     };
@@ -274,6 +285,7 @@ pub(crate) fn concat(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option
     typing::resolve_types_expected(r, ast, operands[1], Some(expected));
     typing::check_expected_type(r, ast, operands[1], expected, "concat operand");
     r.concat_calls.insert(node, method.function);
+    crate::collection_inference::record_concat(r, ast, node, method.result);
     Some(method.result)
 }
 

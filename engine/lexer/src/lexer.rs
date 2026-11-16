@@ -122,6 +122,10 @@ impl<'src> Lexer<'src> {
         self.errors.push(LexError::new(kind, from, to, msg));
     }
 
+    fn push_rich_error(&mut self, err: LexError) {
+        self.errors.push(err);
+    }
+
     // -- indent trigger ---------------------------------------------------
 
     /// Returns `true` for the three nessa format-sensitive trigger tokens:
@@ -218,12 +222,27 @@ impl<'src> Lexer<'src> {
 
         if !matched && target_col != *self.indent_stack.last().unwrap() {
             let pos = self.pos();
-            self.push_error(
+            let mut err = LexError::new(
                 LexErrorKind::UnmatchedIndentation,
                 pos,
                 pos,
                 "unmatched indentation level: expected one of the previous levels",
-            );
+            )
+            .with_note(format!(
+                "found indentation column {target_col}; active outer indentation columns are {:?}",
+                self.indent_stack
+            ));
+            let line_ws = &self.bytes[self.cursor..];
+            let ws_end = line_ws
+                .iter()
+                .position(|&b| b != b' ' && b != b'\t')
+                .unwrap_or(line_ws.len());
+            if line_ws[..ws_end].contains(&b'\t') && line_ws[..ws_end].contains(&b' ') {
+                err = err.with_help(
+                    "this line mixes tabs and spaces in leading indentation; use spaces consistently",
+                );
+            }
+            self.push_rich_error(err);
             self.push_pending(TokenKind::Invalid, pos);
         }
     }
@@ -471,12 +490,16 @@ impl<'src> Lexer<'src> {
                         return self.lex_identifier(start);
                     }
                     self.cursor += c.len_utf8();
-                    self.push_error(
+                    let mut err = LexError::new(
                         LexErrorKind::UnexpectedChar,
                         start,
                         self.pos(),
                         format!("unexpected character: {:?}", c),
                     );
+                    if let Some((desc, ascii)) = unexpected_char_ascii_hint(c) {
+                        err = err.with_help(format!("replace {desc} `{c}` with ASCII `{ascii}`"));
+                    }
+                    self.push_rich_error(err);
                 } else {
                     self.cursor += 1;
                 }
@@ -628,11 +651,16 @@ impl<'src> Lexer<'src> {
             while depth > 0 {
                 match self.peek_byte() {
                     None => {
-                        self.push_error(
-                            LexErrorKind::UnterminatedBlockComment,
-                            start,
-                            self.pos(),
-                            "unterminated block comment",
+                        self.push_rich_error(
+                            LexError::new(
+                                LexErrorKind::UnterminatedBlockComment,
+                                start,
+                                self.pos(),
+                                "unterminated block comment",
+                            )
+                            .with_help(
+                                "close block comments with `-}` (nested `{- ... -}` comments must each be closed)",
+                            ),
                         );
                         return self.token(TokenKind::Invalid, start, self.pos());
                     }
@@ -767,26 +795,49 @@ impl<'src> Lexer<'src> {
             }
             Some(b'u') => {
                 self.cursor += 1;
+                if self.peek_byte() == Some(b'{') {
+                    self.push_rich_error(
+                        LexError::new(
+                            LexErrorKind::InvalidStrLiteral,
+                            start,
+                            self.pos() + 1,
+                            "braced unicode escape `\\u{...}` is not supported; invalid escape sequence",
+                        )
+                        .with_help(
+                            "write 4 hex digits without braces (`\\uXXXX`) or write the UTF-8 character directly",
+                        ),
+                    );
+                    return false;
+                }
                 let Some(value) = self.expect_hex_digits(4, start) else {
                     return false;
                 };
                 if char::from_u32(value).is_none() {
-                    self.push_error(
-                        LexErrorKind::InvalidStrLiteral,
-                        start,
-                        self.pos(),
-                        "unicode escape is not a Unicode scalar value",
+                    self.push_rich_error(
+                        LexError::new(
+                            LexErrorKind::InvalidStrLiteral,
+                            start,
+                            self.pos(),
+                            "unicode escape is not a Unicode scalar value",
+                        )
+                        .with_note("UTF-16 surrogate code points `\\uD800`..`\\uDFFF` are not valid Unicode scalar values"),
                     );
                     return false;
                 }
                 true
             }
-            Some(_) => {
-                self.push_error(
-                    LexErrorKind::InvalidStrLiteral,
-                    start,
-                    self.pos(),
-                    "invalid escape sequence",
+            Some(esc) => {
+                self.push_rich_error(
+                    LexError::new(
+                        LexErrorKind::InvalidStrLiteral,
+                        start,
+                        self.pos(),
+                        "invalid escape sequence",
+                    )
+                    .with_help(format!(
+                        "unknown escape `\\{}`; supported escapes are `\\n`, `\\t`, `\\r`, `\\0`, `\\\\`, `\\\"`, `\\'`, `\\xHH`, and `\\uXXXX`",
+                        esc as char
+                    )),
                 );
                 false
             }
@@ -1398,4 +1449,28 @@ pub fn tokenize(src: &str) -> (Vec<Token>, Vec<LexError>) {
     let mut lexer = Lexer::new(src);
     let tokens = lexer.tokenize();
     (tokens, lexer.errors)
+}
+
+fn unexpected_char_ascii_hint(c: char) -> Option<(&'static str, &'static str)> {
+    match c {
+        '“' | '”' | '„' | '«' | '»' => Some(("typographic double quote", "\"")),
+        '‘' | '’' | '‚' => Some(("typographic single quote", "'")),
+        '（' => Some(("full-width parenthesis", "(")),
+        '）' => Some(("full-width parenthesis", ")")),
+        '［' | '【' => Some(("full-width bracket", "[")),
+        '］' | '】' => Some(("full-width bracket", "]")),
+        '｛' => Some(("full-width brace", "{")),
+        '｝' => Some(("full-width brace", "}")),
+        '，' | '、' => Some(("full-width comma", ",")),
+        '；' => Some(("full-width semicolon", ";")),
+        '：' => Some(("full-width colon", ":")),
+        '＝' => Some(("full-width equals sign", "=")),
+        '＋' => Some(("full-width plus sign", "+")),
+        '－' | '–' | '—' => Some(("dash/minus character", "-")),
+        '！' => Some(("full-width exclamation mark", "!")),
+        '？' => Some(("full-width question mark", "?")),
+        '\u{00A0}' | '\u{3000}' => Some(("non-ASCII space", " ")),
+        '\u{200B}' | '\u{FEFF}' => Some(("zero-width/BOM character", "")),
+        _ => None,
+    }
 }

@@ -41,11 +41,29 @@ pub(crate) fn validate(
                     SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::Constant
                 ) && !within(resolved, function_scope.node, definition.scope)
                 {
+                    let fn_name_node = resolved.ast.fixed_children(function_scope.node)[0];
+                    let fn_name = if fn_name_node.is_null() {
+                        "f".to_string()
+                    } else {
+                        str_interner::get(resolved.ast.node(fn_name_node).str_id)
+                    };
+                    let captured_name = str_interner::get(definition.name);
+                    let note_node = (!definition.def_node.is_null()).then(|| {
+                        (
+                            definition.def_node,
+                            format!("outer local `{captured_name}` declared here"),
+                        )
+                    });
                     errors.push(LoweringError {
                         node,
                         message:
                             "named functions cannot capture enclosing local values; use a lambda"
                                 .into(),
+                        code: Some(5002),
+                        note_node,
+                        help: Some(format!(
+                            "replace `fn {fn_name}(...)` with a closure binding: `let {fn_name} = |...| {{ ... }}`"
+                        )),
                     });
                 }
             }

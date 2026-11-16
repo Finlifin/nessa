@@ -222,12 +222,25 @@ pub(crate) fn resolve_construction(
             .iter()
             .position(|&field| ast.node(ast.fixed_children(field)[0]).str_id == name)
         else {
-            report(
-                r,
-                ast,
-                arg,
-                format!("unknown struct field `{}`", str_interner::get(name)),
-            );
+            let unknown_str = str_interner::get(name);
+            let mut builder = r
+                .diag_ctx
+                .error(format!("unknown struct field `{unknown_str}`"))
+                .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                .with_primary_span(ast.node(arg).span);
+            if !declaration.is_null() {
+                builder = builder.with_label(
+                    ast.node(ast.fixed_children(declaration)[0]).span,
+                    "struct declared here".into(),
+                    diagnostic::Level::Note,
+                );
+            }
+            if let Some(help) =
+                crate::suggestions::unknown_struct_field_help(ast, &field_nodes, &unknown_str)
+            {
+                builder = builder.with_help(help);
+            }
+            builder.emit(r.diag_ctx);
             valid = false;
             crate::typing::resolve_types(r, ast, value);
             continue;
@@ -267,15 +280,20 @@ pub(crate) fn resolve_construction(
                 expression: children[2],
             },
             None => {
-                report(
-                    r,
-                    ast,
-                    node,
-                    format!(
-                        "missing required struct field `{}`",
-                        str_interner::get(ast.node(children[0]).str_id)
-                    ),
-                );
+                let missing_name = str_interner::get(ast.node(children[0]).str_id);
+                let mut builder = r
+                    .diag_ctx
+                    .error(format!("missing required struct field `{missing_name}`"))
+                    .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                    .with_primary_span(ast.node(node).span);
+                if !field.is_null() {
+                    builder = builder.with_label(
+                        ast.node(field).span,
+                        format!("required field `{missing_name}` declared here"),
+                        diagnostic::Level::Note,
+                    );
+                }
+                builder.emit(r.diag_ctx);
                 valid = false;
                 continue;
             }
@@ -449,12 +467,18 @@ pub(crate) fn resolve_pattern(
             .iter()
             .position(|&field| ast.node(ast.fixed_children(field)[0]).str_id == name)
         else {
-            report(
-                r,
-                ast,
-                entry,
-                format!("unknown struct field `{}`", str_interner::get(name)),
-            );
+            let unknown_str = str_interner::get(name);
+            let mut builder = r
+                .diag_ctx
+                .error(format!("unknown struct field `{unknown_str}`"))
+                .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                .with_primary_span(ast.node(entry).span);
+            if let Some(help) =
+                crate::suggestions::unknown_struct_field_help(ast, &field_nodes, &unknown_str)
+            {
+                builder = builder.with_help(help);
+            }
+            builder.emit(r.diag_ctx);
             valid = false;
             if !is_shorthand {
                 resolve_child(r, ast, subpat, None);

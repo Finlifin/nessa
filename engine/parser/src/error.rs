@@ -15,20 +15,30 @@ pub enum ParseErrorKind {
     InvalidBlockPrefix,
 }
 
-/// A single parse error with span and message.
-#[derive(Debug, Clone)]
-pub struct ParseError {
-    pub kind: ParseErrorKind,
-    pub message: String,
-    pub span: Span,
-    pub label: Option<ParseErrorLabel>,
-    pub source_start: Option<BytePos>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseLabelStyle {
+    Error,
+    Note,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParseErrorLabel {
     pub span: Span,
     pub message: String,
+    pub style: ParseLabelStyle,
+}
+
+/// A single parse error with span, secondary labels, notes, and actionable help.
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub message: String,
+    pub span: Span,
+    pub label: Option<ParseErrorLabel>,
+    pub extra_labels: Vec<ParseErrorLabel>,
+    pub notes: Vec<String>,
+    pub helps: Vec<String>,
+    pub source_start: Option<BytePos>,
 }
 
 impl ParseError {
@@ -38,6 +48,9 @@ impl ParseError {
             message: message.into(),
             span,
             label: None,
+            extra_labels: Vec::new(),
+            notes: Vec::new(),
+            helps: Vec::new(),
             source_start: None,
         }
     }
@@ -53,12 +66,44 @@ impl ParseError {
             kind,
             message: message.into(),
             span,
-            source_start: None,
             label: Some(ParseErrorLabel {
                 span: label_span,
                 message: label_message.into(),
+                style: ParseLabelStyle::Error,
             }),
+            extra_labels: Vec::new(),
+            notes: Vec::new(),
+            helps: Vec::new(),
+            source_start: None,
         }
+    }
+
+    pub fn add_error_label(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.extra_labels.push(ParseErrorLabel {
+            span,
+            message: message.into(),
+            style: ParseLabelStyle::Error,
+        });
+        self
+    }
+
+    pub fn add_note_label(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.extra_labels.push(ParseErrorLabel {
+            span,
+            message: message.into(),
+            style: ParseLabelStyle::Note,
+        });
+        self
+    }
+
+    pub fn add_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+
+    pub fn add_help(mut self, help: impl Into<String>) -> Self {
+        self.helps.push(help.into());
+        self
     }
 }
 
@@ -94,13 +139,37 @@ impl NessaError for ParseError {
             });
 
         if let Some(lbl) = &self.label {
-            builder = builder.with_error_source_span(
-                LocatedSourceSpan {
-                    span: lbl.span,
-                    file_start: self.source_start,
-                },
-                lbl.message.clone(),
-            );
+            let loc = LocatedSourceSpan {
+                span: lbl.span,
+                file_start: self.source_start,
+            };
+            builder = match lbl.style {
+                ParseLabelStyle::Error => builder.with_error_source_span(loc, lbl.message.clone()),
+                ParseLabelStyle::Note => {
+                    builder.with_source_label(loc, lbl.message.clone(), diagnostic::Level::Note)
+                }
+            };
+        }
+
+        for lbl in &self.extra_labels {
+            let loc = LocatedSourceSpan {
+                span: lbl.span,
+                file_start: self.source_start,
+            };
+            builder = match lbl.style {
+                ParseLabelStyle::Error => builder.with_error_source_span(loc, lbl.message.clone()),
+                ParseLabelStyle::Note => {
+                    builder.with_source_label(loc, lbl.message.clone(), diagnostic::Level::Note)
+                }
+            };
+        }
+
+        for note in &self.notes {
+            builder = builder.with_note(note.clone());
+        }
+
+        for help in &self.helps {
+            builder = builder.with_help(help.clone());
         }
 
         builder.emit(diag_ctx);

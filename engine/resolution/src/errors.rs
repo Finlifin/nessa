@@ -144,7 +144,22 @@ pub(crate) fn construction(
     expected: Option<TypeIndex>,
 ) -> Option<TypeIndex> {
     let operand = ast.fixed_children(node)[0];
-    typing::resolve_types(r, ast, operand);
+    let symbol_err_expected = if !operand.is_null()
+        && (ast.node(operand).kind == ast::NodeKind::Symbol
+            || (ast.node(operand).kind == ast::NodeKind::Call
+                && !ast.fixed_children(operand)[0].is_null()
+                && ast.node(ast.fixed_children(operand)[0]).kind == ast::NodeKind::Symbol))
+    {
+        expected
+            .and_then(|exp| r.type_pool.error_shape(exp).ok().flatten())
+            .and_then(|shape| match shape.domain {
+                type_pool::ErrorDomain::Closed(members) if members.len() == 1 => Some(members[0]),
+                _ => None,
+            })
+    } else {
+        None
+    };
+    typing::resolve_types_expected(r, ast, operand, symbol_err_expected);
     let Some(&payload) = r.node_types.get(&operand) else {
         if !r.diag_ctx.has_errors() {
             report(

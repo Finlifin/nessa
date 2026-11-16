@@ -37,7 +37,19 @@ pub(crate) fn literal(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Optio
     let bound = Intrinsic::I64.type_index();
     for &operand in &operands {
         crate::typing::resolve_types_expected(r, ast, operand, Some(bound));
-        crate::typing::check_expected_type(r, ast, operand, bound, "range bound");
+        if let Some(&actual) = r.node_types.get(&operand)
+            && r.type_pool.as_intrinsic(actual) == Some(Intrinsic::Usize)
+        {
+            r.node_coercions.insert(
+                operand,
+                crate::Coercion {
+                    target: bound,
+                    kind: crate::CoercionKind::Convert,
+                },
+            );
+        } else {
+            crate::typing::check_expected_type(r, ast, operand, bound, "range bound");
+        }
     }
     let Some((ty, declaration)) = crate::trusted::std_type(r, "range", name)
         .map(|(ty, symbol)| (ty, symbol.def_node))

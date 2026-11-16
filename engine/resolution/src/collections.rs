@@ -104,13 +104,16 @@ pub(crate) fn method_signature(
         .filter(|scope| scope.assoc_type == r.type_pool.canonical_type(ty))
         .find_map(|scope| scope.bindings.get(&name).copied());
     let Some(symbol) = symbol else {
-        r.diag_ctx
-            .error(format!(
-                "unknown {collection_name} member `{}`",
-                str_interner::get(name)
-            ))
-            .with_primary_span(ast.node(projection).span)
-            .emit(r.diag_ctx);
+        let member_str = str_interner::get(name);
+        let mut builder = r
+            .diag_ctx
+            .error(format!("unknown {collection_name} member `{member_str}`"))
+            .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+            .with_primary_span(ast.node(projection).span);
+        for help in crate::suggestions::unknown_member_helps(r, ty, &member_str) {
+            builder = builder.with_help(help);
+        }
+        builder.emit(r.diag_ctx);
         return None;
     };
     let method = symbol;

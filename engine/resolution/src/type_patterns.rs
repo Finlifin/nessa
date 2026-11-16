@@ -25,13 +25,9 @@ pub(crate) fn resolve(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex, input: T
     let children = ast.fixed_children(node);
     let (binder, type_expr) = (children[0], children[1]);
     let Some(target) = crate::typing::resolve_type_expr(r, ast, type_expr) else {
-        let span_node = if type_expr.is_null() { node } else { type_expr };
-        report(
-            r,
-            ast,
-            span_node,
-            "typed pattern requires a valid type".into(),
-        );
+        if type_expr.is_null() {
+            report(r, ast, node, "typed pattern requires a valid type".into());
+        }
         return;
     };
     r.node_types.insert(type_expr, target);

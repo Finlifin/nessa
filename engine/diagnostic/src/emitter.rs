@@ -1,7 +1,8 @@
-//! Ariadne wrapper for pretty-printing diagnostics
+//! Ariadne wrapper for pretty-printing diagnostics across one or more source files.
 
-use super::{Diagnostic, DiagnosticContext, Level};
-use ariadne::{Color, ColorGenerator, Label, Report, Source};
+use super::{Diagnostic, DiagnosticContext, Level, byte_span_to_char_range};
+use ariadne::{Color, Config, Label, Report, sources};
+use rustc_span::FileNameDisplayPreference;
 
 /// Configuration for diagnostic emission
 #[derive(Debug, Clone)]
@@ -24,22 +25,42 @@ impl Default for EmitterConfig {
     }
 }
 
-/// Ariadne-based diagnostic emitter
+/// Ariadne-based diagnostic emitter supporting multi-file spans and in-memory rendering.
 pub struct AriadneEmitter {
-    _config: EmitterConfig,
+    config: EmitterConfig,
 }
 
 impl AriadneEmitter {
     pub fn new(config: EmitterConfig) -> Self {
-        Self { _config: config }
+        Self { config }
     }
 
     pub fn new_default() -> Self {
         Self::new(EmitterConfig::default())
     }
 
-    /// Emit a single diagnostic
+    /// Format a single diagnostic into an owned `String` (honoring `config.use_colors`
+    /// and rendering cross-file labels when present).
+    pub fn render_to_string(&self, diagnostic: &Diagnostic, context: &DiagnosticContext) -> String {
+        let mut buf = Vec::new();
+        self.write_diagnostic(diagnostic, context, &mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Emit a single diagnostic to stderr.
     pub fn emit_diagnostic(&self, diagnostic: &Diagnostic, context: &DiagnosticContext) {
+        let rendered = self.render_to_string(diagnostic, context);
+        if !rendered.is_empty() {
+            eprint!("{rendered}");
+        }
+    }
+
+    fn write_diagnostic(
+        &self,
+        diagnostic: &Diagnostic,
+        context: &DiagnosticContext,
+        out: &mut impl std::io::Write,
+    ) {
         let span = diagnostic
             .primary_span
             .map(|span| (span, diagnostic.primary_source_start))
@@ -54,38 +75,28 @@ impl AriadneEmitter {
                 .source_for_location(span, anchor)
                 .map(|file| (span, file))
         }) else {
-            super::emit_plain_diagnostic(diagnostic);
+            let _ = write_plain_diagnostic(diagnostic, out);
             return;
         };
-        let _colors = ColorGenerator::new();
-        let file_name = format!("{:?}", source_file.name);
 
-        // Convert byte positions to character positions for ariadne
-        let source_content = match &source_file.src {
-            Some(content) => content.as_str(),
-            None => {
-                eprintln!("Error: Source file content not available");
-                return;
-            }
+        let file_name = source_file
+            .name
+            .display(FileNameDisplayPreference::Local)
+            .to_string_lossy()
+            .into_owned();
+
+        let Some(source_content) = source_file.src.as_deref() else {
+            let _ = writeln!(out, "Error: Source file content not available");
+            return;
         };
 
-        let byte_start = (primary_span.lo().0 - source_file.start_pos.0) as usize;
-        let byte_end = (primary_span.hi().0 - source_file.start_pos.0) as usize;
-
-        // Convert byte indices to character indices by counting UTF-8 chars
-        let char_start = source_content
-            .get(..byte_start.min(source_content.len()))
-            .map(|s| s.chars().count())
-            .unwrap_or(0);
-        let char_end = source_content
-            .get(..byte_end.min(source_content.len()))
-            .map(|s| s.chars().count())
-            .unwrap_or(char_start);
+        let (char_start, char_end) = byte_span_to_char_range(&source_file, primary_span);
 
         let mut report = Report::build(
             diagnostic.level.to_ariadne_kind(),
-            (&file_name, char_start..char_end),
-        );
+            (file_name.clone(), char_start..char_end),
+        )
+        .with_config(Config::default().with_color(self.config.use_colors));
 
         if let Some(code) = diagnostic.code {
             report = report.with_code(code);
@@ -93,74 +104,57 @@ impl AriadneEmitter {
 
         report = report.with_message(&diagnostic.message);
 
-        // Add labels with different colors
-        let mut has_source_label = false;
+        let mut source_entries: Vec<(String, String)> =
+            vec![(file_name.clone(), source_content.to_owned())];
+        let mut has_primary_file_label = false;
+
         for label in &diagnostic.labels {
             if let Some(label_file) = context.source_for_location(label.span, label.source_start)
-                && std::ptr::eq(label_file.as_ref(), source_file.as_ref())
+                && let Some(label_src) = label_file.src.as_deref()
             {
-                has_source_label = true;
+                let label_file_id = label_file
+                    .name
+                    .display(FileNameDisplayPreference::Local)
+                    .to_string_lossy()
+                    .into_owned();
+                if std::ptr::eq(label_file.as_ref(), source_file.as_ref()) {
+                    has_primary_file_label = true;
+                } else if !source_entries.iter().any(|(id, _)| id == &label_file_id) {
+                    source_entries.push((label_file_id.clone(), label_src.to_owned()));
+                }
+
                 let color = match label.level {
                     Level::Error => Color::Red,
                     Level::Warning => Color::Yellow,
                     Level::Note => Color::Blue,
                     Level::Help => Color::Cyan,
                 };
-
-                let label_byte_start = (label.span.lo().0 - source_file.start_pos.0) as usize;
-                let label_byte_end = (label.span.hi().0 - source_file.start_pos.0) as usize;
-
-                // Convert byte indices to character indices for label
-                let label_char_start = source_content
-                    .get(..label_byte_start.min(source_content.len()))
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0);
-                let label_char_end = source_content
-                    .get(..label_byte_end.min(source_content.len()))
-                    .map(|s| s.chars().count())
-                    .unwrap_or(label_char_start);
+                let (l_start, l_end) = byte_span_to_char_range(&label_file, label.span);
 
                 report = report.with_label(
-                    Label::new((&file_name, label_char_start..label_char_end))
+                    Label::new((label_file_id, l_start..l_end))
                         .with_message(&label.message)
                         .with_color(color),
                 );
             }
         }
 
-        // Ariadne only renders source locations with a label. Preserve the exact
-        // primary range when no valid same-file label provides that location.
-        if !has_source_label {
+        if !has_primary_file_label {
             report = report.with_label(
-                Label::new((&file_name, char_start..char_end)).with_color(diagnostic.level.color()),
+                Label::new((file_name, char_start..char_end)).with_color(diagnostic.level.color()),
             );
         }
 
-        // Add notes
         for note in &diagnostic.notes {
             report = report.with_note(note);
         }
 
-        // Add helps
         for help in &diagnostic.helps {
             report = report.with_help(help);
         }
 
-        // Print the report
-        let source_content = match &source_file.src {
-            Some(content) => content.as_str(),
-            None => {
-                eprintln!("Error: Source file content not available");
-                return;
-            }
-        };
-
-        if let Err(e) = report
-            .finish()
-            .eprint((&file_name, Source::from(source_content)))
-        {
-            eprintln!("Error printing diagnostic: {}", e);
-        }
+        let cache = sources(source_entries);
+        let _ = report.finish().write(cache, out);
     }
 
     /// Emit all diagnostics from a context
@@ -169,6 +163,31 @@ impl AriadneEmitter {
             self.emit_diagnostic(diagnostic, context);
         }
     }
+}
+
+fn write_plain_diagnostic(
+    diagnostic: &Diagnostic,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    if let Some(code) = diagnostic.code {
+        writeln!(
+            out,
+            "[{code}] {:?}: {}",
+            diagnostic.level, diagnostic.message
+        )?;
+    } else {
+        writeln!(out, "{:?}: {}", diagnostic.level, diagnostic.message)?;
+    }
+    for label in &diagnostic.labels {
+        writeln!(out, "{:?}: {}", label.level, label.message)?;
+    }
+    for note in &diagnostic.notes {
+        writeln!(out, "Note: {note}")?;
+    }
+    for help in &diagnostic.helps {
+        writeln!(out, "Help: {help}")?;
+    }
+    Ok(())
 }
 
 impl Level {

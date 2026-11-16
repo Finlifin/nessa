@@ -33,13 +33,15 @@ impl fmt::Display for LexErrorKind {
     }
 }
 
-/// A single lexer error with contextual information.
+/// A single lexer error with contextual information, notes, and actionable hints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexError {
     pub kind: LexErrorKind,
     pub message: String,
     pub from: Index,
     pub to: Index,
+    pub notes: Vec<String>,
+    pub helps: Vec<String>,
 }
 
 impl LexError {
@@ -49,7 +51,19 @@ impl LexError {
             message: message.into(),
             from,
             to,
+            notes: Vec::new(),
+            helps: Vec::new(),
         }
+    }
+
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+
+    pub fn with_help(mut self, help: impl Into<String>) -> Self {
+        self.helps.push(help.into());
+        self
     }
 
     pub fn span(&self, base_pos: BytePos) -> Span {
@@ -102,7 +116,7 @@ impl NessaError for LexError {
         let builder = diag_ctx
             .error(self.message.clone())
             .with_code(self.error_code());
-        let builder = match diag_ctx.mapped_raw_span(
+        let mut builder = match diag_ctx.mapped_raw_span(
             base_pos,
             RawByteRange {
                 start: self.from,
@@ -114,6 +128,12 @@ impl NessaError for LexError {
                 .with_error_source_span(location, format!("{}", self.kind)),
             Err(error) => builder.with_note(format!("Source location unavailable: {error}")),
         };
+        for note in &self.notes {
+            builder = builder.with_note(note.clone());
+        }
+        for help in &self.helps {
+            builder = builder.with_help(help.clone());
+        }
         builder.emit(diag_ctx);
     }
 }

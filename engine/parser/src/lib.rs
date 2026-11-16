@@ -2,6 +2,7 @@ pub mod basic;
 pub mod definition;
 pub mod error;
 pub mod expr;
+mod heuristics;
 pub mod parser;
 pub mod pattern;
 pub mod statement;

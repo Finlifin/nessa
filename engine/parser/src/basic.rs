@@ -1,9 +1,9 @@
 use ast::{NodeIndex, NodeKind};
 use lexer::token::TokenKind;
 
-use crate::error::{ParseErrorKind, ParseResult};
+use crate::error::{ParseError, ParseErrorKind, ParseResult};
 use crate::parser::{NULL, Parser};
-use crate::{expr, pattern, statement};
+use crate::{expr, heuristics, pattern, statement};
 
 extern crate str_interner;
 
@@ -58,30 +58,174 @@ impl Rule {
 /// Parse zero or more items separated by the rule's separator.
 /// Rules are tried in order; the first successful match is used.
 pub fn try_multi(p: &mut Parser, rules: &[Rule]) -> Result<Vec<NodeIndex>, ParseErrorKind> {
+    try_multi_until(p, rules, None)
+}
+
+fn try_multi_until(
+    p: &mut Parser,
+    rules: &[Rule],
+    close: Option<TokenKind>,
+) -> Result<Vec<NodeIndex>, ParseErrorKind> {
     let _g = p.enter();
 
     let mut nodes = Vec::new();
+    let is_block_or_file = matches!(
+        close,
+        Some(TokenKind::Eof | TokenKind::RBrace | TokenKind::Outdent)
+    );
+    let allow_comma = rules.iter().any(|r| {
+        r.separator == TokenKind::Comma || r.additional_separator == Some(TokenKind::Comma)
+    });
 
     'outer: loop {
-        for rule in rules {
-            let node = (rule.parser)(p)?;
-            if node.is_null() {
-                continue;
-            }
+        heuristics::try_skip_foreign_comments(p);
 
-            nodes.push(node);
-
-            if !p.eat_token(rule.separator)
-                && !rule
-                    .additional_separator
-                    .is_some_and(|separator| p.eat_token(separator))
-            {
-                break 'outer;
-            }
-            continue 'outer;
+        let peek_kind = p.peek_token().kind;
+        if close == Some(peek_kind) || peek_kind == TokenKind::Eof {
+            break;
         }
 
-        // No rule matched → end the multi parse
+        let start_cursor = p.raw_cursor();
+        let errors_before = p.error_count();
+
+        for rule in rules {
+            match (rule.parser)(p) {
+                Ok(node) if node.is_null() => {
+                    if is_block_or_file && p.error_count() > errors_before {
+                        p.synchronize_statement(start_cursor, close, allow_comma);
+                        if p.raw_cursor() <= start_cursor {
+                            let next_kind = p.peek_token().kind;
+                            if close == Some(next_kind)
+                                || next_kind == TokenKind::Eof
+                                || (close != Some(TokenKind::Eof)
+                                    && matches!(next_kind, TokenKind::RBrace | TokenKind::Outdent))
+                            {
+                                break 'outer;
+                            }
+                            p.next_token();
+                        }
+                        continue 'outer;
+                    }
+                    continue;
+                }
+                Ok(node) => {
+                    nodes.push(node);
+                    heuristics::try_skip_foreign_comments(p);
+
+                    if p.eat_token(rule.separator)
+                        || rule
+                            .additional_separator
+                            .is_some_and(|separator| p.eat_token(separator))
+                    {
+                        if p.raw_cursor() <= start_cursor {
+                            break 'outer;
+                        }
+                        continue 'outer;
+                    }
+
+                    if is_block_or_file {
+                        let next_kind = p.peek_token().kind;
+                        if close == Some(next_kind)
+                            || next_kind == TokenKind::Eof
+                            || (close != Some(TokenKind::Eof)
+                                && matches!(next_kind, TokenKind::RBrace | TokenKind::Outdent))
+                        {
+                            break 'outer;
+                        }
+                        if p.error_count() > errors_before {
+                            if !p.had_newline_since(start_cursor) {
+                                let sync_from = p.raw_cursor();
+                                p.synchronize_statement(sync_from, close, allow_comma);
+                            }
+                            if p.raw_cursor() <= start_cursor {
+                                p.next_token();
+                            }
+                            continue 'outer;
+                        }
+                        let span = p.next_token_span();
+                        p.push_error(ParseError::with_label(
+                            ParseErrorKind::UnexpectedToken,
+                            span,
+                            format!("Unexpected `{}` after {}", next_kind.lexeme(), rule.name),
+                            span,
+                            format!("found `{}`", next_kind.lexeme()),
+                        ));
+                        let sync_from = p.raw_cursor();
+                        p.synchronize_statement(sync_from, close, allow_comma);
+                        if p.raw_cursor() <= sync_from {
+                            let after_kind = p.peek_token().kind;
+                            if close == Some(after_kind)
+                                || after_kind == TokenKind::Eof
+                                || (close != Some(TokenKind::Eof)
+                                    && matches!(after_kind, TokenKind::RBrace | TokenKind::Outdent))
+                            {
+                                break 'outer;
+                            }
+                            p.next_token();
+                        }
+                        continue 'outer;
+                    }
+
+                    break 'outer;
+                }
+                Err(kind) => {
+                    if kind == ParseErrorKind::ControlMeetExtendedCall
+                        || (kind == ParseErrorKind::InvalidBlockPrefix
+                            && p.error_count() == errors_before)
+                    {
+                        return Err(kind);
+                    }
+                    if is_block_or_file && p.error_count() > errors_before {
+                        p.synchronize_statement(start_cursor, close, allow_comma);
+                        if p.raw_cursor() <= start_cursor {
+                            let next_kind = p.peek_token().kind;
+                            if close == Some(next_kind)
+                                || next_kind == TokenKind::Eof
+                                || (close != Some(TokenKind::Eof)
+                                    && matches!(next_kind, TokenKind::RBrace | TokenKind::Outdent))
+                            {
+                                break 'outer;
+                            }
+                            p.next_token();
+                        }
+                        continue 'outer;
+                    }
+                    return Err(kind);
+                }
+            }
+        }
+
+        // No rule matched.
+        if is_block_or_file {
+            let next_kind = p.peek_token().kind;
+            if close == Some(next_kind) || next_kind == TokenKind::Eof {
+                break;
+            }
+            if close == Some(TokenKind::Eof)
+                || !matches!(next_kind, TokenKind::RBrace | TokenKind::Outdent)
+            {
+                let expected: Vec<&str> = rules.iter().map(|r| r.name).collect();
+                let msg = if close == Some(TokenKind::Eof) {
+                    "Expected definition or statement, or end of file".to_string()
+                } else {
+                    format!("Expected {} or closing bracket", expected.join(" or "))
+                };
+                let span = p.next_token_span();
+                p.push_error(ParseError::with_label(
+                    ParseErrorKind::UnexpectedToken,
+                    span,
+                    msg,
+                    span,
+                    format!("found `{}`", next_kind.lexeme()),
+                ));
+                p.synchronize_statement(start_cursor, close, allow_comma);
+                if p.raw_cursor() <= start_cursor {
+                    p.next_token();
+                }
+                continue 'outer;
+            }
+        }
+
         break;
     }
 
@@ -97,22 +241,30 @@ pub fn try_multi_with_bracket(
 ) -> Result<Vec<NodeIndex>, ParseErrorKind> {
     let _g = p.enter();
 
+    let open_tok = p.peek_token();
     if !p.eat_token(open) {
         return Ok(Vec::new());
     }
 
-    let nodes = try_multi(p, rules)?;
+    let nodes = try_multi_until(p, rules, Some(close))?;
 
     if !p.eat_token(close) {
-        // Build a description of expected rules
         let expected: Vec<&str> = rules.iter().map(|r| r.name).collect();
-        let _ = p.err_with_label(
+        let span = p.next_token_span();
+        let mut err = ParseError::with_label(
             ParseErrorKind::UnexpectedToken,
-            p.next_token_span(),
+            span,
             format!("Expected {} or closing bracket", expected.join(" or ")),
-            p.next_token_span(),
+            span,
             format!("found `{}`", p.peek_token().kind.lexeme()),
         );
+        if open != TokenKind::Indent {
+            err = err.add_note_label(
+                p.token_span(open_tok),
+                format!("unclosed `{}` opened here", open.lexeme()),
+            );
+        }
+        p.push_error(err);
     }
 
     Ok(nodes)
@@ -417,7 +569,7 @@ pub fn try_pattern_arm(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    p.expect_token(TokenKind::FatArrow)?;
+    heuristics::expect_fat_arrow_in_arm(p, "match/handler arm")?;
 
     let body = try_block_or_statement(p)?;
     if body.is_null() {
@@ -459,7 +611,7 @@ pub fn try_catch_arm(p: &mut Parser) -> ParseResult {
         );
     }
 
-    p.expect_token(TokenKind::FatArrow)?;
+    heuristics::expect_fat_arrow_in_arm(p, "`catch` arm")?;
 
     let body = try_block_or_statement(p)?;
     if body.is_null() {
@@ -515,7 +667,7 @@ pub fn try_parameter(p: &mut Parser) -> ParseResult {
         }
         let mut ty = NULL;
         if p.eat_token(TokenKind::Colon) {
-            ty = expr::try_expr_without_extended_call(p)?;
+            ty = p.with_type_context(expr::try_expr_without_extended_call)?;
         }
         let span = p.current_span();
         let idx = p
@@ -533,7 +685,7 @@ pub fn try_parameter(p: &mut Parser) -> ParseResult {
         let id = try_id(p)?;
         let mut ty = NULL;
         if p.eat_token(TokenKind::Colon) {
-            ty = expr::try_expr_without_extended_call(p)?;
+            ty = p.with_type_context(expr::try_expr_without_extended_call)?;
         }
         p.expect_token(TokenKind::Eq)?;
         let init = expr::try_expr(p)?;
@@ -560,7 +712,7 @@ pub fn try_parameter(p: &mut Parser) -> ParseResult {
         let pat = pattern::try_pattern(p)?;
         let mut ty = NULL;
         if p.eat_token(TokenKind::Colon) {
-            ty = expr::try_expr_without_extended_call(p)?;
+            ty = p.with_type_context(expr::try_expr_without_extended_call)?;
         }
         let span = p.current_span();
         let idx = p
@@ -579,7 +731,7 @@ pub fn try_parameter(p: &mut Parser) -> ParseResult {
     }
     let mut ty = NULL;
     if p.eat_token(TokenKind::Colon) {
-        ty = expr::try_expr_without_extended_call(p)?;
+        ty = p.with_type_context(expr::try_expr_without_extended_call)?;
     }
     let span = p.current_span();
     let idx = p
@@ -595,12 +747,13 @@ pub fn try_parameter(p: &mut Parser) -> ParseResult {
 pub fn try_file_scope(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
 
-    let items = try_multi(
+    let items = try_multi_until(
         p,
         &[Rule::semicolon(
             "definition or statement",
             statement::try_definition_or_statement,
         )],
+        Some(TokenKind::Eof),
     )?;
 
     if !p.eat_token(TokenKind::Eof) {

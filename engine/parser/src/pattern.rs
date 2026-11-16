@@ -268,6 +268,8 @@ fn try_prefix_pattern(p: &mut Parser, option: PatternOption) -> ParseResult {
         | TokenKind::KwTrue
         | TokenKind::KwNull => basic::try_atomic(p),
 
+        TokenKind::Quote => crate::heuristics::try_single_quoted_string_recovery(p),
+
         TokenKind::Id | TokenKind::ArbitraryId => {
             let binder = basic::try_id(p)?;
             try_typed_binding(p, binder, option)

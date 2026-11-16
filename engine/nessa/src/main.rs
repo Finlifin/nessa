@@ -42,12 +42,15 @@ fn print_usage() {
          \x20 help                                              Print this help\n\
          \n\
          Options:\n\
+         \x20 -O0, -O1, -O2, -O3, -O      Set AOT optimization level (`-O` aliases `-O2`; default: `-O0`)\n\
+         \x20 --opt-level <0|1|2|3>       Set AOT optimization level explicitly\n\
          \x20 --locked                    Require and verify package.lock without modifying it\n\
          \x20 --jit <auto|off|tier1|tier2> Configure tiered JIT mode for `run` (default: auto)\n\
          \x20 --emit-ast-dump             Write a source AST dump beside the input\n\
          \x20 --emit-bc-dump              Write a human-readable bytecode disassembly beside the input\n\
          \n\
          Environment:\n\
+         \x20 NESSA_OPT_LEVEL    Default AOT optimization level (`0`, `1`, `2`, `3`; overridden by `-O*`)\n\
          \x20 NESSA_JIT          Default JIT mode (`auto`, `off`, `tier1`, `tier2`; overridden by `--jit`)\n\
          \x20 NESSA_CACHE_DIR    Directory for content-addressed .nsbc cache (set to 'off' to disable)\n\
          \x20 NESSA_NO_CACHE=1   Disable automatic .nsbc compilation caching"
@@ -60,6 +63,7 @@ struct CompileCmdArgs<'a> {
     locked: bool,
     emit_ast_dump: bool,
     emit_bc_dump: bool,
+    opt_level: Option<driver::OptLevel>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,8 +73,15 @@ struct RunCmdArgs<'a> {
     emit_ast_dump: bool,
     emit_bc_dump: bool,
     jit_mode: Option<driver::JitMode>,
+    opt_level: Option<driver::OptLevel>,
     /// `[target_display_string, ...trailing_args]` forwarded to `Driver::with_script_args`.
     script_args: Vec<String>,
+}
+
+fn parse_cli_opt_level(raw: &str) -> Result<driver::OptLevel, String> {
+    driver::OptLevel::parse_str(raw).ok_or_else(|| {
+        format!("error: invalid optimization level '{raw}' (expected 0, 1, 2, or 3)")
+    })
 }
 
 fn parse_cli_jit_mode(raw: &str) -> Result<driver::JitMode, String> {
@@ -93,12 +104,27 @@ fn parse_compile_args(
     let mut locked = false;
     let mut emit_ast_dump = false;
     let mut emit_bc_dump = false;
+    let mut opt_level = None;
 
-    for arg in args {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--locked" if allow_dump_flags => locked = true,
             "--emit-ast-dump" if allow_dump_flags => emit_ast_dump = true,
             "--emit-bc-dump" if allow_dump_flags => emit_bc_dump = true,
+            "-O0" if allow_dump_flags => opt_level = Some(driver::OptLevel::O0),
+            "-O1" if allow_dump_flags => opt_level = Some(driver::OptLevel::O1),
+            "-O2" | "-O" if allow_dump_flags => opt_level = Some(driver::OptLevel::O2),
+            "-O3" if allow_dump_flags => opt_level = Some(driver::OptLevel::O3),
+            "--opt-level" if allow_dump_flags => {
+                let Some(raw) = iter.next() else {
+                    return Err("error: --opt-level requires a level (0|1|2|3)".to_owned());
+                };
+                opt_level = Some(parse_cli_opt_level(raw)?);
+            }
+            s if allow_dump_flags && s.starts_with("--opt-level=") => {
+                opt_level = Some(parse_cli_opt_level(&s["--opt-level=".len()..])?);
+            }
             _ if file.is_none() && !arg.starts_with('-') => file = Some(arg.as_str()),
             other => return Err(format!("unknown option: {other}")),
         }
@@ -113,6 +139,7 @@ fn parse_compile_args(
         locked,
         emit_ast_dump,
         emit_bc_dump,
+        opt_level,
     })
 }
 
@@ -122,6 +149,7 @@ fn parse_run_args(args: &[String]) -> Result<RunCmdArgs<'_>, String> {
     let mut emit_ast_dump = false;
     let mut emit_bc_dump = false;
     let mut jit_mode: Option<driver::JitMode> = None;
+    let mut opt_level: Option<driver::OptLevel> = None;
     let mut trailing_args: Vec<String> = Vec::new();
     let mut after_separator = false;
 
@@ -148,6 +176,27 @@ fn parse_run_args(args: &[String]) -> Result<RunCmdArgs<'_>, String> {
             }
             "--emit-bc-dump" if trailing_args.is_empty() => {
                 emit_bc_dump = true;
+            }
+            "-O0" if trailing_args.is_empty() => {
+                opt_level = Some(driver::OptLevel::O0);
+            }
+            "-O1" if trailing_args.is_empty() => {
+                opt_level = Some(driver::OptLevel::O1);
+            }
+            "-O2" | "-O" if trailing_args.is_empty() => {
+                opt_level = Some(driver::OptLevel::O2);
+            }
+            "-O3" if trailing_args.is_empty() => {
+                opt_level = Some(driver::OptLevel::O3);
+            }
+            "--opt-level" if trailing_args.is_empty() => {
+                let Some(raw) = iter.next() else {
+                    return Err("error: --opt-level requires a level (0|1|2|3)".to_owned());
+                };
+                opt_level = Some(parse_cli_opt_level(raw)?);
+            }
+            s if trailing_args.is_empty() && s.starts_with("--opt-level=") => {
+                opt_level = Some(parse_cli_opt_level(&s["--opt-level=".len()..])?);
             }
             "--jit" if trailing_args.is_empty() => {
                 let Some(raw_mode) = iter.next() else {
@@ -183,6 +232,7 @@ fn parse_run_args(args: &[String]) -> Result<RunCmdArgs<'_>, String> {
         emit_ast_dump,
         emit_bc_dump,
         jit_mode,
+        opt_level,
         script_args,
     })
 }
@@ -279,6 +329,7 @@ fn cmd_run(args: &[String]) {
     let cmd = parse_run_or_exit(args);
     let mut driver = driver::Driver::new().with_script_args(cmd.script_args);
     driver.set_jit_mode(cmd.jit_mode);
+    driver.set_opt_level(cmd.opt_level);
     let input = Path::new(cmd.file);
     let result = if input.is_dir() {
         let compiled = if cmd.locked {
@@ -349,7 +400,8 @@ fn cmd_run(args: &[String]) {
 fn cmd_build(args: &[String]) {
     let cmd = parse_compile_or_exit(args, true);
     let input = Path::new(cmd.file);
-    let driver = driver::Driver::new();
+    let mut driver = driver::Driver::new();
+    driver.set_opt_level(cmd.opt_level);
     let (output_path, result) = if input.is_dir() {
         let output = input.join("package.nsbc");
         let result = if cmd.locked {
@@ -394,7 +446,8 @@ fn cmd_build(args: &[String]) {
 
 fn cmd_check(args: &[String]) {
     let cmd = parse_compile_or_exit(args, true);
-    let driver = driver::Driver::new();
+    let mut driver = driver::Driver::new();
+    driver.set_opt_level(cmd.opt_level);
     let input = Path::new(cmd.file);
     let result = if input.is_dir() {
         let res = if cmd.locked {
@@ -445,7 +498,8 @@ fn cmd_disasm(args: &[String]) {
         eprintln!("unknown option: --emit-ast-dump");
         process::exit(1);
     }
-    let driver = driver::Driver::new();
+    let mut driver = driver::Driver::new();
+    driver.set_opt_level(cmd.opt_level);
     let input = Path::new(cmd.file);
     let result = if input.is_dir() {
         if cmd.locked {

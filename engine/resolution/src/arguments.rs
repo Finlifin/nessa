@@ -412,12 +412,26 @@ pub(crate) fn plan_parameters(
             if ast.node(argument).kind == NodeKind::NamedArg {
                 let name = ast.node(ast.fixed_children(argument)[0]).str_id;
                 let Some(&index) = by_name.get(&name) else {
-                    report(
-                        r,
-                        ast,
-                        argument,
-                        format!("unknown parameter `{}`", str_interner::get(name)),
-                    );
+                    let unknown_str = str_interner::get(name);
+                    let mut builder = r
+                        .diag_ctx
+                        .error(format!("unknown parameter `{unknown_str}`"))
+                        .with_code(diagnostic::codes::UNKNOWN_PARAMETER)
+                        .with_primary_span(ast.node(argument).span);
+                    if !declaration.is_null() {
+                        builder = builder.with_label(
+                            ast.node(declaration).span,
+                            "callable declared here".into(),
+                            diagnostic::Level::Note,
+                        );
+                    }
+                    if let Some(help) = crate::suggestions::unknown_parameter_help(
+                        by_name.keys().copied(),
+                        &unknown_str,
+                    ) {
+                        builder = builder.with_help(help);
+                    }
+                    builder.emit(r.diag_ctx);
                     valid = false;
                     continue;
                 };
@@ -519,12 +533,26 @@ pub(crate) fn plan_parameters(
             } else if ast.node(argument).kind == NodeKind::NamedArg {
                 let name = ast.node(ast.fixed_children(argument)[0]).str_id;
                 let Some(&index) = by_name.get(&name) else {
-                    report(
-                        r,
-                        ast,
-                        argument,
-                        format!("unknown parameter `{}`", str_interner::get(name)),
-                    );
+                    let unknown_str = str_interner::get(name);
+                    let mut builder = r
+                        .diag_ctx
+                        .error(format!("unknown parameter `{unknown_str}`"))
+                        .with_code(diagnostic::codes::UNKNOWN_PARAMETER)
+                        .with_primary_span(ast.node(argument).span);
+                    if !declaration.is_null() {
+                        builder = builder.with_label(
+                            ast.node(declaration).span,
+                            "callable declared here".into(),
+                            diagnostic::Level::Note,
+                        );
+                    }
+                    if let Some(help) = crate::suggestions::unknown_parameter_help(
+                        by_name.keys().copied(),
+                        &unknown_str,
+                    ) {
+                        builder = builder.with_help(help);
+                    }
+                    builder.emit(r.diag_ctx);
                     valid = false;
                     continue;
                 };

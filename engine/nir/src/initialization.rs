@@ -305,10 +305,10 @@ impl<'a> Planner<'a> {
                             scope = self.resolved.scopes[current.0 as usize].parent;
                         }
                         if !local {
-                            errors.push(LoweringError {
+                            errors.push(LoweringError::new(
                                 node,
-                                message: "shared scope initialization cannot capture function-local values".to_owned(),
-                            });
+                                "shared scope initialization cannot capture function-local values",
+                            ));
                         }
                     }
                 }
@@ -1435,9 +1435,11 @@ impl<'a> Planner<'a> {
             if ready.is_empty() {
                 return Err(remaining
                     .iter()
-                    .map(|&owner| LoweringError {
-                        node: self.resolved.scopes[self.scopes[owner].0 as usize].node,
-                        message: "cyclic module value initialization dependency".to_owned(),
+                    .map(|&owner| {
+                        LoweringError::new(
+                            self.resolved.scopes[self.scopes[owner].0 as usize].node,
+                            "cyclic module value initialization dependency",
+                        )
                     })
                     .collect());
             }

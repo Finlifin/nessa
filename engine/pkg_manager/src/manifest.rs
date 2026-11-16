@@ -42,6 +42,7 @@ pub struct ManifestDocument {
     pub(crate) source_sha256: [u8; 32],
     pub(crate) path_dependencies: Vec<PathDependency>,
     pub(crate) ffi: FfiConfig,
+    pub(crate) build_opt_level: Option<u8>,
 }
 
 impl ManifestDocument {
@@ -147,6 +148,7 @@ impl ManifestDocument {
         }
         path_dependencies.sort_by(|a, b| a.key.cmp(&b.key));
         let ffi = parse_ffi_config(metadata.get("ffi"))?;
+        let build_opt_level = parse_build_opt_level(metadata.get("build"))?;
         Ok(Self {
             manifest: PackageManifest {
                 name,
@@ -160,6 +162,7 @@ impl ManifestDocument {
             source_sha256,
             path_dependencies,
             ffi,
+            build_opt_level,
         })
     }
 
@@ -174,6 +177,9 @@ impl ManifestDocument {
     }
     pub fn ffi(&self) -> &FfiConfig {
         &self.ffi
+    }
+    pub fn build_opt_level(&self) -> Option<u8> {
+        self.build_opt_level
     }
     pub fn source_sha256(&self) -> &[u8; 32] {
         &self.source_sha256
@@ -248,8 +254,37 @@ impl ManifestDocument {
                 metadata.remove("dependencies");
             }
         }
+        // Build optimization flags do not alter package/type semantic identity.
+        metadata.remove("build");
         metadata
     }
+}
+
+fn parse_build_opt_level(value: Option<&toml::Value>) -> Result<Option<u8>, PackageError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let table = value
+        .as_table()
+        .ok_or_else(|| PackageError::Manifest("[build] must be a table".into()))?;
+    for key in table.keys() {
+        if key != "opt_level" {
+            return Err(PackageError::Manifest(format!(
+                "unknown field in [build]: {key}"
+            )));
+        }
+    }
+    let Some(opt_val) = table.get("opt_level") else {
+        return Ok(None);
+    };
+    let level = opt_val
+        .as_integer()
+        .and_then(|v| u8::try_from(v).ok())
+        .filter(|&v| v <= 3)
+        .ok_or_else(|| {
+            PackageError::Manifest("build.opt_level must be an integer 0, 1, 2, or 3".into())
+        })?;
+    Ok(Some(level))
 }
 
 fn parse_ffi_config(value: Option<&toml::Value>) -> Result<FfiConfig, PackageError> {

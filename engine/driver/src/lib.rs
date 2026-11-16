@@ -18,6 +18,7 @@ mod standard_library;
 
 pub use execution::{ArtifactLoadError, install_artifact};
 pub use initialization::{EngineConfig, JitConfig, JitMode, JitStats};
+pub use nir::OptLevel;
 
 use ast::dump::dump_ast_to_string_pretty;
 use diagnostic::{Diagnostic, DiagnosticContext, Level, NessaError};
@@ -111,6 +112,7 @@ pub struct Driver {
     script_args: Vec<String>,
     cache_override: Option<Option<PathBuf>>,
     jit_config: Option<JitConfig>,
+    opt_level: Option<OptLevel>,
 }
 
 impl Driver {
@@ -121,7 +123,31 @@ impl Driver {
             script_args: Vec::new(),
             cache_override: None,
             jit_config: None,
+            opt_level: None,
         }
+    }
+
+    /// Override the AOT optimization level (`O0`, `O1`, `O2`, `O3`) for compilations on this driver.
+    pub fn with_opt_level(mut self, level: OptLevel) -> Self {
+        self.opt_level = Some(level);
+        self
+    }
+
+    /// Set or clear the explicit [`OptLevel`] override (`None` falls back to `package.toml` / `NESSA_OPT_LEVEL` / `O0`).
+    pub fn set_opt_level(&mut self, level: Option<OptLevel>) {
+        self.opt_level = level;
+    }
+
+    /// Return the explicit [`OptLevel`] configured on this driver, if any.
+    pub fn opt_level(&self) -> Option<OptLevel> {
+        self.opt_level
+    }
+
+    /// Resolve effective optimization level: explicit `Driver` override > optional manifest `[build] opt_level` > `NESSA_OPT_LEVEL` > `O0`.
+    pub(crate) fn effective_opt_level(&self, manifest_opt_level: Option<u8>) -> OptLevel {
+        self.opt_level
+            .or_else(|| manifest_opt_level.and_then(OptLevel::from_u8))
+            .unwrap_or_else(OptLevel::from_env)
     }
 
     /// Override the JIT mode used when executing artifacts on this driver.
@@ -254,7 +280,14 @@ impl Driver {
         identity: Option<CompilationIdentityContext>,
         startup: nir::StartupMode,
     ) -> CompileResult {
-        self.compile_ast_with_options(ast, diagnostics, identity, startup, None)
+        self.compile_ast_with_options(
+            ast,
+            diagnostics,
+            identity,
+            startup,
+            None,
+            self.effective_opt_level(None),
+        )
     }
 
     fn compile_ast_with_options(
@@ -264,6 +297,7 @@ impl Driver {
         identity: Option<CompilationIdentityContext>,
         startup: nir::StartupMode,
         package_options: Option<resolution::ResolveOptions>,
+        opt_level: OptLevel,
     ) -> CompileResult {
         let original_root = ast.root;
         let needs_bundled_script_packages = package_options.is_none() && {
@@ -340,15 +374,28 @@ impl Driver {
         }
 
         // Phase 4: NIR lowering
-        let nir_module = match nir::try_lower_with_startup(&resolved, startup) {
+        let mut nir_module = match nir::try_lower_with_startup(&resolved, startup) {
             Ok(module) => module,
             Err(errors) => {
                 let context = DiagnosticContext::new(&self.source_map);
                 for error in errors {
-                    context
+                    let mut builder = context
                         .error(error.message)
-                        .with_primary_span(resolved.ast.node(error.node).span)
-                        .emit(&context);
+                        .with_code(error.code.unwrap_or(diagnostic::codes::NIR_LOWERING_ERROR))
+                        .with_primary_span(resolved.ast.node(error.node).span);
+                    if let Some((note_node, note_msg)) = error.note_node
+                        && !note_node.is_null()
+                    {
+                        builder = builder.with_label(
+                            resolved.ast.node(note_node).span,
+                            note_msg,
+                            Level::Note,
+                        );
+                    }
+                    if let Some(help) = error.help {
+                        builder = builder.with_help(help);
+                    }
+                    builder.emit(&context);
                 }
                 diagnostics.extend(context.diagnostics().iter().cloned());
                 return CompileResult::failed(diagnostics, resolved.type_pool);
@@ -410,8 +457,11 @@ impl Driver {
             return CompileResult::failed(diagnostics, resolved.type_pool);
         }
 
-        // Phase 5: Code generation
-        let codegen_output = match codegen::try_codegen(&nir_module) {
+        // Phase 4b: Mid-end NIR optimization passes (`O1` / `O2` / `O3`)
+        nir::optimize_module(&mut nir_module, &mut resolved.type_pool, opt_level);
+
+        // Phase 5: Code generation (with constant deduplication & bytecode peepholes at `O1+`)
+        let codegen_output = match codegen::try_codegen_with_opt(&nir_module, opt_level) {
             Ok(output) => output,
             Err(errors) => {
                 let encoding_diagnostics = DiagnosticContext::new(&self.source_map);
@@ -429,6 +479,7 @@ impl Driver {
                         .unwrap_or(resolved.ast.root);
                     encoding_diagnostics
                         .error(error.message)
+                        .with_code(diagnostic::codes::CODEGEN_LIMIT_OR_ENCODING)
                         .with_primary_span(resolved.ast.node(node).span)
                         .emit(&encoding_diagnostics);
                 }
@@ -452,7 +503,8 @@ impl Driver {
         source: &str,
     ) -> Result<nsbc::CompiledArtifact, Vec<Diagnostic>> {
         let cache_dir = self.resolved_cache_dir();
-        let key = artifact_cache::single_source_key(source, None);
+        let opt_level = self.effective_opt_level(None);
+        let key = artifact_cache::single_source_key(source, None, opt_level);
         if let Some(cached) = artifact_cache::load_cached_artifact(cache_dir.as_deref(), &key) {
             return Ok(cached);
         }

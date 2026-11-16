@@ -118,8 +118,8 @@ fn lower_expr_uncoerced(
             lower_expr(resolved, ast.fixed_children(node_idx)[0], builder, block)
         }
 
-        // ── Identifier ─────────────────────────────────────────────
-        NodeKind::Id | NodeKind::SelfLower | NodeKind::SelfUpper => {
+        // ── Identifier / target-typed enum shorthand ───────────────
+        NodeKind::Id | NodeKind::SelfLower | NodeKind::SelfUpper | NodeKind::Symbol => {
             lower_id(resolved, node_idx, builder, block)
         }
 
@@ -411,7 +411,6 @@ fn lower_expr_uncoerced(
         // ── Non-runtime declarations, types, patterns, and rejected surface constructs ──
         NodeKind::Invalid
         | NodeKind::Underscore
-        | NodeKind::Symbol
         | NodeKind::Object
         | NodeKind::OptionalType
         | NodeKind::EffectQualifiedType

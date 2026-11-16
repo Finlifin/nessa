@@ -77,6 +77,7 @@
 - 用户已明确授权在空间不足或缓存过大时自主执行本工作区的 `cargo clean`，无需重复请求授权；只清理可重新生成的 Cargo 构建产物，保留源码、日志与验收产物。
 - 构建、测试、lint 和清理统一通过 `bash scripts/cargo.sh <cargo 参数>` 执行。隔离副本复制同一入口及根 `Cargo.toml` 的 profile 配置，设置共享 `CARGO_TARGET_DIR=/home/fin/nessa2/target`。入口持有目标目录外的独占锁，达到默认 6 GiB 缓存阈值时先自动 clean，避免清理正在运行的构建；使用同一目录的所有代理必须遵守该入口。
 - 开发/测试 profile 关闭增量缓存与完整调试信息，减少隔离副本产生的重复缓存。需要 Rust 调试信息时可临时用 `CARGO_PROFILE_DEV_DEBUG=2` / `CARGO_PROFILE_TEST_DEBUG=2`，调试后恢复；缓存阈值可通过正整数 `NESSA_BUILD_CACHE_LIMIT_KIB` 调整。不要修改宿主权限配置或将其它目录的删除混同为本次 clean 授权。
+- **并发执行测试二进制（默认要求）**：Cargo 原生 `cargo test` 会对工作区内近两百个独立测试二进制逐个串行执行。运行多目标集成测试（`nessa-test`）或全工作区回归时，**一律使用 `bash scripts/test-parallel.sh`**（内部先经 `scripts/cargo.sh` 独占锁一次性完成编译，再按 `NESSA_TEST_JOBS` 并发度拉起多个测试二进制、为每个进程配置 `--test-threads=$NESSA_TEST_THREADS` 与独立 `NESSA_CACHE_DIR`，并将对 CPU 墙钟敏感的 `multicore`/`reactor` 套件置于末尾独占执行；推荐在 32 核环境下使用 `NESSA_TEST_JOBS=10 NESSA_TEST_THREADS=3`，兼顾速度与内存上限）。单目标快速迭代可继续使用 `bash scripts/cargo.sh test -p <crate> -- --test-threads=4`。
 
 - 修复缺陷时补能复现原问题的回归测试；新增语言能力同时覆盖相关阶段和端到端行为。
 - 测试断言具体语义，如值、类型、绑定、诊断、退出状态或归档内容。只检查“不崩溃”“非空”“有 scope”不足以证明功能正确。
@@ -90,15 +91,15 @@
 ```sh
 # 开发过程中：检查并测试受影响的 crate
 bash scripts/cargo.sh check -p <crate> --all-targets
-bash scripts/cargo.sh test -p <crate>
+bash scripts/cargo.sh test -p <crate> -- --test-threads=4
 
-# 编译管线、语言语义或运行时修改：运行集成测试
-bash scripts/cargo.sh test -p nessa-test
+# 编译管线、语言语义或运行时修改：并发运行集成测试
+NESSA_TEST_JOBS=10 NESSA_TEST_THREADS=3 bash scripts/test-parallel.sh -p nessa-test
 
-# 代码交付前：格式、全 workspace 编译、测试和 lint
+# 代码交付前：格式、全 workspace 编译、并发测试和 lint
 bash scripts/cargo.sh fmt --all -- --check
 bash scripts/cargo.sh check --workspace --all-targets
-bash scripts/cargo.sh test --workspace
+NESSA_TEST_JOBS=10 NESSA_TEST_THREADS=3 bash scripts/test-parallel.sh
 bash scripts/cargo.sh clippy --workspace --all-targets -- -D warnings
 
 # 所有变更：检查差异和空白问题

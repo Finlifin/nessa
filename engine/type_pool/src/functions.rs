@@ -246,6 +246,32 @@ impl TypePool {
         }
         Ok(())
     }
+
+    /// Return all resolved function IDs referenced across method tables, trait
+    /// implementations, and vtables. Used as roots during whole-module dead
+    /// function elimination.
+    pub fn referenced_function_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .methods
+            .iter()
+            .flatten()
+            .map(|m| m.func_id)
+            .chain(
+                self.trait_impls
+                    .iter()
+                    .flat_map(|rec| rec.methods.iter().map(|m| m.func_id)),
+            )
+            .chain(
+                self.vtables
+                    .iter()
+                    .flat_map(|vt| vt.entries.iter().copied()),
+            )
+            .filter(|&id| id != DERIVE_FUNC_ID)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 #[cfg(test)]

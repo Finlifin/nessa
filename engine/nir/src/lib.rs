@@ -24,6 +24,7 @@ mod lists;
 mod literal;
 mod lowering;
 mod named_functions;
+pub mod opt;
 mod optional;
 mod ordering;
 mod ordering_derivation;
@@ -35,6 +36,7 @@ mod trait_parameters;
 mod tuples;
 
 use nsbc::{FuncId, GlobalId, GlobalInfo};
+pub use opt::{OptLevel, optimize_module};
 use resolution::ResolvedAst;
 use runtime::BuiltinFnId;
 use str_interner::StrId;
@@ -312,6 +314,13 @@ impl NirStmt {
             statement => statement,
         }
     }
+
+    pub(crate) fn unscoped_mut(&mut self) -> &mut Self {
+        match self {
+            Self::Scoped { statement, .. } => statement.unscoped_mut(),
+            statement => statement,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -465,11 +474,26 @@ pub fn lower(resolved: &ResolvedAst) -> NirModule {
     try_lower(resolved).expect("resolved initialization dependencies must be valid")
 }
 
-/// A source error found while planning module startup.
+/// A source error found while planning module startup or NIR lowering.
 #[derive(Debug)]
 pub struct LoweringError {
     pub node: ast::NodeIndex,
     pub message: String,
+    pub code: Option<u32>,
+    pub note_node: Option<(ast::NodeIndex, String)>,
+    pub help: Option<String>,
+}
+
+impl LoweringError {
+    pub fn new(node: ast::NodeIndex, message: impl Into<String>) -> Self {
+        Self {
+            node,
+            message: message.into(),
+            code: None,
+            note_node: None,
+            help: None,
+        }
+    }
 }
 
 /// Whether startup invokes the root main after module initialization.
@@ -495,6 +519,9 @@ pub fn try_lower_with_startup(
             vec![LoweringError {
                 node: resolved.ast.root,
                 message: "exe package must define a root main function".into(),
+                code: Some(5001),
+                note_node: None,
+                help: Some("define `fn main() { ... }` at the root of `main.ns`".into()),
             }]
         })?;
         let node = resolved.symbols[main.0 as usize].def_node;
@@ -502,6 +529,12 @@ pub fn try_lower_with_startup(
             return Err(vec![LoweringError {
                 node,
                 message: "exe main must have zero parameters".into(),
+                code: Some(5001),
+                note_node: None,
+                help: Some(
+                    "remove parameters from `fn main()` and read CLI arguments via `std.env.args()`"
+                        .into(),
+                ),
             }]);
         }
     }

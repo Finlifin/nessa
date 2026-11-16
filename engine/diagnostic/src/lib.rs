@@ -1,9 +1,11 @@
 pub mod emitter;
+pub mod suggest;
 pub use source_span::{
     LocatedSourceSpan, RawByteRange, SourceMapping, SourceSpanError, SourceSpanMapper,
 };
+pub use suggest::{codes, did_you_mean, edit_distance, suggest_similar};
 
-use ariadne::{Color, ColorGenerator, Label, Report, ReportKind, Source};
+use ariadne::{Color, ColorGenerator, Label, Report, ReportKind, sources};
 use rustc_span::{BytePos, FileNameDisplayPreference, SourceMap, Span};
 use std::{
     cell::{Cell, Ref, RefCell},
@@ -155,17 +157,28 @@ impl DiagnosticBuilder {
         self
     }
 
-    pub fn with_error_source_span(mut self, location: LocatedSourceSpan, message: String) -> Self {
-        let mut label = DiagnosticMessage::new(location.span, message, Level::Error);
+    pub fn with_error_source_span(self, location: LocatedSourceSpan, message: String) -> Self {
+        self.with_source_label(location, message, Level::Error)
+    }
+
+    pub fn with_source_label(
+        mut self,
+        location: LocatedSourceSpan,
+        message: String,
+        level: Level,
+    ) -> Self {
+        let mut label = DiagnosticMessage::new(location.span, message, level);
         label.source_start = location.file_start;
         self.diagnostic.labels.push(label);
         self
     }
 
     pub fn with_label(mut self, span: Span, message: String, level: Level) -> Self {
-        self.diagnostic
-            .labels
-            .push(DiagnosticMessage::new(span, message, level));
+        if !span.is_dummy() {
+            self.diagnostic
+                .labels
+                .push(DiagnosticMessage::new(span, message, level));
+        }
         self
     }
 
@@ -351,7 +364,7 @@ impl<'a> DiagnosticContext<'a> {
         Some(file)
     }
 
-    /// Emit diagnostic using ariadne, or plain text without a real source span.
+    /// Emit diagnostic using ariadne (including cross-file labels), or plain text without a real source span.
     fn emit_to_ariadne(&self, diagnostic: &Diagnostic) {
         let span = diagnostic
             .primary_span
@@ -370,39 +383,22 @@ impl<'a> DiagnosticContext<'a> {
             return;
         };
         let mut colors = ColorGenerator::new();
-        let file_id_str = format!(
-            "{}",
-            source_file
-                .name
-                .display(FileNameDisplayPreference::Local)
-                .to_string_lossy()
-        );
+        let file_id_str = source_file
+            .name
+            .display(FileNameDisplayPreference::Local)
+            .to_string_lossy()
+            .into_owned();
 
-        // Convert byte positions to character positions for ariadne
-        let source_content = match &source_file.src {
-            Some(content) => content.as_str(),
-            None => {
-                eprintln!("Error: Source file content not available");
-                return;
-            }
+        let Some(source_content) = source_file.src.as_deref() else {
+            eprintln!("Error: Source file content not available");
+            return;
         };
 
-        let byte_start = (primary_span.lo().0 - source_file.start_pos.0) as usize;
-        let byte_end = (primary_span.hi().0 - source_file.start_pos.0) as usize;
-
-        // Convert byte indices to character indices by counting UTF-8 chars
-        let char_start = source_content
-            .get(..byte_start.min(source_content.len()))
-            .map(|s| s.chars().count())
-            .unwrap_or(0);
-        let char_end = source_content
-            .get(..byte_end.min(source_content.len()))
-            .map(|s| s.chars().count())
-            .unwrap_or(char_start);
+        let (char_start, char_end) = byte_span_to_char_range(&source_file, primary_span);
 
         let mut report = Report::build(
             diagnostic.level.to_ariadne_kind(),
-            (&file_id_str, char_start..char_end),
+            (file_id_str.clone(), char_start..char_end),
         );
 
         if let Some(code) = diagnostic.code {
@@ -411,72 +407,82 @@ impl<'a> DiagnosticContext<'a> {
 
         report = report.with_message(&diagnostic.message);
 
-        // Add labels - only from the same file for simplicity
-        let mut has_source_label = false;
+        let mut source_entries: Vec<(String, String)> =
+            vec![(file_id_str.clone(), source_content.to_owned())];
+        let mut has_primary_file_label = false;
+
         for label in &diagnostic.labels {
-            // 检查 span 是否来自同一个文件
             if let Some(label_file) = self.source_for_location(label.span, label.source_start)
-                && std::ptr::eq(label_file.as_ref(), source_file.as_ref())
+                && let Some(label_src) = label_file.src.as_deref()
             {
-                has_source_label = true;
-                let color = colors.next();
+                let label_file_id = label_file
+                    .name
+                    .display(FileNameDisplayPreference::Local)
+                    .to_string_lossy()
+                    .into_owned();
+                if std::ptr::eq(label_file.as_ref(), source_file.as_ref()) {
+                    has_primary_file_label = true;
+                } else if !source_entries.iter().any(|(id, _)| id == &label_file_id) {
+                    source_entries.push((label_file_id.clone(), label_src.to_owned()));
+                }
 
-                let label_byte_start = (label.span.lo().0 - source_file.start_pos.0) as usize;
-                let label_byte_end = (label.span.hi().0 - source_file.start_pos.0) as usize;
-
-                // Convert byte indices to character indices for label
-                let label_char_start = source_content
-                    .get(..label_byte_start.min(source_content.len()))
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0);
-                let label_char_end = source_content
-                    .get(..label_byte_end.min(source_content.len()))
-                    .map(|s| s.chars().count())
-                    .unwrap_or(label_char_start);
+                let color = match label.level {
+                    Level::Error => Color::Red,
+                    Level::Warning => Color::Yellow,
+                    Level::Note => Color::Blue,
+                    Level::Help => Color::Cyan,
+                };
+                let _ = &mut colors;
+                let (l_start, l_end) = byte_span_to_char_range(&label_file, label.span);
 
                 report = report.with_label(
-                    Label::new((&file_id_str, label_char_start..label_char_end))
+                    Label::new((label_file_id, l_start..l_end))
                         .with_message(&label.message)
                         .with_color(color),
                 );
             }
         }
 
-        // Ariadne only renders source locations with a label. Preserve the exact
-        // primary range when no valid same-file label provides that location.
-        if !has_source_label {
+        if !has_primary_file_label {
             report = report.with_label(
-                Label::new((&file_id_str, char_start..char_end))
+                Label::new((file_id_str, char_start..char_end))
                     .with_color(diagnostic.level.color()),
             );
         }
 
-        // Add notes
         for note in &diagnostic.notes {
             report = report.with_note(note);
         }
 
-        // Add helps
         for help in &diagnostic.helps {
             report = report.with_help(help);
         }
 
-        // Print the report - use file_id as identifier
-        let source_content = match &source_file.src {
-            Some(content) => content.as_str(),
-            None => {
-                eprintln!("Error: Source file content not available");
-                return;
-            }
-        };
-
-        if let Err(e) = report
-            .finish()
-            .eprint((&file_id_str, Source::from(source_content)))
-        {
+        let cache = sources(source_entries);
+        if let Err(e) = report.finish().eprint(cache) {
             eprintln!("Error printing diagnostic: {}", e);
         }
     }
+}
+
+pub(crate) fn byte_span_to_char_range(
+    source_file: &rustc_span::SourceFile,
+    span: Span,
+) -> (usize, usize) {
+    let Some(source_content) = source_file.src.as_deref() else {
+        return (0, 0);
+    };
+    let byte_start = span.lo().0.saturating_sub(source_file.start_pos.0) as usize;
+    let byte_end = span.hi().0.saturating_sub(source_file.start_pos.0) as usize;
+    let char_start = source_content
+        .get(..byte_start.min(source_content.len()))
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    let char_end = source_content
+        .get(..byte_end.min(source_content.len()))
+        .map(|s| s.chars().count())
+        .unwrap_or(char_start);
+    (char_start, char_end)
 }
 
 pub(crate) fn emit_plain_diagnostic(diagnostic: &Diagnostic) {

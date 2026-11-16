@@ -117,13 +117,23 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                     || (!definition.def_node.is_null()
                         && ast.node(definition.def_node).kind == NodeKind::ConstDecl)
                 {
-                    r.diag_ctx
-                        .error(format!(
-                            "cannot assign to constant `{}`",
-                            str_interner::get(definition.name)
-                        ))
+                    let const_name = str_interner::get(definition.name);
+                    let mut builder = r
+                        .diag_ctx
+                        .error(format!("cannot assign to constant `{const_name}`"))
+                        .with_code(diagnostic::codes::IMMUTABLE_ASSIGNMENT)
                         .with_primary_span(ast.node(target).span)
-                        .emit(r.diag_ctx);
+                        .with_help(format!(
+                            "declare `{const_name}` with `let` or `var` if it needs to be mutated"
+                        ));
+                    if !definition.def_node.is_null() {
+                        builder = builder.with_label(
+                            ast.node(definition.def_node).span,
+                            format!("constant `{const_name}` declared here"),
+                            Level::Note,
+                        );
+                    }
+                    builder.emit(r.diag_ctx);
                 }
             }
         }
@@ -159,15 +169,8 @@ pub(crate) fn resolve_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         // ── View (e.g. `.print'builtin`) ───────────────────────────
         NodeKind::View => resolve_view(r, ast, node_idx),
 
-        // ── Standalone symbol literal `.id` ────────────────────────
-        NodeKind::Symbol => {
-            r.diag_ctx
-                .error(
-                    "standalone symbol literals `.name` are not supported as runtime values".into(),
-                )
-                .with_primary_span(ast.node(node_idx).span)
-                .emit(r.diag_ctx);
-        }
+        // ── Symbol literal `.id` (checked in typing as target-typed enum shorthand) ──
+        NodeKind::Symbol => {}
 
         // ── Unsupported surface constructs ─────────────────────────
         NodeKind::ResetExpr => {
@@ -770,21 +773,13 @@ fn resolve_id(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex, str_id: str_inte
                     "`{}` is not visible from this module",
                     str_interner::get(str_id)
                 ))
+                .with_code(diagnostic::codes::VISIBILITY_DENIED)
                 .with_primary_span(ast.node(node_idx).span)
+                .with_help("mark the declaration `pub` in its defining module to export it".into())
                 .emit(r.diag_ctx);
         }
         Ok(None) => {
-            let name = str_interner::get(str_id);
-            let span = ast.node(node_idx).span;
-            r.diag_ctx
-                .error(format!("undefined name `{name}`"))
-                .with_primary_span(span)
-                .with_label(
-                    span,
-                    format!("`{name}` is not defined in this scope"),
-                    Level::Error,
-                )
-                .emit(r.diag_ctx);
+            crate::suggestions::emit_undefined_name(r, ast, node_idx, str_id);
         }
     }
 }
@@ -1907,7 +1902,7 @@ fn resolve_projection(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
             kind,
             SymbolKind::Module | SymbolKind::Type | SymbolKind::Trait
         ) {
-            crate::enums::record_reference(r, ast, node_idx);
+            crate::enums::record_reference(r, ast, node_idx, None);
             if r.enum_variants.contains_key(&node_idx)
                 || crate::type_factories::deferred_variant(r, ast, object, member)
             {
@@ -1920,10 +1915,23 @@ fn resolve_projection(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                     r.node_symbols.insert(node_idx, member_sym);
                 }
                 Err(error) => {
-                    r.diag_ctx
-                        .error(error)
-                        .with_primary_span(ast.node(member).span)
-                        .emit(r.diag_ctx);
+                    let owner_ty = r.symbols[obj_sym.0 as usize].type_index;
+                    let member_str = str_interner::get(member_name);
+                    let mut builder = r
+                        .diag_ctx
+                        .error(error.clone())
+                        .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                        .with_primary_span(ast.node(member).span);
+                    if error.starts_with("unknown member")
+                        && owner_ty != type_pool::TypeIndex::INVALID
+                    {
+                        for help in
+                            crate::suggestions::unknown_member_helps(r, owner_ty, &member_str)
+                        {
+                            builder = builder.with_help(help);
+                        }
+                    }
+                    builder.emit(r.diag_ctx);
                 }
             }
         }
@@ -1937,7 +1945,7 @@ fn resolve_projection(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
 fn resolve_property_pattern(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     let children = ast.fixed_children(node_idx);
     resolve_names(r, ast, children[0]);
-    crate::enums::record_reference(r, ast, node_idx);
+    crate::enums::record_reference(r, ast, node_idx, None);
     if r.enum_variants.contains_key(&node_idx)
         || crate::type_factories::deferred_variant(r, ast, children[0], children[1])
     {
@@ -1950,10 +1958,20 @@ fn resolve_property_pattern(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                 r.node_symbols.insert(node_idx, symbol);
             }
             Err(error) => {
-                r.diag_ctx
-                    .error(error)
-                    .with_primary_span(ast.node(node_idx).span)
-                    .emit(r.diag_ctx);
+                let owner_ty = r.symbols[owner.0 as usize].type_index;
+                let member_str = str_interner::get(ast.node(children[1]).str_id);
+                let mut builder = r
+                    .diag_ctx
+                    .error(error.clone())
+                    .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                    .with_primary_span(ast.node(node_idx).span);
+                if error.starts_with("unknown member") && owner_ty != type_pool::TypeIndex::INVALID
+                {
+                    for help in crate::suggestions::unknown_member_helps(r, owner_ty, &member_str) {
+                        builder = builder.with_help(help);
+                    }
+                }
+                builder.emit(r.diag_ctx);
             }
         }
     }

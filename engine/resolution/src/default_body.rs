@@ -475,11 +475,15 @@ pub(crate) struct CheckedBody {
     original_node_types: HashMap<NodeIndex, TypeIndex>,
     original_symbol_types: Vec<TypeIndex>,
     original_function_inference: crate::inference::InferenceState,
+    original_collection_provenance: crate::collection_inference::CollectionProvenanceState,
+    original_narrowed_symbols: HashMap<SymbolId, TypeIndex>,
 }
 impl CheckedBody {
     pub(crate) fn restore(&self, r: &mut Resolver<'_>) {
         self.original_facts.restore(r);
         r.function_inference = self.original_function_inference.clone();
+        r.collection_provenance = self.original_collection_provenance.clone();
+        r.narrowed_symbols = self.original_narrowed_symbols.clone();
         r.node_types = self.original_node_types.clone();
         for (symbol, &ty) in r.symbols.iter_mut().zip(&self.original_symbol_types) {
             symbol.type_index = ty;
@@ -498,6 +502,8 @@ pub(crate) fn check_body(
 ) -> Result<CheckedBody, String> {
     let original_facts = DefaultBodyFacts::capture(r);
     let original_function_inference = r.function_inference.clone();
+    let original_collection_provenance = r.collection_provenance.clone();
+    let original_narrowed_symbols = r.narrowed_symbols.clone();
     let original_node_types = r.node_types.clone();
     let original_symbol_types = r.symbols.iter().map(|symbol| symbol.type_index).collect();
     let provenance = crate::self_provenance::SelfProvenance::new(r, ast, root, owner)?;
@@ -559,6 +565,16 @@ pub(crate) fn check_body(
     r.update_calls.retain(|node, _| !domain.contains(node));
     r.concat_calls.retain(|node, _| !domain.contains(node));
     r.equality_calls.retain(|node, _| !domain.contains(node));
+    r.collection_provenance
+        .node_elements
+        .retain(|node, _| !domain.contains(node));
+    r.collection_provenance
+        .lambda_body_returns
+        .retain(|node, _| !domain.contains(node));
+    r.collection_provenance
+        .refined_call_results
+        .retain(|node, _| !domain.contains(node));
+    r.narrowed_symbols.clear();
     r.default_body_context = Some(DefaultBodyContext {
         implementor,
         trait_owner: owner,
@@ -587,6 +603,8 @@ pub(crate) fn check_body(
     if let Err(error) = values_result {
         original_facts.restore(r);
         r.function_inference = original_function_inference;
+        r.collection_provenance = original_collection_provenance;
+        r.narrowed_symbols = original_narrowed_symbols;
         r.node_types = original_node_types;
         for (symbol, ty) in r.symbols.iter_mut().zip(original_symbol_types) {
             symbol.type_index = ty;
@@ -620,5 +638,7 @@ pub(crate) fn check_body(
         original_function_inference,
         original_node_types,
         original_symbol_types,
+        original_collection_provenance,
+        original_narrowed_symbols,
     })
 }

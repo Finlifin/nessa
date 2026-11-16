@@ -6,7 +6,8 @@ use crate::basic::{
     try_property, try_property_assign,
 };
 use crate::definition;
-use crate::error::{ParseErrorKind, ParseResult};
+use crate::error::{ParseError, ParseErrorKind, ParseResult};
+use crate::heuristics;
 use crate::parser::{NULL, Parser};
 use crate::{pattern, statement};
 
@@ -209,7 +210,9 @@ const PATTERN_TYPE_PREC: i32 = 50;
 
 pub(crate) fn try_pattern_type(p: &mut Parser) -> ParseResult {
     let _g = p.enter();
-    try_expr_pratt(p, PATTERN_TYPE_PREC, ExprOption::without_extended_call())
+    p.with_type_context(|p| {
+        try_expr_pratt(p, PATTERN_TYPE_PREC, ExprOption::without_extended_call())
+    })
 }
 
 pub fn try_expr_with_option(p: &mut Parser, option: ExprOption) -> ParseResult {
@@ -228,6 +231,8 @@ pub fn try_expr_with_option(p: &mut Parser, option: ExprOption) -> ParseResult {
 /// postfix operations like call, projection, effect/error propagation).
 /// If that returns NULL, we treat it as a binary infix operator.
 fn try_expr_pratt(p: &mut Parser, min_prec: i32, option: ExprOption) -> ParseResult {
+    heuristics::try_skip_foreign_comments(p);
+
     // Parse prefix expression as the left operand
     let mut left = try_prefix_expr(p, option)?;
     if left.is_null() {
@@ -235,6 +240,8 @@ fn try_expr_pratt(p: &mut Parser, min_prec: i32, option: ExprOption) -> ParseRes
     }
 
     loop {
+        heuristics::try_skip_foreign_comments(p);
+
         if p.peek(&[TokenKind::Dot, TokenKind::Dot]) {
             if RANGE_PREC < min_prec {
                 break;
@@ -242,6 +249,29 @@ fn try_expr_pratt(p: &mut Parser, min_prec: i32, option: ExprOption) -> ParseRes
             left = parse_range_expr(p, left, option)?;
             continue;
         }
+
+        if let Some((heur_kind, heur_prec)) = heuristics::try_infix_operator_heuristic(p, min_prec)
+        {
+            let right = try_expr_pratt(p, heur_prec + 1, option)?;
+            if right.is_null() {
+                let _ = p.err_with_label(
+                    ParseErrorKind::InvalidSyntax,
+                    p.next_token_span(),
+                    "Expected a right operand after binary operator",
+                    p.next_token_span(),
+                    format!("found `{}`", p.peek_token().kind.lexeme()),
+                );
+            }
+            let span = p.current_span();
+            left = p
+                .ast()
+                .builder(heur_kind, span)
+                .add_child(left)
+                .add_child(right)
+                .build();
+            continue;
+        }
+
         let token = p.peek_token();
         let op = get_expr_op_info(token.kind);
 
@@ -321,6 +351,7 @@ fn try_prefix_expr(p: &mut Parser, option: ExprOption) -> ParseResult {
         | TokenKind::Underscore => basic::try_atomic(p),
 
         TokenKind::FStringStart => try_fstring(p),
+        TokenKind::Quote => heuristics::try_single_quoted_string_recovery(p),
 
         TokenKind::LParen => try_unit_or_paren_or_tuple(p),
         TokenKind::LBracket => try_list(p),
@@ -328,8 +359,8 @@ fn try_prefix_expr(p: &mut Parser, option: ExprOption) -> ParseResult {
         TokenKind::Dot => try_prefix_range_or_symbol(p, option),
         TokenKind::Pipe => try_lambda(p, option),
         TokenKind::KwCase => try_case_map(p, option),
-        TokenKind::Hash => try_effect_qualified_type(p),
-        TokenKind::Bang => try_error_qualified_type(p),
+        TokenKind::Hash => try_effect_qualified_type(p, option),
+        TokenKind::Bang => try_error_qualified_type(p, option),
         TokenKind::KwNot => try_prefix_unary(p, TokenKind::KwNot, NodeKind::BoolNot),
         TokenKind::KwError => try_prefix_unary(p, TokenKind::KwError, NodeKind::ErrorConstruction),
         TokenKind::Question => try_prefix_unary(p, TokenKind::Question, NodeKind::OptionalType),
@@ -340,6 +371,7 @@ fn try_prefix_expr(p: &mut Parser, option: ExprOption) -> ParseResult {
 
         TokenKind::KwIf => statement::try_if_statement(p),
         TokenKind::KwWhen => statement::try_when_statement(p),
+        TokenKind::KwMatch => heuristics::try_prefix_match_recovery(p),
         TokenKind::KwReset => try_reset_expr(p),
         TokenKind::KwShift => try_shift_expr(p),
 
@@ -558,7 +590,7 @@ fn parse_view_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
 fn parse_type_cast_expr(p: &mut Parser, left: NodeIndex) -> ParseResult {
     p.expect_token(TokenKind::KwAs)?;
     p.expect_token(TokenKind::LParen)?;
-    let ty = try_expr(p)?;
+    let ty = p.with_type_context(try_expr)?;
     if ty.is_null() {
         let _ = p.err(
             ParseErrorKind::InvalidSyntax,
@@ -807,7 +839,7 @@ fn try_unit_or_paren_or_tuple(p: &mut Parser) -> ParseResult {
     if !p.peek(&[TokenKind::LParen]) {
         return Ok(NULL);
     }
-    p.next_token(); // consume (
+    let open_tok = p.next_token(); // consume (
 
     // ()
     if p.eat_token(TokenKind::RParen) {
@@ -831,7 +863,7 @@ fn try_unit_or_paren_or_tuple(p: &mut Parser) -> ParseResult {
         let mut elems = vec![first];
         let rest = basic::try_multi(p, &[Rule::comma("tuple element", try_expr)])?;
         elems.extend(rest);
-        p.expect_token(TokenKind::RParen)?;
+        expect_rparen_with_open(p, open_tok)?;
         let span = p.current_span();
         let idx = p
             .ast()
@@ -842,8 +874,29 @@ fn try_unit_or_paren_or_tuple(p: &mut Parser) -> ParseResult {
     }
 
     // Parenthesized expression
-    p.expect_token(TokenKind::RParen)?;
+    expect_rparen_with_open(p, open_tok)?;
     Ok(first)
+}
+
+fn expect_rparen_with_open(
+    p: &mut Parser,
+    open_tok: lexer::token::Token,
+) -> Result<(), ParseErrorKind> {
+    if p.eat_token(TokenKind::RParen) {
+        return Ok(());
+    }
+    let span = p.next_token_span();
+    p.push_error(
+        ParseError::with_label(
+            ParseErrorKind::UnexpectedToken,
+            span,
+            format!("Expected `)`, found `{}`", p.peek_token().kind.lexeme()),
+            span,
+            format!("found `{}`", p.peek_token().kind.lexeme()),
+        )
+        .add_note_label(p.token_span(open_tok), "unclosed `(` opened here"),
+    );
+    Err(ParseErrorKind::UnexpectedToken)
 }
 
 /// `[ expr, ... ]`
@@ -983,7 +1036,7 @@ fn try_prefix_operator(
     Ok(idx)
 }
 
-fn try_effect_qualified_type(p: &mut Parser) -> ParseResult {
+fn try_effect_qualified_type(p: &mut Parser, option: ExprOption) -> ParseResult {
     let _g = p.enter();
 
     if !p.eat_token(TokenKind::Hash) {
@@ -1017,12 +1070,25 @@ fn try_effect_qualified_type(p: &mut Parser) -> ParseResult {
         );
     }
 
-    let inner = try_expr_without_extended_call(p)?;
+    let inner = if option.no_extended_call
+        && matches!(
+            p.peek_token().kind,
+            TokenKind::LBrace | TokenKind::Indent | TokenKind::Colon
+        ) {
+        NULL
+    } else {
+        try_expr_without_extended_call(p)?
+    };
     if inner.is_null() {
-        let _ = p.err(
-            ParseErrorKind::InvalidSyntax,
-            p.next_token_span(),
-            "Expected inner type after effect expression",
+        p.push_error(
+            ParseError::new(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected inner type after effect expression",
+            )
+            .add_help(
+                "an effect-qualified type requires both an effect set and a payload type, e.g. `#my_effect i64`",
+            ),
         );
     }
 
@@ -1036,15 +1102,18 @@ fn try_effect_qualified_type(p: &mut Parser) -> ParseResult {
     Ok(idx)
 }
 
-fn try_error_qualified_type(p: &mut Parser) -> ParseResult {
+fn try_error_qualified_type(p: &mut Parser, option: ExprOption) -> ParseResult {
     let _g = p.enter();
 
+    let bang_tok = p.peek_token();
     if !p.eat_token(TokenKind::Bang) {
         return Ok(NULL);
     }
 
     let mut errs = try_expr_pratt(p, 101, ExprOption::new())?;
+    let mut has_concat = false;
     while p.eat_token(TokenKind::PlusPlus) {
+        has_concat = true;
         let right = try_expr_pratt(p, 101, ExprOption::new())?;
         if right.is_null() {
             p.err(
@@ -1070,12 +1139,43 @@ fn try_error_qualified_type(p: &mut Parser) -> ParseResult {
         );
     }
 
-    let inner = try_expr_without_extended_call(p)?;
+    let inner = if option.no_extended_call
+        && matches!(
+            p.peek_token().kind,
+            TokenKind::LBrace | TokenKind::Indent | TokenKind::Colon
+        ) {
+        NULL
+    } else {
+        try_expr_without_extended_call(p)?
+    };
     if inner.is_null() {
-        let _ = p.err(
-            ParseErrorKind::InvalidSyntax,
-            p.next_token_span(),
-            "Expected inner type after error type expression",
+        if !p.in_type_context() && !has_concat && !errs.is_null() {
+            let full_span = p.current_span();
+            p.push_error(
+                ParseError::with_label(
+                    ParseErrorKind::InvalidSyntax,
+                    full_span,
+                    "boolean negation in Nessa is written `not expr`, not `!expr`",
+                    p.token_span(bang_tok),
+                    "`!` is for error-qualified types (`!Err Type`) or postfix error propagation (`call()!`)",
+                )
+                .add_help("replace `!` with `not `"),
+            );
+            return Ok(p
+                .ast()
+                .builder(NodeKind::BoolNot, full_span)
+                .add_child(errs)
+                .build());
+        }
+        p.push_error(
+            ParseError::new(
+                ParseErrorKind::InvalidSyntax,
+                p.next_token_span(),
+                "Expected inner type after error type expression",
+            )
+            .add_help(
+                "an error-qualified type requires both an error type and a payload type, e.g. `!IoError Unit` or `!IoError i64`",
+            ),
         );
     }
 
@@ -1102,12 +1202,14 @@ fn try_fn_type_expr(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    let params = try_multi_with_bracket(
-        p,
-        &[Rule::comma("parameter type", try_expr)],
-        TokenKind::LParen,
-        TokenKind::RParen,
-    )?;
+    let params = p.with_type_context(|p| {
+        try_multi_with_bracket(
+            p,
+            &[Rule::comma("parameter type", try_expr)],
+            TokenKind::LParen,
+            TokenKind::RParen,
+        )
+    })?;
 
     let span = p.current_span();
     let idx = p
@@ -1134,12 +1236,14 @@ fn try_effect_type_expr(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    let params = try_multi_with_bracket(
-        p,
-        &[Rule::comma("parameter type", try_expr)],
-        TokenKind::LParen,
-        TokenKind::RParen,
-    )?;
+    let params = p.with_type_context(|p| {
+        try_multi_with_bracket(
+            p,
+            &[Rule::comma("parameter type", try_expr)],
+            TokenKind::LParen,
+            TokenKind::RParen,
+        )
+    })?;
 
     let span = p.current_span();
     let idx = p
@@ -1256,6 +1360,20 @@ fn try_lambda(p: &mut Parser, _option: ExprOption) -> ParseResult {
 
     let return_type = definition::try_return_type(p)?;
 
+    if p.peek_token().kind == TokenKind::FatArrow {
+        let arrow = p.next_token();
+        p.push_error(
+            ParseError::new(
+                ParseErrorKind::InvalidSyntax,
+                p.token_span(arrow),
+                "unexpected `=>` after lambda parameters",
+            )
+            .add_help(
+                "Nessa lambdas are written `|params| body` (or `|params| -> RetType { ... }`) without `=>`",
+            ),
+        );
+    }
+
     let body = try_block_or_statement(p)?;
     if body.is_null() {
         let _ = p.err_with_label(
@@ -1330,7 +1448,7 @@ fn try_single_case_map(p: &mut Parser, _option: ExprOption) -> ParseResult {
         );
     }
 
-    p.expect_token(TokenKind::FatArrow)?;
+    heuristics::expect_fat_arrow_in_arm(p, "`case` arm")?;
 
     let body = try_block_or_statement(p)?;
     if body.is_null() {

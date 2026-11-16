@@ -32,6 +32,8 @@ pub(crate) fn resolve_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         r.function_inference.headers_prepared = true;
     }
     if node_idx == ast.root {
+        r.closure_mutated_symbols =
+            crate::flow_narrowing::collect_closure_mutated_symbols(r, ast, ast.root);
         crate::inference::resolve_static_dependencies(r, ast);
     }
 
@@ -280,7 +282,7 @@ pub(crate) fn resolve_types_expected(
         return;
     }
     let kind = ast.node(node_idx).kind;
-    if let Some(ty) = crate::enums::value(r, ast, node_idx) {
+    if let Some(ty) = crate::enums::value(r, ast, node_idx, expected) {
         r.node_types.insert(node_idx, ty);
         record_coercion(r, node_idx, kind, ty, expected);
         return;
@@ -316,41 +318,13 @@ pub(crate) fn resolve_types_expected(
 
         // ── Arithmetic — infer a common numeric type ───────────────
         NodeKind::Add | NodeKind::Sub | NodeKind::Mul | NodeKind::Div | NodeKind::Mod => {
-            let children = ast.fixed_children(node_idx);
-            // The operator consumes raw payloads. Qualification is applied once
-            // to its result at the enclosing value boundary.
-            let operand_expected = payload_inner_expected(&r.type_pool, expected);
-            resolve_types_expected(r, ast, children[0], operand_expected);
-            resolve_types_expected(r, ast, children[1], operand_expected);
-            match (
-                r.node_types.get(&children[0]).copied(),
-                r.node_types.get(&children[1]).copied(),
-            ) {
-                (Some(left), Some(right)) => {
-                    if r.type_pool.as_intrinsic(left) == Some(Intrinsic::Any)
-                        || r.type_pool.as_intrinsic(right) == Some(Intrinsic::Any)
-                    {
-                        Some(Intrinsic::Any.type_index())
-                    } else if let Some(common) = r.type_pool.numeric_lift(left, right) {
-                        Some(common)
-                    } else {
-                        r.diag_ctx.error(format!(
-                            "arithmetic requires compatible numeric operands, found `{}` and `{}`",
-                            type_display_name(&r.type_pool, left), type_display_name(&r.type_pool, right)
-                        )).with_primary_span(ast.node(node_idx).span).emit(r.diag_ctx);
-                        None
-                    }
-                }
-                _ => None,
-            }
+            resolve_arith_types(r, ast, node_idx, kind, expected)
         }
 
         // ── Boolean operators require boolean operands ─────────────
-        NodeKind::BoolAnd | NodeKind::BoolOr | NodeKind::BoolNot => {
-            for &child in ast.fixed_children(node_idx) {
-                if child.is_null() {
-                    continue;
-                }
+        NodeKind::BoolNot => {
+            let child = ast.fixed_children(node_idx)[0];
+            if !child.is_null() {
                 resolve_types_expected(r, ast, child, Some(Intrinsic::Bool.type_index()));
                 if let Some(&ti) = r.node_types.get(&child)
                     && !matches!(
@@ -369,10 +343,15 @@ pub(crate) fn resolve_types_expected(
             }
             Some(Intrinsic::Bool.type_index())
         }
+        NodeKind::BoolAnd | NodeKind::BoolOr => {
+            resolve_logical_short_circuit_types(r, ast, node_idx, kind)
+        }
         // ── Comparison — always Bool ───────────────────────────────
         NodeKind::BoolMatches => {
             let children = ast.fixed_children(node_idx);
+            let saved_dyn = temporarily_un_narrow_dynamic_symbol(r, ast, children[0]);
             resolve_types(r, ast, children[0]);
+            restore_temporarily_un_narrowed_symbol(r, saved_dyn);
             let expected = r.node_types.get(&children[0]).copied();
             crate::enums::pattern(r, ast, children[1], expected);
             Some(Intrinsic::Bool.type_index())
@@ -443,7 +422,9 @@ pub(crate) fn resolve_types_expected(
         // source value can be represented by the requested destination type.
         NodeKind::TypeCast => {
             let children = ast.fixed_children(node_idx);
+            let saved_dyn = temporarily_un_narrow_dynamic_symbol(r, ast, children[0]);
             resolve_types(r, ast, children[0]);
+            restore_temporarily_un_narrowed_symbol(r, saved_dyn);
             let target = resolve_type_expr(r, ast, children[1]);
             if let Some(target) = target {
                 r.node_types.insert(children[1], target);
@@ -475,11 +456,31 @@ pub(crate) fn resolve_types_expected(
                 return;
             }
             if let Some(&sym_id) = r.node_symbols.get(&node_idx) {
-                let symbol = &r.symbols[sym_id.0 as usize];
-                let ti = symbol.type_index;
-                if ti != TypeIndex::INVALID {
+                let sym_kind = r.symbols[sym_id.0 as usize].kind;
+                let ti = r.symbols[sym_id.0 as usize].type_index;
+                if !r.resolving_assign_lhs
+                    && let Some(&narrowed_ty) = r.narrowed_symbols.get(&sym_id)
+                {
+                    let base_canon = (ti != TypeIndex::INVALID)
+                        .then(|| r.type_pool.canonical_type(ti))
+                        .flatten();
+                    let narrowed_canon = r.type_pool.canonical_type(narrowed_ty);
+                    let needs_runtime_assert = base_canon.is_some_and(|c| {
+                        r.type_pool.as_intrinsic(c) == Some(Intrinsic::Any)
+                            || matches!(r.type_pool.get(c).kind, TypeKind::Trait { .. })
+                    }) || narrowed_canon
+                        .is_some_and(|c| matches!(r.type_pool.get(c).kind, TypeKind::Trait { .. }));
+                    if needs_runtime_assert {
+                        crate::task_combinators::emit_runtime_assert_on_expr(
+                            r,
+                            node_idx,
+                            narrowed_ty,
+                        );
+                    }
+                    Some(narrowed_ty)
+                } else if ti != TypeIndex::INVALID {
                     if matches!(
-                        symbol.kind,
+                        sym_kind,
                         SymbolKind::Type | SymbolKind::Trait | SymbolKind::Effect
                     ) {
                         r.node_type_values.insert(node_idx, ti);
@@ -487,7 +488,7 @@ pub(crate) fn resolve_types_expected(
                     } else {
                         Some(ti)
                     }
-                } else if matches!(symbol.kind, SymbolKind::BuiltinFunction(_)) {
+                } else if matches!(sym_kind, SymbolKind::BuiltinFunction(_)) {
                     expected.filter(|&ty| {
                         r.type_pool.canonical_type(ty).is_some_and(|ty| {
                             matches!(r.type_pool.get(ty).kind, TypeKind::Function { .. })
@@ -554,53 +555,18 @@ pub(crate) fn resolve_types_expected(
         }
 
         NodeKind::Assign => {
-            let children = ast.fixed_children(node_idx);
-            crate::task_combinators::note_mutation_target(r, ast, children[0]);
-            if ast.node(children[0]).kind == NodeKind::Call {
-                crate::applications::update(r, ast, node_idx);
-                r.node_types.insert(node_idx, Intrinsic::Unit.type_index());
+            if let Some(ti) = resolve_assign_types(r, ast, node_idx) {
+                Some(ti)
+            } else {
                 return;
             }
-            resolve_types(r, ast, children[0]);
-            crate::assignments::check_place(r, ast, children[0], "assignment");
-            let target = r.node_types.get(&children[0]).copied();
-            resolve_types_expected(r, ast, children[1], target);
-            if let Some(target) = target {
-                check_expected_type(r, ast, children[1], target, "assignment");
-            }
-            Some(Intrinsic::Unit.type_index())
         }
 
         NodeKind::AddAssign
         | NodeKind::SubAssign
         | NodeKind::MulAssign
         | NodeKind::DivAssign
-        | NodeKind::ModAssign => {
-            let children = ast.fixed_children(node_idx);
-            let target = if ast.node(children[0]).kind == NodeKind::Call {
-                crate::assignments::compound_index(r, ast, children[0])
-            } else {
-                resolve_types(r, ast, children[0]);
-                crate::assignments::check_place(r, ast, children[0], "compound assignment");
-                r.node_types.get(&children[0]).copied()
-            };
-            resolve_types_expected(r, ast, children[1], target);
-            if let Some(target) = target {
-                check_expected_type(r, ast, children[1], target, "compound assignment");
-                if r.type_pool.as_intrinsic(target) != Some(Intrinsic::Any)
-                    && !r
-                        .type_pool
-                        .as_intrinsic(target)
-                        .is_some_and(type_pool::Intrinsic::is_numeric)
-                {
-                    r.diag_ctx
-                        .error("compound assignment requires numeric operands".into())
-                        .with_primary_span(ast.node(node_idx).span)
-                        .emit(r.diag_ctx);
-                }
-            }
-            Some(Intrinsic::Unit.type_index())
-        }
+        | NodeKind::ModAssign => resolve_compound_assign_types(r, ast, node_idx),
 
         NodeKind::BreakStatement | NodeKind::ContinueStatement => {
             let guard = ast.fixed_children(node_idx)[1];
@@ -620,132 +586,11 @@ pub(crate) fn resolve_types_expected(
         NodeKind::WhenStatement => resolve_when_types(r, ast, node_idx, expected),
 
         NodeKind::IfStatement | NodeKind::WhileLoop => {
-            let children = ast.fixed_children(node_idx);
-            let condition = if kind == NodeKind::IfStatement {
-                children[0]
-            } else {
-                children[1]
-            };
-            let bool_type = Intrinsic::Bool.type_index();
-            resolve_types_expected(r, ast, condition, Some(bool_type));
-            check_expected_type(r, ast, condition, bool_type, "condition");
-            if kind == NodeKind::IfStatement {
-                resolve_types_expected(r, ast, children[1], expected);
-                resolve_types_expected(r, ast, children[2], expected);
-                if let Some(expected) = expected {
-                    for &branch in &children[1..3] {
-                        if !branch.is_null() {
-                            check_expected_type(r, ast, branch, expected, "conditional branch");
-                        }
-                    }
-                    if children[2].is_null() {
-                        check_expected_type(
-                            r,
-                            ast,
-                            children[2],
-                            expected,
-                            "conditional branch without else",
-                        );
-                    }
-                }
-                let types = [
-                    r.node_types
-                        .get(&children[1])
-                        .copied()
-                        .unwrap_or(Intrinsic::Unit.type_index()),
-                    r.node_types
-                        .get(&children[2])
-                        .copied()
-                        .unwrap_or(Intrinsic::Unit.type_index()),
-                ];
-                Some(join_result_types(r, types))
-            } else {
-                resolve_types(r, ast, children[2]);
-                Some(Intrinsic::Unit.type_index())
-            }
+            resolve_if_or_while_types(r, ast, node_idx, kind, expected)
         }
 
         // ── Block — type is the type of the last expression ────────
-        NodeKind::Block => {
-            crate::inference::resolve_block_dependencies(r, ast, node_idx);
-            let mc = ast.multi_children(node_idx);
-            let last_idx = mc.len().saturating_sub(1);
-            let mut block_handled_effects: Vec<TypeIndex> = Vec::new();
-            let mut capturing_answers: Vec<TypeIndex> = Vec::new();
-            for (i, &child) in mc.iter().enumerate() {
-                if i == last_idx {
-                    resolve_types_expected(r, ast, child, expected);
-                } else {
-                    let child_expected =
-                        if !child.is_null() && ast.node(child).kind == NodeKind::HandlesStatement {
-                            expected
-                        } else {
-                            None
-                        };
-                    resolve_types_expected(r, ast, child, child_expected);
-                }
-                if !child.is_null() {
-                    if let Some(plan) = r.handles_statements.get(&child) {
-                        block_handled_effects.push(plan.effect_type);
-                        if plan.continuation_param.is_some()
-                            && r.type_pool.as_intrinsic(plan.answer_type)
-                                != Some(Intrinsic::NoReturn)
-                        {
-                            capturing_answers.push(plan.answer_type);
-                        }
-                    } else if let Some(plan) = r.let_handlers.get(&child) {
-                        for h in &plan.handlers {
-                            let (eff_ty, cont_p, ret_ty) = match h {
-                                crate::HandlerBindingKind::Callable {
-                                    effect_type,
-                                    continuation_param,
-                                } => (*effect_type, *continuation_param, None),
-                                crate::HandlerBindingKind::CapabilityMethod {
-                                    effect_type,
-                                    continuation_param,
-                                    return_type,
-                                    ..
-                                } => (*effect_type, *continuation_param, Some(*return_type)),
-                            };
-                            block_handled_effects.push(eff_ty);
-                            if cont_p.is_some()
-                                && let Some(rt) = ret_ty
-                                && !matches!(
-                                    r.type_pool.as_intrinsic(rt),
-                                    Some(Intrinsic::Any | Intrinsic::NoReturn)
-                                )
-                            {
-                                capturing_answers.push(crate::capability::strip_effect_qualified(
-                                    &r.type_pool,
-                                    rt,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            let base_ty = mc
-                .last()
-                .and_then(|&last| r.node_types.get(&last).copied())
-                .map(|ty| {
-                    if block_handled_effects.is_empty() {
-                        ty
-                    } else {
-                        crate::capability::subtract_effects(r, ty, &block_handled_effects)
-                    }
-                });
-            if capturing_answers.is_empty() {
-                base_ty
-            } else {
-                let mut combined = base_ty.unwrap_or(Intrinsic::Unit.type_index());
-                for ans in capturing_answers {
-                    if ans != combined {
-                        combined = crate::errors::join(r, combined, ans);
-                    }
-                }
-                Some(combined)
-            }
-        }
+        NodeKind::Block => resolve_block_types(r, ast, node_idx, expected),
 
         NodeKind::HandlerApplication => {
             crate::capability::resolve_handler_application(r, ast, node_idx, expected)
@@ -795,7 +640,31 @@ pub(crate) fn resolve_types_expected(
             }
             Some(Intrinsic::Any.type_index())
         }
-        NodeKind::Symbol => Some(Intrinsic::Any.type_index()),
+        NodeKind::Symbol => {
+            let id_node = ast.fixed_children(node_idx)[0];
+            let sym_name = if id_node.is_null() {
+                "name".to_string()
+            } else {
+                str_interner::get(ast.node(id_node).str_id)
+            };
+            if expected
+                .and_then(|e| payload_inner_expected(&r.type_pool, Some(e)))
+                .and_then(|e| r.type_pool.canonical_type(e))
+                .is_none_or(|e| !matches!(r.type_pool.get(e).kind, TypeKind::Enum { .. }))
+            {
+                r.diag_ctx
+                    .error(
+                        "standalone symbol literals `.name` are not supported as runtime values"
+                            .into(),
+                    )
+                    .with_primary_span(ast.node(node_idx).span)
+                    .with_help(format!(
+                        "if `.{sym_name}` is an enum variant, provide a target enum type or write `EnumType.{sym_name}`"
+                    ))
+                    .emit(r.diag_ctx);
+            }
+            Some(Intrinsic::Any.type_index())
+        }
         NodeKind::Await => {
             let inner = ast.fixed_children(node_idx)[0];
             let expected_future = expected.map(|exp| r.type_pool.intern_future(exp));
@@ -890,114 +759,7 @@ pub(crate) fn resolve_types_expected(
             )
         }
         NodeKind::EffectPropagation | NodeKind::EffectElimination => {
-            let inner = ast.fixed_children(node_idx)[0];
-            resolve_types(r, ast, inner);
-            let mut answer_type = None;
-            let mut handled_effects = Vec::new();
-            for &arm in ast.multi_children(node_idx) {
-                let children = ast.fixed_children(arm);
-                let (pattern, _) = crate::effect::unwrap_handler_pattern(ast, children[0]);
-                if pattern.is_null() || ast.node(pattern).kind != NodeKind::PatternCall {
-                    continue;
-                }
-                let callee = ast.fixed_children(pattern)[0];
-                if let Some(&symbol) = r.node_symbols.get(&callee) {
-                    let eff_ty = r.symbols[symbol.0 as usize].type_index;
-                    if eff_ty != TypeIndex::INVALID {
-                        handled_effects.push(eff_ty);
-                    }
-                }
-                let operation = r.node_symbols.get(&callee).and_then(|&symbol| {
-                    let effect_type = r.symbols[symbol.0 as usize].type_index;
-                    r.effects
-                        .iter()
-                        .find(|effect| effect.type_index == effect_type)
-                        .and_then(|effect| effect.operations.first())
-                        .cloned()
-                });
-                let captures = operation
-                    .as_ref()
-                    .is_some_and(|operation| operation.continuation_param.is_some());
-                let expected_return = if captures {
-                    expected
-                } else {
-                    operation.as_ref().map(|operation| operation.return_type)
-                };
-                // Each handler is lowered to its own closure. Its exits must
-                // neither inherit nor contribute to the enclosing function.
-                r.return_types.push(expected_return);
-                r.inferred_returns.push(Vec::new());
-                resolve_types_expected(r, ast, children[1], expected_return);
-                r.return_types.pop();
-                let returns = r
-                    .inferred_returns
-                    .pop()
-                    .expect("handler return context was pushed");
-                let inferred = infer_return_type(r, ast, children[1], returns);
-                if expected_return.is_none() {
-                    coerce_inferred_returns(r, ast, children[1], inferred);
-                }
-                if let (Some(expected), Some(&actual)) =
-                    (expected_return, r.node_types.get(&children[1]))
-                    && !definitely_returns(ast, children[1])
-                    && !crate::trait_typing::is_subtype(r, ast, children[1], actual, expected)
-                    && !r.type_pool.is_gradually_consistent(actual, expected)
-                {
-                    r.diag_ctx
-                        .error(format!(
-                            "handler result type mismatch: expected `{}`, found `{}`",
-                            type_display_name(&r.type_pool, expected),
-                            type_display_name(&r.type_pool, actual)
-                        ))
-                        .with_primary_span(ast.node(children[1]).span)
-                        .emit(r.diag_ctx);
-                }
-                let handler_result = expected_return.unwrap_or(inferred);
-                crate::errors::finish_callable(r, arm, handler_result);
-                r.node_types.insert(children[1], handler_result);
-                if captures && let Some(&ty) = r.node_types.get(&children[1]) {
-                    // Capturing handlers can replace the computation's result
-                    // (including returning the continuation for later use).
-                    answer_type = Some(match answer_type {
-                        Some(previous) if previous != ty => crate::errors::join(r, previous, ty),
-                        _ => ty,
-                    });
-                }
-            }
-            let residual_effects: Vec<TypeIndex> = r
-                .node_types
-                .get(&inner)
-                .and_then(|&ty| r.type_pool.canonical_type(ty))
-                .and_then(|canon| match &r.type_pool.get(canon).kind {
-                    TypeKind::EffectQualified { effects, .. } => Some(
-                        effects
-                            .iter()
-                            .copied()
-                            .filter(|e| {
-                                let ec = r.type_pool.canonical_type(*e).unwrap_or(*e);
-                                !handled_effects
-                                    .iter()
-                                    .any(|h| r.type_pool.canonical_type(*h).unwrap_or(*h) == ec)
-                            })
-                            .collect(),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let raw_result = answer_type.or_else(|| {
-                r.node_types
-                    .get(&inner)
-                    .copied()
-                    .map(|ty| match r.type_pool.get(ty).kind {
-                        TypeKind::EffectQualified { inner, .. } => inner,
-                        _ => ty,
-                    })
-            });
-            if kind == NodeKind::EffectElimination && !residual_effects.is_empty() {
-                raw_result.map(|res| crate::effect::normalize(r, residual_effects, res))
-            } else {
-                raw_result
-            }
+            resolve_effect_elimination_types(r, ast, node_idx, kind, expected)
         }
 
         // ── Lambda & case closure — resolve params, body, build Function type
@@ -1084,6 +846,595 @@ pub(crate) fn resolve_types_expected(
     }
 }
 
+fn temporarily_un_narrow_dynamic_symbol(
+    r: &mut Resolver,
+    ast: &Ast,
+    expr: NodeIndex,
+) -> Option<(crate::SymbolId, TypeIndex)> {
+    if expr.is_null() || ast.node(expr).kind != NodeKind::Id {
+        return None;
+    }
+    let sym_id = *r.node_symbols.get(&expr)?;
+    let base_ty = r.symbols[sym_id.0 as usize].type_index;
+    let base_canon = (base_ty != TypeIndex::INVALID)
+        .then(|| r.type_pool.canonical_type(base_ty))
+        .flatten()?;
+    let is_dyn = r.type_pool.as_intrinsic(base_canon) == Some(Intrinsic::Any)
+        || matches!(r.type_pool.get(base_canon).kind, TypeKind::Trait { .. });
+    if is_dyn {
+        r.narrowed_symbols.remove(&sym_id).map(|old| (sym_id, old))
+    } else {
+        None
+    }
+}
+
+fn restore_temporarily_un_narrowed_symbol(
+    r: &mut Resolver,
+    saved: Option<(crate::SymbolId, TypeIndex)>,
+) {
+    if let Some((sym_id, old_ty)) = saved {
+        r.narrowed_symbols.insert(sym_id, old_ty);
+    }
+}
+
+#[inline(never)]
+fn resolve_arith_types(
+    r: &mut Resolver,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    kind: NodeKind,
+    expected: Option<TypeIndex>,
+) -> Option<TypeIndex> {
+    let children = ast.fixed_children(node_idx);
+    let operand_expected = payload_inner_expected(&r.type_pool, expected);
+    resolve_types_expected(r, ast, children[0], operand_expected);
+    resolve_types_expected(r, ast, children[1], operand_expected);
+    match (
+        r.node_types.get(&children[0]).copied(),
+        r.node_types.get(&children[1]).copied(),
+    ) {
+        (Some(left), Some(right)) => {
+            if r.type_pool.as_intrinsic(left) == Some(Intrinsic::Any)
+                || r.type_pool.as_intrinsic(right) == Some(Intrinsic::Any)
+            {
+                Some(Intrinsic::Any.type_index())
+            } else if let Some(common) = r.type_pool.numeric_lift(left, right) {
+                Some(common)
+            } else {
+                let mut builder = r
+                    .diag_ctx
+                    .error(format!(
+                        "arithmetic requires compatible numeric operands, found `{}` and `{}`",
+                        type_display_name(&r.type_pool, left),
+                        type_display_name(&r.type_pool, right)
+                    ))
+                    .with_code(diagnostic::codes::INVALID_OPERATOR)
+                    .with_primary_span(ast.node(node_idx).span);
+                for help in crate::suggestions::arithmetic_misuse_helps(r, kind, left, right) {
+                    builder = builder.with_help(help);
+                }
+                builder.emit(r.diag_ctx);
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[inline(never)]
+fn resolve_logical_short_circuit_types(
+    r: &mut Resolver,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    kind: NodeKind,
+) -> Option<TypeIndex> {
+    let children = ast.fixed_children(node_idx);
+    let bool_ty = Intrinsic::Bool.type_index();
+    if !children[0].is_null() {
+        resolve_types_expected(r, ast, children[0], Some(bool_ty));
+        if let Some(&ti) = r.node_types.get(&children[0])
+            && !matches!(
+                r.type_pool.as_intrinsic(ti),
+                Some(Intrinsic::Bool | Intrinsic::Any)
+            )
+        {
+            r.diag_ctx
+                .error(format!(
+                    "boolean operator requires `bool`, found `{}`",
+                    type_display_name(&r.type_pool, ti)
+                ))
+                .with_primary_span(ast.node(children[0]).span)
+                .emit(r.diag_ctx);
+        }
+    }
+    let (true_facts, false_facts) =
+        crate::flow_narrowing::extract_condition_facts(r, ast, children[0]);
+    let rhs_facts = if kind == NodeKind::BoolAnd {
+        true_facts
+    } else {
+        false_facts
+    };
+    let saved_narrowed = r.narrowed_symbols.clone();
+    let mut mutated_rhs = std::collections::HashSet::new();
+    crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+        r,
+        ast,
+        children[1],
+        &mut mutated_rhs,
+    );
+    for (sym, ty) in rhs_facts {
+        if !mutated_rhs.contains(&sym) {
+            r.narrowed_symbols.insert(sym, ty);
+        }
+    }
+    if !children[1].is_null() {
+        resolve_types_expected(r, ast, children[1], Some(bool_ty));
+        if let Some(&ti) = r.node_types.get(&children[1])
+            && !matches!(
+                r.type_pool.as_intrinsic(ti),
+                Some(Intrinsic::Bool | Intrinsic::Any)
+            )
+        {
+            r.diag_ctx
+                .error(format!(
+                    "boolean operator requires `bool`, found `{}`",
+                    type_display_name(&r.type_pool, ti)
+                ))
+                .with_primary_span(ast.node(children[1]).span)
+                .emit(r.diag_ctx);
+        }
+    }
+    r.narrowed_symbols = saved_narrowed;
+    for sym in mutated_rhs {
+        r.narrowed_symbols.remove(&sym);
+    }
+    Some(bool_ty)
+}
+
+/// Returns `None` when `children[0]` was an indexed update (`a(i) = v`) that already
+/// recorded `node_types[node_idx]` and expects an early return without coercion.
+#[inline(never)]
+fn resolve_assign_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) -> Option<TypeIndex> {
+    let children = ast.fixed_children(node_idx);
+    crate::task_combinators::note_mutation_target(r, ast, children[0]);
+    if ast.node(children[0]).kind == NodeKind::Call {
+        crate::applications::update(r, ast, node_idx);
+        r.node_types.insert(node_idx, Intrinsic::Unit.type_index());
+        return None;
+    }
+    if !children[0].is_null()
+        && ast.node(children[0]).kind == NodeKind::Id
+        && let Some(&sym_id) = r.node_symbols.get(&children[0])
+    {
+        r.narrowed_symbols.remove(&sym_id);
+    }
+    let prev_lhs = std::mem::replace(&mut r.resolving_assign_lhs, true);
+    resolve_types(r, ast, children[0]);
+    r.resolving_assign_lhs = prev_lhs;
+    crate::assignments::check_place(r, ast, children[0], "assignment");
+    let target = r.node_types.get(&children[0]).copied();
+    resolve_types_expected(r, ast, children[1], target);
+    if let Some(target) = target {
+        check_expected_type(r, ast, children[1], target, "assignment");
+    }
+    if !children[0].is_null()
+        && ast.node(children[0]).kind == NodeKind::Id
+        && let Some(&sym_id) = r.node_symbols.get(&children[0])
+        && !r.closure_mutated_symbols.contains(&sym_id)
+        && let Some(target_ty) = target
+        && let Some(target_canon) = r.type_pool.canonical_type(target_ty)
+        && let TypeKind::Optional { inner } = r.type_pool.get(target_canon).kind
+        && r.type_pool.as_intrinsic(inner) != Some(Intrinsic::NoReturn)
+        && let Some(&rhs_ty) = r.node_types.get(&children[1])
+        && rhs_ty != r.type_pool.null_type()
+        && r.type_pool.is_subtype(rhs_ty, inner)
+    {
+        r.narrowed_symbols.insert(sym_id, inner);
+    }
+    Some(Intrinsic::Unit.type_index())
+}
+
+#[inline(never)]
+fn resolve_compound_assign_types(
+    r: &mut Resolver,
+    ast: &Ast,
+    node_idx: NodeIndex,
+) -> Option<TypeIndex> {
+    let children = ast.fixed_children(node_idx);
+    if !children[0].is_null()
+        && ast.node(children[0]).kind == NodeKind::Id
+        && let Some(&sym_id) = r.node_symbols.get(&children[0])
+    {
+        r.narrowed_symbols.remove(&sym_id);
+    }
+    let target = if ast.node(children[0]).kind == NodeKind::Call {
+        crate::assignments::compound_index(r, ast, children[0])
+    } else {
+        let prev_lhs = std::mem::replace(&mut r.resolving_assign_lhs, true);
+        resolve_types(r, ast, children[0]);
+        r.resolving_assign_lhs = prev_lhs;
+        crate::assignments::check_place(r, ast, children[0], "compound assignment");
+        r.node_types.get(&children[0]).copied()
+    };
+    resolve_types_expected(r, ast, children[1], target);
+    if let Some(target) = target {
+        check_expected_type(r, ast, children[1], target, "compound assignment");
+        if r.type_pool.as_intrinsic(target) != Some(Intrinsic::Any)
+            && !r
+                .type_pool
+                .as_intrinsic(target)
+                .is_some_and(type_pool::Intrinsic::is_numeric)
+        {
+            r.diag_ctx
+                .error("compound assignment requires numeric operands".into())
+                .with_primary_span(ast.node(node_idx).span)
+                .emit(r.diag_ctx);
+        }
+    }
+    Some(Intrinsic::Unit.type_index())
+}
+
+#[inline(never)]
+fn resolve_if_or_while_types(
+    r: &mut Resolver,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    kind: NodeKind,
+    expected: Option<TypeIndex>,
+) -> Option<TypeIndex> {
+    let children = ast.fixed_children(node_idx);
+    let condition = if kind == NodeKind::IfStatement {
+        children[0]
+    } else {
+        children[1]
+    };
+    let bool_type = Intrinsic::Bool.type_index();
+    if kind == NodeKind::WhileLoop {
+        let mut mutated_loop = std::collections::HashSet::new();
+        crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+            r,
+            ast,
+            condition,
+            &mut mutated_loop,
+        );
+        crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+            r,
+            ast,
+            children[2],
+            &mut mutated_loop,
+        );
+        for sym in &mutated_loop {
+            r.narrowed_symbols.remove(sym);
+        }
+        resolve_types_expected(r, ast, condition, Some(bool_type));
+        check_expected_type(r, ast, condition, bool_type, "condition");
+        let (true_facts, _) = crate::flow_narrowing::extract_condition_facts(r, ast, condition);
+        let pre_loop = r.narrowed_symbols.clone();
+        for (sym, ty) in true_facts {
+            if !mutated_loop.contains(&sym) {
+                r.narrowed_symbols.insert(sym, ty);
+            }
+        }
+        resolve_types(r, ast, children[2]);
+        r.narrowed_symbols = pre_loop;
+        for sym in mutated_loop {
+            r.narrowed_symbols.remove(&sym);
+        }
+        Some(Intrinsic::Unit.type_index())
+    } else {
+        resolve_types_expected(r, ast, condition, Some(bool_type));
+        check_expected_type(r, ast, condition, bool_type, "condition");
+        let state = Box::new((
+            crate::flow_narrowing::extract_condition_facts(r, ast, condition),
+            r.narrowed_symbols.clone(),
+        ));
+        let ((true_facts, false_facts), pre_if) = *state;
+
+        let mut mutated_then = std::collections::HashSet::new();
+        crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+            r,
+            ast,
+            children[1],
+            &mut mutated_then,
+        );
+        for (&sym, &ty) in &true_facts {
+            r.narrowed_symbols.insert(sym, ty);
+        }
+        resolve_types_expected(r, ast, children[1], expected);
+
+        r.narrowed_symbols = pre_if.clone();
+        let mut mutated_else = std::collections::HashSet::new();
+        crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+            r,
+            ast,
+            children[2],
+            &mut mutated_else,
+        );
+        for (&sym, &ty) in &false_facts {
+            r.narrowed_symbols.insert(sym, ty);
+        }
+        resolve_types_expected(r, ast, children[2], expected);
+
+        r.narrowed_symbols = pre_if;
+        let then_diverges = definitely_diverges(r, ast, children[1]);
+        let else_diverges = !children[2].is_null() && definitely_diverges(r, ast, children[2]);
+        if then_diverges && !else_diverges {
+            for sym in &mutated_else {
+                r.narrowed_symbols.remove(sym);
+            }
+            for (sym, ty) in false_facts {
+                if !mutated_else.contains(&sym) {
+                    r.narrowed_symbols.insert(sym, ty);
+                }
+            }
+        } else if else_diverges && !then_diverges {
+            for sym in &mutated_then {
+                r.narrowed_symbols.remove(sym);
+            }
+            for (sym, ty) in true_facts {
+                if !mutated_then.contains(&sym) {
+                    r.narrowed_symbols.insert(sym, ty);
+                }
+            }
+        } else {
+            for sym in mutated_then.into_iter().chain(mutated_else) {
+                r.narrowed_symbols.remove(&sym);
+            }
+        }
+
+        if let Some(expected) = expected {
+            for &branch in &children[1..3] {
+                if !branch.is_null() {
+                    check_expected_type(r, ast, branch, expected, "conditional branch");
+                }
+            }
+            if children[2].is_null() {
+                check_expected_type(
+                    r,
+                    ast,
+                    children[2],
+                    expected,
+                    "conditional branch without else",
+                );
+            }
+        }
+        let types = [
+            r.node_types
+                .get(&children[1])
+                .copied()
+                .unwrap_or(Intrinsic::Unit.type_index()),
+            r.node_types
+                .get(&children[2])
+                .copied()
+                .unwrap_or(Intrinsic::Unit.type_index()),
+        ];
+        Some(join_result_types(r, types))
+    }
+}
+
+#[inline(never)]
+fn resolve_block_types(
+    r: &mut Resolver,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    expected: Option<TypeIndex>,
+) -> Option<TypeIndex> {
+    r.active_blocks.push(node_idx);
+    crate::inference::resolve_block_dependencies(r, ast, node_idx);
+    // Heap-allocate outer narrowing snapshot only when outer narrowings actually exist,
+    // keeping stack frame overhead minuscule on deeply nested module/block trees.
+    let saved_outer = if r.narrowed_symbols.is_empty() {
+        None
+    } else {
+        let mut mutated_in_block = std::collections::HashSet::new();
+        crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+            r,
+            ast,
+            node_idx,
+            &mut mutated_in_block,
+        );
+        Some(Box::new((r.narrowed_symbols.clone(), mutated_in_block)))
+    };
+
+    let mc = ast.multi_children(node_idx);
+    let last_idx = mc.len().saturating_sub(1);
+    let mut block_handled_effects: Vec<TypeIndex> = Vec::new();
+    let mut capturing_answers: Vec<TypeIndex> = Vec::new();
+    for (i, &child) in mc.iter().enumerate() {
+        if i == last_idx {
+            resolve_types_expected(r, ast, child, expected);
+        } else {
+            let child_expected =
+                if !child.is_null() && ast.node(child).kind == NodeKind::HandlesStatement {
+                    expected
+                } else {
+                    None
+                };
+            resolve_types_expected(r, ast, child, child_expected);
+        }
+        if !child.is_null() {
+            if let Some(plan) = r.handles_statements.get(&child) {
+                block_handled_effects.push(plan.effect_type);
+                if plan.continuation_param.is_some()
+                    && r.type_pool.as_intrinsic(plan.answer_type) != Some(Intrinsic::NoReturn)
+                {
+                    capturing_answers.push(plan.answer_type);
+                }
+            } else if let Some(plan) = r.let_handlers.get(&child) {
+                for h in &plan.handlers {
+                    let (eff_ty, cont_p, ret_ty) = match h {
+                        crate::HandlerBindingKind::Callable {
+                            effect_type,
+                            continuation_param,
+                        } => (*effect_type, *continuation_param, None),
+                        crate::HandlerBindingKind::CapabilityMethod {
+                            effect_type,
+                            continuation_param,
+                            return_type,
+                            ..
+                        } => (*effect_type, *continuation_param, Some(*return_type)),
+                    };
+                    block_handled_effects.push(eff_ty);
+                    if cont_p.is_some()
+                        && let Some(rt) = ret_ty
+                        && !matches!(
+                            r.type_pool.as_intrinsic(rt),
+                            Some(Intrinsic::Any | Intrinsic::NoReturn)
+                        )
+                    {
+                        capturing_answers
+                            .push(crate::capability::strip_effect_qualified(&r.type_pool, rt));
+                    }
+                }
+            }
+        }
+    }
+    r.active_blocks.pop();
+    if let Some(boxed) = saved_outer {
+        let (saved_narrowed, mutated_in_block) = *boxed;
+        r.narrowed_symbols = saved_narrowed;
+        for sym in mutated_in_block {
+            r.narrowed_symbols.remove(&sym);
+        }
+    } else {
+        r.narrowed_symbols.clear();
+    }
+    let base_ty = mc
+        .last()
+        .and_then(|&last| r.node_types.get(&last).copied())
+        .map(|ty| {
+            if block_handled_effects.is_empty() {
+                ty
+            } else {
+                crate::capability::subtract_effects(r, ty, &block_handled_effects)
+            }
+        });
+    if capturing_answers.is_empty() {
+        base_ty
+    } else {
+        let mut combined = base_ty.unwrap_or(Intrinsic::Unit.type_index());
+        for ans in capturing_answers {
+            if ans != combined {
+                combined = crate::errors::join(r, combined, ans);
+            }
+        }
+        Some(combined)
+    }
+}
+
+#[inline(never)]
+fn resolve_effect_elimination_types(
+    r: &mut Resolver,
+    ast: &Ast,
+    node_idx: NodeIndex,
+    kind: NodeKind,
+    expected: Option<TypeIndex>,
+) -> Option<TypeIndex> {
+    let inner = ast.fixed_children(node_idx)[0];
+    resolve_types(r, ast, inner);
+    let mut answer_type = None;
+    let mut handled_effects = Vec::new();
+    for &arm in ast.multi_children(node_idx) {
+        let children = ast.fixed_children(arm);
+        let (pattern, _) = crate::effect::unwrap_handler_pattern(ast, children[0]);
+        if pattern.is_null() || ast.node(pattern).kind != NodeKind::PatternCall {
+            continue;
+        }
+        let callee = ast.fixed_children(pattern)[0];
+        if let Some(&symbol) = r.node_symbols.get(&callee) {
+            let eff_ty = r.symbols[symbol.0 as usize].type_index;
+            if eff_ty != TypeIndex::INVALID {
+                handled_effects.push(eff_ty);
+            }
+        }
+        let operation = r.node_symbols.get(&callee).and_then(|&symbol| {
+            let effect_type = r.symbols[symbol.0 as usize].type_index;
+            r.effects
+                .iter()
+                .find(|effect| effect.type_index == effect_type)
+                .and_then(|effect| effect.operations.first())
+                .cloned()
+        });
+        let captures = operation
+            .as_ref()
+            .is_some_and(|operation| operation.continuation_param.is_some());
+        let expected_return = if captures {
+            expected
+        } else {
+            operation.as_ref().map(|operation| operation.return_type)
+        };
+        r.return_types.push(expected_return);
+        r.inferred_returns.push(Vec::new());
+        resolve_types_expected(r, ast, children[1], expected_return);
+        r.return_types.pop();
+        let returns = r
+            .inferred_returns
+            .pop()
+            .expect("handler return context was pushed");
+        let inferred = infer_return_type(r, ast, children[1], returns);
+        if expected_return.is_none() {
+            coerce_inferred_returns(r, ast, children[1], inferred);
+        }
+        if let (Some(expected), Some(&actual)) = (expected_return, r.node_types.get(&children[1]))
+            && !definitely_returns(ast, children[1])
+            && !crate::trait_typing::is_subtype(r, ast, children[1], actual, expected)
+            && !r.type_pool.is_gradually_consistent(actual, expected)
+        {
+            r.diag_ctx
+                .error(format!(
+                    "handler result type mismatch: expected `{}`, found `{}`",
+                    type_display_name(&r.type_pool, expected),
+                    type_display_name(&r.type_pool, actual)
+                ))
+                .with_primary_span(ast.node(children[1]).span)
+                .emit(r.diag_ctx);
+        }
+        let handler_result = expected_return.unwrap_or(inferred);
+        crate::errors::finish_callable(r, arm, handler_result);
+        r.node_types.insert(children[1], handler_result);
+        if captures && let Some(&ty) = r.node_types.get(&children[1]) {
+            answer_type = Some(match answer_type {
+                Some(previous) if previous != ty => crate::errors::join(r, previous, ty),
+                _ => ty,
+            });
+        }
+    }
+    let residual_effects: Vec<TypeIndex> = r
+        .node_types
+        .get(&inner)
+        .and_then(|&ty| r.type_pool.canonical_type(ty))
+        .and_then(|canon| match &r.type_pool.get(canon).kind {
+            TypeKind::EffectQualified { effects, .. } => Some(
+                effects
+                    .iter()
+                    .copied()
+                    .filter(|e| {
+                        let ec = r.type_pool.canonical_type(*e).unwrap_or(*e);
+                        !handled_effects
+                            .iter()
+                            .any(|h| r.type_pool.canonical_type(*h).unwrap_or(*h) == ec)
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let raw_result = answer_type.or_else(|| {
+        r.node_types
+            .get(&inner)
+            .copied()
+            .map(|ty| match r.type_pool.get(ty).kind {
+                TypeKind::EffectQualified { inner, .. } => inner,
+                _ => ty,
+            })
+    });
+    if kind == NodeKind::EffectElimination && !residual_effects.is_empty() {
+        raw_result.map(|res| crate::effect::normalize(r, residual_effects, res))
+    } else {
+        raw_result
+    }
+}
+
 pub(crate) fn check_expected_type(
     r: &mut Resolver,
     ast: &Ast,
@@ -1100,13 +1451,21 @@ pub(crate) fn check_expected_type(
         && !crate::trait_typing::is_subtype(r, ast, value, actual, expected)
         && !r.type_pool.is_gradually_consistent(actual, expected)
     {
-        let mut diagnostic = r.diag_ctx.error(format!(
-            "type mismatch in {context}: expected `{}`, found `{}`",
-            type_display_name(&r.type_pool, expected),
-            type_display_name(&r.type_pool, actual)
-        ));
+        let mut diagnostic = r
+            .diag_ctx
+            .error(format!(
+                "type mismatch in {context}: expected `{}`, found `{}`",
+                type_display_name(&r.type_pool, expected),
+                type_display_name(&r.type_pool, actual)
+            ))
+            .with_code(diagnostic::codes::TYPE_MISMATCH);
         if !value.is_null() {
             diagnostic = diagnostic.with_primary_span(ast.node(value).span);
+        }
+        for help in
+            crate::suggestions::type_mismatch_helps(r, ast, value, actual, expected, context)
+        {
+            diagnostic = diagnostic.with_help(help);
         }
         diagnostic.emit(r.diag_ctx);
     }
@@ -1245,10 +1604,39 @@ pub(crate) fn resolve_type_expr(
     }
     let resolved = resolve_type_expr_inner(r, ast, node_idx);
     if resolved.is_none() {
-        r.diag_ctx
+        // Avoid cascading noise when `node_idx` is an identifier that already failed name lookup.
+        if ast.node(node_idx).kind == NodeKind::Id
+            && !r.node_symbols.contains_key(&node_idx)
+            && r.diag_ctx.has_errors()
+        {
+            return None;
+        }
+        let mut builder = r
+            .diag_ctx
             .error("expected a valid type expression".into())
-            .with_primary_span(ast.node(node_idx).span)
-            .emit(r.diag_ctx);
+            .with_code(diagnostic::codes::INVALID_TYPE_EXPR)
+            .with_primary_span(ast.node(node_idx).span);
+        if let Some(&sym_id) = r.node_symbols.get(&node_idx) {
+            let sym = &r.symbols[sym_id.0 as usize];
+            if !matches!(
+                sym.kind,
+                SymbolKind::Type
+                    | SymbolKind::Trait
+                    | SymbolKind::Effect
+                    | SymbolKind::TypeFactory(_)
+            ) {
+                let sym_name = str_interner::get(sym.name);
+                builder = builder.with_help(format!("`{sym_name}` is a value binding, not a type"));
+                if !sym.def_node.is_null() {
+                    builder = builder.with_label(
+                        ast.node(sym.def_node).span,
+                        format!("`{sym_name}` declared here"),
+                        Level::Note,
+                    );
+                }
+            }
+        }
+        builder.emit(r.diag_ctx);
     }
     resolved
 }
@@ -1574,10 +1962,12 @@ pub(crate) fn resolve_function_def_types(r: &mut Resolver, ast: &Ast, node_idx: 
         TypeKind::EffectQualified { inner, .. } => inner,
         _ => ty,
     });
+    let saved_fn_narrowed = std::mem::take(&mut r.narrowed_symbols);
     r.return_types.push(body_return_type);
     r.inferred_returns.push(Vec::new());
     resolve_types_expected(r, ast, children[2], body_return_type);
     r.return_types.pop();
+    r.narrowed_symbols = saved_fn_narrowed;
     let returns = r
         .inferred_returns
         .pop()
@@ -1615,15 +2005,32 @@ pub(crate) fn resolve_function_def_types(r: &mut Resolver, ast: &Ast, node_idx: 
         let expected = type_display_name(&r.type_pool, ret_ti);
         let found = type_display_name(&r.type_pool, body_ti);
         let body_span = ast.node(children[2]).span;
-        let ret_type_span = ast.node(children[1]).span;
-        r.diag_ctx
-                    .error(format!(
-                        "type mismatch in function `{fn_name}`: expected return type `{expected}`, found `{found}`"
-                    ))
-                    .with_primary_span(body_span)
-                    .with_label(body_span, format!("this has type `{found}`"), Level::Error)
-                    .with_label(ret_type_span, format!("expected `{expected}` because of return type"), Level::Note)
-                    .emit(r.diag_ctx);
+        let mut builder = r
+            .diag_ctx
+            .error(format!(
+                "type mismatch in function `{fn_name}`: expected return type `{expected}`, found `{found}`"
+            ))
+            .with_code(diagnostic::codes::TYPE_MISMATCH)
+            .with_primary_span(body_span)
+            .with_label(body_span, format!("this has type `{found}`"), Level::Error);
+        if !children[1].is_null() {
+            builder = builder.with_label(
+                ast.node(children[1]).span,
+                format!("expected `{expected}` because of return type"),
+                Level::Note,
+            );
+        }
+        for help in crate::suggestions::type_mismatch_helps(
+            r,
+            ast,
+            children[2],
+            body_ti,
+            ret_ti,
+            "return value",
+        ) {
+            builder = builder.with_help(help);
+        }
+        builder.emit(r.diag_ctx);
     }
 
     // Resolve capability.
@@ -1650,16 +2057,22 @@ fn resolve_lambda_types(
     let params = ast.multi_children(node_idx).to_vec();
     crate::capability::validate_lambda_params(r, ast, &params);
 
-    // Extract expected parameter/return types from context (if expected is a Function type).
+    // Extract expected parameter/return types from context (if expected is a Function type),
+    // or from out-of-band local call-site parameter inference.
+    let call_site_params = r
+        .collection_provenance
+        .inferred_lambda_params
+        .remove(&node_idx);
     let (expected_param_types, expected_ret) = expected
         .and_then(|exp| {
             if let TypeKind::Function { params, ret } = &r.type_pool.get(exp).kind {
-                Some((Some(params.clone()), Some(*ret)))
+                let r_opt = (*ret != TypeIndex::INVALID).then_some(*ret);
+                Some((Some(params.clone()), r_opt))
             } else {
                 None
             }
         })
-        .unwrap_or((None, None));
+        .unwrap_or((call_site_params, None));
 
     // Resolve parameter types: use annotations if present, fall back to expected types.
     let mut param_type_list = Vec::with_capacity(params.len());
@@ -1689,20 +2102,27 @@ fn resolve_lambda_types(
 
     // Resolve body with expected return type for bidirectional inference.
     let body_expected = explicit_ret.or(expected_ret);
+    let saved_lambda_narrowed = r.narrowed_symbols.clone();
+    r.narrowed_symbols
+        .retain(|sym, _| !r.assigned_symbols.contains(sym));
     r.return_types.push(body_expected);
     r.inferred_returns.push(Vec::new());
     resolve_types_expected(r, ast, body_node, body_expected);
     r.return_types.pop();
+    r.narrowed_symbols = saved_lambda_narrowed;
     let returns = r
         .inferred_returns
         .pop()
         .expect("lambda return inference context was pushed before resolving its body");
     let body_type = r.node_types.get(&body_node).copied();
 
-    // Determine return type: explicit annotation > body type > expected > Unit.
-    let ret_type = explicit_ret
-        .or(expected_ret)
-        .unwrap_or_else(|| infer_return_type(r, ast, body_node, returns));
+    // Always compute the body's concrete inferred return type for collection `.map` provenance,
+    // while keeping `expected_ret` (e.g. `Any`) on the closure's runtime `Function` type!
+    let inferred_body_ret = infer_return_type(r, ast, body_node, returns);
+    r.collection_provenance
+        .lambda_body_returns
+        .insert(node_idx, inferred_body_ret);
+    let ret_type = explicit_ret.or(expected_ret).unwrap_or(inferred_body_ret);
     if body_expected.is_none() {
         coerce_inferred_returns(r, ast, body_node, ret_type);
     }
@@ -1717,15 +2137,40 @@ fn resolve_lambda_types(
         let expected_name = type_display_name(&r.type_pool, ann_ret);
         let found_name = type_display_name(&r.type_pool, body_ti);
         let body_span = ast.node(body_node).span;
-        let ret_span = ast.node(ret_type_node).span;
-        r.diag_ctx
-                .error(format!(
-                    "type mismatch in lambda: expected return type `{expected_name}`, found `{found_name}`"
-                ))
-                .with_primary_span(body_span)
-                .with_label(body_span, format!("this has type `{found_name}`"), Level::Error)
-                .with_label(ret_span, format!("expected `{expected_name}` because of return type"), Level::Note)
-                .emit(r.diag_ctx);
+        let mut builder = r
+            .diag_ctx
+            .error(format!(
+                "type mismatch in lambda: expected return type `{expected_name}`, found `{found_name}`"
+            ))
+            .with_code(diagnostic::codes::TYPE_MISMATCH)
+            .with_primary_span(body_span)
+            .with_label(
+                body_span,
+                format!("this has type `{found_name}`"),
+                Level::Error,
+            );
+        if !ret_type_node.is_null() {
+            builder = builder.with_label(
+                ast.node(ret_type_node).span,
+                format!("expected `{expected_name}` because of return type"),
+                Level::Note,
+            );
+        } else {
+            builder = builder.with_note(format!(
+                "expected return type `{expected_name}` from surrounding call/binding context"
+            ));
+        }
+        for help in crate::suggestions::type_mismatch_helps(
+            r,
+            ast,
+            body_node,
+            body_ti,
+            ann_ret,
+            "lambda return value",
+        ) {
+            builder = builder.with_help(help);
+        }
+        builder.emit(r.diag_ctx);
     }
 
     // Build the Function type.
@@ -1807,6 +2252,9 @@ fn resolve_case_closure_types(
         .or(expected_param)
         .unwrap_or(Intrinsic::Any.type_index());
 
+    let saved_case_narrowed = r.narrowed_symbols.clone();
+    r.narrowed_symbols
+        .retain(|sym, _| !r.assigned_symbols.contains(sym));
     r.return_types.push(expected_ret);
     r.inferred_returns.push(Vec::new());
     let mut bodies = Vec::new();
@@ -1822,6 +2270,7 @@ fn resolve_case_closure_types(
         }
     }
     r.return_types.pop();
+    r.narrowed_symbols = saved_case_narrowed;
     let returns = r
         .inferred_returns
         .pop()
@@ -1854,7 +2303,9 @@ fn resolve_case_closure_types(
         }
     }
     for (body, _) in bodies {
-        resolve_types_expected(r, ast, body, Some(ret_type));
+        if expected_ret.is_none() {
+            coerce_result_value(r, ast, body, ret_type);
+        }
         check_expected_type(r, ast, body, ret_type, "case arm");
     }
 
@@ -2028,12 +2479,34 @@ pub(crate) fn resolve_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         None
     };
 
-    // Pass the declared type into bidirectional inference before checking compatibility.
+    // Pass the declared type into bidirectional inference (or record local call-site
+    // inferred lambda parameter types out-of-band without polluting `TypePool`).
     if children.len() > 2 {
+        if annotation_ti.is_none()
+            && !has_else
+            && !children[0].is_null()
+            && ast.node(children[0]).kind == NodeKind::Id
+            && !children[2].is_null()
+            && ast.node(children[2]).kind == NodeKind::Lambda
+            && let Some(&fn_sym) = r.node_symbols.get(&children[0])
+            && let Some(inferred_params) =
+                crate::flow_narrowing::infer_local_lambda_call_site_params(
+                    r,
+                    ast,
+                    node_idx,
+                    fn_sym,
+                    children[2],
+                )
+        {
+            r.collection_provenance
+                .inferred_lambda_params
+                .insert(children[2], inferred_params);
+        }
         resolve_types_expected(r, ast, children[2], annotation_ti);
     }
 
-    // Determine the effective type: annotation takes priority, fallback to value type.
+    // Determine the effective type: annotation takes priority, fallback to value type
+    // (upgrading unannotated `let`/`var x = null` from downstream assignments in the block).
     let val_ti = if children.len() > 2 {
         r.node_types.get(&children[2]).copied()
     } else {
@@ -2042,7 +2515,18 @@ pub(crate) fn resolve_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
 
     let binding_annotation = annotation_ti
         .and_then(|ty| crate::default_methods::parameter_body_type(r, ast, children[1], ty));
-    let effective_ti = binding_annotation.or(val_ti);
+    let deferred_null_ti = if binding_annotation.is_none()
+        && !has_else
+        && !children[0].is_null()
+        && ast.node(children[0]).kind == NodeKind::Id
+        && val_ti == Some(r.type_pool.null_type())
+        && let Some(&sym_id) = r.node_symbols.get(&children[0])
+    {
+        crate::flow_narrowing::infer_deferred_null_local_type(r, ast, node_idx, sym_id)
+    } else {
+        None
+    };
+    let effective_ti = binding_annotation.or(deferred_null_ti).or(val_ti);
 
     // Check: if both annotation and value type are known, verify compatibility.
     if let (Some(ann_ti), Some(v_ti)) = (annotation_ti, val_ti)
@@ -2101,6 +2585,20 @@ pub(crate) fn resolve_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                 children[2],
                 false,
             );
+            crate::collection_inference::record_decl_provenance(
+                r,
+                ast,
+                node_idx,
+                children[0],
+                children[2],
+                false,
+            );
+        }
+        if !children[0].is_null()
+            && ast.node(children[0]).kind == NodeKind::Id
+            && let Some(&sym_id) = r.node_symbols.get(&children[0])
+        {
+            r.narrowed_symbols.remove(&sym_id);
         }
     }
 }
@@ -2220,16 +2718,46 @@ fn resolve_when_types(
     let bool_type = Intrinsic::Bool.type_index();
     let arm_expected = if has_else { expected } else { None };
     let mut bodies = Vec::new();
+    let pre_when = r.narrowed_symbols.clone();
+    let mut accumulated_false = r.narrowed_symbols.clone();
+    let mut mutated_any_arm = std::collections::HashSet::new();
     for &arm in arms {
         if arm.is_null() {
             continue;
         }
+        crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+            r,
+            ast,
+            arm,
+            &mut mutated_any_arm,
+        );
         match ast.node(arm).kind {
             NodeKind::ConditionArm => {
                 let children = ast.fixed_children(arm);
+                r.narrowed_symbols = accumulated_false.clone();
                 resolve_types_expected(r, ast, children[0], Some(bool_type));
                 check_expected_type(r, ast, children[0], bool_type, "when condition");
+                let (true_facts, false_facts) =
+                    crate::flow_narrowing::extract_condition_facts(r, ast, children[0]);
+                for (sym, ty) in true_facts {
+                    r.narrowed_symbols.insert(sym, ty);
+                }
                 resolve_types_expected(r, ast, children[1], arm_expected);
+                let mut mutated_cond = std::collections::HashSet::new();
+                crate::flow_narrowing::collect_mutated_symbols_in_subtree(
+                    r,
+                    ast,
+                    children[0],
+                    &mut mutated_cond,
+                );
+                for sym in &mutated_cond {
+                    accumulated_false.remove(sym);
+                }
+                for (sym, ty) in false_facts {
+                    if !mutated_cond.contains(&sym) {
+                        accumulated_false.insert(sym, ty);
+                    }
+                }
                 if has_else
                     && !definitely_returns(ast, children[1])
                     && let Some(&ty) = r.node_types.get(&children[1])
@@ -2240,6 +2768,7 @@ fn resolve_when_types(
             }
             NodeKind::ElseConditionArm => {
                 let body = ast.fixed_children(arm)[0];
+                r.narrowed_symbols = accumulated_false.clone();
                 resolve_types_expected(r, ast, body, arm_expected);
                 if !definitely_returns(ast, body)
                     && let Some(&ty) = r.node_types.get(&body)
@@ -2250,6 +2779,10 @@ fn resolve_when_types(
             }
             _ => resolve_types(r, ast, arm),
         }
+    }
+    r.narrowed_symbols = pre_when;
+    for sym in mutated_any_arm {
+        r.narrowed_symbols.remove(&sym);
     }
     if !has_else {
         return Some(Intrinsic::Unit.type_index());
@@ -2262,7 +2795,9 @@ fn resolve_when_types(
         }
     });
     for (body, _) in bodies {
-        resolve_types_expected(r, ast, body, Some(result));
+        if arm_expected.is_none() {
+            coerce_result_value(r, ast, body, result);
+        }
         check_expected_type(r, ast, body, result, "when arm");
     }
     Some(result)
@@ -2427,8 +2962,8 @@ fn resolve_call_types(
     let children = ast.fixed_children(node_idx);
     // [0] callee  multi = args
     let callee = children[0];
-    if let Some(ty) = crate::enums::construction(r, ast, node_idx) {
-        crate::enums::record_reference(r, ast, callee);
+    if let Some(ty) = crate::enums::construction(r, ast, node_idx, expected) {
+        crate::enums::record_reference(r, ast, callee, expected);
         return Some(ty);
     }
     if let Some(ty) = crate::newtype::construction(r, ast, node_idx) {
@@ -2567,6 +3102,15 @@ fn resolve_call_types(
                 }
             })
         };
+        let expected = crate::collection_inference::expected_callback_arg_type(
+            r,
+            ast,
+            node_idx,
+            callee,
+            parameter_index,
+            arg,
+            expected,
+        );
         let check_ctx = (declaration_bound && expected.is_some()).then_some("argument");
         resolve_call_argument_or_spread(r, ast, arg, expected, check_ctx);
     }
@@ -2677,15 +3221,27 @@ fn resolve_call_types(
                 } else {
                     format!("between {required} and {} arguments", pts.len())
                 };
-                r.diag_ctx
+                let mut builder = r
+                    .diag_ctx
                     .error(format!(
                         "`{callee_name}` expects {arity}, but {} {} supplied",
                         args.len(),
                         if args.len() == 1 { "was" } else { "were" },
                     ))
+                    .with_code(diagnostic::codes::ARITY_MISMATCH)
                     .with_primary_span(call_span)
-                    .with_label(callee_span, format!("expects {arity}"), Level::Note)
-                    .emit(r.diag_ctx);
+                    .with_label(callee_span, format!("expects {arity}"), Level::Note);
+                if let Some(&callee_sym) = r.node_symbols.get(&callee) {
+                    let def = r.symbols[callee_sym.0 as usize].def_node;
+                    if !def.is_null() {
+                        builder = builder.with_label(
+                            ast.node(def).span,
+                            format!("`{callee_name}` declared here"),
+                            Level::Note,
+                        );
+                    }
+                }
+                builder.emit(r.diag_ctx);
             } else {
                 // Type check each argument.
                 for (i, &arg) in args.iter().enumerate() {
@@ -2699,14 +3255,25 @@ fn resolve_call_types(
                             let expected = type_display_name(&r.type_pool, param_ti);
                             let found = type_display_name(&r.type_pool, arg_ti);
                             let arg_span = ast.node(arg).span;
-                            r.diag_ctx
-                            .error(format!(
-                                "type mismatch in argument {} of `{callee_name}`: expected `{expected}`, found `{found}`",
-                                i + 1
-                            ))
-                            .with_primary_span(arg_span)
-                            .with_label(arg_span, format!("expected `{expected}`, found `{found}`"), Level::Error)
-                            .emit(r.diag_ctx);
+                            let mut builder = r
+                                .diag_ctx
+                                .error(format!(
+                                    "type mismatch in argument {} of `{callee_name}`: expected `{expected}`, found `{found}`",
+                                    i + 1
+                                ))
+                                .with_code(diagnostic::codes::TYPE_MISMATCH)
+                                .with_primary_span(arg_span)
+                                .with_label(
+                                    arg_span,
+                                    format!("expected `{expected}`, found `{found}`"),
+                                    Level::Error,
+                                );
+                            for help in crate::suggestions::type_mismatch_helps(
+                                r, ast, arg, arg_ti, param_ti, "argument",
+                            ) {
+                                builder = builder.with_help(help);
+                            }
+                            builder.emit(r.diag_ctx);
                         }
                     }
                 }
@@ -2714,7 +3281,12 @@ fn resolve_call_types(
         }
     }
 
+    let collection_refined =
+        crate::collection_inference::finalize_collection_call(r, ast, node_idx, callee, args);
     if let Some(refined) = crate::task_combinators::refine_call(r, ast, node_idx, callee, args) {
+        return Some(refined);
+    }
+    if let Some(refined) = collection_refined {
         return Some(refined);
     }
 
@@ -3285,12 +3857,14 @@ fn resolve_match_types(
     // [0] scrutinee  multi = arms
     resolve_types(r, ast, children[0]);
     let scrutinee_type = r.node_types.get(&children[0]).copied();
+    let arm_input_type =
+        scrutinee_type.or_else(|| r.diag_ctx.has_errors().then(|| Intrinsic::Any.type_index()));
 
     let mut bodies = Vec::new();
     for &arm in ast.multi_children(node_idx) {
         let arm_children = ast.fixed_children(arm);
         crate::task_combinators::attach_scrutinee_pattern(r, ast, children[0], arm_children[0]);
-        crate::enums::pattern(r, ast, arm_children[0], scrutinee_type);
+        crate::enums::pattern(r, ast, arm_children[0], arm_input_type);
         resolve_types_expected(r, ast, arm_children[1], expected);
         if !definitely_returns(ast, arm_children[1])
             && let Some(&ty) = r.node_types.get(&arm_children[1])
@@ -3326,7 +3900,9 @@ fn resolve_match_types(
         }
     });
     for (body, _) in bodies {
-        resolve_types_expected(r, ast, body, Some(result));
+        if expected.is_none() {
+            coerce_result_value(r, ast, body, result);
+        }
         check_expected_type(r, ast, body, result, "match arm");
     }
     Some(result)
@@ -3374,15 +3950,13 @@ fn resolve_pattern_literals(
             let children = ast.fixed_children(node);
             r.annotation_typed_patterns.insert(node);
             let Some(ann_ty) = resolve_type_expr(r, ast, children[1]) else {
-                let span_node = if children[1].is_null() {
-                    node
-                } else {
-                    children[1]
-                };
-                r.diag_ctx
-                    .error("typed pattern requires a valid type".into())
-                    .with_primary_span(ast.node(span_node).span)
-                    .emit(r.diag_ctx);
+                if children[1].is_null() {
+                    r.diag_ctx
+                        .error("typed pattern requires a valid type".into())
+                        .with_code(diagnostic::codes::INVALID_TYPE_EXPR)
+                        .with_primary_span(ast.node(node).span)
+                        .emit(r.diag_ctx);
+                }
                 return;
             };
             r.node_types.insert(children[1], ann_ty);
@@ -3584,6 +4158,27 @@ fn resolve_projection_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) ->
         if intrinsic == Some(Intrinsic::Any) {
             return Some(Intrinsic::Any.type_index());
         }
+        if !member_node.is_null()
+            && crate::comparison_derivation::declared_method_signature(r, ast, lhs_ti, name)
+                .is_none()
+            && !matches!(
+                r.type_pool.get(lhs_ti).kind,
+                TypeKind::Module { .. }
+                    | TypeKind::Intrinsic(Intrinsic::Type | Intrinsic::Any | Intrinsic::NoReturn)
+            )
+        {
+            let member_str = str_interner::get(ast.node(member_node).str_id);
+            let owner_name = type_display_name(&r.type_pool, lhs_ti);
+            let mut builder = r
+                .diag_ctx
+                .error(format!("unknown member `{member_str}` on `{owner_name}`"))
+                .with_code(diagnostic::codes::UNKNOWN_MEMBER)
+                .with_primary_span(ast.node(node_idx).span);
+            for help in crate::suggestions::unknown_member_helps(r, lhs_ti, &member_str) {
+                builder = builder.with_help(help);
+            }
+            builder.emit(r.diag_ctx);
+        }
     }
 
     None
@@ -3722,17 +4317,31 @@ fn contextual_float_type(pool: &type_pool::TypePool, expected: Option<TypeIndex>
     Intrinsic::F64.type_index()
 }
 
-fn payload_inner_expected(
+pub(crate) fn payload_inner_expected(
     pool: &type_pool::TypePool,
     expected: Option<TypeIndex>,
 ) -> Option<TypeIndex> {
     let expected = expected?;
     let canonical = pool.canonical_type(expected)?;
     match pool.get(canonical).kind {
-        TypeKind::Optional { inner } => Some(inner),
-        TypeKind::ErrorQualified { inner, .. } => payload_inner_expected(pool, Some(inner)),
+        TypeKind::Optional { inner } => Some(peel_qualified_expected(pool, inner)),
+        TypeKind::ErrorQualified { inner, .. } | TypeKind::EffectQualified { inner, .. } => {
+            payload_inner_expected(pool, Some(inner))
+        }
         _ => Some(expected),
     }
+}
+
+fn peel_qualified_expected(pool: &type_pool::TypePool, mut ty: TypeIndex) -> TypeIndex {
+    while let Some(canon) = pool.canonical_type(ty) {
+        match pool.get(canon).kind {
+            TypeKind::ErrorQualified { inner, .. } | TypeKind::EffectQualified { inner, .. } => {
+                ty = inner;
+            }
+            _ => break,
+        }
+    }
+    ty
 }
 
 /// Native registration deliberately carries no language signature. Every native

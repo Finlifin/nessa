@@ -148,27 +148,32 @@ Source Text
     │ Resolved AST + Metadata
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ Phase 4: NIR Lowering (nir)                                          │
-│   Resolved AST ──▶ NIR (Normalized Intermediate Representation)      │
+│ Phase 4: NIR Lowering & Multi-Level AOT Optimization (nir)           │
+│   Resolved AST ──▶ NIR ──▶ nir::opt (O0 / O1 / O2 / O3)              │
 │                                                                      │
 │   - 语法糖脱糖（for → while+iter, ?/! → match, string interp → concat  │
 │   - 控制流标准化（所有分支 → 条件跳转 + 基本块）                            │
 │   - Effect 调用标准化（evidence passing 参数注入）                       │
 │   - 模式匹配编译（decision tree / backtracking automaton）              │
 │   - Lambda 捕获分析与闭包转换                                           │
-│   - 常量折叠与简单优化                                                  │
+│   - AOT 优化管线（O0 保持原始 lowering；O1: 常量折叠/代数化简 + 拷贝与常量 │
+│     传播 + CFG 化简 + DCE/局部槽位压缩；O2: 支配树 GVN/路径条件精化 + 稀  │
+│     疏条件常量传播 SCCP + 死函数消除 DFE；O3: 跨模块作用域安全内联 + 自然  │
+│     循环不变量外提 LICM + 自尾递归循环化消除 TRE）                        │
 └──────────────────────────────────────────────────────────────────────┘
     │ NIR
     ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│ Phase 5: Code Generation (codegen)                                   │
+│ Phase 5: Code Generation & Bytecode Peepholes (codegen)              │
 │   NIR ──▶ NSBC (Nessa Serialized ByteCode)                           │
 │                                                                      │
 │   - 寄存器分配（32 个通用寄存器，ARM 风格 ABI，线性扫描）                 │
 │   - 32-bit 指令编码（含 2-bit 寻址模式）                                 │
 │   - Safe point 插入（循环回边、函数调用点）                               │
 │   - Stack map 生成（GC root 追踪）                                     │
-│   - 常量池构建                                                         │
+│   - 常量池构建（O1+ 全模块常量池去重）                                    │
+│   - 字节码窥孔优化（O1+ 同基本块 StoreSlot→LoadSlot 转发、单指令 JmpIf/   │
+│     JmpIfNot 条件跳转融合、落空跳转消除，同步重定位 safepoint 与 scope 表） │
 │   - 调试信息生成（源码映射）                                              │
 └──────────────────────────────────────────────────────────────────────┘
     │ NSBC
@@ -184,13 +189,15 @@ Source Text
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 编译模式
+### 4.2 编译模式与优化级别
+
+编译器通过 CLI 参数（`-O0`、`-O1`、`-O2`、`-O3`、`-O`、`--opt-level <0..3>`）、`package.toml` 的 `[build] opt_level` 或环境变量 `NESSA_OPT_LEVEL` 选择 AOT 优化级别（默认 `O0`），并将优化级别纳入 `.nsbc` 构建缓存 SHA-256 键。全管线统一采用结构化分层错误码（`1xxx` 词法、`2xxx` 语法与跨语言启发式恢复、`3xxx` 名称/作用域/导入、`4xxx` 类型/Trait/效应/模式、`5xxx` NIR 捕获与降低、`6xxx` 字节码编码）与跨文件 `ariadne` 多标签诊断渲染。
 
 | 模式 | 说明 | 路径 |
 |------|------|------|
-| **开发模式** | 最小化优化，最快编译，保留全部调试信息 | Lex → Parse → Resolution → NIR → Codegen（无优化）→ 直接执行 |
-| **发布模式** | 完整优化，生成归档文件 | Lex → Parse → Resolution → NIR → NIR Opts → Codegen → Archive |
-| **检查模式** | 仅做类型检查和诊断，不生成代码 | Lex → Parse → Resolution → 报告诊断 |
+| **开发模式 (`-O0`)** | 默认零额外优化，最快编译，完整保留辅助函数与原始槽位布局 | Lex → Parse → Resolution → NIR → Codegen(`O0`) → 直接执行 / 归档 |
+| **优化构建 (`-O1` / `-O2` / `-O3`)** | 分级启用 NIR 中端现代编译 Pass 与 Codegen 常量去重/窥孔优化 | Lex → Parse → Resolution → NIR → `nir::opt(O1..O3)` → Codegen(`O1..O3`) → 执行 / 归档 |
+| **检查模式 (`nessa check`)** | 仅做词法、语法（含多错误同步恢复）与类型/效应诊断，不生成代码 | Lex → Parse → Resolution → 报告结构化诊断 |
 
 ---
 

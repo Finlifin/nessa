@@ -25,6 +25,11 @@ pub struct Parser<'a> {
     /// A wildcard consumed as an import path terminator can end a statement;
     /// the same token in an arithmetic expression cannot.
     import_glob_end: Option<usize>,
+    /// Cursor position where a skipped foreign comment ended a statement before a newline.
+    statement_end_override: Option<usize>,
+
+    /// Nesting depth of type-annotation / type-expression positions.
+    type_context_depth: u32,
 
     /// Stack of saved cursor positions (for span tracking per parse rule).
     cursor_stack: Vec<usize>,
@@ -49,6 +54,8 @@ impl<'a> Parser<'a> {
             file_base_pos,
             cursor: 0,
             import_glob_end: None,
+            statement_end_override: None,
+            type_context_depth: 0,
             cursor_stack: vec![0],
             errors: Vec::new(),
         }
@@ -98,6 +105,9 @@ impl<'a> Parser<'a> {
                 if let Some(label) = &mut error.label {
                     label.span = mapper.map_raw_absolute(label.span)?.span;
                 }
+                for label in &mut error.extra_labels {
+                    label.span = mapper.map_raw_absolute(label.span)?.span;
+                }
             }
             self.ast.attach_source(self.source.to_owned(), mapper)?;
             self.errors = errors;
@@ -115,12 +125,9 @@ impl<'a> Parser<'a> {
         (self.ast, self.errors)
     }
 
-    // -- Cursor stack (span tracking) ----------------------------------------
+    // -- Cursor stack & type context -----------------------------------------
 
     /// Push the current cursor position and return a guard that pops it on drop.
-    ///
-    /// The returned [`ParseGuard`] holds a raw pointer to `cursor_stack` so
-    /// that parsing can continue through `&mut self` while the guard exists.
     ///
     /// # Safety (internal)
     ///
@@ -139,6 +146,143 @@ impl<'a> Parser<'a> {
         self.cursor_stack.push(self.cursor);
         ParseGuard {
             cursor_stack: &mut self.cursor_stack as *mut Vec<usize>,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn in_type_context(&self) -> bool {
+        self.type_context_depth > 0
+    }
+
+    pub(crate) fn with_type_context<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.type_context_depth += 1;
+        let res = f(self);
+        self.type_context_depth -= 1;
+        res
+    }
+
+    // -- Raw token inspection & synchronization -------------------------------
+
+    #[inline]
+    pub(crate) fn raw_cursor(&self) -> usize {
+        self.cursor
+    }
+
+    #[inline]
+    pub(crate) fn set_raw_cursor(&mut self, cursor: usize) {
+        self.cursor = cursor.min(self.tokens.len());
+    }
+
+    #[inline]
+    pub(crate) fn raw_tokens(&self) -> &'a [Token] {
+        self.tokens
+    }
+
+    #[inline]
+    pub(crate) fn source_str(&self) -> &'a str {
+        self.source
+    }
+
+    /// Return the index of the next non-Newline raw token starting at `self.cursor`.
+    pub(crate) fn next_non_newline_index(&self) -> usize {
+        let mut idx = self.cursor;
+        while idx < self.tokens.len() && self.tokens[idx].kind == TokenKind::Newline {
+            idx += 1;
+        }
+        idx
+    }
+
+    /// Whether a `Newline` token exists in `self.tokens[from..self.next_non_newline_index()]`.
+    pub(crate) fn had_newline_since(&self, from: usize) -> bool {
+        let end = self.next_non_newline_index().min(self.tokens.len());
+        let start = from.min(end);
+        self.tokens[start..end]
+            .iter()
+            .any(|t| t.kind == TokenKind::Newline)
+    }
+
+    pub(crate) fn mark_statement_end_here(&mut self) {
+        self.statement_end_override = Some(self.cursor);
+    }
+
+    /// Panic-mode synchronization to recover to the next statement or item boundary.
+    pub(crate) fn synchronize_statement(
+        &mut self,
+        start_cursor: usize,
+        close: Option<TokenKind>,
+        allow_comma: bool,
+    ) {
+        let mut paren_depth: u32 = 0;
+        let mut bracket_depth: u32 = 0;
+        let mut brace_depth: u32 = 0;
+        let mut indent_depth: u32 = 0;
+        let mut moved = self.cursor > start_cursor;
+
+        loop {
+            let tok = self.peek_token();
+            if tok.kind == TokenKind::Eof {
+                break;
+            }
+
+            let at_top_depth =
+                paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && indent_depth == 0;
+
+            if at_top_depth {
+                if close == Some(tok.kind)
+                    || (close != Some(TokenKind::Eof)
+                        && matches!(tok.kind, TokenKind::RBrace | TokenKind::Outdent))
+                {
+                    break;
+                }
+                if tok.kind == TokenKind::Semi || (allow_comma && tok.kind == TokenKind::Comma) {
+                    self.next_token();
+                    break;
+                }
+                if moved
+                    && matches!(
+                        tok.kind,
+                        TokenKind::KwFn
+                            | TokenKind::KwStruct
+                            | TokenKind::KwEnum
+                            | TokenKind::KwTrait
+                            | TokenKind::KwImpl
+                            | TokenKind::KwExtend
+                            | TokenKind::KwEffect
+                            | TokenKind::KwHandles
+                            | TokenKind::KwLet
+                            | TokenKind::KwVar
+                            | TokenKind::KwConst
+                            | TokenKind::KwReturn
+                            | TokenKind::KwDefer
+                            | TokenKind::KwFor
+                            | TokenKind::KwWhile
+                            | TokenKind::KwUse
+                            | TokenKind::KwMod
+                            | TokenKind::KwPub
+                            | TokenKind::KwPrivate
+                            | TokenKind::KwTypealias
+                            | TokenKind::KwNewtype
+                            | TokenKind::KwDerive
+                            | TokenKind::KwGlobal
+                    )
+                {
+                    break;
+                }
+            }
+
+            let consumed = self.next_token();
+            moved = true;
+            match consumed.kind {
+                TokenKind::LParen => paren_depth += 1,
+                TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+                TokenKind::LBracket => bracket_depth += 1,
+                TokenKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+                TokenKind::LBrace => brace_depth += 1,
+                TokenKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
+                TokenKind::Indent => indent_depth += 1,
+                TokenKind::Outdent => indent_depth = indent_depth.saturating_sub(1),
+                _ => {}
+            }
         }
     }
 
@@ -259,8 +403,23 @@ impl<'a> Parser<'a> {
                 let next_is_postfix_elim = matches!(next, TokenKind::Hash | TokenKind::Bang)
                     && cursor + 2 < self.tokens.len()
                     && self.tokens[cursor + 2].kind == TokenKind::LBrace;
-                if (prev.can_end_statement() || self.import_glob_end == Some(cursor))
-                    && ((next.can_start_statement() && !next_is_postfix_elim) || next_is_when_else)
+                let next_is_prefix_match_misuse = next == TokenKind::KwMatch
+                    && cursor + 2 < self.tokens.len()
+                    && !matches!(
+                        self.tokens[cursor + 2].kind,
+                        TokenKind::LBrace
+                            | TokenKind::Indent
+                            | TokenKind::Colon
+                            | TokenKind::Newline
+                    )
+                    && self.has_brace_on_same_line(cursor + 2);
+                let prev_ended = prev.can_end_statement()
+                    || self.import_glob_end == Some(cursor)
+                    || self.statement_end_override == Some(cursor);
+                if prev_ended
+                    && ((next.can_start_statement() && !next_is_postfix_elim)
+                        || next_is_when_else
+                        || next_is_prefix_match_misuse)
                 {
                     // Treat newline as semicolon
                     token.kind = TokenKind::Semi;
@@ -289,6 +448,18 @@ impl<'a> Parser<'a> {
             cursor: cursor + 1,
             token,
         }
+    }
+
+    fn has_brace_on_same_line(&self, start: usize) -> bool {
+        let mut idx = start;
+        while idx < self.tokens.len() {
+            match self.tokens[idx].kind {
+                TokenKind::LBrace => return true,
+                TokenKind::Newline | TokenKind::Semi | TokenKind::Eof => return false,
+                _ => idx += 1,
+            }
+        }
+        false
     }
 
     /// Skip raw `Newline` tokens only when the immediately following token is one
@@ -320,6 +491,20 @@ impl<'a> Parser<'a> {
         }
         let token = self.next_token_inner(self.cursor).token;
         token.text(self.source)
+    }
+
+    /// Span of a specific token adjusted by file base pos.
+    pub(crate) fn token_span(&self, token: Token) -> Span {
+        let lo = BytePos(self.file_base_pos.0 + token.from);
+        let hi = BytePos(self.file_base_pos.0 + token.to);
+        Span::new(lo, hi)
+    }
+
+    /// Span covering `[from_byte..to_byte]` within this file.
+    pub(crate) fn span_from_to(&self, from_byte: u32, to_byte: u32) -> Span {
+        let lo = BytePos(self.file_base_pos.0 + from_byte);
+        let hi = BytePos(self.file_base_pos.0 + to_byte);
+        Span::new(lo, hi)
     }
 
     /// Span of the next token (for error reporting), adjusted by file base pos.
@@ -357,6 +542,16 @@ impl<'a> Parser<'a> {
     }
 
     // -- Error helpers --------------------------------------------------------
+
+    #[inline]
+    pub(crate) fn error_count(&self) -> usize {
+        self.errors.len()
+    }
+
+    #[inline]
+    pub(crate) fn push_error(&mut self, error: ParseError) {
+        self.errors.push(error);
+    }
 
     /// Record a parse error and return `Err(kind)`.
     pub(crate) fn err(

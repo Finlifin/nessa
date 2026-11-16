@@ -33,7 +33,9 @@ impl Driver {
         privileged_packages: &BTreeSet<String>,
     ) -> Result<nsbc::CompiledArtifact, Vec<diagnostic::Diagnostic>> {
         let cache_dir = self.resolved_cache_dir();
-        let key = crate::artifact_cache::package_graph_key(root, catalog, privileged_packages);
+        let opt_level = self.effective_opt_level(root.manifest.build_opt_level());
+        let key =
+            crate::artifact_cache::package_graph_key(root, catalog, privileged_packages, opt_level);
         if let Some(cached) =
             crate::artifact_cache::load_cached_artifact(cache_dir.as_deref(), &key)
         {
@@ -205,7 +207,15 @@ impl Driver {
             PackageType::Exe => nir::StartupMode::RequiredMain,
             PackageType::Lib | PackageType::Tmp => nir::StartupMode::InitializationOnly,
         };
-        self.compile_ast_with_options(ast, diagnostics, Some(identity), startup, Some(options))
+        let opt_level = self.effective_opt_level(root.manifest.build_opt_level());
+        self.compile_ast_with_options(
+            ast,
+            diagnostics,
+            Some(identity),
+            startup,
+            Some(options),
+            opt_level,
+        )
     }
 }
 

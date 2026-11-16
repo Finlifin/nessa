@@ -300,6 +300,11 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
             let derived = trait_info.derived_methods.clone();
 
             // Check that all required methods are provided.
+            let trait_def_for_labels = r
+                .symbols
+                .iter()
+                .find(|s| s.kind == SymbolKind::Trait && s.type_index == trait_type)
+                .map(|s| s.def_node);
             for &req_name in &required {
                 if !provided_names.contains(&req_name) {
                     let span = ast.node(node_idx).span;
@@ -309,13 +314,36 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
                         .kind
                         .trait_name()
                         .unwrap_or(req_name);
-                    let mut diag = diagnostic::Diagnostic::error(format!(
-                        "impl of trait `{}` is missing required method `{}`",
-                        str_interner::get(trait_name),
-                        str_interner::get(req_name),
-                    ));
-                    diag.primary_span = Some(span);
-                    r.diagnostics.push(diag);
+                    let req_str = str_interner::get(req_name);
+                    let mut builder = r
+                        .diag_ctx
+                        .error(format!(
+                            "impl of trait `{}` is missing required method `{}`",
+                            str_interner::get(trait_name),
+                            req_str,
+                        ))
+                        .with_code(diagnostic::codes::MISSING_TRAIT_METHOD)
+                        .with_primary_span(span)
+                        .with_help(format!(
+                            "implement `fn {req_str}(self, ...) {{ ... }}` inside this `impl` block"
+                        ));
+                    if let Some(t_node) = trait_def_for_labels
+                        && !t_node.is_null()
+                    {
+                        for &m in ast.multi_children(t_node) {
+                            if ast.node(m).kind == NodeKind::TraitDefFn
+                                && ast.node(ast.fixed_children(m)[0]).str_id == req_name
+                            {
+                                builder = builder.with_label(
+                                    ast.node(m).span,
+                                    format!("required method `{req_str}` declared here"),
+                                    diagnostic::Level::Note,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    builder.emit(r.diag_ctx);
                 }
             }
 

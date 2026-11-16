@@ -3,8 +3,9 @@ use lexer::token::TokenKind;
 
 use crate::basic::{self, Rule, try_multi_in_block};
 use crate::definition;
-use crate::error::{ParseErrorKind, ParseResult};
+use crate::error::{ParseError, ParseErrorKind, ParseResult};
 use crate::expr;
+use crate::heuristics;
 use crate::parser::{NULL, Parser};
 use crate::pattern;
 
@@ -36,6 +37,12 @@ pub fn try_block(p: &mut Parser) -> ParseResult {
 
 /// Dispatches to either a definition or a statement.
 pub fn try_definition_or_statement(p: &mut Parser) -> ParseResult {
+    heuristics::try_skip_foreign_comments(p);
+    let heuristic = heuristics::try_foreign_statement_or_def_heuristic(p)?;
+    if !heuristic.is_null() {
+        return Ok(heuristic);
+    }
+
     let token = p.peek_token();
     match token.kind {
         // Definitions
@@ -118,6 +125,8 @@ fn try_var_statement(p: &mut Parser) -> ParseResult {
 }
 
 fn parse_binding(p: &mut Parser, decl_kind: NodeKind) -> ParseResult {
+    heuristics::try_eat_binding_mut(p, decl_kind);
+
     let pat = pattern::try_pattern(p)?;
     if pat.is_null() {
         let _ = p.err(
@@ -128,7 +137,7 @@ fn parse_binding(p: &mut Parser, decl_kind: NodeKind) -> ParseResult {
     }
 
     let type_ann = if p.eat_token(TokenKind::Colon) {
-        let ty = expr::try_expr_without_extended_call(p)?;
+        let ty = p.with_type_context(expr::try_expr_without_extended_call)?;
         if ty.is_null() {
             let _ = p.err(
                 ParseErrorKind::InvalidSyntax,
@@ -440,6 +449,7 @@ fn try_while_statement(p: &mut Parser) -> ParseResult {
             "Expected condition expression after `while`",
         );
     }
+    let cond = heuristics::try_condition_assign_recovery(p, cond, "while")?;
 
     let body = basic::try_block_or_statement(p)?;
     if body.is_null() {
@@ -471,7 +481,11 @@ pub fn try_if_statement(p: &mut Parser) -> ParseResult {
     if !p.eat_token(TokenKind::KwIf) {
         return Ok(NULL);
     }
+    parse_if_after_keyword(p)
+}
 
+pub(crate) fn parse_if_after_keyword(p: &mut Parser) -> ParseResult {
+    let _g = p.enter();
     let cond = expr::try_expr_without_extended_call(p)?;
     if cond.is_null() {
         let _ = p.err(
@@ -480,6 +494,7 @@ pub fn try_if_statement(p: &mut Parser) -> ParseResult {
             "Expected condition after `if`",
         );
     }
+    let cond = heuristics::try_condition_assign_recovery(p, cond, "if")?;
 
     let then_block = basic::try_block_or_statement(p)?;
     if then_block.is_null() {
@@ -504,6 +519,22 @@ pub fn try_if_statement(p: &mut Parser) -> ParseResult {
             }
             block
         }
+    } else if p.peek_token().kind == TokenKind::Id
+        && matches!(p.next_token_text(), "elif" | "elsif")
+        && heuristics::looks_like_elif_branch(p)
+    {
+        let kw_text = p.next_token_text().to_owned();
+        let kw = p.next_token();
+        let kw_span = p.token_span(kw);
+        p.push_error(
+            ParseError::new(
+                ParseErrorKind::InvalidSyntax,
+                kw_span,
+                format!("Nessa uses `else if`, not `{kw_text}`"),
+            )
+            .add_help(format!("replace `{kw_text}` with `else if`")),
+        );
+        parse_if_after_keyword(p)?
     } else {
         NULL
     };
@@ -553,7 +584,7 @@ fn try_condition_arm(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    p.expect_token(TokenKind::FatArrow)?;
+    heuristics::expect_fat_arrow_in_arm(p, "`when` condition arm")?;
 
     let body = basic::try_block_or_statement(p)?;
     if body.is_null() {
@@ -582,7 +613,7 @@ fn try_else_condition_arm(p: &mut Parser) -> ParseResult {
         return Ok(NULL);
     }
 
-    p.expect_token(TokenKind::FatArrow)?;
+    heuristics::expect_fat_arrow_in_arm(p, "`else` condition arm")?;
 
     let body = basic::try_block_or_statement(p)?;
     if body.is_null() {

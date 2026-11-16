@@ -1,7 +1,9 @@
+mod opt;
 mod validation;
 
 use std::collections::HashMap;
 
+pub use nir::OptLevel;
 pub use validation::EncodingError;
 
 use nir::{
@@ -50,12 +52,18 @@ struct Emitter {
     constants: Vec<Constant>,
     /// Base index into the global constant pool for this function's constants.
     const_base: u32,
+    dedup_pool: Option<HashMap<opt::ConstantKey, u32>>,
     call_scope: Option<u32>,
     method_call_scopes: Vec<(u32, u32)>,
 }
 
 impl Emitter {
+    #[cfg(test)]
     fn new(const_base: u32) -> Self {
+        Self::with_dedup(const_base, None)
+    }
+
+    fn with_dedup(const_base: u32, dedup_pool: Option<HashMap<opt::ConstantKey, u32>>) -> Self {
         Self {
             instructions: Vec::new(),
             block_offsets: Vec::new(),
@@ -63,12 +71,23 @@ impl Emitter {
             safepoint_pcs: Vec::new(),
             constants: Vec::new(),
             const_base,
+            dedup_pool,
             call_scope: None,
             method_call_scopes: Vec::new(),
         }
     }
 
     fn add_constant(&mut self, c: Constant) -> u32 {
+        if let Some(pool) = self.dedup_pool.as_mut() {
+            let key = opt::ConstantKey::from_constant(&c);
+            if let Some(&existing) = pool.get(&key) {
+                return existing;
+            }
+            let global_idx = self.const_base + self.constants.len() as u32;
+            pool.insert(key, global_idx);
+            self.constants.push(c);
+            return global_idx;
+        }
         let global_idx = self.const_base + self.constants.len() as u32;
         self.constants.push(c);
         global_idx
@@ -98,7 +117,9 @@ impl Emitter {
 // ---------------------------------------------------------------------------
 
 pub struct Codegen {
+    opt_level: OptLevel,
     output_constants: Vec<Constant>,
+    dedup_constants: HashMap<opt::ConstantKey, u32>,
     method_call_scopes: Vec<MethodCallScope>,
     encoding_errors: Vec<EncodingError>,
     enum_descriptors: HashMap<(type_pool::TypeIndex, u32), u16>,
@@ -111,8 +132,14 @@ pub struct Codegen {
 
 impl Codegen {
     pub fn new() -> Self {
+        Self::with_opt_level(OptLevel::O0)
+    }
+
+    pub fn with_opt_level(opt_level: OptLevel) -> Self {
         Self {
+            opt_level,
             output_constants: Vec::new(),
+            dedup_constants: HashMap::new(),
             method_call_scopes: Vec::new(),
             encoding_errors: Vec::new(),
             enum_descriptors: HashMap::new(),
@@ -268,6 +295,13 @@ impl Codegen {
                 }
             }
         }
+        if self.opt_level >= OptLevel::O1 {
+            for (idx, c) in self.output_constants.iter().enumerate() {
+                self.dedup_constants
+                    .entry(opt::ConstantKey::from_constant(c))
+                    .or_insert(idx as u32);
+            }
+        }
         let mut functions = Vec::new();
         for func in &module.functions {
             let compiled = self.compile_function(func);
@@ -276,17 +310,24 @@ impl Codegen {
         if !self.encoding_errors.is_empty() {
             return Err(self.encoding_errors);
         }
-        Ok(CodegenOutput {
+        let mut output = CodegenOutput {
             functions,
             constants: self.output_constants,
             globals: module.globals.clone(),
             method_call_scopes: self.method_call_scopes,
-        })
+        };
+        if self.opt_level >= OptLevel::O1 {
+            opt::optimize_bytecode(&mut output);
+        }
+        Ok(output)
     }
 
     fn compile_function(&mut self, func: &NirFunction) -> CompiledFunction {
         let mut layout = FrameLayout::new(func.local_count);
-        let mut emitter = Emitter::new(self.output_constants.len() as u32);
+        let const_base = self.output_constants.len() as u32;
+        let dedup =
+            (self.opt_level >= OptLevel::O1).then(|| std::mem::take(&mut self.dedup_constants));
+        let mut emitter = Emitter::with_dedup(const_base, dedup);
 
         emitter.emit(Instruction::allocate_slots(func.local_count));
         // Store every incoming parameter before reusing any argument register.
@@ -437,6 +478,9 @@ impl Codegen {
         }
 
         self.output_constants.append(&mut emitter.constants);
+        if let Some(pool) = emitter.dedup_pool.take() {
+            self.dedup_constants = pool;
+        }
         self.method_call_scopes
             .extend(
                 emitter
@@ -1147,11 +1191,20 @@ pub fn codegen(module: &NirModule) -> CodegenOutput {
 
 /// Validate source-generated NIR before any encoding assertions can execute.
 pub fn try_codegen(module: &NirModule) -> Result<CodegenOutput, Vec<EncodingError>> {
+    try_codegen_with_opt(module, OptLevel::O0)
+}
+
+/// Validate and compile `module` with back-end constant deduplication and bytecode
+/// peephole optimizations enabled when `opt_level >= OptLevel::O1`.
+pub fn try_codegen_with_opt(
+    module: &NirModule,
+    opt_level: OptLevel,
+) -> Result<CodegenOutput, Vec<EncodingError>> {
     let errors = validation::validate(module);
     if !errors.is_empty() {
         return Err(errors);
     }
-    Codegen::new().compile_checked(module)
+    Codegen::with_opt_level(opt_level).compile_checked(module)
 }
 
 // ---------------------------------------------------------------------------

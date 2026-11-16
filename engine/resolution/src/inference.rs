@@ -233,7 +233,7 @@ fn static_nodes(r: &Resolver<'_>, ast: &Ast) -> Vec<NodeIndex> {
 pub(crate) fn resolve_function_dependencies(r: &mut Resolver<'_>, ast: &Ast, function: NodeIndex) {
     let mut nodes = static_nodes(r, ast);
     nodes.push(function);
-    resolve_nodes(r, ast, nodes, Some(function));
+    resolve_nodes(r, ast, nodes, Some(&[function]));
 }
 
 /// The enclosing expression establishes lambda parameters and match/loop
@@ -277,7 +277,14 @@ pub(crate) fn resolve_block_dependencies(r: &mut Resolver<'_>, ast: &Ast, block:
             typing::prepare_value_annotation(r, ast, node);
         }
     }
-    resolve_nodes(r, ast, nodes, None);
+    let function_roots: Vec<NodeIndex> = nodes
+        .iter()
+        .copied()
+        .filter(|&node| function(ast, node))
+        .collect();
+    if !function_roots.is_empty() {
+        resolve_nodes(r, ast, nodes, Some(&function_roots));
+    }
 }
 
 fn decl_binding_node(ast: &Ast, node: NodeIndex) -> NodeIndex {
@@ -300,7 +307,7 @@ fn resolve_nodes(
     r: &mut Resolver<'_>,
     ast: &Ast,
     mut nodes: Vec<NodeIndex>,
-    root: Option<NodeIndex>,
+    roots_filter: Option<&[NodeIndex]>,
 ) {
     nodes.sort_unstable_by_key(|node| node.0);
     nodes.dedup();
@@ -393,12 +400,12 @@ fn resolve_nodes(
     // Static dependencies establish factory result contracts first. Revisit
     // only the selected receiver edges, then schedule newly resolved methods
     // before checking the consumer body. No checked AST body is replayed here.
-    let roots = root
-        .map(|root| {
-            nodes
+    let roots = roots_filter
+        .map(|targets| {
+            order
                 .iter()
-                .position(|&node| node == root)
-                .into_iter()
+                .copied()
+                .filter(|&idx| targets.contains(&nodes[idx]))
                 .collect::<Vec<_>>()
         })
         .unwrap_or(order);

@@ -109,9 +109,11 @@ fn finalize_hex(hasher: Sha256) -> String {
 pub(crate) fn single_source_key(
     source: &str,
     identity: Option<&CompilationIdentityContext>,
+    opt_level: nir::OptLevel,
 ) -> String {
     let mut hasher = new_seeded_hasher();
     hasher.update(b"single_source\0");
+    hasher.update([opt_level.as_u8()]);
     feed_str(&mut hasher, source);
     match identity {
         None => hasher.update([0u8]),
@@ -170,9 +172,11 @@ pub(crate) fn package_graph_key(
     root: &PackageSources,
     catalog: &[PackageSources],
     privileged_packages: &BTreeSet<String>,
+    opt_level: nir::OptLevel,
 ) -> String {
     let mut hasher = new_seeded_hasher();
     hasher.update(b"package_graph\0");
+    hasher.update([opt_level.as_u8()]);
     feed_package_sources(&mut hasher, root);
     hasher.update((catalog.len() as u64).to_be_bytes());
     for pkg in catalog {
