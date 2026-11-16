@@ -19,7 +19,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let mut vm = Vm::new(
+        let mut vm = Vm::new_with_workers(
             TypePool::with_intrinsics(),
             &GcConfig {
                 heap_size: 8 * 1024 * 1024,
@@ -27,6 +27,7 @@ impl Fixture {
                 gc_threads: 2,
             },
             Arc::new(StackPool::new()),
+            1,
         );
         let operation = vm.operation();
         let task = vm.spawn_root(FuncId(0));
@@ -38,7 +39,7 @@ impl Fixture {
     }
 
     fn task_mut(&mut self) -> &mut runtime::TaskState {
-        self.vm.roots.scheduler.get_task_mut(self.task).unwrap()
+        self.vm.task_mut(self.task).unwrap()
     }
 
     fn raw_capture(&mut self, text: &str, depth: usize) -> ContinuationId {
@@ -76,13 +77,7 @@ impl Fixture {
     }
 
     fn register(&self, register: Reg) -> TaggedValue {
-        self.vm
-            .roots
-            .scheduler
-            .get_task(self.task)
-            .unwrap()
-            .registers
-            .get(register)
+        self.vm.task_ref(self.task).unwrap().registers.get(register)
     }
 
     fn edge(&mut self, capture: ContinuationId, owner_register: Reg) {
@@ -102,9 +97,9 @@ impl Fixture {
         context.call_stack.clear();
         context.handler_stack.clear();
         context.display_state = None;
-        self.vm.roots.temporary_values.borrow_mut().clear();
-        assert!(self.vm.roots.constants.values().is_empty());
-        assert!(self.vm.roots.globals.values().is_empty());
+        self.vm.worker_roots().temporary_values.borrow_mut().clear();
+        assert!(self.vm.constants_read().values().is_empty());
+        assert!(self.vm.roots().globals.is_empty());
     }
 
     fn collect(&mut self) {
@@ -114,13 +109,10 @@ impl Fixture {
     }
 
     fn assert_counts(&self, captured: usize, allocated: usize) {
-        let task = self.vm.roots.scheduler.get_task(self.task).unwrap();
+        let task = self.vm.task_ref(self.task).unwrap();
         assert!(matches!(task.status, TaskStatus::Ready));
         assert_eq!(task.stacks.captured_count(), captured);
-        assert_eq!(
-            self.vm.roots.scheduler.stack_pool().active_count(),
-            allocated
-        );
+        assert_eq!(self.vm.scheduler().stack_pool().active_count(), allocated);
     }
 
     fn assert_payload(&mut self, capture: ContinuationId, text: &str, depth: usize) {
@@ -144,9 +136,7 @@ impl Fixture {
 
     fn has_capture(&self, capture: ContinuationId) -> bool {
         self.vm
-            .roots
-            .scheduler
-            .get_task(self.task)
+            .task_ref(self.task)
             .unwrap()
             .stacks
             .has_capture(capture)
@@ -154,9 +144,7 @@ impl Fixture {
 
     fn root_context_count(&self) -> usize {
         self.vm
-            .roots
-            .scheduler
-            .get_task(self.task)
+            .task_ref(self.task)
             .unwrap()
             .stacks
             .root_contexts()
@@ -253,8 +241,10 @@ fn managed_capture_is_reclaimed_only_after_all_ordinary_register_and_frame_roots
         display_state: None,
         return_pc: 0,
         func_id: FuncId(0),
-        saved_regs: vec![(Reg(9), owner)],
+        saved_regs: runtime::SavedRegs::from_slice(&[(Reg(9), owner)]),
         local_slots: vec![owner],
+        unwind_stack: Vec::new(),
+        is_unwind_target: false,
     });
     context.handler_stack.push(runtime::EffectHandler {
         effect_type: type_pool::Intrinsic::Any.type_index(),

@@ -1,7 +1,11 @@
 //! Dynamic handlers, typed continuation values and delimiter entry/resumption.
 
+use std::sync::atomic::Ordering;
+
 use nsbc::{FuncId, Instruction, Opcode, Reg};
-use runtime::{ClosureEnv, ContinuationId, EffectHandler, PromptId, TaggedValue, TaskId};
+use runtime::{
+    ClosureEnv, ContinuationId, EffectHandler, PromptId, TaggedValue, TaskId, UnwindEntry,
+};
 use type_pool::{Intrinsic, TypeIndex, TypeKind};
 
 use crate::continuation_roots::ContinuationInputContract;
@@ -16,30 +20,29 @@ impl Vm {
     ) -> DispatchResult {
         let payload = e_payload(instruction);
         let register = Reg((payload >> 17) as u8);
-        let (effect_type, continuation_param) = if instruction.opcode
-            == Opcode::PushCapturingHandler
-        {
-            let const_index = payload & 0x1FFFF;
-            let Some(&metadata) = self.roots.constants.values().get(const_index as usize) else {
-                return DispatchResult::Error(VmError::InvalidConstant(const_index));
+        let (effect_type, continuation_param) =
+            if instruction.opcode == Opcode::PushCapturingHandler {
+                let const_index = payload & 0x1FFFF;
+                let metadata = match self.constant_value(const_index) {
+                    Ok(value) => value,
+                    Err(error) => return DispatchResult::Error(error),
+                };
+                let Some(packed) = metadata.as_u64() else {
+                    return DispatchResult::Error(VmError::TypeError);
+                };
+                let position = packed >> 32;
+                if position >= 32 {
+                    return DispatchResult::Error(VmError::TypeError);
+                }
+                (TypeIndex::from_raw(packed as u32), Some(position as u8))
+            } else {
+                (TypeIndex::from_raw(payload & 0x1FFFF), None)
             };
-            let Some(packed) = metadata.as_u64() else {
-                return DispatchResult::Error(VmError::TypeError);
-            };
-            let position = packed >> 32;
-            if position >= 32 {
-                return DispatchResult::Error(VmError::TypeError);
-            }
-            (TypeIndex::from_raw(packed as u32), Some(position as u8))
-        } else {
-            (TypeIndex::from_raw(payload & 0x1FFFF), None)
-        };
-        let task = self
-            .roots
-            .scheduler
-            .get_task(task_id)
-            .expect("dispatched task exists");
-        let closure = task.registers.get(register);
+        let closure = self
+            .task_ref(task_id)
+            .expect("dispatched task exists")
+            .registers
+            .get(register);
         let layout = match Self::closure_layout(closure) {
             Ok(layout) => layout,
             Err(error) => return DispatchResult::Error(error),
@@ -48,13 +51,11 @@ impl Vm {
         if let Err(error) = self.check_entry_environment(handler_func, Some(closure)) {
             return DispatchResult::Error(error);
         }
-        let scope_id = self.state.next_handler_scope_id;
-        self.state.next_handler_scope_id = scope_id.wrapping_add(1);
-        let task = self
-            .roots
-            .scheduler
-            .get_task_mut(task_id)
-            .expect("dispatched task exists");
+        let scope_id = self
+            .shared
+            .next_handler_scope_id
+            .fetch_add(1, Ordering::Relaxed);
+        let task = self.task_mut(task_id).expect("dispatched task exists");
         task.handler_stack.push(EffectHandler {
             effect_type,
             handler_func,
@@ -62,6 +63,7 @@ impl Vm {
             continuation_param,
             scope_id,
         });
+        task.unwind_stack.push(UnwindEntry::HandlerScope(scope_id));
         DispatchResult::Continue
     }
 
@@ -70,7 +72,7 @@ impl Vm {
         task_id: TaskId,
         instruction: &Instruction,
     ) -> DispatchResult {
-        if self.state.native_frame_depth > 0 {
+        if self.worker.native_frame_depth > 0 {
             return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
         }
         let payload = e_payload(instruction);
@@ -79,81 +81,88 @@ impl Vm {
         if arg_count as usize > runtime::GP_REGISTER_COUNT {
             return DispatchResult::Error(VmError::TypeError);
         }
-        let task = self
-            .roots
-            .scheduler
-            .get_task(task_id)
-            .expect("dispatched task exists");
-        let Some(handler) = task
-            .stacks
-            .find_handler(effect)
-            .cloned()
-            .or_else(|| self.roots.scheduler.find_ancestor_handler(task_id, effect))
-        else {
-            return DispatchResult::Error(VmError::UnhandledEffect(effect));
+        let (handler, is_from_ancestor) = {
+            let task = self.task_ref(task_id).expect("dispatched task exists");
+            match task.find_handler_with_ancestors(effect) {
+                Some((found, from_ancestor)) => (*found, from_ancestor),
+                None => return DispatchResult::Error(VmError::UnhandledEffect(effect)),
+            }
         };
-        let code = match self.checked_function(handler.handler_func) {
-            Ok(code) => code,
+        let has_trait_param = match self.checked_function(handler.handler_func) {
+            Ok(code) => code.abi.parameters.iter().any(|parameter| {
+                matches!(
+                    parameter,
+                    nsbc::ParameterAbi::Trait { .. } | nsbc::ParameterAbi::TraitSelf { .. }
+                )
+            }),
             Err(error) => return DispatchResult::Error(error),
         };
-        // EffectCallDyn carries logical raw values and has no lexical
-        // acquisition context. A physical effect opcode would be needed to preserve
-        // proofs for bare trait arguments; never guess handler authority here.
-        if code.abi.parameters.iter().any(|parameter| {
-            matches!(
-                parameter,
-                nsbc::ParameterAbi::Trait { .. } | nsbc::ParameterAbi::TraitSelf { .. }
-            )
-        }) {
+        if has_trait_param {
             return DispatchResult::Error(VmError::UnsupportedFunctionAbi);
         }
-        let Some(effect_type) = self.state.type_pool.canonical_type(effect) else {
-            return DispatchResult::Error(VmError::InvalidType(effect));
+        let cached_effect = self.sync_meta_cache().effect_meta.get(&effect).copied();
+        let (input_type, is_async) = match cached_effect {
+            Some(pair) => pair,
+            None => {
+                let pair = {
+                    let tp = self.type_pool_read();
+                    let Some(effect_type) = tp.canonical_type(effect) else {
+                        return DispatchResult::Error(VmError::InvalidType(effect));
+                    };
+                    let TypeKind::Effect {
+                        ret: raw_ret,
+                        is_async,
+                        ..
+                    } = tp.get(effect_type).kind
+                    else {
+                        return DispatchResult::Error(VmError::InvalidType(effect));
+                    };
+                    let canon_ret = tp
+                        .canonical_type(raw_ret)
+                        .unwrap_or(Intrinsic::Any.type_index());
+                    (canon_ret, is_async)
+                };
+                self.sync_meta_cache().effect_meta.insert(effect, pair);
+                pair
+            }
         };
-        let TypeKind::Effect {
-            ret: input_type,
-            is_async,
-            ..
-        } = self.state.type_pool.get(effect_type).kind
-        else {
-            return DispatchResult::Error(VmError::InvalidType(effect));
-        };
-        let task = self
-            .roots
-            .scheduler
-            .get_task(task_id)
-            .expect("dispatched task exists");
-        let args: Vec<TaggedValue> = task.registers.regs[..arg_count as usize].to_vec();
         if is_async {
             if handler.continuation_param.is_some() {
                 return DispatchResult::Error(VmError::TypeError);
             }
-            return self.spawn_async_effect(task_id, &handler, input_type, &args);
+            return self.spawn_async_effect(task_id, &handler, input_type, arg_count);
+        }
+        let args: Vec<TaggedValue> = self
+            .task_ref(task_id)
+            .expect("dispatched task exists")
+            .registers
+            .regs[..arg_count as usize]
+            .to_vec();
+        if is_from_ancestor && handler.continuation_param.is_some() {
+            return DispatchResult::Error(VmError::CrossTaskContinuationCapture);
         }
         let argument_count = args.len();
         let mut values = args;
         values.push(handler.closure_env);
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&values, |vm| {
             if let Some(position) = handler.continuation_param {
                 if position as usize > argument_count {
                     return Err(VmError::TypeError);
                 }
-                let task = vm
-                    .roots
-                    .scheduler
-                    .get_task_mut(task_id)
-                    .expect("dispatched task exists");
-                let handle = match task.stacks.capture(PromptId(effect.as_u32()), Reg(0)) {
+                let handle = match vm
+                    .task_mut(task_id)
+                    .expect("dispatched task exists")
+                    .stacks
+                    .capture(PromptId(effect.as_u32()), Reg(0))
+                {
                     Ok(handle) => handle,
                     Err(error) => return Err(VmError::Stack(error)),
                 };
                 let continuation = match vm.alloc_effect_continuation(task_id, handle, input_type) {
                     Some(continuation) => continuation,
                     None => {
-                        vm.roots
-                            .scheduler
-                            .get_task_mut(task_id)
+                        vm.task_mut(task_id)
                             .expect("dispatched task exists")
                             .stacks
                             .discard(handle)
@@ -161,7 +170,7 @@ impl Vm {
                         return Err(VmError::OutOfMemory);
                     }
                 };
-                let roots = vm.roots.temporary_values.borrow();
+                let roots = vm.worker_roots().temporary_values.borrow();
                 let mut args = roots[base..base + argument_count].to_vec();
                 let environment = roots[base + argument_count];
                 drop(roots);
@@ -173,7 +182,7 @@ impl Vm {
                     &args,
                 ));
             }
-            let roots = vm.roots.temporary_values.borrow();
+            let roots = vm.worker_roots().temporary_values.borrow();
             let args = roots[base..base + argument_count].to_vec();
             let environment = roots[base + argument_count];
             drop(roots);
@@ -199,7 +208,7 @@ impl Vm {
     ) -> Option<TaggedValue> {
         let contract = ContinuationInputContract {
             input,
-            scope: self.state.type_query_scope,
+            scope: self.worker.type_query_scope,
         };
         self.alloc_continuation_with_contract(task, handle, contract)
     }
@@ -219,12 +228,10 @@ impl Vm {
         // SAFETY: the caller holds an operation and publishes the initialized
         // wrapper before the next safe point or operation exit.
         let pointer = unsafe {
-            self.state
+            self.worker
                 .heap
                 .alloc_object(Intrinsic::Continuation.type_index(), 1)?
         };
-        // The generic GC scanner treats payload words as TaggedValues. A raw
-        // handle divisible by eight would look like an invalid heap pointer.
         let payload = TaggedValue::from_u64(handle.as_u64()).raw();
         // SAFETY: the freshly allocated, 8-byte aligned payload has one u64 word.
         unsafe {
@@ -238,7 +245,7 @@ impl Vm {
         task_id: TaskId,
         instruction: &Instruction,
     ) -> DispatchResult {
-        if self.state.native_frame_depth > 0 {
+        if self.worker.native_frame_depth > 0 {
             return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
         }
         let payload = e_payload(instruction);
@@ -246,12 +253,11 @@ impl Vm {
             return DispatchResult::Error(VmError::InvalidInstruction(instruction.encode()));
         }
         let (body, count) = Instruction::e_control_regs(payload);
-        let task = self
-            .roots
-            .scheduler
-            .get_task(task_id)
-            .expect("dispatched task exists");
-        let environment = task.registers.get(body);
+        let environment = self
+            .task_ref(task_id)
+            .expect("dispatched task exists")
+            .registers
+            .get(body);
         let layout = match Self::closure_layout(environment) {
             Ok(layout) => layout,
             Err(error) => return DispatchResult::Error(error),
@@ -267,32 +273,32 @@ impl Vm {
         if capture_count as usize > runtime::GP_REGISTER_COUNT {
             return DispatchResult::Error(VmError::TypeError);
         }
-        let Some(code) = self.state.bytecode.try_get_function(function) else {
+        let Some(code) = self.shared.bytecode.try_get_function(function) else {
             return DispatchResult::Error(VmError::InvalidFunction(function));
         };
         if code.param_count as u32 != capture_count {
             return DispatchResult::Error(VmError::TypeError);
         }
-        let Some(start) = task.handler_stack.len().checked_sub(count.0 as usize) else {
-            return DispatchResult::Error(VmError::TypeError);
+        let (prompts, handlers, captures) = {
+            let task = self.task_ref(task_id).expect("dispatched task exists");
+            let Some(start) = task.handler_stack.len().checked_sub(count.0 as usize) else {
+                return DispatchResult::Error(VmError::TypeError);
+            };
+            let prompts: Vec<_> = task.handler_stack[start..]
+                .iter()
+                .filter(|handler| handler.continuation_param.is_some())
+                .map(|handler| PromptId(handler.effect_type.as_u32()))
+                .collect();
+            let handlers = task.stacks.effective_handlers();
+            let captures: Vec<_> = (0..capture_count)
+                .map(|index| {
+                    // SAFETY: index is bounded by the checked closure capture count.
+                    unsafe { ClosureEnv::get_capture(layout.pointer, index) }
+                })
+                .collect();
+            (prompts, handlers, captures)
         };
-        let prompts: Vec<_> = task.handler_stack[start..]
-            .iter()
-            .filter(|handler| handler.continuation_param.is_some())
-            .map(|handler| PromptId(handler.effect_type.as_u32()))
-            .collect();
-        let handlers = task.stacks.effective_handlers();
-        let captures: Vec<_> = (0..capture_count)
-            .map(|index| {
-                // SAFETY: index is bounded by the checked closure capture count.
-                unsafe { ClosureEnv::get_capture(layout.pointer, index) }
-            })
-            .collect();
-        let task = self
-            .roots
-            .scheduler
-            .get_task_mut(task_id)
-            .expect("dispatched task exists");
+        let task = self.task_mut(task_id).expect("dispatched task exists");
         match task.stacks.enter_delimiters(&prompts, function, &captures) {
             Ok(()) => {
                 task.handler_stack = handlers;
@@ -312,15 +318,14 @@ impl Vm {
             return DispatchResult::Error(VmError::InvalidInstruction(instruction.encode()));
         }
         let (continuation, value) = Instruction::e_control_regs(payload);
-        let task = self
-            .roots
-            .scheduler
-            .get_task(task_id)
-            .expect("dispatched task exists");
+        let (cont_val, arg_val) = {
+            let task = self.task_ref(task_id).expect("dispatched task exists");
+            (task.registers.get(continuation), task.registers.get(value))
+        };
         self.resume_language_continuation(
             task_id,
-            task.registers.get(continuation),
-            task.registers.get(value),
+            cont_val,
+            arg_val,
             instruction.opcode == Opcode::ResumeContinuationOnce,
         )
     }
@@ -364,32 +369,28 @@ impl Vm {
         value: TaggedValue,
         once: bool,
     ) -> DispatchResult {
-        if self.state.native_frame_depth > 0 {
+        if self.worker.native_frame_depth > 0 {
             return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
         }
         let result = self.with_temporary_roots(&[continuation, value], |vm| {
             let handle = Self::language_continuation_handle(continuation)?;
             let contract = vm.continuation_input_contract(task_id, handle)?;
-            let previous_scope = vm.state.type_query_scope;
-            vm.state.type_query_scope = contract.scope;
+            let previous_scope = vm.worker.type_query_scope;
+            vm.worker.type_query_scope = contract.scope;
             let checked = vm.assert_value_type(value, contract.input);
-            vm.state.type_query_scope = previous_scope;
+            vm.worker.type_query_scope = previous_scope;
             let checked = checked?;
-            // Conversion may allocate; the owner and source remain rooted until
-            // the converted value is installed in the resumed context below.
-            let task = vm
-                .roots
-                .scheduler
-                .get_task_mut(task_id)
-                .expect("validated capture's task exists");
             if once {
-                task.stacks
+                vm.task_mut(task_id)
+                    .expect("validated capture's task exists")
+                    .stacks
                     .resume(handle, checked)
                     .map_err(VmError::Stack)?;
-                vm.roots.continuations.remove(&handle);
+                vm.roots().continuations.lock().remove(&handle);
             } else {
-                // Validate before branching so a failed input cannot grow the pool
-                // or consume the preserved multi-shot template.
+                let task = vm
+                    .task_mut(task_id)
+                    .expect("validated capture's task exists");
                 let branch = task.stacks.fork(handle).map_err(VmError::Stack)?;
                 task.stacks
                     .resume(branch, checked)
@@ -408,7 +409,7 @@ impl Vm {
         task_id: TaskId,
         continuation: TaggedValue,
     ) -> DispatchResult {
-        if self.state.native_frame_depth > 0 {
+        if self.worker.native_frame_depth > 0 {
             return DispatchResult::Error(VmError::EffectAcrossNativeFrame);
         }
         let handle = match Self::language_continuation_handle(continuation) {
@@ -419,33 +420,29 @@ impl Vm {
             Ok(contract) => contract,
             Err(error) => return DispatchResult::Error(error),
         };
-        let task = self
-            .roots
-            .scheduler
-            .get_task_mut(task_id)
-            .expect("dispatched task exists");
-        let branch = match task.stacks.fork(handle) {
+        let branch = match self
+            .task_mut(task_id)
+            .expect("dispatched task exists")
+            .stacks
+            .fork(handle)
+        {
             Ok(branch) => branch,
             Err(error) => return DispatchResult::Error(VmError::Stack(error)),
         };
         match self.alloc_continuation_with_contract(task_id, branch, contract) {
             Some(value) => {
-                self.roots
-                    .scheduler
-                    .get_task_mut(task_id)
+                self.task_mut(task_id)
                     .expect("dispatched task exists")
                     .registers
                     .set(Reg(0), value);
                 DispatchResult::Continue
             }
             None => {
-                // No language value owns the new branch if allocation fails.
-                let task = self
-                    .roots
-                    .scheduler
-                    .get_task_mut(task_id)
-                    .expect("dispatched task exists");
-                let _ = task.stacks.discard(branch);
+                let _ = self
+                    .task_mut(task_id)
+                    .expect("dispatched task exists")
+                    .stacks
+                    .discard(branch);
                 DispatchResult::Error(VmError::OutOfMemory)
             }
         }
@@ -458,13 +455,23 @@ impl Vm {
         environment: Option<TaggedValue>,
         args: &[TaggedValue],
     ) -> DispatchResult {
+        if self.checked_function(function).is_ok_and(|code| {
+            code.abi.parameters.len() == args.len()
+                && code
+                    .abi
+                    .parameters
+                    .iter()
+                    .all(|p| *p == nsbc::ParameterAbi::Value)
+        }) {
+            return self.invoke_closure_physical(task_id, function, environment, args);
+        }
         let mut roots = args.to_vec();
         roots.extend(environment);
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&roots, |vm| {
             let physical = vm.expand_logical_arguments(function, args)?;
             let environment =
-                environment.map(|_| vm.roots.temporary_values.borrow()[base + args.len()]);
+                environment.map(|_| vm.worker_roots().temporary_values.borrow()[base + args.len()]);
             Ok(vm.invoke_closure_physical(task_id, function, environment, &physical))
         })
         .unwrap_or_else(DispatchResult::Error)
@@ -486,42 +493,42 @@ impl Vm {
         if let Err(error) = self.check_physical_arguments(function, args) {
             return DispatchResult::Error(error);
         }
-        let mut parameters = Vec::new();
+        let mut param_buf = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+        let mut total_len = 0usize;
         if let Some(environment) = environment {
             let layout = match Self::closure_layout(environment) {
                 Ok(layout) => layout,
                 Err(error) => return DispatchResult::Error(error),
             };
-            let count = layout.capture_count;
-            if count as usize + args.len() > runtime::GP_REGISTER_COUNT {
+            let count = layout.capture_count as usize;
+            if count + args.len() > runtime::GP_REGISTER_COUNT {
                 return DispatchResult::Error(VmError::TypeError);
             }
-            for index in 0..count {
+            for (index, slot) in param_buf.iter_mut().enumerate().take(count) {
                 // SAFETY: index is within the initialized capture array.
-                parameters.push(unsafe { ClosureEnv::get_capture(layout.pointer, index) });
+                *slot = unsafe { ClosureEnv::get_capture(layout.pointer, index as u32) };
             }
+            total_len = count;
         }
-        parameters.extend_from_slice(args);
-        let Some(code) = self.state.bytecode.try_get_function(function) else {
-            return DispatchResult::Error(VmError::InvalidFunction(function));
+        param_buf[total_len..total_len + args.len()].copy_from_slice(args);
+        total_len += args.len();
+        let parameters = &param_buf[..total_len];
+        let param_count = match self.shared.bytecode.try_get_function(function) {
+            Some(code) => code.param_count,
+            None => return DispatchResult::Error(VmError::InvalidFunction(function)),
         };
-        if code.param_count as usize != parameters.len() {
+        if param_count as usize != parameters.len() {
             return DispatchResult::Error(VmError::ArityError {
-                expected: code.param_count,
+                expected: param_count,
                 got: parameters.len() as u8,
             });
         }
-        // Save the caller before installing closure parameters, including captures.
-        let outcome = self.push_call_frame(task_id, function, &parameters);
+        let outcome = self.push_call_frame(task_id, function, parameters);
         if !matches!(outcome, DispatchResult::Continue) {
             return outcome;
         }
-        let task = self
-            .roots
-            .scheduler
-            .get_task_mut(task_id)
-            .expect("dispatched task exists");
-        task.registers.regs[..parameters.len()].copy_from_slice(&parameters);
+        let task = self.task_mut(task_id).expect("dispatched task exists");
+        task.registers.regs[..parameters.len()].copy_from_slice(parameters);
         outcome
     }
 }
@@ -539,8 +546,6 @@ mod tests {
             let pointer = continuation.as_heap_ptr().unwrap();
             // SAFETY: alloc_continuation initialized this live one-word payload.
             let payload = unsafe { pointer.cast::<u64>().read() };
-            // GC's generic payload slot scanner recognizes aligned, nonzero
-            // words as pointers; the handle must retain an immediate tag.
             assert_ne!(payload & 0b111, 0);
             assert_eq!(Vm::language_continuation_handle(continuation).unwrap(), id);
         }

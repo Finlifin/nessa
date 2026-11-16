@@ -5,6 +5,7 @@ use runtime::TaggedValue;
 use str_interner::StrId;
 use type_pool::{FieldInfo, TypeIndex, TypeKind};
 
+use crate::collections::{read_u64_atomic, write_u64_atomic};
 use crate::{Vm, VmError};
 
 pub(super) struct EnumLayout {
@@ -19,12 +20,9 @@ pub(super) struct EnumLayout {
 
 impl Vm {
     fn enum_descriptor(&self, ty: TypeIndex, variant: u32) -> Result<EnumLayout, VmError> {
-        let ty = self
-            .state
-            .type_pool
-            .canonical_type(ty)
-            .ok_or(VmError::InvalidType(ty))?;
-        let TypeKind::Enum { name, variants } = &self.state.type_pool.get(ty).kind else {
+        let tp = self.type_pool_read();
+        let ty = tp.canonical_type(ty).ok_or(VmError::InvalidType(ty))?;
+        let TypeKind::Enum { name, variants } = &tp.get(ty).kind else {
             return Err(VmError::TypeError);
         };
         let selected = variants
@@ -76,19 +74,20 @@ impl Vm {
             self.error_layout(value, 0)?;
             return Ok(None);
         }
-        let ty = self
-            .state
-            .type_pool
-            .canonical_type(header.type_index)
-            .ok_or(VmError::TypeError)?;
-        if !matches!(self.state.type_pool.get(ty).kind, TypeKind::Enum { .. }) {
-            return Ok(None);
-        }
+        let ty = {
+            let tp = self.type_pool_read();
+            let ty = tp
+                .canonical_type(header.type_index)
+                .ok_or(VmError::TypeError)?;
+            if !matches!(tp.get(ty).kind, TypeKind::Enum { .. }) {
+                return Ok(None);
+            }
+            ty
+        };
         if header.payload_words() == 0 {
             return Err(VmError::TypeError);
         }
-        // SAFETY: header checked for at least one aligned initialized tag slot.
-        let (tag_type, tag) = TaggedValue::from_raw(unsafe { pointer.cast::<u64>().read() })
+        let (tag_type, tag) = TaggedValue::from_raw(read_u64_atomic(pointer as *const u64, 0))
             .as_enum()
             .ok_or(VmError::TypeError)?;
         let mut descriptor = self.enum_descriptor(tag_type, tag)?;
@@ -118,36 +117,35 @@ impl Vm {
         if values.is_empty() {
             return self.enum_constant(ty, variant);
         }
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&values, |vm| {
             for (index, field) in descriptor.fields.iter().enumerate() {
-                let value = vm.roots.temporary_values.borrow()[root + index];
+                let value = vm.worker_roots().temporary_values.borrow()[root + index];
                 let converted = vm.assert_value_type(value, field.ty)?;
-                vm.roots.temporary_values.borrow_mut()[root + index] = converted;
+                vm.worker_roots().temporary_values.borrow_mut()[root + index] = converted;
             }
             let tag = vm.enum_constant(descriptor.ty, variant)?;
             // SAFETY: every converted field occupies an updateable root. The
             // complete fresh object is initialized before another allocation.
             let payload = unsafe {
-                vm.state
+                vm.worker
                     .heap
                     .alloc_object(descriptor.ty, descriptor.words as u16)
             }
             .ok_or(VmError::OutOfMemory)?;
-            let roots = vm.roots.temporary_values.borrow();
-            // SAFETY: words includes the tag plus the maximum variant fields.
-            unsafe {
-                payload.as_ptr().cast::<u64>().write(tag.raw());
-                for index in 1..descriptor.words {
-                    let value = if index <= descriptor.fields.len() {
-                        roots[root + index - 1]
-                    } else {
-                        TaggedValue::UNIT
-                    };
-                    payload.as_ptr().cast::<u64>().add(index).write(value.raw());
-                }
-                Ok(TaggedValue::from_heap_ptr(payload.as_ptr()))
+            let roots = vm.worker_roots().temporary_values.borrow();
+            let base = payload.as_ptr().cast::<u64>();
+            write_u64_atomic(base, 0, tag.raw());
+            for index in 1..descriptor.words {
+                let value = if index <= descriptor.fields.len() {
+                    roots[root + index - 1]
+                } else {
+                    TaggedValue::UNIT
+                };
+                write_u64_atomic(base, index, value.raw());
             }
+            // SAFETY: `payload` is fully initialized.
+            Ok(unsafe { TaggedValue::from_heap_ptr(payload.as_ptr()) })
         })
     }
 
@@ -167,8 +165,7 @@ impl Vm {
     /// Nominal enums, templates and non-enum values are type errors.
     pub(super) fn iteration_step_done(&self, value: TaggedValue) -> Result<bool, VmError> {
         let layout = self.enum_layout(value)?.ok_or(VmError::TypeError)?;
-        self.state
-            .type_pool
+        self.type_pool_read()
             .checked_iteration_step_item(layout.ty)
             .map_err(|_| VmError::TypeError)?
             .ok_or(VmError::TypeError)?;
@@ -185,8 +182,7 @@ impl Vm {
             .fields
             .get(index as usize)
             .ok_or(VmError::InvalidField(index))?;
-        // SAFETY: current variant field count and complete allocation were checked.
-        let value = TaggedValue::from_raw(unsafe { layout.pointer.add(index as usize).read() });
+        let value = TaggedValue::from_raw(read_u64_atomic(layout.pointer, index as usize));
         self.assert_value_type(value, field.ty)
     }
 
@@ -224,7 +220,7 @@ mod tests {
             offset,
             has_default: false,
         };
-        vm.state.type_pool.register(TypeInfo {
+        vm.type_pool_write().register(TypeInfo {
             kind: TypeKind::Enum {
                 name: str_interner::intern("Choice"),
                 variants: vec![
@@ -255,20 +251,18 @@ mod tests {
     }
 
     fn arguments(vm: &mut Vm, values: &[TaggedValue]) -> TaggedValue {
-        let ty = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let ty = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::Any.type_index(); values.len()],
         });
-        let root = vm.roots.temporary_values.borrow().len();
+        let root = vm.worker_roots().temporary_values.borrow().len();
         vm.with_temporary_roots(values, |vm| {
             // SAFETY: source values are rooted and this fixture initializes its full payload.
-            let payload = unsafe { vm.state.heap.alloc_object(ty, values.len() as u16) }.unwrap();
-            let roots = vm.roots.temporary_values.borrow();
+            let payload = unsafe { vm.worker.heap.alloc_object(ty, values.len() as u16) }.unwrap();
+            let roots = vm.worker_roots().temporary_values.borrow();
+            let base = payload.as_ptr().cast::<u64>();
             for index in 0..values.len() {
                 let value = roots[root + index];
-                // SAFETY: index is within the fresh payload; no allocation intervenes.
-                unsafe {
-                    payload.as_ptr().cast::<u64>().add(index).write(value.raw());
-                }
+                write_u64_atomic(base, index, value.raw());
             }
             // SAFETY: initialized live managed allocation.
             Ok(unsafe { TaggedValue::from_heap_ptr(payload.as_ptr()) })
@@ -280,8 +274,7 @@ mod tests {
     fn iteration_step_distinguishes_null_and_end_and_checks_item() {
         let mut vm = make_vm();
         let ty = vm
-            .state
-            .type_pool
+            .type_pool_write()
             .intern_iteration_step(Intrinsic::Any.type_index())
             .unwrap();
         let done = vm.enum_constant(ty, type_pool::ITERATION_DONE_TAG).unwrap();
@@ -296,8 +289,7 @@ mod tests {
         assert!(vm.enum_is(yielded, descriptor).unwrap());
         assert!(vm.enum_is(done, done).unwrap());
         let typed = vm
-            .state
-            .type_pool
+            .type_pool_write()
             .intern_iteration_step(Intrinsic::I64.type_index())
             .unwrap();
         let descriptor = vm
@@ -361,7 +353,7 @@ mod tests {
                 Err(VmError::TypeError)
             ));
             let value = vm.new_enum(descriptor, args)?;
-            vm.roots.temporary_values.borrow_mut().push(value);
+            vm.worker_roots().temporary_values.borrow_mut().push(value);
             assert_eq!(vm.reflected_type(value)?, ty);
             assert!(vm.value_matches_type(value, ty, 0)?);
             assert_eq!(
@@ -430,18 +422,16 @@ mod tests {
         let args = arguments(&mut vm, &[TaggedValue::from_i64(2), TaggedValue::TRUE]);
         vm.with_temporary_roots(&[args], |vm| {
             let value = vm.new_enum(vm.enum_constant(ty, 2)?, args)?;
-            vm.roots.temporary_values.borrow_mut().push(value);
+            vm.worker_roots().temporary_values.borrow_mut().push(value);
             let pointer = value.as_heap_ptr().unwrap().cast_mut().cast::<u64>();
-            // SAFETY: corrupt this owned test object's tag, retaining its allocation bounds.
-            unsafe {
-                pointer.write(vm.enum_constant(other, 2)?.raw());
-            }
+            write_u64_atomic(pointer, 0, vm.enum_constant(other, 2)?.raw());
             assert!(matches!(vm.enum_layout(value), Err(VmError::TypeError)));
             assert!(matches!(vm.reflected_type(value), Err(VmError::TypeError)));
             Ok(())
         })
         .unwrap();
     }
+
     #[test]
     fn enum_is_and_comparison_opcodes_preserve_nominal_discriminants() {
         use crate::DispatchResult;
@@ -473,12 +463,7 @@ mod tests {
         });
         let task = vm.spawn_root(FuncId(0));
         let value = vm.enum_constant(ty, 0).unwrap();
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(0), value);
+        vm.task_mut(task).unwrap().registers.set(Reg(0), value);
         for (descriptor, expected) in [(own, true), (foreign, false)] {
             assert!(matches!(
                 vm.dispatch(
@@ -488,22 +473,11 @@ mod tests {
                 DispatchResult::Continue
             ));
             assert_eq!(
-                vm.roots
-                    .scheduler
-                    .get_task(task)
-                    .unwrap()
-                    .registers
-                    .get(Reg(1))
-                    .as_bool(),
+                vm.task_ref(task).unwrap().registers.get(Reg(1)).as_bool(),
                 Some(expected)
             );
         }
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(2), value);
+        vm.task_mut(task).unwrap().registers.set(Reg(2), value);
         assert!(matches!(
             vm.dispatch(
                 task,
@@ -512,13 +486,7 @@ mod tests {
             DispatchResult::Continue
         ));
         assert_eq!(
-            vm.roots
-                .scheduler
-                .get_task(task)
-                .unwrap()
-                .registers
-                .get(Reg(1))
-                .as_bool(),
+            vm.task_ref(task).unwrap().registers.get(Reg(1)).as_bool(),
             Some(true)
         );
         assert!(matches!(
@@ -534,16 +502,9 @@ mod tests {
             ),
             DispatchResult::Continue
         ));
-        assert_eq!(
-            vm.roots
-                .scheduler
-                .get_task(task)
-                .unwrap()
-                .registers
-                .get(Reg(1)),
-            value
-        );
+        assert_eq!(vm.task_ref(task).unwrap().registers.get(Reg(1)), value);
     }
+
     #[test]
     fn registered_self_methods_dispatch_for_nullary_and_heap_enum_values() {
         use nsbc::{AddrMode, Opcode};
@@ -551,7 +512,7 @@ mod tests {
             let mut vm = make_vm();
             let ty = enum_type(&mut vm, 1);
             let method = str_interner::intern("value");
-            vm.state.type_pool.add_method(
+            vm.type_pool_write().add_method(
                 ty,
                 type_pool::MethodSlot {
                     name: method,
@@ -608,12 +569,7 @@ mod tests {
             } else {
                 vm.enum_constant(ty, 0).unwrap()
             };
-            vm.roots
-                .scheduler
-                .get_task_mut(task)
-                .unwrap()
-                .registers
-                .set(Reg(20), value);
+            vm.task_mut(task).unwrap().registers.set(Reg(20), value);
             assert!(matches!(vm.run(), VmResult::Finished));
             assert_eq!(vm.task_result_i64(task).unwrap(), 42);
         }

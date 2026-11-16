@@ -84,13 +84,24 @@ fetch_data()# {
 
 ## Future 与 Await
 
-### `Future` 类型
+### `Future(T)` 类型与组合子静态类型推导
 
-`Future` 是一个内建类型，表示一个异步计算的惰性结果引用：
+`Future(T)` 是一个一等参数化内建类型，保留异步效应的精确返回类型（含受检错误集）：
 
 ```nessa
-let future: Future<!NetErr Response> = http.get(url)#
+let future: Future(!NetErr Response) = http.get(url)#
 ```
+
+除单个 `.await` 外，`std.task` 与 `List` 组合子同样支持编译期精确类型精化，无需手工 `.as(...)` 强转：
+
+| 调用形式 | 编译期精化结果 |
+|---|---|
+| `xs.await_all()` / `task.await_all(xs)`（元素为 `Future(T)`） | 元素类型被追踪为 `T` 的 `List`（索引/模式解构直接得到 `T`） |
+| `xs.await_any()` / `task.await_any(xs)`（元素为 `Future(T)`） | `T` |
+| `task.await_first(fa, fb)`（`Future(A)` 与 `Future(B)`） | `Either`，解构 `Left(a)` / `Right(b)` 或调用 `unwrap_left()` / `unwrap_right()` 自动精化为 `A` / `B` |
+| `task.with_timeout(ms, thunk)`（`thunk: fn() -> !E T`） | `![TimeoutError, ...E] T` |
+
+若向 `await_all`、`await_any` 或 `await_first` 传入静态已知的非 `Future` 元素，编译器会在类型检查阶段直接报错拒绝。
 
 ### `.await` 操作
 
@@ -165,12 +176,14 @@ fn compute_while_waiting() -> #http.get Unit {
 
 ### Safe-Point 插入位置
 
-编译器在以下位置自动插入 safe-point：
+编译器仅在以下两类收敛位置发射 `Opcode::Safepoint`（避免逐指令检查开销）：
 
 | 位置 | 说明 |
 |------|------|
-| 循环回边 | `while` / `for` 循环每次迭代前 |
-| 函数调用 | 每次函数调用前后 |
+| 循环回边 | `while` / `for` 循环头及所有回边跳转目标 |
+| 函数入口 | 每个编译函数的入口（覆盖直接调用与相互递归） |
+
+此外，`.await`、`std.sync` 原语等待以及 `libuv` 非阻塞 I/O 调用属于显式挂起点，任务在未就绪时会释放当前 Worker 线程供其它就绪任务运行。
 
 ## 错误处理
 

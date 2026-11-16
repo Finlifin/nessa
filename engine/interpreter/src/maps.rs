@@ -4,6 +4,7 @@ use gc::ObjectHeader;
 use runtime::TaggedValue;
 use type_pool::CollectionRole;
 
+use crate::collections::{read_u64_atomic, write_u64_atomic};
 use crate::{Vm, VmError};
 
 const MAX_CAPACITY: usize = 8192;
@@ -32,10 +33,8 @@ fn string_key(value: TaggedValue) -> Result<String, VmError> {
 }
 
 impl MapLayout {
-    fn slot(&self, bucket: usize, field: usize) -> TaggedValue {
-        // SAFETY: MapLayout validates the four-word bucket region. Callers use
-        // bucket < capacity and field < 4 while the rooted operation is active.
-        TaggedValue::from_raw(unsafe { self.buffer.add(bucket * 4 + field).read() })
+    pub(super) fn slot(&self, bucket: usize, field: usize) -> TaggedValue {
+        TaggedValue::from_raw(read_u64_atomic(self.buffer, bucket * 4 + field))
     }
 
     fn bucket_state(&self, bucket: usize) -> Result<u64, VmError> {
@@ -118,20 +117,16 @@ impl MapLayout {
     }
 
     fn write_bucket(&self, bucket: usize, hash: u64, key: TaggedValue, value: TaggedValue) {
-        // SAFETY: bucket is a checked occupied/vacant slot in this managed buffer;
-        // both references are rooted and no allocation or safepoint intervenes.
-        unsafe {
-            let slot = self.buffer.add(bucket * 4);
-            slot.write(TaggedValue::from_u64(OCCUPIED).raw());
-            slot.add(1).write(TaggedValue::from_u64(hash).raw());
-            slot.add(2).write(key.raw());
-            slot.add(3).write(value.raw());
-        }
+        let base = bucket * 4;
+        write_u64_atomic(self.buffer, base, TaggedValue::from_u64(OCCUPIED).raw());
+        write_u64_atomic(self.buffer, base + 1, TaggedValue::from_u64(hash).raw());
+        write_u64_atomic(self.buffer, base + 2, key.raw());
+        write_u64_atomic(self.buffer, base + 3, value.raw());
     }
 }
 
 impl Vm {
-    pub(super) fn map_layout(&self, value: TaggedValue) -> Result<MapLayout, VmError> {
+    pub(super) fn map_layout_unlocked(&self, value: TaggedValue) -> Result<MapLayout, VmError> {
         let pointer = value.as_heap_ptr().ok_or(VmError::TypeError)?;
         // SAFETY: operand is a live managed root in the current mutator operation.
         let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
@@ -139,8 +134,7 @@ impl Vm {
             return Err(VmError::TypeError);
         }
         if self
-            .state
-            .type_pool
+            .type_pool_read()
             .checked_collection_role(header.type_index)
             .map_err(|_| VmError::TypeError)?
             != Some(CollectionRole::Map)
@@ -149,14 +143,9 @@ impl Vm {
             return Err(VmError::TypeError);
         }
         let wrapper = pointer.cast_mut().cast::<u64>();
-        // SAFETY: the wrapper contains exactly three aligned tagged words.
-        let (length, capacity, buffer) = unsafe {
-            (
-                TaggedValue::from_raw(wrapper.read()),
-                TaggedValue::from_raw(wrapper.add(1).read()),
-                TaggedValue::from_raw(wrapper.add(2).read()),
-            )
-        };
+        let length = TaggedValue::from_raw(read_u64_atomic(wrapper, 0));
+        let capacity = TaggedValue::from_raw(read_u64_atomic(wrapper, 1));
+        let buffer = TaggedValue::from_raw(read_u64_atomic(wrapper, 2));
         let length = length
             .as_u64()
             .and_then(|v| usize::try_from(v).ok())
@@ -189,8 +178,7 @@ impl Vm {
             return Err(VmError::TypeError);
         }
         if self
-            .state
-            .type_pool
+            .type_pool_read()
             .checked_collection_role(header.type_index)
             .map_err(|_| VmError::TypeError)?
             != Some(CollectionRole::MapBuffer)
@@ -198,38 +186,53 @@ impl Vm {
         {
             return Err(VmError::TypeError);
         }
-        let layout = MapLayout {
+        Ok(MapLayout {
             wrapper,
             buffer: buffer.cast_mut().cast(),
             length,
             capacity,
-        };
-        // Collection roles cannot be mutated by ordinary field/object opcodes.
-        // Check touched buckets in find; traversing the whole table here would
-        // make a sequence of inserts quadratic even without hash collisions.
-        Ok(layout)
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn map_layout(&self, value: TaggedValue) -> Result<MapLayout, VmError> {
+        let _guard = self.stripe_read(value)?;
+        self.map_layout_unlocked(value)
+    }
+
+    fn snapshot_map_pairs(
+        &self,
+        map: TaggedValue,
+    ) -> Result<Vec<(TaggedValue, TaggedValue)>, VmError> {
+        let _guard = self.stripe_read(map)?;
+        let layout = self.map_layout_unlocked(map)?;
+        let buckets = layout.occupied_buckets()?;
+        let mut out = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let key = layout.slot(bucket, 2);
+            let _ = string_key(key)?;
+            out.push((key, layout.slot(bucket, 3)));
+        }
+        Ok(out)
     }
 
     fn map_buffer(&mut self, capacity: usize) -> Result<TaggedValue, VmError> {
         let words = u16::try_from(capacity.checked_mul(4).ok_or(VmError::ObjectTooLarge)?)
             .map_err(|_| VmError::ObjectTooLarge)?;
         let ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .map_buffer_type()
             .ok_or(VmError::TypeError)?;
-        // SAFETY: mutator owns this allocation; initialize every slot before publication.
+        // SAFETY: mutator owns this allocation with no lock held across `alloc_object`.
         let pointer =
-            unsafe { self.state.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+            unsafe { self.worker.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+        let base = pointer.as_ptr().cast::<u64>();
         for bucket in 0..capacity {
-            // SAFETY: each four-word bucket lies in the fresh payload.
-            unsafe {
-                let slot = pointer.as_ptr().cast::<u64>().add(bucket * 4);
-                slot.write(TaggedValue::from_u64(EMPTY).raw());
-                slot.add(1).write(TaggedValue::from_u64(0).raw());
-                slot.add(2).write(TaggedValue::UNIT.raw());
-                slot.add(3).write(TaggedValue::UNIT.raw());
-            }
+            let slot = bucket * 4;
+            write_u64_atomic(base, slot, TaggedValue::from_u64(EMPTY).raw());
+            write_u64_atomic(base, slot + 1, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(base, slot + 2, TaggedValue::UNIT.raw());
+            write_u64_atomic(base, slot + 3, TaggedValue::UNIT.raw());
         }
         // SAFETY: aligned, live, completely initialized managed allocation.
         Ok(unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) })
@@ -246,137 +249,124 @@ impl Vm {
                 .checked_next_power_of_two()
                 .ok_or(VmError::ObjectTooLarge)?
         };
-        let ty = self.state.type_pool.map_type().ok_or(VmError::TypeError)?;
-        self.state
-            .type_pool
-            .map_buffer_type()
-            .ok_or(VmError::TypeError)?;
+        let ty = {
+            let tp = self.type_pool_read();
+            let map_ty = tp.map_type().ok_or(VmError::TypeError)?;
+            tp.map_buffer_type().ok_or(VmError::TypeError)?;
+            map_ty
+        };
         // SAFETY: initialize the empty wrapper before any further allocation.
-        let pointer = unsafe { self.state.heap.alloc_object(ty, 3) }.ok_or(VmError::OutOfMemory)?;
-        // SAFETY: the new wrapper has exactly three aligned payload words.
-        unsafe {
-            let wrapper = pointer.as_ptr().cast::<u64>();
-            wrapper.write(TaggedValue::from_u64(0).raw());
-            wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-            wrapper.add(2).write(TaggedValue::NULL.raw());
-        }
+        let pointer =
+            unsafe { self.worker.heap.alloc_object(ty, 3) }.ok_or(VmError::OutOfMemory)?;
+        let wrapper = pointer.as_ptr().cast::<u64>();
+        write_u64_atomic(wrapper, 0, TaggedValue::from_u64(0).raw());
+        write_u64_atomic(wrapper, 1, TaggedValue::from_u64(0).raw());
+        write_u64_atomic(wrapper, 2, TaggedValue::NULL.raw());
         // SAFETY: wrapper is live, aligned and initialized.
         let value = unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) };
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[value], |vm| {
             if capacity != 0 {
                 let buffer = vm.map_buffer(capacity)?;
-                vm.roots.temporary_values.borrow_mut().push(buffer);
-                let value = vm.roots.temporary_values.borrow()[root];
-                let layout = vm.map_layout(value)?;
-                // SAFETY: no safepoint follows; publish the completed buffer atomically
-                // with respect to VM operations and collection root scanning.
-                unsafe {
-                    layout
-                        .wrapper
-                        .add(1)
-                        .write(TaggedValue::from_u64(capacity as u64).raw());
-                    layout.wrapper.add(2).write(buffer.raw());
-                }
+                vm.worker_roots().temporary_values.borrow_mut().push(buffer);
+                let value = vm.worker_roots().temporary_values.borrow()[root];
+                let layout = vm.map_layout_unlocked(value)?;
+                write_u64_atomic(
+                    layout.wrapper,
+                    1,
+                    TaggedValue::from_u64(capacity as u64).raw(),
+                );
+                write_u64_atomic(layout.wrapper, 2, buffer.raw());
             }
-            Ok(vm.roots.temporary_values.borrow()[root])
+            Ok(vm.worker_roots().temporary_values.borrow()[root])
         })
     }
 
     pub(super) fn map_len(&self, map: TaggedValue) -> Result<usize, VmError> {
-        Ok(self.map_layout(map)?.length)
+        let _guard = self.stripe_read(map)?;
+        Ok(self.map_layout_unlocked(map)?.length)
     }
 
-    fn map_column(&mut self, map: TaggedValue, field: usize) -> Result<TaggedValue, VmError> {
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[map], |vm| {
-            // Validate all buckets and the occupied count before allocation.
-            let layout = vm.map_layout(map)?;
-            let buckets = layout.occupied_buckets()?;
-            for &bucket in &buckets {
-                string_key(layout.slot(bucket, 2))?;
+    fn map_column(&mut self, map: TaggedValue, select_key: bool) -> Result<TaggedValue, VmError> {
+        let pairs = self.snapshot_map_pairs(map)?;
+        let selected: Vec<TaggedValue> = pairs
+            .into_iter()
+            .map(|(k, v)| if select_key { k } else { v })
+            .collect();
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&selected, |vm| {
+            let column = vm.new_list(selected.len())?;
+            let layout = vm.list_layout_unlocked(column)?;
+            let roots = vm.worker_roots().temporary_values.borrow();
+            for index in 0..selected.len() {
+                write_u64_atomic(layout.buffer, index, roots[base + index].raw());
             }
-            let column = vm.new_list(buckets.len())?;
-            vm.with_temporary_roots(&[column], |vm| {
-                // Reacquire the layout after allocating the List. No managed
-                // allocation or callback occurs while copying the live slots.
-                let map = vm.roots.temporary_values.borrow()[root];
-                let layout = vm.map_layout(map)?;
-                for (index, bucket) in buckets.into_iter().enumerate() {
-                    vm.list_set(
-                        column,
-                        TaggedValue::from_u64(index as u64),
-                        layout.slot(bucket, field),
-                    )?;
-                }
-                Ok(column)
-            })
+            Ok(column)
         })
     }
 
     pub(super) fn map_keys(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
-        self.map_column(map, 2)
+        self.map_column(map, true)
     }
 
     pub(super) fn map_values(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
-        self.map_column(map, 3)
+        self.map_column(map, false)
     }
 
     pub(super) fn map_entries(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[map], |vm| {
-            let layout = vm.map_layout(map)?;
-            let buckets = layout.occupied_buckets()?;
-            for &bucket in &buckets {
-                string_key(layout.slot(bucket, 2))?;
+        let pairs = self.snapshot_map_pairs(map)?;
+        let count = pairs.len();
+        let mut flat = Vec::with_capacity(count * 2);
+        for (k, v) in pairs {
+            flat.push(k);
+            flat.push(v);
+        }
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&flat, |vm| {
+            let column = vm.new_list(count)?;
+            let col_slot = vm.worker_roots().temporary_values.borrow().len();
+            vm.worker_roots().temporary_values.borrow_mut().push(column);
+            let str_ty = type_pool::Intrinsic::Str.type_index();
+            let any_ty = type_pool::Intrinsic::Any.type_index();
+            for index in 0..count {
+                let (key, value) = {
+                    let roots = vm.worker_roots().temporary_values.borrow();
+                    (roots[base + index * 2], roots[base + index * 2 + 1])
+                };
+                let pair = vm.alloc_tuple(&[str_ty, any_ty], &[key, value])?;
+                let column = vm.worker_roots().temporary_values.borrow()[col_slot];
+                vm.list_set(column, TaggedValue::from_u64(index as u64), pair)?;
             }
-            let column = vm.new_list(buckets.len())?;
-            vm.with_temporary_roots(&[column], |vm| {
-                let str_ty = type_pool::Intrinsic::Str.type_index();
-                let any_ty = type_pool::Intrinsic::Any.type_index();
-                for (index, bucket) in buckets.into_iter().enumerate() {
-                    let map = vm.roots.temporary_values.borrow()[root];
-                    let layout = vm.map_layout(map)?;
-                    let key = layout.slot(bucket, 2);
-                    let value = layout.slot(bucket, 3);
-                    let pair = vm.alloc_tuple(&[str_ty, any_ty], &[key, value])?;
-                    let column = vm.roots.temporary_values.borrow()[root + 1];
-                    vm.list_set(column, TaggedValue::from_u64(index as u64), pair)?;
-                }
-                Ok(vm.roots.temporary_values.borrow()[root + 1])
-            })
+            Ok(vm.worker_roots().temporary_values.borrow()[col_slot])
         })
     }
 
     pub(super) fn map_copy(&mut self, map: TaggedValue) -> Result<TaggedValue, VmError> {
         let dest = self.new_map(0)?;
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[map, dest], |vm| {
-            let map = vm.roots.temporary_values.borrow()[root];
-            let dest = vm.roots.temporary_values.borrow()[root + 1];
+            let map = vm.worker_roots().temporary_values.borrow()[root];
+            let dest = vm.worker_roots().temporary_values.borrow()[root + 1];
             vm.map_merge(dest, map)?;
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+            Ok(vm.worker_roots().temporary_values.borrow()[root + 1])
         })
     }
 
     pub(super) fn map_clear(&mut self, map: TaggedValue) -> Result<(), VmError> {
-        let layout = self.map_layout(map)?;
+        let _guard = self.stripe_write(map)?;
+        let layout = self.map_layout_unlocked(map)?;
         if layout.capacity == 0 {
             return Ok(());
         }
         let _ = layout.occupied_buckets()?;
-        // SAFETY: every bucket was checked above. Empty slots drop key and value
-        // edges so a cleared entry can be collected. No allocation follows.
-        unsafe {
-            for bucket in 0..layout.capacity {
-                let slot = layout.buffer.add(bucket * 4);
-                slot.write(TaggedValue::from_u64(EMPTY).raw());
-                slot.add(1).write(TaggedValue::from_u64(0).raw());
-                slot.add(2).write(TaggedValue::UNIT.raw());
-                slot.add(3).write(TaggedValue::UNIT.raw());
-            }
-            layout.wrapper.write(TaggedValue::from_u64(0).raw());
+        for bucket in 0..layout.capacity {
+            let slot = bucket * 4;
+            write_u64_atomic(layout.buffer, slot, TaggedValue::from_u64(EMPTY).raw());
+            write_u64_atomic(layout.buffer, slot + 1, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(layout.buffer, slot + 2, TaggedValue::UNIT.raw());
+            write_u64_atomic(layout.buffer, slot + 3, TaggedValue::UNIT.raw());
         }
+        write_u64_atomic(layout.wrapper, 0, TaggedValue::from_u64(0).raw());
         Ok(())
     }
 
@@ -385,21 +375,28 @@ impl Vm {
         map: TaggedValue,
         other: TaggedValue,
     ) -> Result<(), VmError> {
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[map, other], |vm| {
-            let other = vm.roots.temporary_values.borrow()[root + 1];
-            let layout = vm.map_layout(other)?;
-            let buckets = layout.occupied_buckets()?;
-            let entries: Vec<(TaggedValue, TaggedValue)> = buckets
-                .into_iter()
-                .map(|bucket| (layout.slot(bucket, 2), layout.slot(bucket, 3)))
-                .collect();
-            for &(key, value) in &entries {
-                vm.roots.temporary_values.borrow_mut().push(key);
-                vm.roots.temporary_values.borrow_mut().push(value);
+            let other = vm.worker_roots().temporary_values.borrow()[root + 1];
+            let entries = vm.snapshot_map_pairs(other)?;
+            let count = entries.len();
+            let entry_base = vm.worker_roots().temporary_values.borrow().len();
+            {
+                let mut roots = vm.worker_roots().temporary_values.borrow_mut();
+                for &(key, value) in &entries {
+                    roots.push(key);
+                    roots.push(value);
+                }
             }
-            for (key, value) in entries {
-                let map = vm.roots.temporary_values.borrow()[root];
+            for idx in 0..count {
+                let (map, key, value) = {
+                    let roots = vm.worker_roots().temporary_values.borrow();
+                    (
+                        roots[root],
+                        roots[entry_base + idx * 2],
+                        roots[entry_base + idx * 2 + 1],
+                    )
+                };
                 vm.map_set(map, key, value)?;
             }
             Ok(())
@@ -412,11 +409,7 @@ impl Vm {
         key: TaggedValue,
         value: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
-        if self.map_contains(map, key)? {
-            return self.map_get(map, key);
-        }
-        self.map_set(map, key, value)?;
-        Ok(value)
+        Ok(self.map_set_internal(map, key, value, false)?.0)
     }
 
     pub(super) fn map_insert_absent(
@@ -425,11 +418,7 @@ impl Vm {
         key: TaggedValue,
         value: TaggedValue,
     ) -> Result<bool, VmError> {
-        if self.map_contains(map, key)? {
-            return Ok(false);
-        }
-        self.map_set(map, key, value)?;
-        Ok(true)
+        Ok(self.map_set_internal(map, key, value, false)?.1)
     }
 
     pub(super) fn map_get(
@@ -438,7 +427,8 @@ impl Vm {
         key: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let key = string_key(key)?;
-        let layout = self.map_layout(map)?;
+        let _guard = self.stripe_read(map)?;
+        let layout = self.map_layout_unlocked(map)?;
         Ok(layout
             .find(&key, key_hash(&key))?
             .0
@@ -447,8 +437,9 @@ impl Vm {
 
     pub(super) fn map_contains(&self, map: TaggedValue, key: TaggedValue) -> Result<bool, VmError> {
         let key = string_key(key)?;
+        let _guard = self.stripe_read(map)?;
         Ok(self
-            .map_layout(map)?
+            .map_layout_unlocked(map)?
             .find(&key, key_hash(&key))?
             .0
             .is_some())
@@ -460,84 +451,128 @@ impl Vm {
         key: TaggedValue,
         value: TaggedValue,
     ) -> Result<(), VmError> {
+        let _ = self.map_set_internal(map, key, value, true)?;
+        Ok(())
+    }
+
+    fn map_set_internal(
+        &mut self,
+        map: TaggedValue,
+        key: TaggedValue,
+        value: TaggedValue,
+        overwrite: bool,
+    ) -> Result<(TaggedValue, bool), VmError> {
         let text = string_key(key)?;
         let hash = key_hash(&text);
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[map, key, value], |vm| {
-            let old = vm.map_layout(map)?;
-            let (existing, available) = old.find(&text, hash)?;
-            if let Some(bucket) = existing {
-                old.write_bucket(bucket, hash, key, value);
-                return Ok(());
-            }
-            let length = old.length + 1;
-            let grow =
-                old.capacity == 0 || (length > old.capacity * 3 / 4 && old.capacity < MAX_CAPACITY);
-            if !grow {
-                let bucket = available.ok_or(VmError::ObjectTooLarge)?;
-                old.write_bucket(bucket, hash, key, value);
-                // SAFETY: wrapper is rooted and has three words, no allocation intervenes.
-                unsafe {
-                    old.wrapper
-                        .write(TaggedValue::from_u64(length as u64).raw());
-                }
-                return Ok(());
-            }
-            let capacity = old
-                .capacity
-                .checked_mul(2)
-                .ok_or(VmError::ObjectTooLarge)?
-                .max(4);
-            let buffer = vm.map_buffer(capacity)?;
-            vm.roots.temporary_values.borrow_mut().push(buffer);
-            // Reload every managed operand after buffer allocation.
-            let map = vm.roots.temporary_values.borrow()[root];
-            let key = vm.roots.temporary_values.borrow()[root + 1];
-            let value = vm.roots.temporary_values.borrow()[root + 2];
-            let old = vm.map_layout(map)?;
-            let fresh = MapLayout {
-                wrapper: old.wrapper,
-                buffer: buffer
-                    .as_heap_ptr()
-                    .ok_or(VmError::TypeError)?
-                    .cast_mut()
-                    .cast(),
-                length: 0,
-                capacity,
-            };
-            let mut occupied = 0;
-            for bucket in 0..old.capacity {
-                if old.bucket_state(bucket)? == OCCUPIED {
-                    occupied += 1;
-                    let old_key = old.slot(bucket, 2);
-                    let old_text = string_key(old_key)?;
-                    let old_hash = key_hash(&old_text);
-                    if old.slot(bucket, 1).as_u64() != Some(old_hash) {
-                        return Err(VmError::TypeError);
+            loop {
+                let needed_cap = {
+                    let map = vm.worker_roots().temporary_values.borrow()[root];
+                    let key = vm.worker_roots().temporary_values.borrow()[root + 1];
+                    let value = vm.worker_roots().temporary_values.borrow()[root + 2];
+                    let _guard = vm.stripe_write(map)?;
+                    let old = vm.map_layout_unlocked(map)?;
+                    let (existing, available) = old.find(&text, hash)?;
+                    if let Some(bucket) = existing {
+                        if overwrite {
+                            old.write_bucket(bucket, hash, key, value);
+                            return Ok((value, false));
+                        }
+                        return Ok((old.slot(bucket, 3), false));
                     }
-                    let target = fresh
-                        .find(&old_text, old_hash)?
-                        .1
-                        .ok_or(VmError::TypeError)?;
-                    fresh.write_bucket(target, old_hash, old_key, old.slot(bucket, 3));
+                    let length = old.length + 1;
+                    let grow = old.capacity == 0
+                        || (length > old.capacity * 3 / 4 && old.capacity < MAX_CAPACITY);
+                    if !grow {
+                        let bucket = available.ok_or(VmError::ObjectTooLarge)?;
+                        old.write_bucket(bucket, hash, key, value);
+                        write_u64_atomic(
+                            old.wrapper,
+                            0,
+                            TaggedValue::from_u64(length as u64).raw(),
+                        );
+                        return Ok((value, true));
+                    }
+                    old.capacity
+                        .checked_mul(2)
+                        .ok_or(VmError::ObjectTooLarge)?
+                        .max(4)
+                };
+
+                // Allocate rehash buffer outside the stripe lock.
+                let buffer = vm.map_buffer(needed_cap)?;
+                let buf_slot = vm.worker_roots().temporary_values.borrow().len();
+                vm.worker_roots().temporary_values.borrow_mut().push(buffer);
+
+                let map = vm.worker_roots().temporary_values.borrow()[root];
+                let key = vm.worker_roots().temporary_values.borrow()[root + 1];
+                let value = vm.worker_roots().temporary_values.borrow()[root + 2];
+                let buffer = vm.worker_roots().temporary_values.borrow()[buf_slot];
+                let _guard = vm.stripe_write(map)?;
+                let old = vm.map_layout_unlocked(map)?;
+                let (existing, available) = old.find(&text, hash)?;
+                if let Some(bucket) = existing {
+                    if overwrite {
+                        old.write_bucket(bucket, hash, key, value);
+                        return Ok((value, false));
+                    }
+                    return Ok((old.slot(bucket, 3), false));
                 }
+                let length = old.length + 1;
+                let grow = old.capacity == 0
+                    || (length > old.capacity * 3 / 4 && old.capacity < MAX_CAPACITY);
+                if !grow {
+                    let bucket = available.ok_or(VmError::ObjectTooLarge)?;
+                    old.write_bucket(bucket, hash, key, value);
+                    write_u64_atomic(old.wrapper, 0, TaggedValue::from_u64(length as u64).raw());
+                    return Ok((value, true));
+                }
+                if old.capacity >= needed_cap {
+                    continue;
+                }
+
+                let fresh = MapLayout {
+                    wrapper: old.wrapper,
+                    buffer: buffer
+                        .as_heap_ptr()
+                        .ok_or(VmError::TypeError)?
+                        .cast_mut()
+                        .cast(),
+                    length: 0,
+                    capacity: needed_cap,
+                };
+                let mut occupied = 0;
+                for bucket in 0..old.capacity {
+                    if old.bucket_state(bucket)? == OCCUPIED {
+                        occupied += 1;
+                        let old_key = old.slot(bucket, 2);
+                        let old_text = string_key(old_key)?;
+                        let old_hash = key_hash(&old_text);
+                        if old.slot(bucket, 1).as_u64() != Some(old_hash) {
+                            return Err(VmError::TypeError);
+                        }
+                        let target = fresh
+                            .find(&old_text, old_hash)?
+                            .1
+                            .ok_or(VmError::TypeError)?;
+                        fresh.write_bucket(target, old_hash, old_key, old.slot(bucket, 3));
+                    }
+                }
+                if occupied != old.length {
+                    return Err(VmError::TypeError);
+                }
+                let bucket = fresh.find(&text, hash)?.1.ok_or(VmError::TypeError)?;
+                fresh.write_bucket(bucket, hash, key, value);
+                write_u64_atomic(old.wrapper, 0, TaggedValue::from_u64(length as u64).raw());
+                write_u64_atomic(
+                    old.wrapper,
+                    1,
+                    TaggedValue::from_u64(needed_cap as u64).raw(),
+                );
+                write_u64_atomic(old.wrapper, 2, buffer.raw());
+                return Ok((value, true));
             }
-            if occupied != old.length {
-                return Err(VmError::TypeError);
-            }
-            let bucket = fresh.find(&text, hash)?.1.ok_or(VmError::TypeError)?;
-            fresh.write_bucket(bucket, hash, key, value);
-            // SAFETY: fresh buffer is fully initialized and registered; commit
-            // only after all fallible checks. No GC or user callback intervenes.
-            unsafe {
-                old.wrapper
-                    .write(TaggedValue::from_u64(length as u64).raw());
-                old.wrapper
-                    .add(1)
-                    .write(TaggedValue::from_u64(capacity as u64).raw());
-                old.wrapper.add(2).write(buffer.raw());
-            }
-            Ok(())
         })
     }
 
@@ -547,24 +582,23 @@ impl Vm {
         key: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let key = string_key(key)?;
-        let layout = self.map_layout(map)?;
+        let _guard = self.stripe_write(map)?;
+        let layout = self.map_layout_unlocked(map)?;
         let Some(bucket) = layout.find(&key, key_hash(&key))?.0 else {
             return Ok(TaggedValue::NULL);
         };
         let value = layout.slot(bucket, 3);
         let length = layout.length.checked_sub(1).ok_or(VmError::TypeError)?;
-        // SAFETY: checked bucket and wrapper remain live without allocations.
-        // Clear both references so removed keys and values can be collected.
-        unsafe {
-            let slot = layout.buffer.add(bucket * 4);
-            slot.write(TaggedValue::from_u64(DELETED).raw());
-            slot.add(1).write(TaggedValue::from_u64(0).raw());
-            slot.add(2).write(TaggedValue::UNIT.raw());
-            slot.add(3).write(TaggedValue::UNIT.raw());
-            layout
-                .wrapper
-                .write(TaggedValue::from_u64(length as u64).raw());
-        }
+        let slot = bucket * 4;
+        write_u64_atomic(layout.buffer, slot, TaggedValue::from_u64(DELETED).raw());
+        write_u64_atomic(layout.buffer, slot + 1, TaggedValue::from_u64(0).raw());
+        write_u64_atomic(layout.buffer, slot + 2, TaggedValue::UNIT.raw());
+        write_u64_atomic(layout.buffer, slot + 3, TaggedValue::UNIT.raw());
+        write_u64_atomic(
+            layout.wrapper,
+            0,
+            TaggedValue::from_u64(length as u64).raw(),
+        );
         Ok(value)
     }
 }
@@ -578,20 +612,23 @@ mod tests {
     fn keys_compare_by_content_and_null_is_distinct_from_absence() {
         let mut vm = make_vm();
         let map = vm.new_map(0).unwrap();
-        let root = vm.roots.temporary_values.borrow().len();
+        let root = vm.worker_roots().temporary_values.borrow().len();
         vm.with_temporary_roots(&[map], |vm| {
             let key = vm.alloc_string("same")?;
-            vm.roots.temporary_values.borrow_mut().push(key);
+            vm.worker_roots().temporary_values.borrow_mut().push(key);
             let equivalent = vm.alloc_string("same")?;
-            vm.roots.temporary_values.borrow_mut().push(equivalent);
-            let map = vm.roots.temporary_values.borrow()[root];
-            let key = vm.roots.temporary_values.borrow()[root + 1];
-            let equivalent = vm.roots.temporary_values.borrow()[root + 2];
+            vm.worker_roots()
+                .temporary_values
+                .borrow_mut()
+                .push(equivalent);
+            let map = vm.worker_roots().temporary_values.borrow()[root];
+            let key = vm.worker_roots().temporary_values.borrow()[root + 1];
+            let equivalent = vm.worker_roots().temporary_values.borrow()[root + 2];
             assert_ne!(key, equivalent);
             vm.map_set(map, key, TaggedValue::NULL)?;
-            let map = vm.roots.temporary_values.borrow()[root];
-            let key = vm.roots.temporary_values.borrow()[root + 1];
-            let equivalent = vm.roots.temporary_values.borrow()[root + 2];
+            let map = vm.worker_roots().temporary_values.borrow()[root];
+            let key = vm.worker_roots().temporary_values.borrow()[root + 1];
+            let equivalent = vm.worker_roots().temporary_values.borrow()[root + 2];
             assert!(vm.map_contains(map, equivalent)?);
             assert!(vm.map_get(map, equivalent)?.is_null());
             vm.map_set(map, equivalent, TaggedValue::UNIT)?;
@@ -609,7 +646,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(vm.roots.temporary_values.borrow().is_empty());
+        assert!(vm.worker_roots().temporary_values.borrow().is_empty());
     }
 
     #[test]
@@ -626,7 +663,7 @@ mod tests {
             let mut values = Vec::new();
             for key in &keys {
                 let key = vm.alloc_string(key)?;
-                vm.roots.temporary_values.borrow_mut().push(key);
+                vm.worker_roots().temporary_values.borrow_mut().push(key);
                 values.push(key);
             }
             for (index, &key) in values.iter().take(3).enumerate() {
@@ -639,7 +676,10 @@ mod tests {
             assert_eq!(vm.map_get(map, values[3])?, TaggedValue::TRUE);
             assert_eq!(vm.map_len(map)?, 3);
             let snapshot = vm.map_keys(map)?;
-            vm.roots.temporary_values.borrow_mut().push(snapshot);
+            vm.worker_roots()
+                .temporary_values
+                .borrow_mut()
+                .push(snapshot);
             assert_eq!(vm.list_len(snapshot)?, 3);
             let copied: Vec<_> = (0..3)
                 .map(|index| vm.list_get(snapshot, TaggedValue::from_i64(index)))
@@ -663,7 +703,10 @@ mod tests {
             assert_eq!(vm.map_layout(map)?.capacity, MAX_CAPACITY);
             assert_eq!(vm.map_len(map)?, MAX_CAPACITY);
             let snapshot = vm.map_keys(map)?;
-            vm.roots.temporary_values.borrow_mut().push(snapshot);
+            vm.worker_roots()
+                .temporary_values
+                .borrow_mut()
+                .push(snapshot);
             assert_eq!(vm.list_len(snapshot)?, MAX_CAPACITY);
             let mut seen = std::collections::HashSet::new();
             for index in 0..MAX_CAPACITY {
@@ -678,7 +721,10 @@ mod tests {
             ));
             assert_eq!(vm.map_len(map)?, MAX_CAPACITY);
             let existing = vm.alloc_string("entry4096")?;
-            vm.roots.temporary_values.borrow_mut().push(existing);
+            vm.worker_roots()
+                .temporary_values
+                .borrow_mut()
+                .push(existing);
             vm.map_set(map, existing, TaggedValue::TRUE)?;
             assert_eq!(vm.map_get(map, existing)?, TaggedValue::TRUE);
             assert_eq!(vm.map_remove(map, existing)?, TaggedValue::TRUE);
@@ -701,14 +747,14 @@ mod tests {
         let map = vm.new_map(4).unwrap();
         vm.with_temporary_roots(&[map], |vm| {
             let key = vm.alloc_string("self")?;
-            vm.roots.temporary_values.borrow_mut().push(key);
+            vm.worker_roots().temporary_values.borrow_mut().push(key);
             vm.map_set(map, key, map)?;
             assert_eq!(
                 vm.format_aggregate(map)?.as_deref(),
                 Some("{\"self\": <cycle>}")
             );
             let list = vm.new_list(1)?;
-            vm.roots.temporary_values.borrow_mut().push(list);
+            vm.worker_roots().temporary_values.borrow_mut().push(list);
             let text = vm.alloc_string("line\n")?;
             vm.list_set(list, TaggedValue::from_i64(0), text)?;
             vm.map_set(map, key, list)?;
@@ -718,7 +764,6 @@ mod tests {
             );
             let layout = vm.map_layout(map)?;
             let bucket = layout.find("self", key_hash("self"))?.0.unwrap();
-            // SAFETY: intentionally damage the state of a live four-word test bucket.
             unsafe {
                 layout
                     .buffer
@@ -739,23 +784,20 @@ mod tests {
         let map = vm.new_map(0).unwrap();
         vm.with_temporary_roots(&[map], |vm| {
             let empty = vm.map_keys(map)?;
-            vm.roots.temporary_values.borrow_mut().push(empty);
+            vm.worker_roots().temporary_values.borrow_mut().push(empty);
             assert_eq!(vm.list_len(empty)?, 0);
             let key = vm.alloc_string("key")?;
-            vm.roots.temporary_values.borrow_mut().push(key);
+            vm.worker_roots().temporary_values.borrow_mut().push(key);
             vm.map_set(map, key, TaggedValue::NULL)?;
             let layout = vm.map_layout(map)?;
-            // SAFETY: intentionally corrupt the tagged length of the rooted test wrapper.
             unsafe { layout.wrapper.write(TaggedValue::from_u64(2).raw()) };
             assert!(matches!(vm.map_keys(map), Err(VmError::TypeError)));
-            // SAFETY: restore wrapper length and corrupt only the live String's length word.
             let pointer = key.as_heap_ptr().unwrap().cast_mut().cast::<u64>();
             unsafe {
                 layout.wrapper.write(TaggedValue::from_u64(1).raw());
                 pointer.write(u64::MAX);
             }
             assert!(matches!(vm.map_keys(map), Err(VmError::TypeError)));
-            // SAFETY: restore the three-byte String then give it invalid UTF-8.
             unsafe {
                 pointer.write(3);
                 pointer.cast::<u8>().add(8).write(0xff);
@@ -764,7 +806,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(vm.roots.temporary_values.borrow().is_empty());
+        assert!(vm.worker_roots().temporary_values.borrow().is_empty());
     }
 
     #[test]

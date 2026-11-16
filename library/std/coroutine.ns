@@ -4,6 +4,8 @@ use .builtin.*
 use .collections.*
 
 private const _panic: fn(Any) -> NoReturn = .panic'builtin
+private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+private const _task_current_id: fn() -> i64 = .__task_current_id'builtin
 
 private effect _co_yield(value: Any, catch k) -> Any
 
@@ -48,7 +50,29 @@ impl Display for CoroutineError {
     }
 }
 
-private global _running_stack: List = List()
+private global _running_stacks: Map = Map()
+
+private fn _current_task_key() -> String = _to_string_raw(_task_current_id())
+
+private fn _current_running_stack() -> ?List {
+    let key = _current_task_key()
+    if _running_stacks.contains(key) {
+        _running_stacks.get(key).as(List)
+    } else {
+        null
+    }
+}
+
+private fn _ensure_running_stack() -> List {
+    let key = _current_task_key()
+    if _running_stacks.contains(key) {
+        _running_stacks.get(key).as(List)
+    } else {
+        let fresh = List()
+        _running_stacks.set(key, fresh)
+        fresh
+    }
+}
 
 pub struct Coroutine {
     status_field: CoroutineStatus,
@@ -75,17 +99,21 @@ impl Coroutine {
             return error CoroutineError.AlreadyRunning
         }
 
-        if not _running_stack.is_empty() {
-            let caller = _running_stack.last().as(Coroutine)
+        let task_key = _current_task_key()
+        let running_stack = _ensure_running_stack()
+        if not running_stack.is_empty() {
+            let caller = running_stack.last().as(Coroutine)
             caller.status_field = CoroutineStatus.normal
         }
-        _running_stack.push(self)
+        running_stack.push(self)
         self.status_field = CoroutineStatus.running
 
         defer {
-            let _ = _running_stack.pop()
-            if not _running_stack.is_empty() {
-                let caller = _running_stack.last().as(Coroutine)
+            let _ = running_stack.pop()
+            if running_stack.is_empty() {
+                let _ = _running_stacks.remove(task_key)
+            } else {
+                let caller = running_stack.last().as(Coroutine)
                 caller.status_field = CoroutineStatus.running
             }
             if self.status_field == CoroutineStatus.running {
@@ -181,17 +209,21 @@ pub fn close(co: Coroutine) -> !CoroutineError Unit {
 }
 
 pub fn running() -> ?Coroutine {
-    if _running_stack.is_empty() {
-        null
-    } else {
-        _running_stack.last().as(Coroutine)
+    _current_running_stack() match {
+        stack? => if stack.is_empty() { null } else { stack.last().as(Coroutine) },
+        null => null,
     }
 }
 
-pub fn is_yieldable() -> bool = not _running_stack.is_empty()
+pub fn is_yieldable() -> bool {
+    _current_running_stack() match {
+        stack? => not stack.is_empty(),
+        null => false,
+    }
+}
 
 pub fn yield_val(.value: Any = null) -> Any {
-    if _running_stack.is_empty() {
+    if not is_yieldable() {
         _panic("attempt to yield from outside a coroutine")
     }
     _co_yield(value)#

@@ -290,9 +290,8 @@ pub fn ffi_dlsym(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 
     let kind = parse_signature(&sig_str)?;
     let backing = {
-        let lib = ctx
-            .resources()
-            .get::<FfiLibraryHandle>(lib_id, TAG_FFI_LIBRARY)?;
+        let resources = ctx.resources();
+        let lib = resources.get::<FfiLibraryHandle>(lib_id, TAG_FFI_LIBRARY)?;
         Arc::clone(&lib.backing)
     };
     let Some(fn_addr) = backing.lookup_symbol(&sym_name)? else {
@@ -424,9 +423,8 @@ fn invoke_symbol_with_roots(
     roots: &[BuiltinRoot],
 ) -> Result<(), VmError> {
     let (backing, fn_addr, kind) = {
-        let sym = ctx
-            .resources()
-            .get::<FfiSymbolHandle>(sym_id, TAG_FFI_SYMBOL)?;
+        let resources = ctx.resources();
+        let sym = resources.get::<FfiSymbolHandle>(sym_id, TAG_FFI_SYMBOL)?;
         (Arc::clone(&sym.backing), sym.fn_addr, sym.kind.clone())
     };
 

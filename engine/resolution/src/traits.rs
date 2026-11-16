@@ -109,11 +109,9 @@ pub(crate) fn prepare_trait_parents(r: &mut Resolver, ast: &Ast) {
 pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
     // ── Collect trait method signatures ────────────────────────────
     let trait_defs: Vec<_> = r
-        .scopes
+        .symbols
         .iter()
-        .flat_map(|scope| scope.bindings.values())
-        .filter_map(|&sym_id| {
-            let sym = &r.symbols[sym_id.0 as usize];
+        .filter_map(|sym| {
             if sym.kind == SymbolKind::Trait {
                 Some((sym.name, sym.type_index, sym.def_node))
             } else {

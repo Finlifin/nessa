@@ -46,3 +46,36 @@ pub fn host_call(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     let args = ctx.arg_rooted(1)?;
     ctx.invoke_host_call(&op, &args)
 }
+
+/// `800` `__defer_push() -> bool`
+pub fn defer_push(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(0)?;
+    ctx.defer_push();
+    Ok(())
+}
+
+/// `801` `__defer_pop() -> Unit`
+pub fn defer_pop(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(0)?;
+    ctx.defer_pop();
+    Ok(())
+}
+
+/// `802` `__defer_resume_unwind() -> Unit`
+pub fn defer_resume_unwind(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(0)?;
+    ctx.defer_resume_unwind();
+    Ok(())
+}
+
+/// `803` `__task_current_id() -> i64`
+pub fn task_current_id(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(0)?;
+    ctx.task_current_id()
+}
+
+/// `804` `__task_tree_snapshot() -> String`
+pub fn task_tree_snapshot(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ctx.require_arity(0)?;
+    ctx.task_tree_snapshot()
+}

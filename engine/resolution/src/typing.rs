@@ -555,6 +555,7 @@ pub(crate) fn resolve_types_expected(
 
         NodeKind::Assign => {
             let children = ast.fixed_children(node_idx);
+            crate::task_combinators::note_mutation_target(r, ast, children[0]);
             if ast.node(children[0]).kind == NodeKind::Call {
                 crate::applications::update(r, ast, node_idx);
                 r.node_types.insert(node_idx, Intrinsic::Unit.type_index());
@@ -2013,6 +2014,7 @@ pub(crate) fn param_type_index(r: &Resolver, ast: &Ast, param_idx: NodeIndex) ->
 
 pub(crate) fn resolve_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     if r.function_inference.values.contains(&node_idx) {
+        crate::task_combinators::refresh_decl_in_lexical_order(r, ast, node_idx);
         return;
     }
     let children = ast.fixed_children(node_idx);
@@ -2082,11 +2084,24 @@ pub(crate) fn resolve_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                 .with_primary_span(ast.node(else_node).span)
                 .emit(r.diag_ctx);
         }
+        if children.len() > 2 {
+            crate::task_combinators::attach_scrutinee_pattern(r, ast, children[2], children[0]);
+        }
         crate::enums::pattern(r, ast, children[0], effective_ti);
     } else if let Some(ti) = effective_ti {
         // Propagate type to the irrefutable pattern symbol(s).
         resolve_pattern_literals(r, ast, children[0], Some(ti));
         crate::error_patterns::validate_binding(r, ast, children[0], 0);
+        if children.len() > 2 {
+            crate::task_combinators::record_decl(
+                r,
+                ast,
+                children[0],
+                children[1],
+                children[2],
+                false,
+            );
+        }
     }
 }
 
@@ -2100,7 +2115,7 @@ pub(crate) fn resolve_irrefutable_pattern(
     crate::error_patterns::validate_binding(r, ast, pat, 0);
 }
 
-fn definitely_diverges(r: &Resolver, ast: &Ast, node: NodeIndex) -> bool {
+pub(crate) fn definitely_diverges(r: &Resolver, ast: &Ast, node: NodeIndex) -> bool {
     if node.is_null() {
         return false;
     }
@@ -2523,7 +2538,17 @@ fn resolve_call_types(
         r.call_arguments.insert(node_idx, plan);
     }
     for (i, &arg) in args.iter().enumerate() {
-        let expected = if unpacked_call {
+        let parameter_index = argument_parameters[i].unwrap_or(i);
+        let unconstrained_thunk = crate::task_combinators::should_infer_unconstrained_lambda(
+            r,
+            ast,
+            callee,
+            parameter_index,
+            arg,
+        );
+        let expected = if unconstrained_thunk {
+            None
+        } else if unpacked_call {
             argument_parameters[i].and_then(|param_idx| {
                 param_types
                     .as_ref()
@@ -2533,7 +2558,6 @@ fn resolve_call_types(
         } else if variadic_arguments.contains(&i) {
             Some(Intrinsic::Any.type_index())
         } else {
-            let parameter_index = argument_parameters[i].unwrap_or(i);
             param_types.as_ref().and_then(|pts| {
                 let t = pts.get(parameter_index).copied()?;
                 if t != TypeIndex::INVALID {
@@ -2688,6 +2712,10 @@ fn resolve_call_types(
                 }
             }
         }
+    }
+
+    if let Some(refined) = crate::task_combinators::refine_call(r, ast, node_idx, callee, args) {
+        return Some(refined);
     }
 
     // Infer return type from callee.
@@ -2863,7 +2891,22 @@ fn builtin_return_type(pool: &type_pool::TypePool, id: runtime::BuiltinFnId) -> 
         | ids::BYTES_SET
         | ids::BYTES_PUSH
         | ids::BYTES_CLEAR
-        | ids::BYTES_EXTEND => Intrinsic::Unit.type_index(),
+        | ids::BYTES_EXTEND
+        | ids::DEFER_POP
+        | ids::DEFER_RESUME_UNWIND
+        | ids::SYNC_CHAN_CLOSE
+        | ids::SYNC_MUTEX_UNLOCK
+        | ids::SYNC_MUTEX_SET
+        | ids::SYNC_RWLOCK_READ_UNLOCK
+        | ids::SYNC_RWLOCK_WRITE_UNLOCK
+        | ids::SYNC_RWLOCK_SET
+        | ids::SYNC_SEM_ACQUIRE
+        | ids::SYNC_SEM_RELEASE
+        | ids::SYNC_ONCE_COMPLETE
+        | ids::SYNC_ONCE_ABORT
+        | ids::SYNC_ATOMIC_STORE
+        | ids::NET_TCP_CLOSE
+        | ids::NET_UDP_CLOSE => Intrinsic::Unit.type_index(),
         ids::TYPE_OF => Intrinsic::Type.type_index(),
         ids::LIST_INIT
         | ids::STR_SPLIT
@@ -3014,7 +3057,15 @@ fn builtin_return_type(pool: &type_pool::TypePool, id: runtime::BuiltinFnId) -> 
         | ids::FS_IS_FILE
         | ids::FS_IS_DIR
         | ids::TASK_IS_READY
-        | ids::BYTES_EQ => Intrinsic::Bool.type_index(),
+        | ids::BYTES_EQ
+        | ids::DEFER_PUSH
+        | ids::SYNC_CHAN_IS_CLOSED
+        | ids::SYNC_MUTEX_TRY_LOCK
+        | ids::SYNC_MUTEX_IS_LOCKED
+        | ids::SYNC_RWLOCK_TRY_READ_LOCK
+        | ids::SYNC_RWLOCK_TRY_WRITE_LOCK
+        | ids::SYNC_SEM_TRY_ACQUIRE
+        | ids::SYNC_BARRIER_WAIT => Intrinsic::Bool.type_index(),
         ids::CHAR_TO_ASCII_UPPERCASE
         | ids::CHAR_TO_ASCII_LOWERCASE
         | ids::CHAR_REPLACEMENT
@@ -3064,7 +3115,8 @@ fn builtin_return_type(pool: &type_pool::TypePool, id: runtime::BuiltinFnId) -> 
         | ids::F64_TO_PRECISION
         | ids::ENV_OS
         | ids::ENV_ARCH
-        | ids::RT_BACKTRACE => Intrinsic::Str.type_index(),
+        | ids::RT_BACKTRACE
+        | ids::TASK_TREE_SNAPSHOT => Intrinsic::Str.type_index(),
         ids::TO_I64
         | ids::STR_LEN
         | ids::STR_CHAR_LEN
@@ -3108,7 +3160,22 @@ fn builtin_return_type(pool: &type_pool::TypePool, id: runtime::BuiltinFnId) -> 
         | ids::PROC_PID
         | ids::RT_GC_COLLECT
         | ids::FFI_DLOPEN
-        | ids::FFI_DLSYM => Intrinsic::I64.type_index(),
+        | ids::FFI_DLSYM
+        | ids::TASK_CURRENT_ID
+        | ids::SYNC_CHAN_NEW
+        | ids::SYNC_CHAN_SEND
+        | ids::SYNC_CHAN_TRY_SEND
+        | ids::SYNC_CHAN_LEN
+        | ids::SYNC_MUTEX_NEW
+        | ids::SYNC_RWLOCK_NEW
+        | ids::SYNC_SEM_NEW
+        | ids::SYNC_SEM_AVAILABLE
+        | ids::SYNC_ONCE_NEW
+        | ids::SYNC_BARRIER_NEW
+        | ids::SYNC_ATOMIC_NEW
+        | ids::SYNC_ATOMIC_LOAD
+        | ids::SYNC_ATOMIC_SWAP
+        | ids::SYNC_ATOMIC_FETCH_ADD => Intrinsic::I64.type_index(),
         ids::BYTES_LEN | ids::BYTES_CAP => Intrinsic::Usize.type_index(),
         ids::BYTES_GET => Intrinsic::U8.type_index(),
         ids::U64_MAX | ids::SCALAR_HASH | ids::RNG_NEXT_U64 | ids::BYTES_READ_U64_LE => {
@@ -3222,6 +3289,7 @@ fn resolve_match_types(
     let mut bodies = Vec::new();
     for &arm in ast.multi_children(node_idx) {
         let arm_children = ast.fixed_children(arm);
+        crate::task_combinators::attach_scrutinee_pattern(r, ast, children[0], arm_children[0]);
         crate::enums::pattern(r, ast, arm_children[0], scrutinee_type);
         resolve_types_expected(r, ast, arm_children[1], expected);
         if !definitely_returns(ast, arm_children[1])
@@ -3512,6 +3580,9 @@ fn resolve_projection_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) ->
             || intrinsic.is_some_and(|kind| kind != Intrinsic::Any)
         {
             return crate::methods::projection(r, ast, node_idx, lhs_ti);
+        }
+        if intrinsic == Some(Intrinsic::Any) {
+            return Some(Intrinsic::Any.type_index());
         }
     }
 

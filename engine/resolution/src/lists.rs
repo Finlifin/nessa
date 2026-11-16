@@ -16,6 +16,7 @@ pub(crate) fn literal(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Optio
     for &element in ast.multi_children(node) {
         typing::resolve_types_expected(r, ast, element, Some(Intrinsic::Any.type_index()));
     }
+    crate::task_combinators::record_list_literal(r, ast, node);
     let ty = r.type_pool.list_type();
     if ty.is_none() {
         r.diag_ctx

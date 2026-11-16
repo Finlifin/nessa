@@ -39,6 +39,8 @@ const MODULES: &[(&str, &str)] = &[
     ("bytes", include_str!("../../../library/std/bytes.ns")),
     ("rand", include_str!("../../../library/std/rand.ns")),
     ("task", include_str!("../../../library/std/task.ns")),
+    ("sync", include_str!("../../../library/std/sync.ns")),
+    ("net", include_str!("../../../library/std/net.ns")),
     ("prelude", include_str!("../../../library/std/prelude.ns")),
 ];
 

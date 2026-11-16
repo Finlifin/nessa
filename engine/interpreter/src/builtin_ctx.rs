@@ -5,13 +5,15 @@
 //! this context instead of touching registers directly.
 
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use gc::ObjectHeader;
 use nsbc::Reg;
 use runtime::{BuiltinFnId, Number, TaggedValue, TaskId};
-use type_pool::{Intrinsic, TypeIndex, TypeKind, TypePool};
+use scheduler::{NetOutcome, ProcessSpec, TaskOpPoll, TaskOpResult};
+use type_pool::{Intrinsic, TypeIndex, TypeKind};
 
-use crate::{Vm, VmError};
+use crate::{SharedVm, Vm, VmError, VmTypePoolRef};
 
 /// Native builtin function pointer.
 pub type BuiltinFn = fn(&mut BuiltinCtx<'_>) -> Result<(), VmError>;
@@ -49,6 +51,10 @@ pub enum BuiltinOutcome {
     Yield,
     /// Suspend the current task and rewind PC by 1 to retry when awakened.
     SuspendRetry,
+    /// Immediately begin cooperative cancellation unwinding (`defer` blocks).
+    StartCancelUnwind,
+    /// Advance cooperative cancellation unwinding after a `defer` block completes.
+    ResumeCancelUnwind,
     /// Terminate the process with the given exit code.
     Exit(i32),
     /// Abort with a panic message.
@@ -83,6 +89,30 @@ pub enum NativeValue {
     Tuple(Vec<NativeValue>),
 }
 
+/// Thread-safe handle to host-owned VM resources (`VmFileTable`, `VmRng`) passed to
+/// offloaded `uv_queue_work` closures without exposing GC heap or mutator state.
+#[derive(Clone)]
+pub struct VmIoContext {
+    shared: Arc<SharedVm>,
+}
+
+impl VmIoContext {
+    #[inline]
+    pub fn files(&self) -> &crate::resources::VmFileTable {
+        &self.shared.files
+    }
+
+    #[inline]
+    pub fn rng_next_u64(&self) -> u64 {
+        self.shared.rng.lock().next_u64()
+    }
+
+    #[inline]
+    pub fn create_temp_file(&self) -> (i64, i64, String) {
+        self.shared.files.create_temp(&self.shared.rng)
+    }
+}
+
 /// Control-flow and value outcome returned by an embedder [`HostHandler`].
 #[derive(Debug, Clone)]
 pub enum HostCallOutcome {
@@ -97,7 +127,7 @@ pub enum HostCallOutcome {
 }
 
 /// Host-provided callback interface invoked by the privileged `__host_call` builtin.
-pub trait HostHandler {
+pub trait HostHandler: Send + Sync {
     fn call(&mut self, op: &str, args: &[NativeValue], task_id: TaskId) -> HostCallOutcome;
 }
 
@@ -114,23 +144,21 @@ pub struct BuiltinCtx<'vm> {
 
 impl Drop for BuiltinCtx<'_> {
     fn drop(&mut self) {
-        self.vm
-            .roots
-            .temporary_values
-            .borrow_mut()
-            .truncate(self.root_base);
-        self.vm
-            .roots
-            .native_pins
-            .borrow_mut()
-            .truncate(self.pin_base);
+        let wr = self.vm.worker_roots();
+        wr.temporary_values.borrow_mut().truncate(self.root_base);
+        wr.native_pins.borrow_mut().truncate(self.pin_base);
     }
 }
 
 impl<'vm> BuiltinCtx<'vm> {
     pub(crate) fn new(vm: &'vm mut Vm, task_id: TaskId, arg_count: u8) -> Self {
-        let root_base = vm.roots.temporary_values.borrow().len();
-        let pin_base = vm.roots.native_pins.borrow().len();
+        let (root_base, pin_base) = {
+            let wr = vm.worker_roots();
+            (
+                wr.temporary_values.borrow().len(),
+                wr.native_pins.borrow().len(),
+            )
+        };
         Self {
             vm,
             task_id,
@@ -143,7 +171,14 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     fn require_rooted_value(&self, value: TaggedValue) -> Result<(), VmError> {
-        if value.is_heap() && !self.vm.roots.temporary_values.borrow().contains(&value) {
+        if value.is_heap()
+            && !self
+                .vm
+                .worker_roots()
+                .temporary_values
+                .borrow()
+                .contains(&value)
+        {
             return Err(VmError::TypeError);
         }
         Ok(())
@@ -151,11 +186,12 @@ impl<'vm> BuiltinCtx<'vm> {
 
     fn retain_collection_result(&self, value: TaggedValue) -> TaggedValue {
         if value.is_heap() {
-            let mut roots = self.vm.roots.temporary_values.borrow_mut();
+            let wr = self.vm.worker_roots();
+            let mut roots = wr.temporary_values.borrow_mut();
             if !roots.contains(&value) {
                 roots.push(value);
             }
-            let mut pins = self.vm.roots.native_pins.borrow_mut();
+            let mut pins = wr.native_pins.borrow_mut();
             if !pins.contains(&value) {
                 pins.push(value);
             }
@@ -623,12 +659,7 @@ impl<'vm> BuiltinCtx<'vm> {
                 got: self.arg_count,
             });
         }
-        let task = self
-            .vm
-            .roots
-            .scheduler
-            .get_task(self.task_id)
-            .ok_or(VmError::InvalidTask)?;
+        let task = self.vm.task_ref(self.task_id).ok_or(VmError::InvalidTask)?;
         Ok(task.registers.get(Reg(i)))
     }
 
@@ -651,7 +682,7 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     fn push_movable_root(&self, value: TaggedValue) -> Result<BuiltinRoot, VmError> {
-        let mut roots = self.vm.roots.temporary_values.borrow_mut();
+        let mut roots = self.vm.worker_roots().temporary_values.borrow_mut();
         let index = roots.len();
         roots.push(value);
         Ok(BuiltinRoot {
@@ -668,7 +699,7 @@ impl<'vm> BuiltinCtx<'vm> {
             return Err(VmError::TypeError);
         }
         self.vm
-            .roots
+            .worker_roots()
             .temporary_values
             .borrow()
             .get(root.index)
@@ -764,7 +795,14 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn set_return(&mut self, val: TaggedValue) -> Result<(), VmError> {
-        if val.is_heap() && !self.vm.roots.temporary_values.borrow().contains(&val) {
+        if val.is_heap()
+            && !self
+                .vm
+                .worker_roots()
+                .temporary_values
+                .borrow()
+                .contains(&val)
+        {
             return Err(VmError::TypeError);
         }
         self.write_return(val);
@@ -772,7 +810,7 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub(crate) fn write_return(&mut self, val: TaggedValue) {
-        if let Some(t) = self.vm.roots.scheduler.get_task_mut(self.task_id) {
+        if let Some(t) = self.vm.task_mut(self.task_id) {
             t.registers.set(Reg(0), val);
         }
     }
@@ -866,12 +904,11 @@ impl<'vm> BuiltinCtx<'vm> {
         if logical_len > avail {
             return Err(VmError::InvalidIndex);
         }
-        // SAFETY: `layout.wrapper` remained unmoved during `f` because no managed allocation occurred.
-        unsafe {
-            layout
-                .wrapper
-                .write(TaggedValue::from_u64(logical_len as u64).raw());
-        }
+        crate::collections::write_u64_atomic(
+            layout.wrapper,
+            0,
+            TaggedValue::from_u64(logical_len as u64).raw(),
+        );
         Ok(out)
     }
 
@@ -991,11 +1028,13 @@ impl<'vm> BuiltinCtx<'vm> {
         self.vm.bytes_read_u64_le(bytes, offset)
     }
 
-    pub fn resources(&self) -> &crate::resources::VmResourceTable {
+    pub fn resources(&self) -> parking_lot::MutexGuard<'_, crate::resources::VmResourceTable> {
         self.vm.resources()
     }
 
-    pub fn resources_mut(&mut self) -> &mut crate::resources::VmResourceTable {
+    pub fn resources_mut(
+        &mut self,
+    ) -> parking_lot::MutexGuard<'_, crate::resources::VmResourceTable> {
         self.vm.resources_mut()
     }
 
@@ -1126,7 +1165,7 @@ impl<'vm> BuiltinCtx<'vm> {
         self.require_rooted_value(right)?;
         for value in [left, right] {
             if let Some(ty) = value.as_type()
-                && self.vm.state.type_pool.canonical_type(ty).is_none()
+                && self.vm.type_pool_read().canonical_type(ty).is_none()
             {
                 return Err(VmError::InvalidType(ty));
             }
@@ -1215,11 +1254,11 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn rng_next_u64(&mut self) -> u64 {
-        self.vm.state.rng.next_u64()
+        self.vm.shared.rng.lock().next_u64()
     }
 
     pub fn rng_seed(&mut self, mode: i64, s1: i64, s2: i64) -> Result<(i64, i64), VmError> {
-        self.vm.state.rng.seed(mode, s1, s2)
+        self.vm.shared.rng.lock().seed(mode, s1, s2)
     }
 
     pub fn format_backtrace(
@@ -1231,28 +1270,27 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn file_open(&mut self, path: &str, mode: &str) -> (i64, i64, String) {
-        self.vm.state.files.open(path, mode)
+        self.vm.shared.files.open(path, mode)
     }
 
     pub fn file_temp(&mut self) -> (i64, i64, String) {
-        let state = &mut *self.vm.state;
-        state.files.create_temp(&mut state.rng)
+        self.vm.shared.files.create_temp(&self.vm.shared.rng)
     }
 
     pub fn file_close(&mut self, id: i64) -> (i64, String) {
-        self.vm.state.files.close(id)
+        self.vm.shared.files.close(id)
     }
 
     pub fn file_is_open(&self, id: i64) -> bool {
-        self.vm.state.files.is_open(id)
+        self.vm.shared.files.is_open(id)
     }
 
     pub fn file_flush(&mut self, id: i64) -> (i64, String) {
-        self.vm.state.files.flush(id)
+        self.vm.shared.files.flush(id)
     }
 
     pub fn file_read_all(&mut self, id: i64) -> Result<(i64, String), VmError> {
-        self.vm.state.files.read_all(id)
+        self.vm.shared.files.read_all(id)
     }
 
     pub fn file_read_line(
@@ -1260,7 +1298,7 @@ impl<'vm> BuiltinCtx<'vm> {
         id: i64,
         keep_newline: bool,
     ) -> Result<(i64, Option<String>, String), VmError> {
-        self.vm.state.files.read_line(id, keep_newline)
+        self.vm.shared.files.read_line(id, keep_newline)
     }
 
     pub fn file_read_chars(
@@ -1268,7 +1306,7 @@ impl<'vm> BuiltinCtx<'vm> {
         id: i64,
         count: i64,
     ) -> Result<(i64, Option<String>, String), VmError> {
-        self.vm.state.files.read_chars(id, count)
+        self.vm.shared.files.read_chars(id, count)
     }
 
     pub fn file_read_bytes(
@@ -1276,35 +1314,168 @@ impl<'vm> BuiltinCtx<'vm> {
         id: i64,
         max_bytes: i64,
     ) -> Result<(i64, Vec<u8>, String), VmError> {
-        self.vm.state.files.read_bytes(id, max_bytes)
+        self.vm.shared.files.read_bytes(id, max_bytes)
     }
 
     pub fn file_read_number(&mut self, id: i64) -> (i64, Option<f64>, String) {
-        self.vm.state.files.read_number(id)
+        self.vm.shared.files.read_number(id)
     }
 
     pub fn file_write_bytes(&mut self, id: i64, bytes: &[u8]) -> (i64, String) {
-        self.vm.state.files.write_bytes(id, bytes)
+        self.vm.shared.files.write_bytes(id, bytes)
     }
 
     pub fn file_seek(&mut self, id: i64, whence: i64, offset: i64) -> (i64, i64, String) {
-        self.vm.state.files.seek(id, whence, offset)
+        self.vm.shared.files.seek(id, whence, offset)
     }
 
-    pub fn type_pool(&self) -> &TypePool {
+    /// True if `self.task_id` has been cancelled and is not yet unwinding `defer` blocks.
+    #[inline]
+    pub fn should_abort_for_cancel(&self) -> bool {
+        let already_unwinding = self
+            .vm
+            .task_ref(self.task_id)
+            .is_some_and(|t| t.unwinding_cancel);
+        !already_unwinding && self.vm.scheduler().is_cancelled(self.task_id)
+    }
+
+    /// Non-blocking `libuv` timer sleep (`uv_timer_t` on `nessa-io-reactor`).
+    pub fn sleep_async_ms(&mut self, duration_ms: u64) -> Result<(), VmError> {
+        match self.vm.scheduler().poll_task_op(self.task_id) {
+            TaskOpPoll::Ready(TaskOpResult::Unit) => {
+                self.return_unit();
+                Ok(())
+            }
+            TaskOpPoll::Ready(_) => unreachable!("unexpected TaskOpResult variant for sleep"),
+            TaskOpPoll::Pending => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            TaskOpPoll::Vacant => {
+                if self.should_abort_for_cancel() {
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                    return Ok(());
+                }
+                if duration_ms == 0 {
+                    self.return_unit();
+                    if self.vm.scheduler().has_other_ready_tasks() {
+                        self.outcome = BuiltinOutcome::Yield;
+                    }
+                    return Ok(());
+                }
+                self.vm.scheduler().submit_sleep(self.task_id, duration_ms);
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    /// Non-blocking `libuv` child process execution (`uv_spawn` + pipes on `nessa-io-reactor`).
+    ///
+    /// `prepare` runs only on initial submission (`TaskOpPoll::Vacant`) and may return `Ok(None)`
+    /// after writing a synchronous return value (such as empty shell command fast-path).
+    pub fn spawn_process_async<P>(&mut self, prepare: P) -> Result<(), VmError>
+    where
+        P: FnOnce(&mut Self) -> Result<Option<ProcessSpec>, VmError>,
+    {
+        match self.vm.scheduler().poll_task_op(self.task_id) {
+            TaskOpPoll::Ready(TaskOpResult::Process(out)) => {
+                self.check_string_size(out.stdout.len())?;
+                self.check_string_size(out.stderr.len())?;
+                self.return_native(NativeValue::Tuple(vec![
+                    NativeValue::I64(out.code),
+                    NativeValue::I64(out.exit_code),
+                    NativeValue::Str(out.stdout),
+                    NativeValue::Str(out.stderr),
+                ]))
+            }
+            TaskOpPoll::Ready(_) => unreachable!("unexpected TaskOpResult variant for process"),
+            TaskOpPoll::Pending => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            TaskOpPoll::Vacant => {
+                if self.should_abort_for_cancel() {
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                    return Ok(());
+                }
+                let Some(spec) = prepare(self)? else {
+                    return Ok(());
+                };
+                self.vm.scheduler().submit_process(self.task_id, spec);
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    /// Offload blocking file/filesystem work onto `libuv`'s `uv_queue_work` threadpool without
+    /// blocking any compute worker thread.
+    ///
+    /// `prepare` runs only on initial submission (`TaskOpPoll::Vacant`) to validate and extract
+    /// arguments from GC-managed registers; returning `Ok(None)` completes synchronously.
+    pub fn run_blocking_native<P, W>(&mut self, prepare: P) -> Result<(), VmError>
+    where
+        P: FnOnce(&mut Self) -> Result<Option<W>, VmError>,
+        W: FnOnce(&VmIoContext) -> Result<NativeValue, VmError> + Send + 'static,
+    {
+        match self.vm.scheduler().poll_task_op(self.task_id) {
+            TaskOpPoll::Ready(TaskOpResult::Work(boxed)) => {
+                let res = *boxed
+                    .downcast::<Result<NativeValue, VmError>>()
+                    .expect("blocking IO task result type matches");
+                let native = res?;
+                self.return_native(native)
+            }
+            TaskOpPoll::Ready(_) => {
+                unreachable!("unexpected TaskOpResult variant for blocking IO")
+            }
+            TaskOpPoll::Pending => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            TaskOpPoll::Vacant => {
+                if self.should_abort_for_cancel() {
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                    return Ok(());
+                }
+                let Some(work_fn) = prepare(self)? else {
+                    return Ok(());
+                };
+                let io_ctx = VmIoContext {
+                    shared: Arc::clone(&self.vm.shared),
+                };
+                self.vm
+                    .scheduler()
+                    .submit_work(self.task_id, move || -> Result<NativeValue, VmError> {
+                        work_fn(&io_ctx)
+                    });
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn type_pool(&self) -> VmTypePoolRef<'_> {
         self.vm.type_pool()
     }
 
     /// Format any tagged value for display (print/println).
     pub fn format_value(&self, val: TaggedValue) -> Result<String, VmError> {
-        if val.is_heap() && !self.vm.roots.temporary_values.borrow().contains(&val) {
+        if val.is_heap()
+            && !self
+                .vm
+                .worker_roots()
+                .temporary_values
+                .borrow()
+                .contains(&val)
+        {
             return Err(VmError::TypeError);
         }
         if let Some(ty) = val.as_type() {
             return self
                 .vm
-                .state
-                .type_pool
+                .type_pool_read()
                 .display_name(ty)
                 .ok_or(VmError::InvalidType(ty));
         }
@@ -1327,10 +1498,42 @@ impl<'vm> BuiltinCtx<'vm> {
         self.outcome = BuiltinOutcome::Yield;
     }
 
+    pub fn suspend_retry(&mut self) {
+        self.outcome = BuiltinOutcome::SuspendRetry;
+    }
+
+    pub fn defer_push(&mut self) {
+        if let Some(t) = self.vm.task_mut(self.task_id) {
+            let resume_pc = t.pc;
+            t.unwind_stack
+                .push(runtime::UnwindEntry::DeferPc(resume_pc));
+            t.registers.set(Reg(0), TaggedValue::FALSE);
+        }
+    }
+
+    pub fn defer_pop(&mut self) {
+        if let Some(t) = self.vm.task_mut(self.task_id) {
+            if let Some(pos) = t
+                .unwind_stack
+                .iter()
+                .rposition(|e| matches!(e, runtime::UnwindEntry::DeferPc(_)))
+            {
+                t.unwind_stack.remove(pos);
+            }
+            t.registers.set(Reg(0), TaggedValue::UNIT);
+        }
+    }
+
+    pub fn defer_resume_unwind(&mut self) {
+        self.write_return(TaggedValue::UNIT);
+        self.outcome = BuiltinOutcome::ResumeCancelUnwind;
+    }
+
     pub fn task_is_ready(&self, future_val: TaggedValue) -> Result<bool, VmError> {
         self.require_rooted_value(future_val)?;
         let fid = self.vm.decode_future_id(future_val)?;
-        let entry = self.vm.roots.promises.get(&fid).ok_or(VmError::TypeError)?;
+        let promises = self.vm.roots().promises.shard(fid).lock();
+        let entry = promises.get(&fid).ok_or(VmError::TypeError)?;
         Ok(!matches!(
             entry.state,
             crate::futures::PromiseState::Pending
@@ -1338,55 +1541,120 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn task_await_all(&mut self, list_handle: &BuiltinRoot) -> Result<(), VmError> {
-        let list_val = self.load_rooted(list_handle)?;
-        let len = self.vm.list_len(list_val)?;
-        let mut fids = Vec::with_capacity(len);
-        for i in 0..len {
-            let elem = self
-                .vm
-                .list_get(list_val, TaggedValue::from_i64(i as i64))?;
-            fids.push(self.vm.decode_future_id(elem)?);
-        }
-        for &fid in &fids {
-            let entry = self
-                .vm
-                .roots
-                .promises
-                .get_mut(&fid)
-                .ok_or(VmError::TypeError)?;
-            match &entry.state {
-                crate::futures::PromiseState::Failed(err) => {
-                    let err = err.clone();
-                    entry.observed_failure = true;
-                    return Err(err);
-                }
-                crate::futures::PromiseState::Cancelled => return Err(VmError::TaskCancelled),
-                _ => {}
+        if self.vm.scheduler().is_cancelled(self.task_id) {
+            if let Some(st) = self.vm.shared.await_all_ops.remove(self.task_id) {
+                st.early_exit
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
         }
-        for &fid in &fids {
-            if self
-                .vm
-                .roots
-                .promises
-                .get(&fid)
-                .is_some_and(|e| matches!(e.state, crate::futures::PromiseState::Pending))
+
+        let existing = self.vm.shared.await_all_ops.get(self.task_id);
+        if let Some(st) = existing {
+            if !st.early_exit.load(std::sync::atomic::Ordering::Acquire)
+                && st.remaining.load(std::sync::atomic::Ordering::Acquire) > 0
             {
-                self.vm.register_promise_waiter(fid, self.task_id);
                 self.outcome = BuiltinOutcome::SuspendRetry;
                 return Ok(());
             }
+            let _ = self.vm.shared.await_all_ops.remove(self.task_id);
         }
-        let out_list = self.vm.new_list(len)?;
+
+        let list_val = self.load_rooted(list_handle)?;
+        let elems = self.vm.snapshot_list_elements(list_val)?;
+        let len = elems.len();
+        let mut fids = Vec::with_capacity(len);
+        for elem in elems {
+            fids.push(self.vm.decode_future_id(elem)?);
+        }
+
+        let completed_vals = if fids.is_empty() {
+            Vec::new()
+        } else {
+            let mut promises = self.vm.roots().promises.lock_fids(&fids);
+            let mut failed_fid = None;
+            let mut failed_err = None;
+            let mut cancelled = false;
+            let mut pending_unique = Vec::new();
+            let mut seen_pending = std::collections::HashSet::new();
+            for &fid in &fids {
+                let entry = promises.get(fid).ok_or(VmError::TypeError)?;
+                match &entry.state {
+                    crate::futures::PromiseState::Failed(err) => {
+                        failed_fid = Some(fid);
+                        failed_err = Some(err.clone());
+                        break;
+                    }
+                    crate::futures::PromiseState::Cancelled => {
+                        cancelled = true;
+                        break;
+                    }
+                    crate::futures::PromiseState::Pending => {
+                        if seen_pending.insert(fid) {
+                            pending_unique.push(fid);
+                        }
+                    }
+                    crate::futures::PromiseState::Completed(_) => {}
+                }
+            }
+            if let (Some(fid), Some(err)) = (failed_fid, failed_err) {
+                drop(promises);
+                self.vm.mark_promise_failure_observed(fid);
+                return Err(err);
+            }
+            if cancelled {
+                return Err(VmError::TaskCancelled);
+            }
+            if !pending_unique.is_empty() {
+                let state = std::sync::Arc::new(crate::futures::AwaitAllState {
+                    task_id: self.task_id,
+                    remaining: std::sync::atomic::AtomicUsize::new(pending_unique.len()),
+                    early_exit: std::sync::atomic::AtomicBool::new(false),
+                });
+                for pfid in pending_unique {
+                    if let Some(entry) = promises.get_mut(pfid) {
+                        entry.all_waiters.push(std::sync::Arc::clone(&state));
+                    }
+                }
+                drop(promises);
+                self.vm.shared.await_all_ops.insert(self.task_id, state);
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                return Ok(());
+            }
+            let mut vals = Vec::with_capacity(len);
+            for &fid in &fids {
+                let entry = promises
+                    .get(fid)
+                    .expect("all promises verified Completed under lock");
+                match &entry.state {
+                    crate::futures::PromiseState::Completed(v) => vals.push(*v),
+                    _ => unreachable!("all promises verified Completed under lock"),
+                }
+            }
+            vals
+        };
+
+        let base = self.vm.worker_roots().temporary_values.borrow().len();
+        let out_list = self.vm.with_temporary_roots(&completed_vals, |vm| {
+            let list = vm.new_list(len)?;
+            let list_slot = vm.worker_roots().temporary_values.borrow().len();
+            vm.worker_roots().temporary_values.borrow_mut().push(list);
+            for i in 0..len {
+                let (cur_list, val) = {
+                    let roots = vm.worker_roots().temporary_values.borrow();
+                    (roots[list_slot], roots[base + i])
+                };
+                vm.list_set(cur_list, TaggedValue::from_i64(i as i64), val)?;
+            }
+            let final_list = vm.worker_roots().temporary_values.borrow()[list_slot];
+            vm.worker_roots()
+                .temporary_values
+                .borrow_mut()
+                .truncate(list_slot);
+            Ok(final_list)
+        })?;
         let out_list = self.retain_collection_result(out_list);
-        for (i, fid) in fids.into_iter().enumerate() {
-            let val = match &self.vm.roots.promises[&fid].state {
-                crate::futures::PromiseState::Completed(v) => *v,
-                _ => unreachable!("all promises verified Completed above"),
-            };
-            self.vm
-                .list_set(out_list, TaggedValue::from_i64(i as i64), val)?;
-        }
         self.write_return(out_list);
         Ok(())
     }
@@ -1396,41 +1664,59 @@ impl<'vm> BuiltinCtx<'vm> {
         list_handle: &BuiltinRoot,
     ) -> Result<Option<(usize, TaggedValue)>, VmError> {
         let list_val = self.load_rooted(list_handle)?;
-        let len = self.vm.list_len(list_val)?;
+        let elems = self.vm.snapshot_list_elements(list_val)?;
+        let len = elems.len();
         if len == 0 {
             return Err(VmError::InvalidArgument(
                 "await_any requires a non-empty list of Futures",
             ));
         }
         let mut fids = Vec::with_capacity(len);
-        for i in 0..len {
-            let elem = self
-                .vm
-                .list_get(list_val, TaggedValue::from_i64(i as i64))?;
+        for elem in elems {
             fids.push(self.vm.decode_future_id(elem)?);
         }
-        let mut winner: Option<(usize, Result<TaggedValue, VmError>)> = None;
-        for (idx, &fid) in fids.iter().enumerate() {
-            let entry = self
-                .vm
-                .roots
-                .promises
-                .get_mut(&fid)
-                .ok_or(VmError::TypeError)?;
-            match &entry.state {
-                crate::futures::PromiseState::Completed(val) => {
-                    winner = Some((idx, Ok(*val)));
-                    break;
+
+        let (winner, any_pending) = {
+            let mut promises = self.vm.roots().promises.lock_fids(&fids);
+            let mut winner: Option<(usize, Result<TaggedValue, VmError>)> = None;
+            let mut failed_fid_to_mark = None;
+            for (idx, &fid) in fids.iter().enumerate() {
+                let entry = promises.get(fid).ok_or(VmError::TypeError)?;
+                match &entry.state {
+                    crate::futures::PromiseState::Completed(val) => {
+                        winner = Some((idx, Ok(*val)));
+                        break;
+                    }
+                    crate::futures::PromiseState::Failed(err) => {
+                        failed_fid_to_mark = Some(fid);
+                        winner = Some((idx, Err(err.clone())));
+                        break;
+                    }
+                    _ => {}
                 }
-                crate::futures::PromiseState::Failed(err) => {
-                    let err = err.clone();
-                    entry.observed_failure = true;
-                    winner = Some((idx, Err(err)));
-                    break;
-                }
-                _ => {}
             }
-        }
+            if let Some(fid) = failed_fid_to_mark {
+                drop(promises);
+                self.vm.mark_promise_failure_observed(fid);
+                (winner, false)
+            } else if winner.is_some() {
+                (winner, false)
+            } else {
+                let mut any_pending = false;
+                for &fid in &fids {
+                    if let Some(entry) = promises.get_mut(fid)
+                        && matches!(entry.state, crate::futures::PromiseState::Pending)
+                    {
+                        any_pending = true;
+                        if !entry.waiters.contains(&self.task_id) {
+                            entry.waiters.push(self.task_id);
+                        }
+                    }
+                }
+                (None, any_pending)
+            }
+        };
+
         if let Some((winner_idx, outcome)) = winner {
             let winner_fid = fids[winner_idx];
             for (idx, &other_fid) in fids.iter().enumerate() {
@@ -1440,19 +1726,7 @@ impl<'vm> BuiltinCtx<'vm> {
             }
             return outcome.map(|val| Some((winner_idx, val)));
         }
-        let mut any_pending = false;
-        for &fid in &fids {
-            if self
-                .vm
-                .roots
-                .promises
-                .get(&fid)
-                .is_some_and(|e| matches!(e.state, crate::futures::PromiseState::Pending))
-            {
-                any_pending = true;
-                self.vm.register_promise_waiter(fid, self.task_id);
-            }
-        }
+
         if any_pending {
             self.outcome = BuiltinOutcome::SuspendRetry;
             Ok(None)
@@ -1472,14 +1746,14 @@ impl<'vm> BuiltinCtx<'vm> {
         let Some((winner_idx, val)) = self.resolve_await_any(list_handle)? else {
             return Ok(());
         };
-        let base = self.vm.roots.temporary_values.borrow().len();
+        let base = self.vm.worker_roots().temporary_values.borrow().len();
         let tuple = self
             .vm
             .with_temporary_roots(&[val, TaggedValue::UNIT], |vm| {
                 let idx_val = vm.number_value(Number::I64(winner_idx as i64))?;
-                vm.roots.temporary_values.borrow_mut()[base + 1] = idx_val;
+                vm.worker_roots().temporary_values.borrow_mut()[base + 1] = idx_val;
                 let (cur_val, cur_idx) = {
-                    let roots = vm.roots.temporary_values.borrow();
+                    let roots = vm.worker_roots().temporary_values.borrow();
                     (roots[base], roots[base + 1])
                 };
                 vm.alloc_tuple(
@@ -1494,23 +1768,760 @@ impl<'vm> BuiltinCtx<'vm> {
     pub fn take_outcome(&mut self) -> BuiltinOutcome {
         std::mem::replace(&mut self.outcome, BuiltinOutcome::Continue)
     }
+
+    // -----------------------------------------------------------------------
+    // Task introspection (`803..=804`)
+    // -----------------------------------------------------------------------
+
+    pub fn task_current_id(&mut self) -> Result<(), VmError> {
+        self.return_i64(self.task_id.0 as i64)
+    }
+
+    pub fn task_tree_snapshot(&mut self) -> Result<(), VmError> {
+        let snapshot = self.vm.scheduler().format_tree_snapshot();
+        self.return_string(&snapshot)
+    }
+
+    // -----------------------------------------------------------------------
+    // Tuple & byte-list helpers for `std.sync` and `std.net`
+    // -----------------------------------------------------------------------
+
+    fn return_i64_any_tuple(&mut self, code: i64, val: TaggedValue) -> Result<(), VmError> {
+        let base = self.vm.worker_roots().temporary_values.borrow().len();
+        let tuple = self
+            .vm
+            .with_temporary_roots(&[val, TaggedValue::UNIT], |vm| {
+                let code_val = vm.number_value(Number::I64(code))?;
+                vm.worker_roots().temporary_values.borrow_mut()[base + 1] = code_val;
+                let (cur_val, cur_code) = {
+                    let roots = vm.worker_roots().temporary_values.borrow();
+                    (roots[base], roots[base + 1])
+                };
+                vm.alloc_tuple(
+                    &[Intrinsic::I64.type_index(), Intrinsic::Any.type_index()],
+                    &[cur_code, cur_val],
+                )
+            })?;
+        self.write_return(tuple);
+        Ok(())
+    }
+
+    fn return_bool_any_tuple(&mut self, flag: bool, val: TaggedValue) -> Result<(), VmError> {
+        let base = self.vm.worker_roots().temporary_values.borrow().len();
+        let tuple = self.vm.with_temporary_roots(&[val], |vm| {
+            let cur_val = vm.worker_roots().temporary_values.borrow()[base];
+            vm.alloc_tuple(
+                &[Intrinsic::Bool.type_index(), Intrinsic::Any.type_index()],
+                &[TaggedValue::from_bool(flag), cur_val],
+            )
+        })?;
+        self.write_return(tuple);
+        Ok(())
+    }
+
+    pub fn extract_byte_list(
+        &self,
+        list_root: &BuiltinRoot,
+    ) -> Result<Result<Vec<u8>, String>, VmError> {
+        let list_val = self.reload_root(list_root)?;
+        let elems = self.vm.snapshot_list_elements(list_val)?;
+        let mut out = Vec::with_capacity(elems.len());
+        for elem in elems {
+            let num = self.number_of(elem)?;
+            let Some(v) = num.to_i64_checked() else {
+                return Ok(Err("byte value out of valid range 0..=255".to_string()));
+            };
+            if !(0..=255).contains(&v) {
+                return Ok(Err(format!("byte value {v} out of valid range 0..=255")));
+            }
+            out.push(v as u8);
+        }
+        Ok(Ok(out))
+    }
+
+    // -----------------------------------------------------------------------
+    // `std.sync` primitives (`805..=846`)
+    // -----------------------------------------------------------------------
+
+    pub fn sync_chan_new(&mut self, capacity: i64) -> Result<(), VmError> {
+        let id = self.vm.roots().sync.chan_new(capacity)?;
+        self.return_i64(id)
+    }
+
+    pub fn sync_chan_send(&mut self, id: i64, val_root: &BuiltinRoot) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            if self
+                .vm
+                .roots()
+                .sync
+                .chan_take_accepted_on_cancel(id, self.task_id)
+            {
+                return self.return_i64(0);
+            }
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        let val = self.load_rooted(val_root)?;
+        let sched = self.vm.scheduler().clone();
+        match self
+            .vm
+            .roots()
+            .sync
+            .chan_send(&sched, id, self.task_id, val)?
+        {
+            crate::sync_primitives::SyncPoll::Ready(code) => self.return_i64(code),
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_chan_try_send(&mut self, id: i64, val_root: &BuiltinRoot) -> Result<(), VmError> {
+        let val = self.load_rooted(val_root)?;
+        let sched = self.vm.scheduler().clone();
+        let code = self.vm.roots().sync.chan_try_send(&sched, id, val)?;
+        self.return_i64(code)
+    }
+
+    pub fn sync_chan_recv(&mut self, id: i64) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        let sched = self.vm.scheduler().clone();
+        match self.vm.roots().sync.chan_recv(&sched, id, self.task_id)? {
+            crate::sync_primitives::SyncPoll::Ready((code, val)) => {
+                self.return_i64_any_tuple(code, val)
+            }
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_chan_try_recv(&mut self, id: i64) -> Result<(), VmError> {
+        let sched = self.vm.scheduler().clone();
+        let (code, val) = self.vm.roots().sync.chan_try_recv(&sched, id)?;
+        self.return_i64_any_tuple(code, val)
+    }
+
+    pub fn sync_chan_close(&mut self, id: i64) -> Result<(), VmError> {
+        let sched = self.vm.scheduler().clone();
+        self.vm.roots().sync.chan_close(&sched, id)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_chan_is_closed(&mut self, id: i64) -> Result<(), VmError> {
+        let closed = self.vm.roots().sync.chan_is_closed(id)?;
+        self.return_bool(closed);
+        Ok(())
+    }
+
+    pub fn sync_chan_len(&mut self, id: i64) -> Result<(), VmError> {
+        let len = self.vm.roots().sync.chan_len(id)?;
+        self.return_i64(len)
+    }
+
+    pub fn sync_mutex_new(&mut self, val_root: &BuiltinRoot) -> Result<(), VmError> {
+        let val = self.load_rooted(val_root)?;
+        let id = self.vm.roots().sync.mutex_new(val);
+        self.return_i64(id)
+    }
+
+    pub fn sync_mutex_lock(&mut self, id: i64) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        match self.vm.roots().sync.mutex_lock(id, self.task_id)? {
+            crate::sync_primitives::SyncPoll::Ready(val) => {
+                self.write_return(val);
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_mutex_try_lock(&mut self, id: i64) -> Result<(), VmError> {
+        let ok = self.vm.roots().sync.mutex_try_lock(id, self.task_id)?;
+        self.return_bool(ok);
+        Ok(())
+    }
+
+    pub fn sync_mutex_unlock(&mut self, id: i64) -> Result<(), VmError> {
+        let sched = self.vm.scheduler().clone();
+        self.vm
+            .roots()
+            .sync
+            .mutex_unlock(&sched, id, self.task_id)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_mutex_get(&mut self, id: i64) -> Result<(), VmError> {
+        let val = self.vm.roots().sync.mutex_get(id, self.task_id)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn sync_mutex_set(&mut self, id: i64, val_root: &BuiltinRoot) -> Result<(), VmError> {
+        let val = self.load_rooted(val_root)?;
+        self.vm.roots().sync.mutex_set(id, self.task_id, val)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_mutex_is_locked(&mut self, id: i64) -> Result<(), VmError> {
+        let locked = self.vm.roots().sync.mutex_is_locked(id)?;
+        self.return_bool(locked);
+        Ok(())
+    }
+
+    pub fn sync_rwlock_new(&mut self, val_root: &BuiltinRoot) -> Result<(), VmError> {
+        let val = self.load_rooted(val_root)?;
+        let id = self.vm.roots().sync.rwlock_new(val);
+        self.return_i64(id)
+    }
+
+    pub fn sync_rwlock_read_lock(&mut self, id: i64) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        match self.vm.roots().sync.rwlock_read_lock(id, self.task_id)? {
+            crate::sync_primitives::SyncPoll::Ready(val) => {
+                self.write_return(val);
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_rwlock_try_read_lock(&mut self, id: i64) -> Result<(), VmError> {
+        let ok = self
+            .vm
+            .roots()
+            .sync
+            .rwlock_try_read_lock(id, self.task_id)?;
+        self.return_bool(ok);
+        Ok(())
+    }
+
+    pub fn sync_rwlock_read_unlock(&mut self, id: i64) -> Result<(), VmError> {
+        let sched = self.vm.scheduler().clone();
+        self.vm
+            .roots()
+            .sync
+            .rwlock_read_unlock(&sched, id, self.task_id)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_rwlock_write_lock(&mut self, id: i64) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        match self.vm.roots().sync.rwlock_write_lock(id, self.task_id)? {
+            crate::sync_primitives::SyncPoll::Ready(val) => {
+                self.write_return(val);
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_rwlock_try_write_lock(&mut self, id: i64) -> Result<(), VmError> {
+        let ok = self
+            .vm
+            .roots()
+            .sync
+            .rwlock_try_write_lock(id, self.task_id)?;
+        self.return_bool(ok);
+        Ok(())
+    }
+
+    pub fn sync_rwlock_write_unlock(&mut self, id: i64) -> Result<(), VmError> {
+        let sched = self.vm.scheduler().clone();
+        self.vm
+            .roots()
+            .sync
+            .rwlock_write_unlock(&sched, id, self.task_id)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_rwlock_get(&mut self, id: i64) -> Result<(), VmError> {
+        let val = self.vm.roots().sync.rwlock_get(id, self.task_id)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn sync_rwlock_set(&mut self, id: i64, val_root: &BuiltinRoot) -> Result<(), VmError> {
+        let val = self.load_rooted(val_root)?;
+        self.vm.roots().sync.rwlock_set(id, self.task_id, val)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_sem_new(&mut self, permits: i64) -> Result<(), VmError> {
+        let id = self.vm.roots().sync.sem_new(permits)?;
+        self.return_i64(id)
+    }
+
+    pub fn sync_sem_acquire(&mut self, id: i64) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        match self.vm.roots().sync.sem_acquire(id, self.task_id)? {
+            crate::sync_primitives::SyncPoll::Ready(()) => {
+                self.return_unit();
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_sem_try_acquire(&mut self, id: i64) -> Result<(), VmError> {
+        let ok = self.vm.roots().sync.sem_try_acquire(id)?;
+        self.return_bool(ok);
+        Ok(())
+    }
+
+    pub fn sync_sem_release(&mut self, id: i64, count: i64) -> Result<(), VmError> {
+        let sched = self.vm.scheduler().clone();
+        self.vm.roots().sync.sem_release(&sched, id, count)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_sem_available(&mut self, id: i64) -> Result<(), VmError> {
+        let avail = self.vm.roots().sync.sem_available(id)?;
+        self.return_i64(avail)
+    }
+
+    pub fn sync_once_new(&mut self) -> Result<(), VmError> {
+        let id = self.vm.roots().sync.once_new();
+        self.return_i64(id)
+    }
+
+    pub fn sync_once_begin(&mut self, id: i64) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        match self.vm.roots().sync.once_begin(id, self.task_id)? {
+            crate::sync_primitives::SyncPoll::Ready((code, val)) => {
+                self.return_i64_any_tuple(code, val)
+            }
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_once_complete(&mut self, id: i64, val_root: &BuiltinRoot) -> Result<(), VmError> {
+        let val = self.load_rooted(val_root)?;
+        let is_err = self
+            .vm
+            .error_layout(val, 0)?
+            .is_some_and(|layout| layout.tag != type_pool::TypeId::ZERO);
+        let sched = self.vm.scheduler().clone();
+        if is_err {
+            self.vm.roots().sync.once_abort(&sched, id, self.task_id)?;
+        } else {
+            self.vm
+                .roots()
+                .sync
+                .once_complete(&sched, id, self.task_id, val)?;
+        }
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_once_abort(&mut self, id: i64) -> Result<(), VmError> {
+        let sched = self.vm.scheduler().clone();
+        self.vm.roots().sync.once_abort(&sched, id, self.task_id)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_once_get(&mut self, id: i64) -> Result<(), VmError> {
+        match self.vm.roots().sync.once_get(id)? {
+            Some(val) => self.return_bool_any_tuple(true, val),
+            None => self.return_bool_any_tuple(false, TaggedValue::UNIT),
+        }
+    }
+
+    pub fn sync_barrier_new(&mut self, parties: i64) -> Result<(), VmError> {
+        let id = self.vm.roots().sync.barrier_new(parties)?;
+        self.return_i64(id)
+    }
+
+    pub fn sync_barrier_wait(&mut self, id: i64) -> Result<(), VmError> {
+        if self.should_abort_for_cancel() {
+            if let Some(is_leader) = self
+                .vm
+                .roots()
+                .sync
+                .barrier_take_completed_on_cancel(id, self.task_id)
+            {
+                self.return_bool(is_leader);
+                return Ok(());
+            }
+            let sched = self.vm.scheduler().clone();
+            self.vm.roots().sync.cancel_task(&sched, self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(());
+        }
+        let sched = self.vm.scheduler().clone();
+        match self
+            .vm
+            .roots()
+            .sync
+            .barrier_wait(&sched, id, self.task_id)?
+        {
+            crate::sync_primitives::SyncPoll::Ready(is_leader) => {
+                self.return_bool(is_leader);
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::SuspendRetry => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn sync_atomic_new(&mut self, initial: i64) -> Result<(), VmError> {
+        let id = self.vm.roots().sync.atomic_new(initial)?;
+        self.return_i64(id)
+    }
+
+    pub fn sync_atomic_load(&mut self, id: i64) -> Result<(), VmError> {
+        let val = self.vm.roots().sync.atomic_load(id)?;
+        self.return_i64(val)
+    }
+
+    pub fn sync_atomic_store(&mut self, id: i64, val: i64) -> Result<(), VmError> {
+        self.vm.roots().sync.atomic_store(id, val)?;
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn sync_atomic_swap(&mut self, id: i64, val: i64) -> Result<(), VmError> {
+        let prev = self.vm.roots().sync.atomic_swap(id, val)?;
+        self.return_i64(prev)
+    }
+
+    pub fn sync_atomic_fetch_add(&mut self, id: i64, delta: i64) -> Result<(), VmError> {
+        let prev = self.vm.roots().sync.atomic_fetch_add(id, delta)?;
+        self.return_i64(prev)
+    }
+
+    pub fn sync_atomic_cas(&mut self, id: i64, expected: i64, desired: i64) -> Result<(), VmError> {
+        let (ok, actual) = self.vm.roots().sync.atomic_cas(id, expected, desired)?;
+        self.return_native(NativeValue::Tuple(vec![
+            NativeValue::Bool(ok),
+            NativeValue::I64(actual),
+        ]))
+    }
+
+    // -----------------------------------------------------------------------
+    // `std.net` non-blocking `libuv` operations (`847..=864`)
+    // -----------------------------------------------------------------------
+
+    fn complete_net_outcome(&mut self, out: NetOutcome) -> Result<(), VmError> {
+        match out {
+            NetOutcome::HandleAddr {
+                code,
+                msg,
+                handle_id,
+                host,
+                port,
+            } => {
+                self.check_string_size(msg.len())?;
+                self.check_string_size(host.len())?;
+                self.return_native(NativeValue::Tuple(vec![
+                    NativeValue::I64(code),
+                    NativeValue::Str(msg),
+                    NativeValue::I64(handle_id),
+                    NativeValue::Str(host),
+                    NativeValue::I64(port),
+                ]))
+            }
+            NetOutcome::Bytes { code, msg, data } => {
+                self.check_string_size(msg.len())?;
+                let items = data
+                    .into_iter()
+                    .map(|b| NativeValue::I64(i64::from(b)))
+                    .collect();
+                self.return_native(NativeValue::Tuple(vec![
+                    NativeValue::I64(code),
+                    NativeValue::Str(msg),
+                    NativeValue::List(items),
+                ]))
+            }
+            NetOutcome::Line { code, msg, line } => {
+                self.check_string_size(msg.len())?;
+                if let Some(ref s) = line {
+                    self.check_string_size(s.len())?;
+                }
+                self.return_native(NativeValue::Tuple(vec![
+                    NativeValue::I64(code),
+                    NativeValue::Str(msg),
+                    NativeValue::OptStr(line),
+                ]))
+            }
+            NetOutcome::Count { code, msg, count } => {
+                self.check_string_size(msg.len())?;
+                self.return_native(NativeValue::Tuple(vec![
+                    NativeValue::I64(code),
+                    NativeValue::Str(msg),
+                    NativeValue::I64(count),
+                ]))
+            }
+            NetOutcome::Datagram {
+                code,
+                msg,
+                data,
+                host,
+                port,
+            } => {
+                self.check_string_size(msg.len())?;
+                self.check_string_size(host.len())?;
+                let items = data
+                    .into_iter()
+                    .map(|b| NativeValue::I64(i64::from(b)))
+                    .collect();
+                self.return_native(NativeValue::Tuple(vec![
+                    NativeValue::I64(code),
+                    NativeValue::Str(msg),
+                    NativeValue::List(items),
+                    NativeValue::Str(host),
+                    NativeValue::I64(port),
+                ]))
+            }
+            NetOutcome::Hosts { code, msg, addrs } => {
+                self.check_string_size(msg.len())?;
+                let mut items = Vec::with_capacity(addrs.len());
+                for ip in addrs {
+                    self.check_string_size(ip.len())?;
+                    items.push(NativeValue::Str(ip));
+                }
+                self.return_native(NativeValue::Tuple(vec![
+                    NativeValue::I64(code),
+                    NativeValue::Str(msg),
+                    NativeValue::List(items),
+                ]))
+            }
+        }
+    }
+
+    pub fn run_net_op<S>(&mut self, submit: S) -> Result<(), VmError>
+    where
+        S: FnOnce(&mut Self) -> Result<bool, VmError>,
+    {
+        match self.vm.scheduler().poll_task_op(self.task_id) {
+            TaskOpPoll::Ready(TaskOpResult::Net(out)) => self.complete_net_outcome(out),
+            TaskOpPoll::Ready(_) => unreachable!("unexpected TaskOpResult variant for net op"),
+            TaskOpPoll::Pending => {
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            TaskOpPoll::Vacant => {
+                if self.should_abort_for_cancel() {
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                    return Ok(());
+                }
+                if submit(self)? {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn net_tcp_local_addr(&mut self, id: i64) -> Result<(), VmError> {
+        match self.vm.scheduler().tcp_local_addr(id) {
+            Some((ip, port)) => self.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(0),
+                NativeValue::Str(String::new()),
+                NativeValue::Str(ip),
+                NativeValue::I64(port),
+            ])),
+            None => self.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(6),
+                NativeValue::Str("TCP socket is closed".to_string()),
+                NativeValue::Str(String::new()),
+                NativeValue::I64(0),
+            ])),
+        }
+    }
+
+    pub fn net_tcp_peer_addr(&mut self, id: i64) -> Result<(), VmError> {
+        match self.vm.scheduler().tcp_peer_addr(id) {
+            Some((ip, port)) => self.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(0),
+                NativeValue::Str(String::new()),
+                NativeValue::Str(ip),
+                NativeValue::I64(port),
+            ])),
+            None => self.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(6),
+                NativeValue::Str("TCP stream is closed".to_string()),
+                NativeValue::Str(String::new()),
+                NativeValue::I64(0),
+            ])),
+        }
+    }
+
+    pub fn net_tcp_close(&mut self, id: i64) -> Result<(), VmError> {
+        if !self.vm.scheduler().tcp_close(id) {
+            return Err(VmError::InvalidArgument("invalid TCP handle"));
+        }
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn net_udp_local_addr(&mut self, id: i64) -> Result<(), VmError> {
+        match self.vm.scheduler().udp_local_addr(id) {
+            Some((ip, port)) => self.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(0),
+                NativeValue::Str(String::new()),
+                NativeValue::Str(ip),
+                NativeValue::I64(port),
+            ])),
+            None => self.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(6),
+                NativeValue::Str("UDP socket is closed".to_string()),
+                NativeValue::Str(String::new()),
+                NativeValue::I64(0),
+            ])),
+        }
+    }
+
+    pub fn net_udp_close(&mut self, id: i64) -> Result<(), VmError> {
+        if !self.vm.scheduler().udp_close(id) {
+            return Err(VmError::InvalidArgument("invalid UDP handle"));
+        }
+        self.return_unit();
+        Ok(())
+    }
+
+    pub fn submit_tcp_listen(&self, host: String, port: i64, backlog: i64) {
+        self.vm
+            .scheduler()
+            .submit_tcp_listen(self.task_id, host, port, backlog);
+    }
+
+    pub fn submit_tcp_accept(&self, listener_id: i64) {
+        self.vm
+            .scheduler()
+            .submit_tcp_accept(self.task_id, listener_id);
+    }
+
+    pub fn submit_tcp_connect(&self, host: String, port: i64) {
+        self.vm
+            .scheduler()
+            .submit_tcp_connect(self.task_id, host, port);
+    }
+
+    pub fn submit_tcp_read_bytes(&self, stream_id: i64, max_bytes: usize) {
+        self.vm
+            .scheduler()
+            .submit_tcp_read_bytes(self.task_id, stream_id, max_bytes);
+    }
+
+    pub fn submit_tcp_read_line(&self, stream_id: i64) {
+        self.vm
+            .scheduler()
+            .submit_tcp_read_line(self.task_id, stream_id);
+    }
+
+    pub fn submit_tcp_write(&self, stream_id: i64, data: Vec<u8>) {
+        self.vm
+            .scheduler()
+            .submit_tcp_write(self.task_id, stream_id, data);
+    }
+
+    pub fn submit_tcp_set_nodelay(&self, stream_id: i64, enable: bool) {
+        self.vm
+            .scheduler()
+            .submit_tcp_set_nodelay(self.task_id, stream_id, enable);
+    }
+
+    pub fn submit_udp_bind(&self, host: String, port: i64) {
+        self.vm
+            .scheduler()
+            .submit_udp_bind(self.task_id, host, port);
+    }
+
+    pub fn submit_udp_send(&self, sock_id: i64, host: String, port: i64, data: Vec<u8>) {
+        self.vm
+            .scheduler()
+            .submit_udp_send(self.task_id, sock_id, host, port, data);
+    }
+
+    pub fn submit_udp_recv(&self, sock_id: i64, max_bytes: usize) {
+        self.vm
+            .scheduler()
+            .submit_udp_recv(self.task_id, sock_id, max_bytes);
+    }
+
+    pub fn submit_resolve_host(&self, host: String) {
+        self.vm.scheduler().submit_resolve_host(self.task_id, host);
+    }
 }
 
 impl Vm {
-    fn intern_optional_type(&mut self, inner: TypeIndex) -> TypeIndex {
-        (0..self.state.type_pool.len())
-            .map(|index| TypeIndex::from_raw(index as u32))
-            .find(|&index| {
-                matches!(
-                    &self.state.type_pool.get(index).kind,
-                    TypeKind::Optional { inner: found } if *found == inner
-                )
-            })
-            .unwrap_or_else(|| {
-                self.state
-                    .type_pool
-                    .intern_structural(TypeKind::Optional { inner })
-            })
+    fn intern_optional_type(&self, inner: TypeIndex) -> TypeIndex {
+        {
+            let tp = self.type_pool_read();
+            if let Some(found) = (0..tp.len())
+                .map(|index| TypeIndex::from_raw(index as u32))
+                .find(|&index| {
+                    matches!(
+                        &tp.get(index).kind,
+                        TypeKind::Optional { inner: found } if *found == inner
+                    )
+                })
+            {
+                return found;
+            }
+        }
+        self.type_pool_write()
+            .intern_structural(TypeKind::Optional { inner })
     }
 
     pub(crate) fn alloc_native(
@@ -1573,67 +2584,71 @@ impl Vm {
                 Ok((v, ty))
             }
             NativeValue::List(items) => {
-                let list_ty = self.state.type_pool.list_type().ok_or(VmError::TypeError)?;
+                let list_ty = self
+                    .type_pool_read()
+                    .list_type()
+                    .ok_or(VmError::TypeError)?;
                 let list = self.new_list(items.len())?;
-                let base = self.roots.temporary_values.borrow().len();
+                let base = self.worker_roots().temporary_values.borrow().len();
                 self.with_temporary_roots(&[list, TaggedValue::UNIT], |vm| {
                     for (idx, item) in items.into_iter().enumerate() {
                         let (elem, _) = vm.alloc_native(task_id, item)?;
-                        vm.roots.temporary_values.borrow_mut()[base + 1] = elem;
+                        vm.worker_roots().temporary_values.borrow_mut()[base + 1] = elem;
                         let (cur_list, cur_elem) = {
-                            let roots = vm.roots.temporary_values.borrow();
+                            let roots = vm.worker_roots().temporary_values.borrow();
                             (roots[base], roots[base + 1])
                         };
                         vm.list_set(cur_list, TaggedValue::from_u64(idx as u64), cur_elem)?;
-                        vm.roots.temporary_values.borrow_mut()[base + 1] = TaggedValue::UNIT;
+                        vm.worker_roots().temporary_values.borrow_mut()[base + 1] =
+                            TaggedValue::UNIT;
                     }
-                    let final_list = vm.roots.temporary_values.borrow()[base];
+                    let final_list = vm.worker_roots().temporary_values.borrow()[base];
                     Ok((final_list, list_ty))
                 })
             }
             NativeValue::StringMap(entries) => {
-                let map_ty = self.state.type_pool.map_type().ok_or(VmError::TypeError)?;
+                let map_ty = self.type_pool_read().map_type().ok_or(VmError::TypeError)?;
                 let cap = if entries.is_empty() {
                     0
                 } else {
                     entries.len().saturating_mul(2).min(8192)
                 };
                 let map = self.new_map(cap)?;
-                let base = self.roots.temporary_values.borrow().len();
+                let base = self.worker_roots().temporary_values.borrow().len();
                 self.with_temporary_roots(&[map, TaggedValue::UNIT, TaggedValue::UNIT], |vm| {
                     for (key_str, val_spec) in entries {
                         vm.check_display_bytes(task_id, key_str.len())?;
                         Self::string_payload_words(key_str.len())?;
                         let k = vm.alloc_string(&key_str)?;
-                        vm.roots.temporary_values.borrow_mut()[base + 1] = k;
+                        vm.worker_roots().temporary_values.borrow_mut()[base + 1] = k;
                         let (v, _) = vm.alloc_native(task_id, val_spec)?;
-                        vm.roots.temporary_values.borrow_mut()[base + 2] = v;
+                        vm.worker_roots().temporary_values.borrow_mut()[base + 2] = v;
                         let (cur_map, cur_key, cur_val) = {
-                            let roots = vm.roots.temporary_values.borrow();
+                            let roots = vm.worker_roots().temporary_values.borrow();
                             (roots[base], roots[base + 1], roots[base + 2])
                         };
                         vm.map_set(cur_map, cur_key, cur_val)?;
-                        let mut roots = vm.roots.temporary_values.borrow_mut();
+                        let mut roots = vm.worker_roots().temporary_values.borrow_mut();
                         roots[base + 1] = TaggedValue::UNIT;
                         roots[base + 2] = TaggedValue::UNIT;
                     }
-                    let final_map = vm.roots.temporary_values.borrow()[base];
+                    let final_map = vm.worker_roots().temporary_values.borrow()[base];
                     Ok((final_map, map_ty))
                 })
             }
             NativeValue::Tuple(items) => {
                 let len = items.len();
                 let init_slots = vec![TaggedValue::UNIT; len];
-                let base = self.roots.temporary_values.borrow().len();
+                let base = self.worker_roots().temporary_values.borrow().len();
                 self.with_temporary_roots(&init_slots, |vm| {
                     let mut elem_types = Vec::with_capacity(len);
                     for (idx, item) in items.into_iter().enumerate() {
                         let (val, ty) = vm.alloc_native(task_id, item)?;
-                        vm.roots.temporary_values.borrow_mut()[base + idx] = val;
+                        vm.worker_roots().temporary_values.borrow_mut()[base + idx] = val;
                         elem_types.push(ty);
                     }
                     let values: Vec<TaggedValue> =
-                        vm.roots.temporary_values.borrow()[base..base + len].to_vec();
+                        vm.worker_roots().temporary_values.borrow()[base..base + len].to_vec();
                     let tuple = vm.alloc_tuple(&elem_types, &values)?;
                     let tuple_ty = vm.reflected_type(tuple)?;
                     Ok((tuple, tuple_ty))
@@ -1677,16 +2692,19 @@ impl Vm {
         if let Some(s) = heap_string_to_owned(val) {
             return Ok(NativeValue::Str(s));
         }
-        if let Ok(len) = self.list_len(val) {
-            let mut items = Vec::with_capacity(len);
-            for i in 0..len {
-                let elem = self.list_get(val, TaggedValue::from_u64(i as u64))?;
+        if let Ok(elems) = self.snapshot_list_elements(val) {
+            let mut items = Vec::with_capacity(elems.len());
+            for elem in elems {
                 items.push(self.value_to_native(elem, depth + 1)?);
             }
             return Ok(NativeValue::List(items));
         }
-        if let Ok(layout) = self.map_layout(val) {
-            let raw_entries = layout.snapshot_entries()?;
+        let maybe_map_entries = (|| -> Result<Vec<(String, TaggedValue)>, VmError> {
+            let _guard = self.stripe_read(val)?;
+            let layout = self.map_layout_unlocked(val)?;
+            layout.snapshot_entries()
+        })();
+        if let Ok(raw_entries) = maybe_map_entries {
             let mut entries = Vec::with_capacity(raw_entries.len());
             for (k, v) in raw_entries {
                 entries.push((k, self.value_to_native(v, depth + 1)?));
@@ -1721,26 +2739,27 @@ impl BuiltinCtx<'_> {
     /// Dispatch `(op, args)` to the embedder's [`HostHandler`] and encode `(ok: bool, payload: Any)`.
     pub fn invoke_host_call(&mut self, op: &str, args_root: &BuiltinRoot) -> Result<(), VmError> {
         let list_val = self.load_rooted(args_root)?;
-        let len = self.vm.list_len(list_val)?;
-        let mut native_args = Vec::with_capacity(len);
-        for i in 0..len {
-            let elem = self
-                .vm
-                .list_get(list_val, TaggedValue::from_u64(i as u64))?;
+        let elems = self.vm.snapshot_list_elements(list_val)?;
+        let mut native_args = Vec::with_capacity(elems.len());
+        for elem in elems {
             native_args.push(self.vm.value_to_native(elem, 0)?);
         }
-        let Some(mut handler) = self.vm.state.host_handler.take() else {
-            return self.return_host_call_pair(
-                false,
-                NativeValue::Str("no host handler installed".to_string()),
-            );
+        let outcome = {
+            let mut guard = self.vm.shared.host_handler.lock();
+            let Some(handler) = guard.as_mut() else {
+                drop(guard);
+                return self.return_host_call_pair(
+                    false,
+                    NativeValue::Str("no host handler installed".to_string()),
+                );
+            };
+            handler.call(op, &native_args, self.task_id)
         };
-        let outcome = handler.call(op, &native_args, self.task_id);
-        self.vm.state.host_handler = Some(handler);
         match outcome {
             HostCallOutcome::Return(val) => self.return_host_call_pair(true, val),
             HostCallOutcome::Error(msg) => self.return_host_call_pair(false, NativeValue::Str(msg)),
             HostCallOutcome::SuspendRetry => {
+                self.vm.scheduler().mark_external_waiter(self.task_id);
                 self.outcome = BuiltinOutcome::SuspendRetry;
                 Ok(())
             }
@@ -1764,10 +2783,12 @@ pub(crate) fn with_heap_string_str<R>(val: TaggedValue, f: impl FnOnce(&str) -> 
     {
         return None;
     }
+    // SAFETY: `Str` payloads are immutable after publication and word-aligned.
     let len = unsafe { *(ptr as *const u64) } as usize;
     if len > header.payload_words() * 8 - 8 {
         return None;
     }
+    // SAFETY: `len` was bounds-checked against `header.payload_words()`.
     let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
     let s = std::str::from_utf8(bytes).ok()?;
     Some(f(s))
@@ -1809,9 +2830,7 @@ mod tests {
     fn native_root_handles_reject_wrong_live_context_and_invalid_argument() {
         let mut vm = crate::tests::make_vm();
         let task = vm.spawn_root(nsbc::FuncId(0));
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
+        vm.task_mut(task)
             .unwrap()
             .registers
             .set(Reg(0), TaggedValue::from_i64(42));
@@ -1855,15 +2874,10 @@ mod tests {
         let index = vm
             .push_constant(&nsbc::Constant::Str("retained".into()))
             .unwrap();
-        let value = vm.roots.constants.get(index);
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(0), value);
-        let roots_before = vm.roots.temporary_values.borrow().len();
-        let pins_before = vm.roots.native_pins.borrow().len();
+        let value = vm.roots().constants.read(0).get(index);
+        vm.task_mut(task).unwrap().registers.set(Reg(0), value);
+        let roots_before = vm.worker_roots().temporary_values.borrow().len();
+        let pins_before = vm.worker_roots().native_pins.borrow().len();
         let result = (|| -> Result<(), VmError> {
             let ctx = BuiltinCtx::new(&mut vm, task, 1);
             ctx.arg(0)?;
@@ -1871,8 +2885,11 @@ mod tests {
             Err(VmError::TypeError)
         })();
         assert!(matches!(result, Err(VmError::TypeError)));
-        assert_eq!(vm.roots.temporary_values.borrow().len(), roots_before);
-        assert_eq!(vm.roots.native_pins.borrow().len(), pins_before);
+        assert_eq!(
+            vm.worker_roots().temporary_values.borrow().len(),
+            roots_before
+        );
+        assert_eq!(vm.worker_roots().native_pins.borrow().len(), pins_before);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let ctx = BuiltinCtx::new(&mut vm, task, 1);
             ctx.arg(0).unwrap();
@@ -1880,8 +2897,11 @@ mod tests {
             panic!("native callback unwind fixture");
         }));
         assert!(result.is_err());
-        assert_eq!(vm.roots.temporary_values.borrow().len(), roots_before);
-        assert_eq!(vm.roots.native_pins.borrow().len(), pins_before);
+        assert_eq!(
+            vm.worker_roots().temporary_values.borrow().len(),
+            roots_before
+        );
+        assert_eq!(vm.worker_roots().native_pins.borrow().len(), pins_before);
     }
 
     fn concat(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
@@ -1917,7 +2937,7 @@ mod tests {
             } else {
                 "concat"
             });
-            vm.state.type_pool.add_method(
+            vm.type_pool_write().add_method(
                 Intrinsic::Str.type_index(),
                 type_pool::MethodSlot {
                     name,
@@ -2036,19 +3056,14 @@ mod tests {
     #[test]
     fn scalar_equality_primitive_rejects_opaque_buffers_and_forged_type_values() {
         let mut vm = crate::tests::make_vm();
-        let buffer_type = vm.state.type_pool.list_buffer_type().unwrap();
+        let buffer_type = vm.type_pool_read().list_buffer_type().unwrap();
         let task = vm.spawn_root(nsbc::FuncId(0));
         // SAFETY: TestVm holds an operation. The zero-slot opaque buffer is
         // initialized and immediately placed in the registered task roots.
-        let payload = unsafe { vm.state.heap.alloc_object(buffer_type, 0) }.unwrap();
+        let payload = unsafe { vm.heap_mut().alloc_object(buffer_type, 0) }.unwrap();
         // SAFETY: this allocation is initialized and remains live under the operation.
         let value = unsafe { TaggedValue::from_heap_ptr(payload.as_ptr()) };
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(0), value);
+        vm.task_mut(task).unwrap().registers.set(Reg(0), value);
         let ctx = BuiltinCtx::new(&mut vm, task, 1);
         let value = ctx.arg(0).unwrap();
         assert!(matches!(
@@ -2140,7 +3155,7 @@ mod tests {
         for kind in [Intrinsic::Closure, Intrinsic::Continuation, Intrinsic::Str] {
             // SAFETY: TestVm holds an operation throughout fixture mutation.
             // The object is published before any subsequent managed allocation.
-            let payload = unsafe { vm.state.heap.alloc_object(kind.type_index(), 1) }.unwrap();
+            let payload = unsafe { vm.heap_mut().alloc_object(kind.type_index(), 1) }.unwrap();
             // SAFETY: the allocation owns one aligned u64 payload word. For Str,
             // length 8 is invalid because there is no room after the prefix.
             unsafe {
@@ -2148,12 +3163,7 @@ mod tests {
             }
             // SAFETY: payload points to this initialized, live heap allocation.
             let value = unsafe { TaggedValue::from_heap_ptr(payload.as_ptr()) };
-            vm.roots
-                .scheduler
-                .get_task_mut(task)
-                .unwrap()
-                .registers
-                .set(Reg(0), value);
+            vm.task_mut(task).unwrap().registers.set(Reg(0), value);
             let ctx = BuiltinCtx::new(&mut vm, task, 1);
             assert!(matches!(ctx.arg_string(0), Err(VmError::TypeError)));
             let value = ctx.arg(0).unwrap();

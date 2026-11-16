@@ -453,6 +453,9 @@ pub struct TypePool {
     /// Indices created by structural interning. Raw registrations may represent
     /// nominal declarations even when their descriptor resembles a signature.
     structural_types: Vec<TypeIndex>,
+    /// Pre-indexed `TypeKind::Future` entries for fast runtime `Future(T)` lookup.
+    future_types: Vec<TypeIndex>,
+    future_index_dirty: bool,
     /// TypeId → TypeIndex reverse lookup.
     id_to_index: std::collections::HashMap<TypeId, TypeIndex>,
     /// Per-type method tables.
@@ -485,6 +488,8 @@ impl TypePool {
         Self {
             types: Vec::new(),
             structural_types: Vec::new(),
+            future_types: Vec::new(),
+            future_index_dirty: false,
             id_to_index: std::collections::HashMap::new(),
             methods: Vec::new(),
             scopes: Vec::new(),
@@ -783,6 +788,9 @@ impl TypePool {
         if info.type_id != TypeId::ZERO {
             self.id_to_index.insert(info.type_id, idx);
         }
+        if matches!(info.kind, TypeKind::Future { .. }) {
+            self.future_types.push(idx);
+        }
         self.invalidate_type_identities();
         self.types.push(info);
         self.methods.push(Vec::new());
@@ -893,6 +901,7 @@ impl TypePool {
     /// Look up type info mutably by index.
     pub fn get_mut(&mut self, idx: TypeIndex) -> &mut TypeInfo {
         self.invalidate_type_identities();
+        self.future_index_dirty = true;
         self.concrete_types
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -933,6 +942,16 @@ impl TypePool {
     /// Look up a pre-interned `Future(inner)` type without mutating the pool.
     pub fn find_future(&self, inner: TypeIndex) -> Option<TypeIndex> {
         let canon_inner = self.canonical_type(inner)?;
+        if !self.future_index_dirty {
+            for &idx in &self.future_types {
+                if let TypeKind::Future { inner: cand } = self.types[idx.as_u32() as usize].kind
+                    && self.canonical_type(cand) == Some(canon_inner)
+                {
+                    return Some(idx);
+                }
+            }
+            return None;
+        }
         for (idx, info) in self.types.iter().enumerate() {
             if let TypeKind::Future { inner: cand } = info.kind
                 && self.canonical_type(cand) == Some(canon_inner)

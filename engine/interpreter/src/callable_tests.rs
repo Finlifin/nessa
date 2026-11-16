@@ -29,7 +29,7 @@ fn apply_and_update_dispatch_for_heap_and_immediate_receiver_types() {
         let value = match kind {
             "struct" | "tuple" => {
                 let ty = if kind == "struct" {
-                    vm.state.type_pool.register(TypeInfo {
+                    vm.type_pool_write().register(TypeInfo {
                         kind: TypeKind::Struct {
                             name: str_interner::intern("Callable"),
                             fields: vec![],
@@ -39,13 +39,12 @@ fn apply_and_update_dispatch_for_heap_and_immediate_receiver_types() {
                         align: 8,
                     })
                 } else {
-                    vm.state
-                        .type_pool
+                    vm.type_pool_write()
                         .intern_structural(TypeKind::Tuple { elements: vec![] })
                 };
                 // SAFETY: TestVm holds an operation. This zero-field allocation
                 // has no uninitialized slots and is published before allocating again.
-                let pointer = unsafe { vm.state.heap.alloc_object(ty, 0) }.unwrap();
+                let pointer = unsafe { vm.heap_mut().alloc_object(ty, 0) }.unwrap();
                 unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) }
             }
             "enum" | "payload_enum" => {
@@ -59,7 +58,7 @@ fn apply_and_update_dispatch_for_heap_and_immediate_receiver_types() {
                         has_default: false,
                     }]
                 };
-                let ty = vm.state.type_pool.register(TypeInfo {
+                let ty = vm.type_pool_write().register(TypeInfo {
                     kind: TypeKind::Enum {
                         name: str_interner::intern("CallableEnum"),
                         variants: vec![VariantInfo {
@@ -77,7 +76,7 @@ fn apply_and_update_dispatch_for_heap_and_immediate_receiver_types() {
                     tag
                 } else {
                     // SAFETY: initialize both words before publishing the live enum.
-                    let pointer = unsafe { vm.state.heap.alloc_object(ty, 2) }.unwrap();
+                    let pointer = unsafe { vm.heap_mut().alloc_object(ty, 2) }.unwrap();
                     unsafe {
                         pointer.as_ptr().cast::<u64>().write(tag.raw());
                         pointer
@@ -105,7 +104,7 @@ fn apply_and_update_dispatch_for_heap_and_immediate_receiver_types() {
         let apply = str_interner::intern("apply");
         let update = str_interner::intern("update");
         for (name, function) in [(apply, 1), (update, 2)] {
-            vm.state.type_pool.add_method(
+            vm.type_pool_write().add_method(
                 ty,
                 MethodSlot {
                     name,
@@ -150,12 +149,7 @@ fn apply_and_update_dispatch_for_heap_and_immediate_receiver_types() {
             });
         }
         let task = vm.spawn_root(FuncId(0));
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(10), value);
+        vm.task_mut(task).unwrap().registers.set(Reg(10), value);
         assert!(matches!(vm.run(), VmResult::Finished), "kind={kind}");
         assert_eq!(vm.task_result_i64(task).unwrap(), 42, "kind={kind}");
         assert_eq!(vm.active_stack_count(), 0);
@@ -168,7 +162,7 @@ fn dynamic_callers_reject_missing_methods_and_incomplete_full_arity() {
         let mut vm = make_vm();
         let apply = str_interner::intern("apply");
         if registered {
-            vm.state.type_pool.add_method(
+            vm.type_pool_write().add_method(
                 Intrinsic::Bool.type_index(),
                 MethodSlot {
                     name: apply,
@@ -202,9 +196,7 @@ fn dynamic_callers_reject_missing_methods_and_incomplete_full_arity() {
             });
         }
         let task = vm.spawn_root(FuncId(0));
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
+        vm.task_mut(task)
             .unwrap()
             .registers
             .set(Reg(10), TaggedValue::TRUE);

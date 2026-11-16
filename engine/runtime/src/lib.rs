@@ -13,6 +13,51 @@ pub use builtin::{
     lookup_builtin_fn_meta,
 };
 
+/// Fast non-cryptographic Fx/SplitMix hasher for internal runtime integer/ID tables.
+#[derive(Default)]
+pub struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h = (h ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x517cc1b727220a95);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        let x = i ^ (i >> 30);
+        self.0 = (self.0 ^ x).wrapping_mul(0xbf58476d1ce4e5b9);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+pub type FastHashMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FastHasher>>;
+pub type FastHashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<FastHasher>>;
+
 // ---------------------------------------------------------------------------
 // TaggedValue — the universal 64-bit runtime value
 // ---------------------------------------------------------------------------
@@ -333,6 +378,100 @@ impl Default for RegisterFile {
 // CallFrame — a single frame on the call stack
 // ---------------------------------------------------------------------------
 
+/// Entry recorded on a frame's LIFO cleanup stack for deterministic cancellation unwinding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwindEntry {
+    /// Resume bytecode at `pc` with `r0 = true` to run a `defer` cleanup block.
+    DeferPc(u32),
+    /// Cancel and await all child tasks in `scope_id`, then pop the top `EffectHandler`.
+    HandlerScope(u64),
+}
+
+/// Inline fixed-capacity buffer for callee-saved registers (`Reg::CALLEE_SAVED`),
+/// avoiding a heap allocation on every function call frame push/pop.
+#[derive(Clone, Copy)]
+pub struct SavedRegs {
+    entries: [(Reg, TaggedValue); Reg::CALLEE_SAVED.len()],
+    len: u8,
+}
+
+impl SavedRegs {
+    pub const fn new() -> Self {
+        Self {
+            entries: [(Reg(0), TaggedValue::UNIT); Reg::CALLEE_SAVED.len()],
+            len: 0,
+        }
+    }
+
+    pub fn from_slice(items: &[(Reg, TaggedValue)]) -> Self {
+        let mut out = Self::new();
+        for &(reg, val) in items {
+            out.push(reg, val);
+        }
+        out
+    }
+
+    #[inline]
+    pub fn push(&mut self, reg: Reg, val: TaggedValue) {
+        let idx = self.len as usize;
+        assert!(idx < self.entries.len(), "SavedRegs capacity exceeded");
+        self.entries[idx] = (reg, val);
+        self.len += 1;
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[(Reg, TaggedValue)] {
+        &self.entries[..self.len as usize]
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [(Reg, TaggedValue)] {
+        &mut self.entries[..self.len as usize]
+    }
+}
+
+impl Default for SavedRegs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for SavedRegs {
+    type Target = [(Reg, TaggedValue)];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for SavedRegs {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a SavedRegs {
+    type Item = &'a (Reg, TaggedValue);
+    type IntoIter = std::slice::Iter<'a, (Reg, TaggedValue)>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut SavedRegs {
+    type Item = &'a mut (Reg, TaggedValue);
+    type IntoIter = std::slice::IterMut<'a, (Reg, TaggedValue)>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
+    }
+}
+
 /// A frame on the call stack.
 #[derive(Clone)]
 pub struct CallFrame {
@@ -342,9 +481,13 @@ pub struct CallFrame {
     /// Function being executed.
     pub func_id: FuncId,
     /// Saved register values (spilled before call).
-    pub saved_regs: Vec<(Reg, TaggedValue)>,
+    pub saved_regs: SavedRegs,
     /// Caller-local values, moved into the frame while the callee executes.
     pub local_slots: Vec<TaggedValue>,
+    /// Saved LIFO cleanup actions (`defer` PCs and handler scopes) of the caller frame.
+    pub unwind_stack: Vec<UnwindEntry>,
+    /// Whether the caller frame was actively executing a cancellation `defer` block.
+    pub is_unwind_target: bool,
 }
 
 /// Traversal state is owned by a frame/segment; cloning a continuation copies
@@ -371,9 +514,23 @@ pub enum TaskStatus {
     Finished,
 }
 
-/// Unique identifier for a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Unique generational identifier for a task: `(generation << 32) | slot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskId(pub u64);
+
+impl TaskId {
+    pub const fn from_parts(slot: u32, generation: u32) -> Self {
+        Self(((generation as u64) << 32) | (slot as u64))
+    }
+
+    pub const fn slot(self) -> u32 {
+        self.0 as u32
+    }
+
+    pub const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
 
 /// Complete execution state of a single task.
 pub struct TaskState {
@@ -385,26 +542,131 @@ pub struct TaskState {
     pub parent: Option<TaskId>,
     /// Child tasks spawned by this task.
     pub children: Vec<TaskId>,
-    /// Future IDs spawned directly by this task.
-    pub promise_set: Vec<u64>,
+    /// Active or unobserved-failed Future IDs spawned directly by this task.
+    pub promise_set: std::collections::BTreeSet<u64>,
     /// If this task was spawned for an async effect handler, the promise it fulfills.
     pub spawned_promise: Option<u64>,
     /// Cooperative/safepoint cancellation flag propagated down the task tree.
     pub cancelled: bool,
+    /// True once this task has entered deterministic cancellation `defer`/handler unwinding.
+    pub unwinding_cancel: bool,
+    /// True while suspended inside `begin_or_step_cancel_unwind` awaiting child cleanup.
+    pub paused_in_unwind_step: bool,
+    /// Snapshot of visible ancestor tasks' effect handlers at spawn time (outermost to innermost).
+    /// Stored per-task so moving GC updates `closure_env` slots without cross-task races.
+    pub ancestor_handlers: Vec<EffectHandler>,
 }
 
 impl TaskState {
     pub fn new(id: TaskId, func_id: FuncId) -> Self {
+        Self::from_stacks(id, TaskStacks::new(func_id))
+    }
+
+    pub fn new_with_pool(
+        id: TaskId,
+        func_id: FuncId,
+        pool: std::sync::Arc<stack_pool::StackPool>,
+    ) -> Self {
+        Self::from_stacks(id, TaskStacks::with_pool(func_id, pool))
+    }
+
+    /// Reinitialize a reaped `TaskState` in place for reuse on a new `TaskId` generation.
+    pub fn reinit_for_spawn(
+        &mut self,
+        id: TaskId,
+        func_id: FuncId,
+        pool: Option<std::sync::Arc<stack_pool::StackPool>>,
+    ) {
+        self.id = id;
+        self.status = TaskStatus::Ready;
+        self.stacks.reinit_for_spawn(func_id, pool);
+        self.parent = None;
+        self.children.clear();
+        self.promise_set.clear();
+        self.spawned_promise = None;
+        self.cancelled = false;
+        self.unwinding_cancel = false;
+        self.paused_in_unwind_step = false;
+        self.ancestor_handlers.clear();
+    }
+
+    fn from_stacks(id: TaskId, stacks: TaskStacks) -> Self {
         Self {
             id,
             status: TaskStatus::Ready,
-            stacks: TaskStacks::new(func_id),
+            stacks,
             parent: None,
             children: Vec::new(),
-            promise_set: Vec::new(),
+            promise_set: std::collections::BTreeSet::new(),
             spawned_promise: None,
             cancelled: false,
+            unwinding_cancel: false,
+            paused_in_unwind_step: false,
+            ancestor_handlers: Vec::new(),
         }
+    }
+
+    /// Snapshot the visible handler chain into a stack-allocated buffer `buf` without
+    /// heap allocation whenever `<= N` handlers are visible (returns `None` if `> N`).
+    pub fn snapshot_child_ancestor_handlers_inline<const N: usize>(
+        &self,
+        buf: &mut [EffectHandler; N],
+    ) -> Option<usize> {
+        let mut own_buf = [EffectHandler::PLACEHOLDER; N];
+        let own_len = self
+            .stacks
+            .collect_effective_handlers_inline(&mut own_buf)?;
+        let mut out_len = 0usize;
+        for handler in &self.ancestor_handlers {
+            if !own_buf[..own_len]
+                .iter()
+                .any(|inner| inner.effect_type == handler.effect_type)
+            {
+                if out_len >= N {
+                    return None;
+                }
+                buf[out_len] = *handler;
+                out_len += 1;
+            }
+        }
+        if out_len + own_len > N {
+            return None;
+        }
+        buf[out_len..out_len + own_len].copy_from_slice(&own_buf[..own_len]);
+        Some(out_len + own_len)
+    }
+
+    /// Snapshot the visible handler chain (ancestors + own active segments) for a newly
+    /// spawned child task, keeping only the nearest binding per effect type.
+    pub fn snapshot_child_ancestor_handlers(&self) -> Vec<EffectHandler> {
+        let own_effective = self.stacks.effective_handlers();
+        if self.ancestor_handlers.is_empty() {
+            return own_effective;
+        }
+        let mut merged = Vec::with_capacity(self.ancestor_handlers.len() + own_effective.len());
+        for handler in &self.ancestor_handlers {
+            if !own_effective
+                .iter()
+                .any(|inner| inner.effect_type == handler.effect_type)
+            {
+                merged.push(*handler);
+            }
+        }
+        merged.extend(own_effective);
+        merged
+    }
+
+    /// Find the nearest handler for `effect` in this task's active stack chain, falling
+    /// back to `ancestor_handlers`. The boolean is `true` when resolved from an ancestor task.
+    pub fn find_handler_with_ancestors(&self, effect: TypeIndex) -> Option<(&EffectHandler, bool)> {
+        if let Some(local) = self.stacks.find_handler(effect) {
+            return Some((local, false));
+        }
+        self.ancestor_handlers
+            .iter()
+            .rev()
+            .find(|handler| handler.effect_type == effect)
+            .map(|handler| (handler, true))
     }
 }
 
@@ -428,7 +690,7 @@ impl std::ops::DerefMut for TaskState {
 // ---------------------------------------------------------------------------
 
 /// An effect handler installed on the handler stack.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct EffectHandler {
     pub effect_type: TypeIndex,
     /// Function to call when the effect is invoked.
@@ -439,6 +701,16 @@ pub struct EffectHandler {
     pub continuation_param: Option<u8>,
     /// Unique identifier for this handler's lexical installation scope.
     pub scope_id: u64,
+}
+
+impl EffectHandler {
+    pub const PLACEHOLDER: Self = Self {
+        effect_type: TypeIndex::INVALID,
+        handler_func: FuncId(0),
+        closure_env: TaggedValue::UNIT,
+        continuation_param: None,
+        scope_id: 0,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -500,16 +772,24 @@ impl Default for BytecodeStore {
 // GlobalTable — runtime global variables
 // ---------------------------------------------------------------------------
 
-/// Table of global variables.
+const GLOBAL_STATE_UNINIT: u8 = 0;
+const GLOBAL_STATE_WRITING_CONST: u8 = 1;
+const GLOBAL_STATE_INIT: u8 = 2;
+
+/// Thread-safe table of runtime global variables.
+///
+/// Reads and stores use Acquire/Release atomic operations on fixed-capacity slices
+/// installed before execution, while stopped-world GC root scanning updates raw slots
+/// exclusively via `visit_raw_slots_mut`.
 pub struct GlobalTable {
-    values: Vec<TaggedValue>,
+    values: Vec<std::sync::atomic::AtomicU64>,
     slots: Vec<GlobalSlot>,
     schema_initialized: bool,
 }
 
 struct GlobalSlot {
     info: GlobalInfo,
-    initialized: bool,
+    state: std::sync::atomic::AtomicU8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,10 +822,12 @@ impl GlobalTable {
         self.slots
             .try_reserve_exact(schema.len())
             .map_err(|_| GlobalError::OutOfMemory)?;
-        self.values.resize(schema.len(), TaggedValue::UNIT);
+        self.values.extend(
+            (0..schema.len()).map(|_| std::sync::atomic::AtomicU64::new(TaggedValue::UNIT.raw())),
+        );
         self.slots.extend(schema.iter().map(|&info| GlobalSlot {
             info,
-            initialized: false,
+            state: std::sync::atomic::AtomicU8::new(GLOBAL_STATE_UNINIT),
         }));
         self.schema_initialized = true;
         Ok(())
@@ -553,56 +835,89 @@ impl GlobalTable {
 
     pub fn alloc(&mut self, init: TaggedValue) -> u32 {
         let idx = self.values.len() as u32;
-        self.values.push(init);
+        self.values
+            .push(std::sync::atomic::AtomicU64::new(init.raw()));
         self.slots.push(GlobalSlot {
             info: GlobalInfo {
                 type_index: type_pool::Intrinsic::Any.type_index(),
                 is_mutable: true,
             },
-            initialized: true,
+            state: std::sync::atomic::AtomicU8::new(GLOBAL_STATE_INIT),
         });
         idx
     }
 
     pub fn get(&self, idx: u32) -> Result<TaggedValue, GlobalError> {
+        use std::sync::atomic::Ordering;
         let slot = self
             .slots
             .get(idx as usize)
             .ok_or(GlobalError::InvalidIndex(idx))?;
-        if !slot.initialized {
+        if slot.state.load(Ordering::Acquire) != GLOBAL_STATE_INIT {
             return Err(GlobalError::Uninitialized(idx));
         }
-        Ok(self.values[idx as usize])
+        Ok(TaggedValue::from_raw(
+            self.values[idx as usize].load(Ordering::Acquire),
+        ))
     }
 
-    pub fn set(&mut self, idx: u32, val: TaggedValue) -> Result<(), GlobalError> {
-        self.check_store(idx)?;
-        self.values[idx as usize] = val;
-        self.slots[idx as usize].initialized = true;
-        Ok(())
+    pub fn set(&self, idx: u32, val: TaggedValue) -> Result<(), GlobalError> {
+        use std::sync::atomic::Ordering;
+        let slot = self
+            .slots
+            .get(idx as usize)
+            .ok_or(GlobalError::InvalidIndex(idx))?;
+        if slot.info.is_mutable {
+            self.values[idx as usize].store(val.raw(), Ordering::Release);
+            slot.state.store(GLOBAL_STATE_INIT, Ordering::Release);
+            Ok(())
+        } else {
+            slot.state
+                .compare_exchange(
+                    GLOBAL_STATE_UNINIT,
+                    GLOBAL_STATE_WRITING_CONST,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| GlobalError::Immutable(idx))?;
+            self.values[idx as usize].store(val.raw(), Ordering::Release);
+            slot.state.store(GLOBAL_STATE_INIT, Ordering::Release);
+            Ok(())
+        }
     }
 
     /// Check write permission before any potentially allocating type coercion.
     pub fn check_store(&self, idx: u32) -> Result<GlobalInfo, GlobalError> {
+        use std::sync::atomic::Ordering;
         let slot = self
             .slots
             .get(idx as usize)
             .ok_or(GlobalError::InvalidIndex(idx))?;
-        if slot.initialized && !slot.info.is_mutable {
+        if !slot.info.is_mutable && slot.state.load(Ordering::Acquire) != GLOBAL_STATE_UNINIT {
             return Err(GlobalError::Immutable(idx));
         }
         Ok(slot.info)
     }
 
-    /// Iterate over all values (for GC root scanning).
-    pub fn values(&self) -> &[TaggedValue] {
-        &self.values
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 
-    /// Update registered value slots during exclusive stopped-world root tracing.
+    /// Snapshot current global values in slot order (used by tests and inspection).
+    pub fn values_snapshot(&self) -> Vec<TaggedValue> {
+        use std::sync::atomic::Ordering;
+        self.values
+            .iter()
+            .map(|atom| TaggedValue::from_raw(atom.load(Ordering::Acquire)))
+            .collect()
+    }
+
+    /// Visit registered raw value slots during exclusive stopped-world root tracing.
     /// Forwarding preserves each slot's type and initialization state.
-    pub fn values_mut(&mut self) -> &mut [TaggedValue] {
-        &mut self.values
+    pub fn visit_raw_slots_mut(&mut self, mut visit: impl FnMut(*mut u64)) {
+        for atom in &mut self.values {
+            visit(std::ptr::from_mut(atom.get_mut()));
+        }
     }
 }
 
@@ -650,7 +965,10 @@ mod global_tests {
         table.set(1, TaggedValue::FALSE).unwrap();
         table.set(1, TaggedValue::TRUE).unwrap();
         assert_eq!(table.get(1), Ok(TaggedValue::TRUE));
-        assert_eq!(table.values(), &[TaggedValue::UNIT, TaggedValue::TRUE]);
+        assert_eq!(
+            table.values_snapshot(),
+            vec![TaggedValue::UNIT, TaggedValue::TRUE]
+        );
         assert_eq!(
             table.initialize(&[]),
             Err(GlobalError::SchemaAlreadyInitialized)

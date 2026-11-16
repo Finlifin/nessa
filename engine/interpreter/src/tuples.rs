@@ -4,6 +4,7 @@ use gc::ObjectHeader;
 use runtime::TaggedValue;
 use type_pool::{TypeId, TypeIndex, TypeKind};
 
+use crate::collections::{read_u64_atomic, write_u64_atomic};
 use crate::{Vm, VmError};
 
 impl Vm {
@@ -16,52 +17,73 @@ impl Vm {
             return Err(VmError::TypeError);
         }
         let words = u16::try_from(values.len()).map_err(|_| VmError::ObjectTooLarge)?;
-        let existing = (0..self.state.type_pool.len())
-            .map(|index| TypeIndex::from_raw(index as u32))
-            .find(|&index| {
-                matches!(
-                    &self.state.type_pool.get(index).kind,
-                    TypeKind::Tuple { elements: found } if found.as_slice() == elements
-                )
-            });
-        let ty = match existing {
-            Some(index) => {
-                let info = self.state.type_pool.get(index);
-                if info.type_id == TypeId::ZERO && info.size == 0 {
-                    let info_mut = self.state.type_pool.get_mut(index);
-                    info_mut.size = u32::from(words).saturating_mul(8);
-                    info_mut.align = 8;
-                }
-                index
-            }
-            None => {
-                let index = self.state.type_pool.intern_structural(TypeKind::Tuple {
-                    elements: elements.to_vec(),
+        let fast_ty = {
+            let tp = self.type_pool_read();
+            let existing = (0..tp.len())
+                .map(|index| TypeIndex::from_raw(index as u32))
+                .find(|&index| {
+                    matches!(
+                        &tp.get(index).kind,
+                        TypeKind::Tuple { elements: found } if found.as_slice() == elements
+                    )
                 });
-                let info_mut = self.state.type_pool.get_mut(index);
-                info_mut.size = u32::from(words).saturating_mul(8);
-                info_mut.align = 8;
-                if let Some(input) = self.state.type_pool.identity_input().cloned() {
-                    self.state
-                        .type_pool
-                        .finalize_type_identities(input)
-                        .map_err(|_| VmError::InvalidType(index))?;
+            existing.and_then(|index| {
+                let info = tp.get(index);
+                if info.type_id != TypeId::ZERO || info.size != 0 || info.align != 0 {
+                    Some(index)
+                } else {
+                    None
                 }
-                index
+            })
+        };
+        let ty = match fast_ty {
+            Some(index) => index,
+            None => {
+                let mut tp = self.type_pool_write();
+                let existing = (0..tp.len())
+                    .map(|index| TypeIndex::from_raw(index as u32))
+                    .find(|&index| {
+                        matches!(
+                            &tp.get(index).kind,
+                            TypeKind::Tuple { elements: found } if found.as_slice() == elements
+                        )
+                    });
+                match existing {
+                    Some(index) => {
+                        let info = tp.get(index);
+                        if info.type_id == TypeId::ZERO && info.size == 0 {
+                            let info_mut = tp.get_mut(index);
+                            info_mut.size = u32::from(words).saturating_mul(8);
+                            info_mut.align = 8;
+                        }
+                        index
+                    }
+                    None => {
+                        let index = tp.intern_structural(TypeKind::Tuple {
+                            elements: elements.to_vec(),
+                        });
+                        let info_mut = tp.get_mut(index);
+                        info_mut.size = u32::from(words).saturating_mul(8);
+                        info_mut.align = 8;
+                        if let Some(input) = tp.identity_input().cloned() {
+                            tp.finalize_type_identities(input)
+                                .map_err(|_| VmError::InvalidType(index))?;
+                        }
+                        index
+                    }
+                }
             }
         };
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(values, |vm| {
             // SAFETY: payload length fits u16; every element is rooted for the
-            // allocation and written before another safepoint.
+            // allocation and written before another safepoint, with no lock held.
             let pointer =
-                unsafe { vm.state.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+                unsafe { vm.worker.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+            let base = pointer.as_ptr().cast::<u64>();
             for index in 0..values.len() {
-                let value = vm.roots.temporary_values.borrow()[root + index];
-                // SAFETY: index is in bounds of the fresh aligned tuple payload.
-                unsafe {
-                    pointer.as_ptr().cast::<u64>().add(index).write(value.raw());
-                }
+                let value = vm.worker_roots().temporary_values.borrow()[root + index];
+                write_u64_atomic(base, index, value.raw());
             }
             // SAFETY: the tuple payload is fully initialized.
             Ok(unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) })
@@ -75,21 +97,22 @@ impl Vm {
         if !header.is_ordinary() {
             return Err(VmError::TypeError);
         }
-        let ty = self
-            .state
-            .type_pool
-            .canonical_type(header.type_index)
-            .ok_or(VmError::TypeError)?;
-        let TypeKind::Tuple { elements } = &self.state.type_pool.get(ty).kind else {
-            return Err(VmError::TypeError);
+        let elem_len = {
+            let tp = self.type_pool_read();
+            let ty = tp
+                .canonical_type(header.type_index)
+                .ok_or(VmError::TypeError)?;
+            let TypeKind::Tuple { elements } = &tp.get(ty).kind else {
+                return Err(VmError::TypeError);
+            };
+            elements.len()
         };
-        if header.payload_words() != elements.len() {
+        if header.payload_words() != elem_len {
             return Err(VmError::TypeError);
         }
-        // SAFETY: exact payload length checked; this snapshot uses host allocation
-        // only, so the live source remains rooted without a collection safepoint.
-        Ok((0..elements.len())
-            .map(|index| TaggedValue::from_raw(unsafe { pointer.cast::<u64>().add(index).read() }))
+        let base = pointer as *const u64;
+        Ok((0..elem_len)
+            .map(|index| TaggedValue::from_raw(read_u64_atomic(base, index)))
             .collect())
     }
 
@@ -109,28 +132,22 @@ impl Vm {
         }
         // Snapshot values into updateable roots; both inputs and converted
         // outputs may move during element conversion or final allocation.
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&values, |vm| {
             for (index, &expected) in elements.iter().enumerate() {
-                let element = vm.roots.temporary_values.borrow()[base + index];
+                let element = vm.worker_roots().temporary_values.borrow()[base + index];
                 let element = vm.cast_value(element, expected, depth)?;
-                vm.roots.temporary_values.borrow_mut()[base + index] = element;
+                vm.worker_roots().temporary_values.borrow_mut()[base + index] = element;
             }
             let words = u16::try_from(elements.len()).map_err(|_| VmError::ObjectTooLarge)?;
             // SAFETY: every converted value is rooted. Reload those roots after
             // allocation and initialize fully before another safepoint.
-            let pointer =
-                unsafe { vm.state.heap.alloc_object(target, words) }.ok_or(VmError::OutOfMemory)?;
+            let pointer = unsafe { vm.worker.heap.alloc_object(target, words) }
+                .ok_or(VmError::OutOfMemory)?;
+            let raw_base = pointer.as_ptr().cast::<u64>();
             for index in 0..elements.len() {
-                let element = vm.roots.temporary_values.borrow()[base + index];
-                // SAFETY: index is in bounds of the fresh aligned tuple payload.
-                unsafe {
-                    pointer
-                        .as_ptr()
-                        .cast::<u64>()
-                        .add(index)
-                        .write(element.raw());
-                }
+                let element = vm.worker_roots().temporary_values.borrow()[base + index];
+                write_u64_atomic(raw_base, index, element.raw());
             }
             // SAFETY: complete initialized managed allocation, no further safepoint.
             Ok(unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) })
@@ -145,17 +162,15 @@ mod tests {
     use type_pool::Intrinsic;
 
     fn tuple(vm: &mut Vm, ty: TypeIndex, values: &[TaggedValue]) -> TaggedValue {
-        let root = vm.roots.temporary_values.borrow().len();
+        let root = vm.worker_roots().temporary_values.borrow().len();
         vm.with_temporary_roots(values, |vm| {
             // SAFETY: fixture values are rooted, and payload length fits u16.
-            let pointer = unsafe { vm.state.heap.alloc_object(ty, values.len() as u16) }.unwrap();
-            let roots = vm.roots.temporary_values.borrow();
+            let pointer = unsafe { vm.worker.heap.alloc_object(ty, values.len() as u16) }.unwrap();
+            let roots = vm.worker_roots().temporary_values.borrow();
+            let base = pointer.as_ptr().cast::<u64>();
             for index in 0..values.len() {
                 let value = roots[root + index];
-                // SAFETY: the fresh allocation contains this initialized slot.
-                unsafe {
-                    pointer.as_ptr().cast::<u64>().add(index).write(value.raw());
-                }
+                write_u64_atomic(base, index, value.raw());
             }
             // SAFETY: initialized live managed allocation.
             Ok(unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) })
@@ -166,13 +181,13 @@ mod tests {
     #[test]
     fn gradual_tuple_assertions_check_elements_and_preserve_source_layout() {
         let mut vm = make_vm();
-        let source_ty = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let source_ty = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::Any.type_index(), Intrinsic::Any.type_index()],
         });
-        let target = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let target = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::F64.type_index(), Intrinsic::Bool.type_index()],
         });
-        let narrow = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let narrow = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::I8.type_index(), Intrinsic::Bool.type_index()],
         });
         let source = tuple(
@@ -183,7 +198,10 @@ mod tests {
         vm.with_temporary_roots(&[source], |vm| {
             assert!(vm.value_matches_type(source, target, 0)?);
             let converted = vm.assert_value_type(source, target)?;
-            vm.roots.temporary_values.borrow_mut().push(converted);
+            vm.worker_roots()
+                .temporary_values
+                .borrow_mut()
+                .push(converted);
             assert_ne!(converted, source);
             assert_eq!(vm.reflected_type(source)?, source_ty);
             assert_eq!(vm.reflected_type(converted)?, target);
@@ -198,7 +216,10 @@ mod tests {
                 Err(VmError::TypeError)
             ));
             let narrowed = vm.cast_value(source, narrow, 0)?;
-            vm.roots.temporary_values.borrow_mut().push(narrowed);
+            vm.worker_roots()
+                .temporary_values
+                .borrow_mut()
+                .push(narrowed);
             assert_eq!(
                 vm.reflected_type(vm.tuple_values(narrowed)?[0])?,
                 Intrinsic::I8.type_index()
@@ -220,12 +241,11 @@ mod tests {
     #[test]
     fn tuple_display_handles_singletons_nesting_cycles_and_exact_payloads() {
         let mut vm = make_vm();
-        let singleton = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let singleton = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::Any.type_index()],
         });
         let empty = vm
-            .state
-            .type_pool
+            .type_pool_write()
             .intern_structural(TypeKind::Tuple { elements: vec![] });
         let source = tuple(&mut vm, singleton, &[TaggedValue::NULL]);
         vm.with_temporary_roots(&[source], |vm| {
@@ -256,22 +276,22 @@ mod tests {
     #[test]
     fn nested_tuple_casts_reject_bad_elements_and_arity() {
         let mut vm = make_vm();
-        let any = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let any = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::Any.type_index()],
         });
-        let integer = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let integer = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::I64.type_index()],
         });
-        let nested = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let nested = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![integer],
         });
-        let pair = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let pair = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::Any.type_index(); 2],
         });
         let inner = tuple(&mut vm, any, &[TaggedValue::TRUE]);
         vm.with_temporary_roots(&[inner], |vm| {
             let outer = tuple(vm, any, &[inner]);
-            vm.roots.temporary_values.borrow_mut().push(outer);
+            vm.worker_roots().temporary_values.borrow_mut().push(outer);
             assert!(!vm.value_matches_type(outer, nested, 0)?);
             assert!(matches!(
                 vm.assert_value_type(outer, nested),
@@ -294,25 +314,23 @@ mod tests {
     fn alloc_tuple_preserves_finalized_type_identities_for_error_checks() {
         let mut vm = make_vm();
         let err_ty = vm
-            .state
-            .type_pool
+            .type_pool_write()
             .intern_structural(TypeKind::ErrorQualified {
                 errors: vec![Intrinsic::Str.type_index()],
                 inner: Intrinsic::I64.type_index(),
             });
         {
-            let info = vm.state.type_pool.get_mut(err_ty);
+            let mut tp = vm.type_pool_write();
+            let info = tp.get_mut(err_ty);
             info.size = 24;
             info.align = 8;
-        }
-        vm.state
-            .type_pool
-            .finalize_type_identities(type_pool::TypeIdentityInput {
+            tp.finalize_type_identities(type_pool::TypeIdentityInput {
                 schema: 1,
                 packages: Vec::new(),
                 declarations: Vec::new(),
             })
             .unwrap();
+        }
 
         let msg = vm.alloc_string("unseen tuple shape").unwrap();
         let tup = vm
@@ -323,8 +341,7 @@ mod tests {
             .unwrap();
         vm.with_temporary_roots(&[tup], |vm| {
             let id = vm
-                .state
-                .type_pool
+                .type_pool_read()
                 .stable_type_id(err_ty)
                 .expect("stable_type_id must remain valid after dynamic alloc_tuple");
             assert_ne!(id, TypeId::ZERO);

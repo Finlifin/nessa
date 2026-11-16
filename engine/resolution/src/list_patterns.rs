@@ -19,6 +19,12 @@ pub(crate) fn resolve(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex, expected
     if !crate::lists::is_list(r, expected) && expected != Intrinsic::Any.type_index() {
         report(r, node, "List pattern requires List or Any input");
     }
+    let elem_ty = r
+        .task_combinators
+        .pattern_list_elements
+        .get(&node)
+        .copied()
+        .unwrap_or(Intrinsic::Any.type_index());
     let mut has_rest = false;
     for &child in ast.multi_children(node) {
         if ast.node(child).kind == NodeKind::PatternRestBind {
@@ -41,7 +47,8 @@ pub(crate) fn resolve(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex, expected
                 );
             }
         } else {
-            crate::enums::pattern(r, ast, child, Some(Intrinsic::Any.type_index()));
+            crate::enums::pattern(r, ast, child, Some(elem_ty));
+            crate::task_combinators::record_pattern_element_coercion(r, ast, child, elem_ty);
         }
     }
 }

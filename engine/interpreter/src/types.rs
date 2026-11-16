@@ -5,6 +5,7 @@ use nsbc::Instruction;
 use runtime::{Number, TaggedValue, TaskId};
 use type_pool::{Intrinsic, TypeIndex, TypeKind};
 
+use crate::collections::write_u64_atomic;
 use crate::{DispatchResult, Vm, VmError, a_fields};
 
 impl Vm {
@@ -26,7 +27,7 @@ impl Vm {
             return Err(VmError::TypeError);
         }
         let function = self
-            .state
+            .shared
             .bytecode
             .try_get_function(nsbc::FuncId(id))
             .ok_or(VmError::InvalidFunction(nsbc::FuncId(id)))?;
@@ -35,14 +36,19 @@ impl Vm {
             return Ok(None);
         }
         let ty = self.canonical_type(function.function_type)?;
-        let TypeKind::Function { params, .. } = &self.state.type_pool.get(ty).kind else {
-            return Err(VmError::InvalidType(ty));
+        let param_len = {
+            let tp = self.type_pool_read();
+            let TypeKind::Function { params, .. } = &tp.get(ty).kind else {
+                return Err(VmError::InvalidType(ty));
+            };
+            params.len()
         };
-        if params.len() != function.abi.logical_parameter_count() {
+        if param_len != function.abi.logical_parameter_count() {
             return Err(VmError::TypeError);
         }
         Ok(Some(ty))
     }
+
     /// Construct a pool-local descriptor, checking metadata and transparent aliases.
     pub(crate) fn type_value(&self, ty: TypeIndex) -> Result<TaggedValue, VmError> {
         let ty = self.canonical_type(ty)?;
@@ -50,24 +56,85 @@ impl Vm {
     }
 
     pub(crate) fn reflected_type(&self, value: TaggedValue) -> Result<TypeIndex, VmError> {
-        let ty = self
-            .value_type(value)?
-            .unwrap_or_else(|| self.state.type_pool.null_type());
+        let ty = match self.value_type(value)? {
+            Some(ty) => ty,
+            None => self.type_pool_read().null_type(),
+        };
         self.canonical_type(ty)
     }
 
     pub(super) fn canonical_type(&self, ty: TypeIndex) -> Result<TypeIndex, VmError> {
-        let canonical = self
-            .state
-            .type_pool
-            .canonical_type(ty)
-            .ok_or(VmError::InvalidType(ty))?;
-        // Declarations can hold symbolic associated types, but runtime values
-        // and conversions require their concrete implementation bindings.
-        if self.state.type_pool.contains_associated_type(canonical) {
-            return Err(VmError::InvalidType(ty));
+        let raw = ty.as_u32() as usize;
+        if let Some(Some(cached)) = self.sync_meta_cache().canonical_types.get(raw).copied() {
+            return Ok(cached);
+        }
+        let canonical = {
+            let tp = self.type_pool_read();
+            let canonical = tp.canonical_type(ty).ok_or(VmError::InvalidType(ty))?;
+            // Declarations can hold symbolic associated types, but runtime values
+            // and conversions require their concrete implementation bindings.
+            if tp.contains_associated_type(canonical) {
+                return Err(VmError::InvalidType(ty));
+            }
+            canonical
+        };
+        if raw < 1_048_576 {
+            let mut cache = self.sync_meta_cache();
+            if cache.canonical_types.len() <= raw {
+                cache.canonical_types.resize(raw + 1, None);
+            }
+            cache.canonical_types[raw] = Some(canonical);
         }
         Ok(canonical)
+    }
+
+    pub(crate) fn cached_heap_type_meta(
+        &self,
+        heap_type: TypeIndex,
+    ) -> Result<crate::CachedHeapTypeMeta, VmError> {
+        let raw = heap_type.as_u32() as usize;
+        if let Some(Some(meta)) = self.sync_meta_cache().heap_type_meta.get(raw).copied() {
+            return Ok(meta);
+        }
+        let meta = {
+            let tp = self.type_pool_read();
+            if tp.as_intrinsic(heap_type).is_some() {
+                crate::CachedHeapTypeMeta::Slow
+            } else {
+                match &tp.get(heap_type).kind {
+                    TypeKind::Struct { fields, .. } => {
+                        match tp
+                            .checked_collection_role(heap_type)
+                            .map_err(|_| VmError::TypeError)?
+                        {
+                            Some(
+                                role @ (type_pool::CollectionRole::List
+                                | type_pool::CollectionRole::Map),
+                            ) => crate::CachedHeapTypeMeta::Collection(role),
+                            Some(_) => crate::CachedHeapTypeMeta::Slow,
+                            None => match u16::try_from(fields.len()) {
+                                Ok(expected_words) => {
+                                    crate::CachedHeapTypeMeta::PlainStruct { expected_words }
+                                }
+                                Err(_) => crate::CachedHeapTypeMeta::Slow,
+                            },
+                        }
+                    }
+                    TypeKind::Newtype { .. } | TypeKind::Future { .. } => {
+                        crate::CachedHeapTypeMeta::SingleWord
+                    }
+                    _ => crate::CachedHeapTypeMeta::Slow,
+                }
+            }
+        };
+        if raw < 1_048_576 {
+            let mut cache = self.sync_meta_cache();
+            if cache.heap_type_meta.len() <= raw {
+                cache.heap_type_meta.resize(raw + 1, None);
+            }
+            cache.heap_type_meta[raw] = Some(meta);
+        }
+        Ok(meta)
     }
 
     /// Only called with rooted VM values inside the execution operation.
@@ -115,12 +182,47 @@ impl Vm {
                 return Err(VmError::TypeError);
             }
             let heap_type = self.canonical_type(header.type_index)?;
-            match self
-                .state
-                .type_pool
-                .checked_collection_role(heap_type)
-                .map_err(|_| VmError::TypeError)?
-            {
+            match self.cached_heap_type_meta(heap_type)? {
+                crate::CachedHeapTypeMeta::Collection(_) => return Ok(Some(heap_type)),
+                crate::CachedHeapTypeMeta::PlainStruct { expected_words } => {
+                    return if header.payload_words() == expected_words as usize {
+                        Ok(Some(heap_type))
+                    } else {
+                        Err(VmError::TypeError)
+                    };
+                }
+                crate::CachedHeapTypeMeta::SingleWord => {
+                    return if header.payload_words() == 1 {
+                        Ok(Some(heap_type))
+                    } else {
+                        Err(VmError::TypeError)
+                    };
+                }
+                crate::CachedHeapTypeMeta::Slow => {}
+            }
+            let (intrinsic_kind, is_enum, collection_role) = {
+                let tp = self.type_pool_read();
+                let intrinsic_kind = tp.as_intrinsic(heap_type);
+                let collection_role = tp
+                    .checked_collection_role(heap_type)
+                    .map_err(|_| VmError::TypeError)?;
+                if let TypeKind::Struct { fields, .. } = &tp.get(heap_type).kind
+                    && collection_role.is_none()
+                    && header.payload_words() != fields.len()
+                {
+                    return Err(VmError::TypeError);
+                }
+                if matches!(
+                    tp.get(heap_type).kind,
+                    TypeKind::Newtype { .. } | TypeKind::Future { .. }
+                ) && header.payload_words() != 1
+                {
+                    return Err(VmError::TypeError);
+                }
+                let is_enum = matches!(tp.get(heap_type).kind, TypeKind::Enum { .. });
+                (intrinsic_kind, is_enum, collection_role)
+            };
+            match collection_role {
                 Some(type_pool::CollectionRole::Bytes) => {
                     self.bytes_layout(value)?;
                 }
@@ -133,7 +235,7 @@ impl Vm {
                 }
                 _ => {}
             }
-            if let Some(kind) = self.state.type_pool.as_intrinsic(heap_type) {
+            if let Some(kind) = intrinsic_kind {
                 if kind.is_numeric() {
                     // SAFETY: live ordinary object, retained in caller roots.
                     if unsafe { Number::from_tagged(value) }.is_none() {
@@ -151,41 +253,17 @@ impl Vm {
                     return Err(VmError::TypeError);
                 }
             }
-            if let TypeKind::Struct { fields, .. } = &self.state.type_pool.get(heap_type).kind
-                && self
-                    .state
-                    .type_pool
-                    .checked_collection_role(heap_type)
-                    .map_err(|_| VmError::TypeError)?
-                    .is_none()
-                && header.payload_words() != fields.len()
-            {
-                return Err(VmError::TypeError);
-            }
-            if matches!(
-                self.state.type_pool.get(heap_type).kind,
-                TypeKind::Newtype { .. } | TypeKind::Future { .. }
-            ) && header.payload_words() != 1
-            {
-                return Err(VmError::TypeError);
-            }
             if header.type_index == Intrinsic::Closure.type_index() {
                 return self
                     .closure_type(pointer, header.payload_words())
                     .map(|signature| Some(signature.unwrap_or(Intrinsic::Closure.type_index())));
             }
-            if matches!(
-                self.state
-                    .type_pool
-                    .get(self.canonical_type(header.type_index)?)
-                    .kind,
-                TypeKind::Enum { .. }
-            ) {
+            if is_enum {
                 return self
                     .enum_layout(value)
                     .map(|layout| layout.map(|layout| layout.ty));
             }
-            return Ok(Some(self.canonical_type(header.type_index)?));
+            return Ok(Some(heap_type));
         } else {
             return Err(VmError::TypeError);
         };
@@ -198,12 +276,14 @@ impl Vm {
         target: TypeIndex,
         depth: usize,
     ) -> Result<bool, VmError> {
-        if depth >= self.state.type_pool.len() || depth >= crate::error_values::MAX_VALUE_DEPTH {
+        let pool_len = self.type_pool_read().len();
+        if depth >= pool_len || depth >= crate::error_values::MAX_VALUE_DEPTH {
             return Err(VmError::InvalidType(target));
         }
         let target = self.canonical_type(target)?;
         let envelope = self.error_layout(value, depth)?;
-        match &self.state.type_pool.get(target).kind {
+        let target_kind = self.type_pool_read().get(target).kind.clone();
+        match target_kind {
             TypeKind::Intrinsic(Intrinsic::Any) => {
                 self.value_type_depth(value, depth + 1)?;
                 Ok(true)
@@ -213,11 +293,11 @@ impl Vm {
                 if value.is_null() {
                     Ok(true)
                 } else {
-                    self.value_matches_type(value, *inner, depth + 1)
+                    self.value_matches_type(value, inner, depth + 1)
                 }
             }
             TypeKind::EffectQualified { inner, .. } => {
-                self.value_matches_type(value, *inner, depth + 1)
+                self.value_matches_type(value, inner, depth + 1)
             }
             TypeKind::ErrorQualified { .. } => {
                 let Some(layout) = envelope else {
@@ -228,8 +308,7 @@ impl Vm {
                     self.value_matches_type(layout.payload, inner, depth + 1)
                 } else {
                     let concrete = self
-                        .state
-                        .type_pool
+                        .type_pool_read()
                         .lookup_by_id(layout.tag)
                         .ok_or(VmError::TypeError)?;
                     self.error_member(concrete, &members)
@@ -239,49 +318,41 @@ impl Vm {
                 let Some(actual) = self.value_type(value)? else {
                     return Ok(false);
                 };
-                if let Some(scope) = self.state.type_query_scope {
+                if let Some(scope) = self.worker.type_query_scope {
                     return self
-                        .state
-                        .type_pool
+                        .type_pool_read()
                         .has_trait_impl_scoped(actual, target, scope)
                         .map_err(VmError::TraitLookup);
                 }
                 // Legacy bytecode and host queries have no lexical authority.
                 // Do not silently reinterpret a scoped proof as a global one.
                 let actual = self.canonical_type(actual)?;
-                if self
-                    .state
-                    .type_pool
-                    .trait_impls_snapshot()
-                    .iter()
-                    .any(|record| {
-                        record.visible_scope.is_some()
-                            && self.state.type_pool.canonical_type(record.implementor)
-                                == Some(actual)
-                            && self.state.type_pool.canonical_type(record.trait_type)
-                                == Some(target)
-                    })
-                {
+                let tp = self.type_pool_read();
+                if tp.trait_impls_snapshot().iter().any(|record| {
+                    record.visible_scope.is_some()
+                        && tp.canonical_type(record.implementor) == Some(actual)
+                        && tp.canonical_type(record.trait_type) == Some(target)
+                }) {
                     return Err(VmError::MissingTraitContext);
                 }
-                Ok(self.state.type_pool.has_trait_impl(actual, target))
+                Ok(tp.has_trait_impl(actual, target))
             }
             TypeKind::Function { .. } => {
                 Ok(self
                     .value_type_depth(value, depth + 1)?
                     .is_some_and(|actual| {
-                        self.state.type_pool.is_gradually_consistent(actual, target)
+                        self.type_pool_read()
+                            .is_gradually_consistent(actual, target)
                     }))
             }
             TypeKind::Future { .. } => {
                 Ok(self
                     .value_type_depth(value, depth + 1)?
                     .is_some_and(|actual| {
-                        matches!(
-                            self.state.type_pool.get(actual).kind,
-                            TypeKind::Future { .. }
-                        ) && (self.state.type_pool.is_subtype(actual, target)
-                            || self.state.type_pool.is_gradually_consistent(actual, target))
+                        let tp = self.type_pool_read();
+                        matches!(tp.get(actual).kind, TypeKind::Future { .. })
+                            && (tp.is_subtype(actual, target)
+                                || tp.is_gradually_consistent(actual, target))
                     }))
             }
             TypeKind::Tuple { elements } => {
@@ -293,7 +364,7 @@ impl Vm {
                 if values.len() != elements.len() {
                     return Ok(false);
                 }
-                for (&value, &expected) in values.iter().zip(elements) {
+                for (&value, &expected) in values.iter().zip(&elements) {
                     if !self.value_matches_type(value, expected, depth + 1)? {
                         return Ok(false);
                     }
@@ -306,7 +377,7 @@ impl Vm {
                     actual == target
                         || (actual.as_u32() <= Intrinsic::F64.type_index().as_u32()
                             && target.as_u32() <= Intrinsic::F64.type_index().as_u32()
-                            && self.state.type_pool.is_subtype(actual, target))
+                            && self.type_pool_read().is_subtype(actual, target))
                 })),
         }
     }
@@ -320,6 +391,36 @@ impl Vm {
         self.assert_value_type_depth(value, target, 0)
     }
 
+    #[inline]
+    pub(crate) fn value_is_exact_intrinsic_fast(value: TaggedValue, target: TypeIndex) -> bool {
+        if target == Intrinsic::I64.type_index() {
+            return value.as_i64().is_some();
+        }
+        if target == Intrinsic::U64.type_index() {
+            return value.as_u64().is_some();
+        }
+        if target == Intrinsic::F64.type_index() {
+            return value.as_f64().is_some();
+        }
+        if target == Intrinsic::Bool.type_index() {
+            return value.as_bool().is_some();
+        }
+        if target == Intrinsic::Char.type_index() {
+            return value.as_char().is_some();
+        }
+        if target == Intrinsic::Unit.type_index() {
+            return value.is_unit();
+        }
+        if target == Intrinsic::Str.type_index()
+            && let Some(ptr) = value.as_heap_ptr()
+        {
+            // SAFETY: caller holds a mutator operation and `value` is a live VM value.
+            let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+            return header.is_ordinary() && header.type_index == Intrinsic::Str.type_index();
+        }
+        false
+    }
+
     fn assert_value_type_depth(
         &mut self,
         value: TaggedValue,
@@ -329,13 +430,15 @@ impl Vm {
         if depth >= crate::error_values::MAX_VALUE_DEPTH {
             return Err(VmError::TypeError);
         }
-        if matches!(
-            self.state.type_pool.get(self.canonical_type(target)?).kind,
-            TypeKind::ErrorQualified { .. }
-        ) {
-            return self.assert_error(value, self.canonical_type(target)?, depth);
+        if Self::value_is_exact_intrinsic_fast(value, target) {
+            return Ok(value);
         }
-        match self.state.type_pool.get(self.canonical_type(target)?).kind {
+        let canonical = self.canonical_type(target)?;
+        let kind = self.type_pool_read().get(canonical).kind.clone();
+        if matches!(kind, TypeKind::ErrorQualified { .. }) {
+            return self.assert_error(value, canonical, depth);
+        }
+        match kind {
             TypeKind::Optional { inner } if !value.is_null() => {
                 return self.assert_value_type_depth(value, inner, depth + 1);
             }
@@ -356,22 +459,26 @@ impl Vm {
         target: TypeIndex,
         depth: usize,
     ) -> Result<TaggedValue, VmError> {
-        if depth >= self.state.type_pool.len() || depth >= crate::error_values::MAX_VALUE_DEPTH {
+        if depth < crate::error_values::MAX_VALUE_DEPTH
+            && Self::value_is_exact_intrinsic_fast(value, target)
+        {
+            return Ok(value);
+        }
+        let pool_len = self.type_pool_read().len();
+        if depth >= pool_len || depth >= crate::error_values::MAX_VALUE_DEPTH {
             return Err(VmError::InvalidType(target));
         }
         let target = self.canonical_type(target)?;
-        if matches!(
-            self.state.type_pool.get(target).kind,
-            TypeKind::ErrorQualified { .. }
-        ) {
+        let target_kind = self.type_pool_read().get(target).kind.clone();
+        if matches!(target_kind, TypeKind::ErrorQualified { .. }) {
             return self.convert_error(value, target, depth);
         }
-        match self.state.type_pool.get(target).kind {
+        match &target_kind {
             TypeKind::Optional { inner } if !value.is_null() => {
-                return self.cast_value(value, inner, depth + 1);
+                return self.cast_value(value, *inner, depth + 1);
             }
             TypeKind::EffectQualified { inner, .. } => {
-                return self.cast_value(value, inner, depth + 1);
+                return self.cast_value(value, *inner, depth + 1);
             }
             _ => {}
         }
@@ -387,12 +494,18 @@ impl Vm {
         if target != Intrinsic::Any.type_index()
             && let Some(actual) = self.value_type_depth(value, depth + 1)?
             && actual != target
-            && let TypeKind::Newtype { inner, .. } = self.state.type_pool.get(actual).kind
-            && self.canonical_type(inner)? == target
         {
-            return self.load_field_value(value, 0);
+            let maybe_newtype_inner = match self.type_pool_read().get(actual).kind {
+                TypeKind::Newtype { inner, .. } => Some(inner),
+                _ => None,
+            };
+            if let Some(inner) = maybe_newtype_inner
+                && self.canonical_type(inner)? == target
+            {
+                return self.load_field_value(value, 0);
+            }
         }
-        match self.state.type_pool.get(target).kind.clone() {
+        match target_kind {
             TypeKind::Intrinsic(kind) if kind.is_numeric() => {
                 // SAFETY: the source register keeps value rooted until this
                 // scalar snapshot has been read. Allocation follows the read.
@@ -406,21 +519,20 @@ impl Vm {
                 if !self.value_matches_type(value, inner, depth + 1)? {
                     return Err(VmError::TypeError);
                 }
-                let root = self.roots.temporary_values.borrow().len();
+                let root = self.worker_roots().temporary_values.borrow().len();
                 self.with_temporary_roots(&[value], |vm| {
-                    let value = vm.roots.temporary_values.borrow()[root];
+                    let value = vm.worker_roots().temporary_values.borrow()[root];
                     let inner_val = vm.assert_value_type_depth(value, inner, depth + 1)?;
-                    let inner_root = vm.roots.temporary_values.borrow().len();
+                    let inner_root = vm.worker_roots().temporary_values.borrow().len();
                     vm.with_temporary_roots(&[inner_val], |vm| {
                         // SAFETY: execution operation is active and inner_val is rooted in
                         // temporary_values across alloc_object. Payload is initialized before return.
-                        let ptr = unsafe { vm.state.heap.alloc_object(target, 1) }
+                        let ptr = unsafe { vm.worker.heap.alloc_object(target, 1) }
                             .ok_or(VmError::OutOfMemory)?;
-                        let rooted_inner = vm.roots.temporary_values.borrow()[inner_root];
-                        unsafe {
-                            ptr.as_ptr().cast::<u64>().write(rooted_inner.raw());
-                            Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
-                        }
+                        let rooted_inner = vm.worker_roots().temporary_values.borrow()[inner_root];
+                        write_u64_atomic(ptr.as_ptr().cast::<u64>(), 0, rooted_inner.raw());
+                        // SAFETY: `ptr` points to a fresh, fully initialized 1-word heap object.
+                        Ok(unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) })
                     })
                 })
             }
@@ -455,7 +567,7 @@ impl Vm {
         };
         // SAFETY: the execution operation is active and number is an owned
         // scalar. Initialize and publish without a second allocation/safepoint.
-        let payload = unsafe { self.state.heap.alloc_object(kind.type_index(), 1) }
+        let payload = unsafe { self.worker.heap.alloc_object(kind.type_index(), 1) }
             .ok_or(VmError::OutOfMemory)?;
         unsafe {
             payload.as_ptr().cast::<u64>().write(bits);
@@ -469,13 +581,10 @@ impl Vm {
         instruction: Instruction,
     ) -> DispatchResult {
         let (destination, source, index) = a_fields(&instruction);
-        let value = self
-            .roots
-            .scheduler
-            .get_task(task)
-            .unwrap()
-            .registers
-            .get(source);
+        let Some(task_ref) = self.task_ref(task) else {
+            return DispatchResult::Error(VmError::InvalidTask);
+        };
+        let value = task_ref.registers.get(source);
         let target = TypeIndex::from_raw(index as u32);
         let result = if instruction.opcode == nsbc::Opcode::TypeCheck {
             self.value_matches_type(value, target, 0)
@@ -499,13 +608,12 @@ impl Vm {
         };
         match result {
             Ok(value) => {
-                self.roots
-                    .scheduler
-                    .get_task_mut(task)
-                    .unwrap()
-                    .registers
-                    .set(destination, value);
-                DispatchResult::Continue
+                if let Some(t) = self.task_mut(task) {
+                    t.registers.set(destination, value);
+                    DispatchResult::Continue
+                } else {
+                    DispatchResult::Error(VmError::InvalidTask)
+                }
             }
             Err(error) => DispatchResult::Error(error),
         }
@@ -527,13 +635,8 @@ mod tests {
         let mut vm = crate::tests::make_vm();
         let index = vm.push_constant(&constant).unwrap();
         let task = vm.spawn_root(nsbc::FuncId(0));
-        let value = vm.roots.constants.get(index);
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(0), value);
+        let value = vm.roots().constants.read(0).get(index);
+        vm.task_mut(task).unwrap().registers.set(Reg(0), value);
         let result = vm.dispatch_type_operation(
             task,
             Instruction::a_type(
@@ -563,13 +666,7 @@ mod tests {
             let (vm, task, result) = apply(Opcode::TypeCheck, constant, target.type_index());
             assert!(matches!(result, DispatchResult::Continue));
             assert_eq!(
-                vm.roots
-                    .scheduler
-                    .get_task(task)
-                    .unwrap()
-                    .registers
-                    .get(Reg(1))
-                    .as_bool(),
+                vm.task_ref(task).unwrap().registers.get(Reg(1)).as_bool(),
                 Some(expected)
             );
         }
@@ -578,11 +675,11 @@ mod tests {
     #[test]
     fn closure_type_checks_use_function_metadata_and_validate_capture_layout() {
         let mut vm = crate::tests::make_vm();
-        let signature = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let signature = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![Intrinsic::I64.type_index()],
             ret: Intrinsic::I64.type_index(),
         });
-        let wrong = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let wrong = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![Intrinsic::Bool.type_index()],
             ret: Intrinsic::I64.type_index(),
         });
@@ -600,8 +697,7 @@ mod tests {
         // SAFETY: TestVm owns an operation; initialize and publish this exact
         // two-word closure before any further managed allocation or safepoint.
         let payload = unsafe {
-            vm.state
-                .heap
+            vm.heap_mut()
                 .alloc_object(Intrinsic::Closure.type_index(), 2)
         }
         .unwrap();
@@ -609,12 +705,7 @@ mod tests {
             runtime::ClosureEnv::write(payload.as_ptr(), nsbc::FuncId(0), &[]);
         }
         let value = unsafe { TaggedValue::from_heap_ptr(payload.as_ptr()) };
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(0), value);
+        vm.task_mut(task).unwrap().registers.set(Reg(0), value);
         assert!(vm.value_matches_type(value, signature, 0).unwrap());
         assert!(!vm.value_matches_type(value, wrong, 0).unwrap());
         assert_eq!(vm.reflected_type(value).unwrap(), signature);
@@ -645,13 +736,11 @@ mod tests {
         let task = vm.spawn_root(nsbc::FuncId(0));
         let ctx = crate::BuiltinCtx::new(&mut vm, task, 0);
         assert_eq!(ctx.format_value(value).unwrap(), "i64");
-        let value = ctx
-            .vm
-            .type_value(ctx.vm.state.type_pool.null_type())
-            .unwrap();
+        let null_ty = ctx.vm.type_pool_read().null_type();
+        let value = ctx.vm.type_value(null_ty).unwrap();
         assert_eq!(ctx.format_value(value).unwrap(), "?NoReturn");
         drop(ctx);
-        vm.state.type_pool = type_pool::TypePool::new();
+        *vm.type_pool_write() = type_pool::TypePool::new();
         assert!(matches!(
             vm.reflected_type(TaggedValue::NULL),
             Err(VmError::InvalidType(_))
@@ -672,13 +761,7 @@ mod tests {
             Intrinsic::F64.type_index(),
         );
         assert!(matches!(result, DispatchResult::Continue));
-        let value = vm
-            .roots
-            .scheduler
-            .get_task(task)
-            .unwrap()
-            .registers
-            .get(Reg(1));
+        let value = vm.task_ref(task).unwrap().registers.get(Reg(1));
         // SAFETY: the fixture VM owns the live value and no allocation occurs.
         assert_eq!(
             unsafe { Number::from_tagged(value) }.unwrap(),
@@ -692,15 +775,7 @@ mod tests {
             let (vm, task, result) =
                 apply(Opcode::TypeCastSafe, constant, Intrinsic::I8.type_index());
             assert!(matches!(result, DispatchResult::Continue));
-            assert!(
-                vm.roots
-                    .scheduler
-                    .get_task(task)
-                    .unwrap()
-                    .registers
-                    .get(Reg(1))
-                    .is_null()
-            );
+            assert!(vm.task_ref(task).unwrap().registers.get(Reg(1)).is_null());
         }
         let (_, _, result) = apply(
             Opcode::TypeCastSafe,
@@ -721,13 +796,7 @@ mod tests {
             Intrinsic::I8.type_index(),
         );
         assert!(matches!(result, DispatchResult::Continue));
-        let value = vm
-            .roots
-            .scheduler
-            .get_task(task)
-            .unwrap()
-            .registers
-            .get(Reg(1));
+        let value = vm.task_ref(task).unwrap().registers.get(Reg(1));
         assert!(value.is_heap());
         assert_eq!(
             vm.value_type(value).unwrap(),
@@ -747,8 +816,8 @@ mod tests {
 
     #[test]
     fn optional_types_and_aliases_test_null_and_inner_values() {
-        let mut vm = crate::tests::make_vm();
-        let optional = vm.state.type_pool.register(type_pool::TypeInfo {
+        let vm = crate::tests::make_vm();
+        let optional = vm.type_pool_write().register(type_pool::TypeInfo {
             kind: TypeKind::Optional {
                 inner: Intrinsic::Bool.type_index(),
             },
@@ -756,7 +825,7 @@ mod tests {
             size: 8,
             align: 8,
         });
-        let alias = vm.state.type_pool.register(type_pool::TypeInfo {
+        let alias = vm.type_pool_write().register(type_pool::TypeInfo {
             kind: TypeKind::Typealias {
                 name: str_interner::intern("MaybeBool"),
                 target: optional,
@@ -781,9 +850,9 @@ mod tests {
 
     #[test]
     fn malformed_alias_cycles_produce_an_error_without_recursing() {
-        let mut vm = crate::tests::make_vm();
-        let index = TypeIndex::from_raw(vm.state.type_pool.len() as u32);
-        let alias = vm.state.type_pool.register(type_pool::TypeInfo {
+        let vm = crate::tests::make_vm();
+        let index = TypeIndex::from_raw(vm.type_pool_read().len() as u32);
+        let alias = vm.type_pool_write().register(type_pool::TypeInfo {
             kind: TypeKind::Typealias {
                 name: str_interner::intern("Cycle"),
                 target: index,
@@ -802,8 +871,8 @@ mod tests {
     #[test]
     fn unresolved_associated_types_are_not_runtime_values_even_under_optional() {
         let mut vm = crate::tests::make_vm();
-        let owner = vm.state.type_pool.well_known.display;
-        let symbolic = vm.state.type_pool.register(type_pool::TypeInfo {
+        let owner = vm.type_pool_read().well_known.display;
+        let symbolic = vm.type_pool_write().register(type_pool::TypeInfo {
             kind: TypeKind::AssociatedType {
                 trait_owner: owner,
                 name: str_interner::intern("Item"),
@@ -813,10 +882,9 @@ mod tests {
             align: 0,
         });
         let optional = vm
-            .state
-            .type_pool
+            .type_pool_write()
             .intern_structural(TypeKind::Optional { inner: symbolic });
-        let function = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let function = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![],
             ret: optional,
         });
@@ -839,7 +907,7 @@ mod tests {
                 Err(VmError::InvalidType(_))
             ));
         }
-        let concrete = vm.state.type_pool.intern_structural(TypeKind::Optional {
+        let concrete = vm.type_pool_write().intern_structural(TypeKind::Optional {
             inner: Intrinsic::Str.type_index(),
         });
         assert!(
@@ -847,6 +915,7 @@ mod tests {
                 .unwrap()
         );
     }
+
     #[test]
     fn trait_queries_need_lexical_authority_and_never_borrow_a_previous_query() {
         let mut vm = crate::tests::make_vm();
@@ -877,16 +946,16 @@ mod tests {
             vm.value_matches_type(value, marker, 0),
             Err(VmError::MissingTraitContext)
         ));
-        vm.state.type_query_scope = Some(1);
+        vm.worker.type_query_scope = Some(1);
         assert!(vm.value_matches_type(value, marker, 0).unwrap());
-        vm.state.type_query_scope = Some(0);
+        vm.worker.type_query_scope = Some(0);
         assert!(!vm.value_matches_type(value, marker, 0).unwrap());
-        vm.state.type_query_scope = None;
+        vm.worker.type_query_scope = None;
         assert!(matches!(
             vm.value_matches_type(value, marker, 0),
             Err(VmError::MissingTraitContext)
         ));
         vm.install_type_pool(type_pool::TypePool::with_intrinsics());
-        assert!(vm.state.type_query_scope.is_none());
+        assert!(vm.worker.type_query_scope.is_none());
     }
 }

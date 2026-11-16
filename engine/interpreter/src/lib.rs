@@ -1,14 +1,17 @@
 use gc::{GC_FLAGS, GcConfig, Heap, NessaSlot, ObjectHeader};
 use nsbc::{AddrMode, FuncId, Instruction, InstructionData, Opcode, ParameterAbi, Reg};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use runtime::{
     BuiltinFnId, BytecodeStore, CallFrame, ClosureEnv, ConstantPool, FunctionCode, GlobalTable,
     Number, TaggedValue, TaskId,
 };
-use scheduler::Scheduler;
+use scheduler::{Scheduler, WorkerNext, WorkerQueue};
 use stack_pool::StackPool;
 use std::cell::{RefCell, UnsafeCell};
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use str_interner::StrId;
 use type_pool::{Intrinsic, TypeIndex, TypePool};
 
@@ -43,15 +46,306 @@ mod method_access;
 mod moving_allocation_tests;
 mod numeric;
 pub mod resources;
+pub(crate) mod sync_primitives;
 mod trait_proofs;
 mod tuples;
 mod types;
 pub use builtin_ctx::{
     BuiltinCtx, BuiltinFn, BuiltinFnTable, BuiltinOutcome, BuiltinRoot, HostCallOutcome,
-    HostHandler, NativeValue,
+    HostHandler, NativeValue, VmIoContext,
 };
 pub use jit::{JitConfig, JitMode, JitStats};
 pub use resources::VmResourceTable;
+pub use scheduler::{ProcessOutcome, ProcessSpec};
+
+/// Number of cache-line-padded `RwLock` stripes protecting concurrent `List`/`Map` mutations.
+pub const CONTAINER_STRIPE_COUNT: usize = 64;
+
+/// Cache-line-aligned `RwLock` stripe avoiding false sharing across worker cores.
+#[repr(align(64))]
+pub(crate) struct CachePaddedRwLock(pub(crate) RwLock<()>);
+
+impl Default for CachePaddedRwLock {
+    fn default() -> Self {
+        Self(RwLock::new(()))
+    }
+}
+
+/// Cache-line-aligned `AtomicU64` counter avoiding false sharing across worker cores.
+#[repr(align(64))]
+pub(crate) struct CachePaddedAtomicU64(pub(crate) AtomicU64);
+
+impl Default for CachePaddedAtomicU64 {
+    fn default() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+/// Read-mostly lock sharded by worker ID so concurrent worker reads hit strictly
+/// core-local cache lines with zero cross-core atomic cache-line bouncing.
+pub(crate) struct ShardedRwLock<T> {
+    writer_gate: Mutex<()>,
+    shards: Box<[CachePaddedRwLock]>,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: Concurrent readers hold a shard read lock preventing any writer from entering;
+// writers hold `writer_gate` and exclusive write locks on every shard `0..shards.len()`.
+unsafe impl<T: Send> Send for ShardedRwLock<T> {}
+unsafe impl<T: Send + Sync> Sync for ShardedRwLock<T> {}
+
+pub(crate) struct ShardedReadGuard<'a, T> {
+    data: &'a T,
+    _shard_guard: RwLockReadGuard<'a, ()>,
+}
+
+impl<T> Deref for ShardedReadGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        self.data
+    }
+}
+
+pub(crate) struct ShardedWriteGuard<'a, T> {
+    data: *mut T,
+    on_drop_epoch: Option<&'a AtomicU64>,
+    _shard_guards: Vec<RwLockWriteGuard<'a, ()>>,
+    _writer_gate: MutexGuard<'a, ()>,
+}
+
+impl<T> Drop for ShardedWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.on_drop_epoch {
+            epoch.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+impl<T> Deref for ShardedWriteGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: All shard write locks are held for the lifetime of `self`.
+        unsafe { &*self.data }
+    }
+}
+
+impl<T> DerefMut for ShardedWriteGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: Exclusive `&mut self` + all shard write locks guarantee unique mutable access.
+        unsafe { &mut *self.data }
+    }
+}
+
+impl<T> ShardedRwLock<T> {
+    pub(crate) fn new(value: T, shard_count: usize) -> Self {
+        let count = shard_count.max(1);
+        let shards: Vec<CachePaddedRwLock> =
+            (0..count).map(|_| CachePaddedRwLock::default()).collect();
+        Self {
+            writer_gate: Mutex::new(()),
+            shards: shards.into_boxed_slice(),
+            data: UnsafeCell::new(value),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn read(&self, worker_id: usize) -> ShardedReadGuard<'_, T> {
+        let idx = worker_id % self.shards.len();
+        let shard_guard = self.shards[idx].0.read();
+        // SAFETY: Holding `shards[idx]` read lock blocks any writer from acquiring all shards.
+        let data = unsafe { &*self.data.get() };
+        ShardedReadGuard {
+            data,
+            _shard_guard: shard_guard,
+        }
+    }
+
+    pub(crate) fn write(&self) -> ShardedWriteGuard<'_, T> {
+        self.write_inner(None)
+    }
+
+    pub(crate) fn write_with_epoch<'a>(&'a self, epoch: &'a AtomicU64) -> ShardedWriteGuard<'a, T> {
+        self.write_inner(Some(epoch))
+    }
+
+    fn write_inner<'a>(&'a self, on_drop_epoch: Option<&'a AtomicU64>) -> ShardedWriteGuard<'a, T> {
+        let gate = self.writer_gate.lock();
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in self.shards.iter() {
+            guards.push(shard.0.write());
+        }
+        if let Some(epoch) = on_drop_epoch {
+            epoch.fetch_add(1, Ordering::Release);
+        }
+        ShardedWriteGuard {
+            data: self.data.get(),
+            on_drop_epoch,
+            _shard_guards: guards,
+            _writer_gate: gate,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn data_ptr(&self) -> *mut T {
+        self.data.get()
+    }
+}
+
+/// Shared read guard over the VM's [`TypePool`].
+pub struct VmTypePoolRef<'a>(ShardedReadGuard<'a, TypePool>);
+
+impl Deref for VmTypePoolRef<'_> {
+    type Target = TypePool;
+
+    fn deref(&self) -> &TypePool {
+        &self.0
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct TraitProofRegistry {
+    pub(crate) proofs: std::collections::HashMap<u64, Arc<trait_proofs::FrozenTraitProof>>,
+    pub(crate) cache: std::collections::HashMap<(usize, TypeIndex), TaggedValue>,
+}
+
+pub(crate) struct WorkerRoots {
+    pub(crate) temporary_values: RefCell<Vec<TaggedValue>>,
+    pub(crate) native_pins: RefCell<Vec<TaggedValue>>,
+}
+
+impl WorkerRoots {
+    fn new() -> Self {
+        Self {
+            temporary_values: RefCell::new(Vec::new()),
+            native_pins: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+pub(crate) struct WorkerRootSlot(UnsafeCell<WorkerRoots>);
+
+impl WorkerRootSlot {
+    fn new() -> Self {
+        Self(UnsafeCell::new(WorkerRoots::new()))
+    }
+}
+
+// SAFETY: During mutator execution, `worker_roots[worker_id]` is accessed exclusively by
+// `worker_id`'s OS thread. During STW GC, all mutators are stopped before `scan_vm_roots`
+// traverses all slots via `&mut VmRoots`.
+unsafe impl Send for WorkerRootSlot {}
+unsafe impl Sync for WorkerRootSlot {}
+
+// ---------------------------------------------------------------------------
+// Auxiliary Worker Epoch Synchronization
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct AuxEpochState {
+    run_epoch: u64,
+    epoch_running: bool,
+    shutdown: bool,
+    active_aux_workers: usize,
+    first_error: Option<VmError>,
+    saw_deadlock: bool,
+}
+
+pub(crate) struct AuxEpochSync {
+    lock: Mutex<AuxEpochState>,
+    start_cv: Condvar,
+    done_cv: Condvar,
+    all_aux_entered: AtomicBool,
+}
+
+impl AuxEpochSync {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(AuxEpochState::default()),
+            start_cv: Condvar::new(),
+            done_cv: Condvar::new(),
+            all_aux_entered: AtomicBool::new(false),
+        }
+    }
+
+    fn begin_run_epoch(&self, wake_aux_immediately: bool) {
+        let mut guard = self.lock.lock();
+        guard.run_epoch = guard.run_epoch.wrapping_add(1);
+        guard.epoch_running = true;
+        guard.first_error = None;
+        guard.saw_deadlock = false;
+        self.all_aux_entered.store(false, Ordering::Release);
+        if wake_aux_immediately {
+            self.start_cv.notify_all();
+        }
+    }
+
+    fn record_error(&self, err: VmError) {
+        let mut guard = self.lock.lock();
+        if guard.first_error.is_none() {
+            guard.first_error = Some(err);
+        }
+    }
+
+    fn record_deadlock(&self) {
+        let mut guard = self.lock.lock();
+        guard.saw_deadlock = true;
+    }
+
+    fn end_run_epoch(&self) -> (Option<VmError>, bool) {
+        let mut guard = self.lock.lock();
+        guard.epoch_running = false;
+        while guard.active_aux_workers > 0 {
+            self.done_cv.wait(&mut guard);
+        }
+        (
+            guard.first_error.take(),
+            std::mem::replace(&mut guard.saw_deadlock, false),
+        )
+    }
+}
+
+/// Drop guard stored as the first field of the primary [`Vm`].
+///
+/// Signals shutdown and joins all auxiliary OS worker threads while `_roots` and `shared`
+/// are still alive, guaranteeing every auxiliary MMTk `Mutator` unregisters cleanly before
+/// `VmRoots` is unregistered and freed.
+struct PrimaryAuxShutdown {
+    shared: Option<Arc<SharedVm>>,
+}
+
+impl PrimaryAuxShutdown {
+    fn new(shared: Arc<SharedVm>) -> Self {
+        Self {
+            shared: Some(shared),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.shared = None;
+    }
+}
+
+impl Drop for PrimaryAuxShutdown {
+    fn drop(&mut self) {
+        let Some(shared) = self.shared.take() else {
+            return;
+        };
+        {
+            let mut guard = shared.epoch_sync.lock.lock();
+            guard.shutdown = true;
+            guard.epoch_running = false;
+            shared.epoch_sync.start_cv.notify_all();
+        }
+        shared.roots.scheduler.request_abort();
+        let handles = std::mem::take(&mut *shared.aux_handles.lock());
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // VM — the top-level virtual machine
@@ -59,68 +353,129 @@ pub use resources::VmResourceTable;
 
 /// The top-level Nessa virtual machine.
 pub struct Vm {
-    // Field order unregisters roots before freeing their stable backing state.
-    _roots: gc::RootRegistration,
-    roots: Box<RootCell>,
-    state: Box<VmState>,
+    // 1st dropped: shuts down & joins aux OS threads while `_roots` and `shared` are still live.
+    _aux_shutdown: Option<PrimaryAuxShutdown>,
+    // 2nd dropped: unregisters `VmRoots` from MMTk after all aux mutators have exited.
+    _roots: Option<gc::RootRegistration>,
+    // 3rd dropped: drops this worker's MMTk `Heap` (`Mutator`).
+    pub(crate) worker: Box<WorkerState>,
+    // 4th dropped: frees `SharedVm` and `VmRoots` (`strong_count == 1`).
+    pub(crate) shared: Arc<SharedVm>,
 }
 
-/// Address-stable runtime state, accessed only within mutator operations.
-struct VmState {
-    bytecode: BytecodeStore,
-    type_pool: TypePool,
-    heap: Heap,
-    builtins: BuiltinFnTable,
-    method_call_scopes: std::collections::HashMap<(FuncId, usize), u32>,
-    type_query_scope: Option<u32>,
-    trait_proofs: std::collections::HashMap<u64, trait_proofs::FrozenTraitProof>,
-    trait_proof_cache: std::collections::HashMap<(usize, TypeIndex), TaggedValue>,
-    pending_root_entries: std::collections::HashSet<TaskId>,
-    script_args: Vec<String>,
-    rng: resources::VmRng,
-    files: resources::VmFileTable,
-    json: json_kernel::VmJsonState,
-    resources: resources::VmResourceTable,
-    native_frame_depth: u32,
-    ffi_allowlist: Option<std::collections::HashSet<String>>,
-    next_future_id: u64,
-    next_handler_scope_id: u64,
-    slice_safepoints: u32,
-    host_handler: Option<Box<dyn HostHandler>>,
-    jit: jit::JitEngine,
+#[derive(Clone, Copy)]
+pub(crate) enum CachedHeapTypeMeta {
+    Collection(type_pool::CollectionRole),
+    PlainStruct { expected_words: u16 },
+    SingleWord,
+    Slow,
+}
+
+#[derive(Default)]
+pub(crate) struct WorkerMetaCache {
+    pub(crate) epoch: u64,
+    pub(crate) validated_funcs: Vec<bool>,
+    pub(crate) method_ic:
+        runtime::FastHashMap<(FuncId, u32, TypeIndex, StrId), Option<type_pool::MethodSlot>>,
+    pub(crate) list_roles: Option<Option<(TypeIndex, TypeIndex)>>,
+    pub(crate) future_by_inner: runtime::FastHashMap<TypeIndex, TypeIndex>,
+    pub(crate) is_future_type: Vec<Option<bool>>,
+    pub(crate) effect_meta: runtime::FastHashMap<TypeIndex, (TypeIndex, bool)>,
+    pub(crate) indirect_contracts: runtime::FastHashMap<FuncId, Arc<[(usize, TypeIndex)]>>,
+    pub(crate) canonical_types: Vec<Option<TypeIndex>>,
+    pub(crate) heap_type_meta: Vec<Option<CachedHeapTypeMeta>>,
+}
+
+/// Per-worker execution state owned exclusively by one OS thread.
+pub(crate) struct WorkerState {
+    pub(crate) worker_id: usize,
+    pub(crate) heap: Heap,
+    pub(crate) type_query_scope: Option<u32>,
+    pub(crate) slice_safepoints: u32,
+    pub(crate) native_frame_depth: u32,
+    pub(crate) local_queue_ptr: Option<NonNull<WorkerQueue>>,
+    pub(crate) meta_cache: RefCell<WorkerMetaCache>,
+    pub(crate) jit: jit::JitEngine,
+    pub(crate) jit_synced_epoch: u64,
+    pub(crate) jit_reported_fns: usize,
+    pub(crate) jit_reported_bytes: usize,
+    pub(crate) jit_reported_deopts: usize,
+}
+
+/// Shared runtime metadata and synchronized services across all workers of a [`Vm`].
+pub(crate) struct SharedVm {
+    pub(crate) gc_config: GcConfig,
+    pub(crate) configured_workers: usize,
+    pub(crate) metadata_epoch: AtomicU64,
+    pub(crate) bytecode: BytecodeStore,
+    pub(crate) builtins: BuiltinFnTable,
+    pub(crate) method_call_scopes: runtime::FastHashMap<(FuncId, usize), u32>,
+    pub(crate) script_args: Vec<String>,
+    pub(crate) type_pool: ShardedRwLock<TypePool>,
+    pub(crate) trait_registry: ShardedRwLock<TraitProofRegistry>,
+    pub(crate) pending_root_entries: Mutex<std::collections::HashSet<TaskId>>,
+    pub(crate) pending_root_count: AtomicUsize,
+    pub(crate) rng: Mutex<resources::VmRng>,
+    pub(crate) files: resources::VmFileTable,
+    pub(crate) json: Mutex<json_kernel::VmJsonState>,
+    pub(crate) resources: Mutex<resources::VmResourceTable>,
+    pub(crate) ffi_allowlist: RwLock<Option<std::collections::HashSet<String>>>,
+    pub(crate) host_handler: Mutex<Option<Box<dyn HostHandler>>>,
+    pub(crate) jit_config: RwLock<jit::JitConfig>,
+    pub(crate) jit_epoch: AtomicU64,
+    pub(crate) jit_compiled_functions: AtomicUsize,
+    pub(crate) jit_code_bytes: AtomicUsize,
+    pub(crate) jit_deopt_count: AtomicUsize,
+    pub(crate) next_future_id: AtomicU64,
+    pub(crate) next_handler_scope_id: AtomicU64,
+    pub(crate) await_all_ops: Arc<futures::AwaitAllTable>,
+    pub(crate) container_stripes: Box<[CachePaddedRwLock; CONTAINER_STRIPE_COUNT]>,
+    pub(crate) worker_slices: Box<[CachePaddedAtomicU64]>,
+    pub(crate) epoch_sync: Arc<AuxEpochSync>,
+    pub(crate) aux_started: AtomicBool,
+    pub(crate) aux_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    pub(crate) roots: Box<RootCell>,
 }
 
 /// The collector accesses only this independently stored root domain, never
-/// the allocator or a VmState currently borrowed across allocation/collection.
-struct VmRoots {
-    globals: GlobalTable,
-    constants: ConstantPool,
-    scheduler: Scheduler,
-    temporary_values: RefCell<Vec<TaggedValue>>,
-    native_pins: RefCell<Vec<TaggedValue>>,
-    continuations:
+/// the allocator or a WorkerState currently borrowed across allocation/collection.
+pub(crate) struct VmRoots {
+    pub(crate) globals: GlobalTable,
+    pub(crate) constants: ShardedRwLock<ConstantPool>,
+    pub(crate) scheduler: Scheduler,
+    pub(crate) worker_roots: Box<[WorkerRootSlot]>,
+    pub(crate) continuations: Mutex<
         std::collections::HashMap<runtime::ContinuationId, continuation_roots::ManagedContinuation>,
-    weak_finalizers: Vec<continuation_roots::WeakFinalizer>,
-    promises: std::collections::HashMap<u64, futures::PromiseEntry>,
-    handler_scopes: std::collections::HashMap<u64, Vec<u64>>,
-    json_writer_ancestors: std::collections::HashMap<i64, Vec<TaggedValue>>,
+    >,
+    pub(crate) weak_finalizers: Mutex<Vec<continuation_roots::WeakFinalizer>>,
+    pub(crate) promises: futures::PromiseTable,
+    pub(crate) handler_scopes: futures::HandlerScopeTable,
+    pub(crate) json_writer_ancestors: Mutex<std::collections::HashMap<i64, Vec<TaggedValue>>>,
+    pub(crate) sync: Arc<sync_primitives::SyncRegistry>,
+    pub(crate) uncollected_terminal_promises: AtomicUsize,
 }
 
 impl Drop for VmRoots {
     fn drop(&mut self) {
-        for mut finalizer in self.weak_finalizers.drain(..) {
+        for mut finalizer in self.weak_finalizers.get_mut().drain(..) {
             finalizer.run_cleanup();
         }
     }
 }
 
-struct RootCell(UnsafeCell<VmRoots>);
+pub(crate) struct RootCell(UnsafeCell<VmRoots>);
+
+// SAFETY: All runtime accesses through `Deref` use interior atomic/lock synchronization or
+// per-worker partitioning (`worker_roots[worker_id]`). Exclusive `&mut VmRoots` access in
+// `scan_vm_roots` occurs strictly during MMTk stop-the-world when all mutators are parked.
+unsafe impl Send for RootCell {}
+unsafe impl Sync for RootCell {}
 
 impl Deref for RootCell {
     type Target = VmRoots;
     fn deref(&self) -> &VmRoots {
-        // SAFETY: VM access is guarded by an operation. Collector reads happen
-        // only while that operation is stopped, with no outstanding root borrow.
+        // SAFETY: Mutators access synchronized fields while holding a mutator session;
+        // collector `&mut VmRoots` access happens only under STW.
         unsafe { &*self.0.get() }
     }
 }
@@ -131,18 +486,394 @@ impl DerefMut for RootCell {
     }
 }
 
+/// RAII guard binding a leased [`WorkerQueue`] pointer onto [`WorkerState`] for one worker loop.
+struct ScopedWorkerQueueGuard<'a> {
+    vm: &'a mut Vm,
+}
+
+impl Drop for ScopedWorkerQueueGuard<'_> {
+    fn drop(&mut self) {
+        self.vm.worker.local_queue_ptr = None;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerLoopExit {
+    AllFinished,
+    Deadlock,
+    Aborted,
+}
+
 impl Vm {
+    /// Resolve the default worker thread count (`NESSA_WORKER_THREADS` override in `1..=64`,
+    /// otherwise `std::thread::available_parallelism()` clamped to `1..=8`).
+    pub fn default_worker_threads() -> usize {
+        if let Ok(raw) = std::env::var("NESSA_WORKER_THREADS")
+            && let Ok(parsed) = raw.trim().parse::<usize>()
+            && parsed >= 1
+        {
+            return parsed.clamp(1, 64);
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(1)
+    }
+
+    pub fn new(type_pool: TypePool, gc_config: &GcConfig, stack_pool: Arc<StackPool>) -> Self {
+        Self::new_with_workers(
+            type_pool,
+            gc_config,
+            stack_pool,
+            Self::default_worker_threads(),
+        )
+    }
+
+    pub fn new_with_workers(
+        type_pool: TypePool,
+        gc_config: &GcConfig,
+        stack_pool: Arc<StackPool>,
+        worker_threads: usize,
+    ) -> Self {
+        let configured_workers = worker_threads.clamp(1, 64);
+        let worker = Box::new(WorkerState {
+            worker_id: 0,
+            heap: gc::gc_init(gc_config),
+            type_query_scope: None,
+            slice_safepoints: 64,
+            native_frame_depth: 0,
+            local_queue_ptr: None,
+            meta_cache: RefCell::new(WorkerMetaCache::default()),
+            jit: Self::new_default_jit(),
+            jit_synced_epoch: 0,
+            jit_reported_fns: 0,
+            jit_reported_bytes: 0,
+            jit_reported_deopts: 0,
+        });
+        let worker_roots: Vec<WorkerRootSlot> = (0..configured_workers)
+            .map(|_| WorkerRootSlot::new())
+            .collect();
+        let worker_slices: Vec<CachePaddedAtomicU64> = (0..configured_workers)
+            .map(|_| CachePaddedAtomicU64::default())
+            .collect();
+        let stripes: [CachePaddedRwLock; CONTAINER_STRIPE_COUNT] =
+            std::array::from_fn(|_| CachePaddedRwLock::default());
+        let scheduler = Scheduler::with_workers(stack_pool, configured_workers);
+        let await_all_ops = Arc::new(futures::AwaitAllTable::new());
+        let sync = Arc::new(sync_primitives::SyncRegistry::new());
+        {
+            let await_all_for_hook = Arc::clone(&await_all_ops);
+            let sync_for_hook = Arc::clone(&sync);
+            let weak_sched = scheduler.downgrade();
+            scheduler.set_cancel_hook(Arc::new(move |tid| {
+                if let Some(st) = await_all_for_hook.remove(tid) {
+                    st.early_exit.store(true, Ordering::Release);
+                }
+                if let Some(sched) = weak_sched.upgrade() {
+                    sync_for_hook.cancel_task(&sched, tid);
+                }
+            }));
+        }
+        let roots = Box::new(RootCell(UnsafeCell::new(VmRoots {
+            globals: GlobalTable::new(),
+            constants: ShardedRwLock::new(ConstantPool::new(), configured_workers),
+            scheduler,
+            worker_roots: worker_roots.into_boxed_slice(),
+            continuations: Mutex::new(std::collections::HashMap::new()),
+            weak_finalizers: Mutex::new(Vec::new()),
+            promises: futures::PromiseTable::new(),
+            handler_scopes: futures::HandlerScopeTable::new(),
+            json_writer_ancestors: Mutex::new(std::collections::HashMap::new()),
+            sync,
+            uncollected_terminal_promises: AtomicUsize::new(0),
+        })));
+        // SAFETY: `roots` is a stable heap allocation outliving `_roots`. `PrimaryAuxShutdown`
+        // drops first (joining all aux threads), then `_roots` unregisters `VmRoots`, and only
+        // after `worker` drops does `Arc<SharedVm>` drop `roots`.
+        let registration = unsafe {
+            gc::RootRegistration::new_with_conditional_roots(
+                roots.0.get().cast(),
+                scan_vm_roots,
+                continuation_roots::CALLBACKS,
+            )
+        };
+        let shared = Arc::new(SharedVm {
+            gc_config: gc_config.clone(),
+            configured_workers,
+            metadata_epoch: AtomicU64::new(1),
+            bytecode: BytecodeStore::new(),
+            builtins: BuiltinFnTable::new(),
+            method_call_scopes: runtime::FastHashMap::default(),
+            script_args: Vec::new(),
+            type_pool: ShardedRwLock::new(type_pool, configured_workers),
+            trait_registry: ShardedRwLock::new(TraitProofRegistry::default(), configured_workers),
+            pending_root_entries: Mutex::new(std::collections::HashSet::new()),
+            pending_root_count: AtomicUsize::new(0),
+            rng: Mutex::new(resources::VmRng::new()),
+            files: resources::VmFileTable::new(),
+            json: Mutex::new(json_kernel::VmJsonState::new()),
+            resources: Mutex::new(resources::VmResourceTable::new()),
+            ffi_allowlist: RwLock::new(None),
+            host_handler: Mutex::new(None),
+            jit_config: RwLock::new(jit::JitConfig::default()),
+            jit_epoch: AtomicU64::new(0),
+            jit_compiled_functions: AtomicUsize::new(0),
+            jit_code_bytes: AtomicUsize::new(0),
+            jit_deopt_count: AtomicUsize::new(0),
+            next_future_id: AtomicU64::new(1),
+            next_handler_scope_id: AtomicU64::new(1),
+            await_all_ops,
+            container_stripes: Box::new(stripes),
+            worker_slices: worker_slices.into_boxed_slice(),
+            epoch_sync: Arc::new(AuxEpochSync::new()),
+            aux_started: AtomicBool::new(false),
+            aux_handles: Mutex::new(Vec::new()),
+            roots,
+        });
+        let aux_shutdown = PrimaryAuxShutdown::new(Arc::clone(&shared));
+        Self {
+            _aux_shutdown: Some(aux_shutdown),
+            _roots: Some(registration),
+            worker,
+            shared,
+        }
+    }
+
+    #[inline]
+    pub fn worker_count(&self) -> usize {
+        self.shared.configured_workers
+    }
+
+    #[inline]
+    pub fn scheduler_snapshot_handle(&self) -> Scheduler {
+        self.shared.roots.scheduler.clone()
+    }
+
+    /// Snapshot per-worker task execution slice counts (`0..worker_count()`).
+    pub fn worker_slice_counts(&self) -> Vec<u64> {
+        self.shared
+            .worker_slices
+            .iter()
+            .map(|c| c.0.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    // -- Internal Helper Accessors -------------------------------------------
+
+    #[inline]
+    pub(crate) fn roots(&self) -> &VmRoots {
+        &self.shared.roots
+    }
+
+    #[inline]
+    pub(crate) fn scheduler(&self) -> &Scheduler {
+        &self.shared.roots.scheduler
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn heap(&self) -> &Heap {
+        &self.worker.heap
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn heap_mut(&mut self) -> &mut Heap {
+        &mut self.worker.heap
+    }
+
+    #[inline]
+    pub(crate) fn worker_roots(&self) -> &WorkerRoots {
+        // SAFETY: `self.worker.worker_id` is uniquely owned by the current OS thread,
+        // and `worker_roots` has length `configured_workers`.
+        unsafe {
+            &*self.shared.roots.worker_roots[self.worker.worker_id]
+                .0
+                .get()
+        }
+    }
+
+    #[inline]
+    pub(crate) fn local_queue(&self) -> Option<&WorkerQueue> {
+        // SAFETY: `local_queue_ptr` is set exclusively for the stack lifetime of
+        // `lease_worker_queue` inside `run_worker_loop` and cleared by `ScopedWorkerQueueGuard`.
+        self.worker
+            .local_queue_ptr
+            .map(|ptr| unsafe { ptr.as_ref() })
+    }
+
+    #[inline]
+    pub(crate) fn type_pool_read(&self) -> ShardedReadGuard<'_, TypePool> {
+        self.shared.type_pool.read(self.worker.worker_id)
+    }
+
+    #[inline]
+    pub(crate) fn type_pool_write(&self) -> ShardedWriteGuard<'_, TypePool> {
+        self.shared
+            .type_pool
+            .write_with_epoch(&self.shared.metadata_epoch)
+    }
+
+    #[inline]
+    pub(crate) fn bump_metadata_epoch(&self) {
+        self.shared.metadata_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn sync_meta_cache(&self) -> std::cell::RefMut<'_, WorkerMetaCache> {
+        let cur = self.shared.metadata_epoch.load(Ordering::Acquire);
+        let mut cache = self.worker.meta_cache.borrow_mut();
+        if cache.epoch != cur {
+            cache.epoch = cur;
+            cache.validated_funcs.clear();
+            cache.method_ic.clear();
+            cache.list_roles = None;
+            cache.future_by_inner.clear();
+            cache.is_future_type.clear();
+            cache.effect_meta.clear();
+            cache.indirect_contracts.clear();
+            cache.canonical_types.clear();
+            cache.heap_type_meta.clear();
+        }
+        cache
+    }
+
+    #[inline]
+    pub(crate) fn trait_registry_read(&self) -> ShardedReadGuard<'_, TraitProofRegistry> {
+        self.shared.trait_registry.read(self.worker.worker_id)
+    }
+
+    #[inline]
+    pub(crate) fn trait_registry_write(&self) -> ShardedWriteGuard<'_, TraitProofRegistry> {
+        self.shared.trait_registry.write()
+    }
+
+    #[inline]
+    pub(crate) fn constants_read(&self) -> ShardedReadGuard<'_, ConstantPool> {
+        self.shared.roots.constants.read(self.worker.worker_id)
+    }
+
+    /// Exclusive mutable access to [`SharedVm`] outside `Vm::run()`.
+    ///
+    /// Note: `_aux_shutdown` holds a second `Arc<SharedVm>` on the primary `Vm`, so
+    /// outside `Vm::run()` (when `active_aux_workers == 0`) we temporarily release and
+    /// restore `_aux_shutdown` to obtain `&mut SharedVm` via `Arc::get_mut`.
+    pub(crate) fn with_exclusive_shared_mut<R>(&mut self, f: impl FnOnce(&mut SharedVm) -> R) -> R {
+        let had_shutdown = if let Some(mut shutdown) = self._aux_shutdown.take() {
+            shutdown.disarm();
+            true
+        } else {
+            false
+        };
+        let shared_mut = Arc::get_mut(&mut self.shared)
+            .expect("exclusive SharedVm access requires calling outside Vm::run");
+        let result = f(shared_mut);
+        if had_shutdown {
+            self._aux_shutdown = Some(PrimaryAuxShutdown::new(Arc::clone(&self.shared)));
+        }
+        result
+    }
+
+    #[inline]
+    pub(crate) fn task_ref(&self, task_id: TaskId) -> Option<&runtime::TaskState> {
+        // SAFETY: Called by the worker owning `Running` `task_id` or post-run host queries.
+        unsafe { self.shared.roots.scheduler.owner_task(task_id) }
+    }
+
+    #[inline]
+    pub(crate) fn task_mut(&mut self, task_id: TaskId) -> Option<&mut runtime::TaskState> {
+        // SAFETY: `&mut Vm` is uniquely owned by this worker thread, which exclusively owns
+        // `Running` `task_id` (or exclusive `&mut Vm` outside `Vm::run`).
+        unsafe { self.shared.roots.scheduler.owner_task_mut(task_id) }
+    }
+
+    #[inline]
+    pub(crate) fn stripe_index_of(value: TaggedValue) -> Result<usize, VmError> {
+        let ptr = value.as_heap_ptr().ok_or(VmError::TypeError)?;
+        // SAFETY: `value` is a live heap reference within an active mutator operation;
+        // `gc_meta` stripe bits are immutable after allocation and preserved across GC copies.
+        let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
+        Ok(header.stripe_index())
+    }
+
+    #[inline]
+    pub(crate) fn stripe_read(
+        &self,
+        value: TaggedValue,
+    ) -> Result<RwLockReadGuard<'_, ()>, VmError> {
+        let idx = Self::stripe_index_of(value)?;
+        Ok(self.shared.container_stripes[idx].0.read())
+    }
+
+    #[inline]
+    pub(crate) fn stripe_write(
+        &self,
+        value: TaggedValue,
+    ) -> Result<RwLockWriteGuard<'_, ()>, VmError> {
+        let idx = Self::stripe_index_of(value)?;
+        Ok(self.shared.container_stripes[idx].0.write())
+    }
+
+    /// Lazily start auxiliary OS worker threads (`1..configured_workers`) the first time
+    /// concurrent tasks exist, waking them immediately if a `Vm::run()` epoch is active.
+    pub(crate) fn ensure_aux_workers_started(&self) {
+        if self.shared.configured_workers <= 1 {
+            return;
+        }
+        if self.shared.aux_started.load(Ordering::Acquire) {
+            if !self
+                .shared
+                .epoch_sync
+                .all_aux_entered
+                .load(Ordering::Acquire)
+            {
+                self.shared.epoch_sync.start_cv.notify_all();
+            }
+            return;
+        }
+        let mut handles = self.shared.aux_handles.lock();
+        if self.shared.aux_started.load(Ordering::Acquire) {
+            drop(handles);
+            if !self
+                .shared
+                .epoch_sync
+                .all_aux_entered
+                .load(Ordering::Acquire)
+            {
+                self.shared.epoch_sync.start_cv.notify_all();
+            }
+            return;
+        }
+        for worker_id in 1..self.shared.configured_workers {
+            let weak_shared: Weak<SharedVm> = Arc::downgrade(&self.shared);
+            let gc_config = self.shared.gc_config.clone();
+            let sync = Arc::clone(&self.shared.epoch_sync);
+            let total_aux = self.shared.configured_workers - 1;
+            let handle = std::thread::Builder::new()
+                .name(format!("nessa-worker-{worker_id}"))
+                .spawn(move || {
+                    aux_worker_thread_main(worker_id, total_aux, gc_config, weak_shared, sync)
+                })
+                .expect("failed to spawn Nessa worker thread");
+            handles.push(handle);
+        }
+        self.shared.aux_started.store(true, Ordering::Release);
+        drop(handles);
+        self.shared.epoch_sync.start_cv.notify_all();
+    }
+
+    // -- Public & Runtime API ------------------------------------------------
+
     /// Request a synchronous, exhaustive collection. False means the configured
     /// plan (for example NoGC) did not perform a collection.
     pub fn collect_garbage(&mut self) -> Result<bool, VmError> {
         let _operation = self.execution_operation()?;
         // SAFETY: the operation keeps this mutator live, and public APIs retain
         // managed references only in registered roots or owned host snapshots.
-        Ok(unsafe { self.state.heap.collect_garbage() })
+        Ok(unsafe { self.worker.heap.collect_garbage() })
     }
 
     pub fn completed_collections(&self) -> u64 {
-        self.state.heap.completed_collections()
+        self.worker.heap.completed_collections()
     }
 
     pub fn constant_string(&mut self, index: u32) -> Result<String, VmError> {
@@ -151,16 +882,15 @@ impl Vm {
         builtin_ctx::heap_string_to_owned(value).ok_or(VmError::TypeError)
     }
 
-    fn constant_value(&self, index: u32) -> Result<TaggedValue, VmError> {
-        self.roots
-            .constants
+    pub(crate) fn constant_value(&self, index: u32) -> Result<TaggedValue, VmError> {
+        self.constants_read()
             .values()
             .get(index as usize)
             .copied()
             .ok_or(VmError::InvalidConstant(index))
     }
 
-    fn constant_u32(&self, index: u32) -> Result<u32, VmError> {
+    pub(crate) fn constant_u32(&self, index: u32) -> Result<u32, VmError> {
         let value = self.constant_value(index)?;
         if let Some(raw) = value.as_u64() {
             u32::try_from(raw).map_err(|_| VmError::TypeError)
@@ -171,31 +901,35 @@ impl Vm {
         }
     }
 
-    fn operation(&self) -> gc::MutatorSession<'static> {
+    pub(crate) fn operation(&self) -> gc::MutatorSession<'static> {
         // SAFETY: all callers keep Vm alive until the guard is dropped, and
-        // mutation requires &mut Vm. A nested operation stays on its owner
-        // thread. Allocation callers publish results before ending the guard.
-        unsafe { self.state.heap.begin_operation() }
+        // `self.worker.heap` is owned exclusively by this thread.
+        unsafe { self.worker.heap.begin_operation() }
     }
 
-    fn execution_operation(&self) -> Result<gc::MutatorSession<'static>, VmError> {
+    pub(crate) fn execution_operation(&self) -> Result<gc::MutatorSession<'static>, VmError> {
         // SAFETY: same lifetime/publication guarantees as operation; rejects
         // cross-VM reentry that would leave the caller running while blocked.
-        unsafe { self.state.heap.begin_execution() }.map_err(|_| VmError::CrossVmOperation)
+        unsafe { self.worker.heap.begin_execution() }.map_err(|_| VmError::CrossVmOperation)
     }
 
-    pub fn type_pool(&self) -> &TypePool {
-        &self.state.type_pool
+    pub fn type_pool(&self) -> VmTypePoolRef<'_> {
+        VmTypePoolRef(self.type_pool_read())
     }
 
     pub fn install_type_pool(&mut self, type_pool: TypePool) {
         let _operation = self.operation();
-        self.state.trait_proofs.clear();
-        self.state.trait_proof_cache.clear();
-        self.state.type_pool = type_pool;
-        self.state.method_call_scopes.clear();
-        self.state.type_query_scope = None;
-        self.state.jit.invalidate_all();
+        self.worker.type_query_scope = None;
+        self.with_exclusive_shared_mut(|shared| {
+            let mut reg = shared.trait_registry.write();
+            reg.proofs.clear();
+            reg.cache.clear();
+            drop(reg);
+            *shared.type_pool.write() = type_pool;
+            shared.method_call_scopes.clear();
+            shared.metadata_epoch.fetch_add(1, Ordering::Release);
+        });
+        self.invalidate_jit();
     }
 
     /// Allocate, initialize and publish a constant in one operation.
@@ -215,7 +949,7 @@ impl Vm {
                 variant,
             } => self.enum_constant(*type_index, *variant)?,
         };
-        Ok(self.roots.constants.push(value))
+        Ok(self.shared.roots.constants.write().push(value))
     }
 
     /// Return an owned scalar snapshot; no borrowed task or heap value escapes.
@@ -229,8 +963,7 @@ impl Vm {
     pub fn task_result_string(&mut self, task: TaskId) -> Result<Option<String>, VmError> {
         let _operation = self.operation();
         let value = self
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task)
             .ok_or(VmError::InvalidTask)?
             .registers
@@ -247,8 +980,7 @@ impl Vm {
     pub fn task_result_bool(&mut self, task: TaskId) -> Result<Option<bool>, VmError> {
         let _operation = self.operation();
         let value = self
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task)
             .ok_or(VmError::InvalidTask)?
             .registers
@@ -263,8 +995,7 @@ impl Vm {
     pub fn task_result_is_null(&self, task: TaskId) -> Result<bool, VmError> {
         let _operation = self.operation();
         Ok(self
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task)
             .ok_or(VmError::InvalidTask)?
             .registers
@@ -276,8 +1007,7 @@ impl Vm {
     pub fn task_result_is_unit(&self, task: TaskId) -> Result<bool, VmError> {
         let _operation = self.operation();
         Ok(self
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task)
             .ok_or(VmError::InvalidTask)?
             .registers
@@ -287,79 +1017,44 @@ impl Vm {
 
     pub fn active_stack_count(&self) -> usize {
         let _operation = self.operation();
-        self.roots.scheduler.stack_pool().active_count()
+        self.scheduler().stack_pool().active_count()
     }
 
-    pub fn new(type_pool: TypePool, gc_config: &GcConfig, stack_pool: Arc<StackPool>) -> Self {
-        let state = Box::new(VmState {
-            bytecode: BytecodeStore::new(),
-            type_pool,
-            heap: gc::gc_init(gc_config),
-            builtins: BuiltinFnTable::new(),
-            method_call_scopes: std::collections::HashMap::new(),
-            type_query_scope: None,
-            trait_proofs: std::collections::HashMap::new(),
-            trait_proof_cache: std::collections::HashMap::new(),
-            pending_root_entries: std::collections::HashSet::new(),
-            script_args: Vec::new(),
-            rng: resources::VmRng::new(),
-            files: resources::VmFileTable::new(),
-            json: json_kernel::VmJsonState::new(),
-            resources: resources::VmResourceTable::new(),
-            native_frame_depth: 0,
-            ffi_allowlist: None,
-            next_future_id: 1,
-            next_handler_scope_id: 1,
-            slice_safepoints: 64,
-            host_handler: None,
-            jit: Self::new_default_jit(),
-        });
-        let roots = Box::new(RootCell(UnsafeCell::new(VmRoots {
-            globals: GlobalTable::new(),
-            constants: ConstantPool::new(),
-            scheduler: Scheduler::with_stack_pool(stack_pool),
-            temporary_values: RefCell::new(Vec::new()),
-            native_pins: RefCell::new(Vec::new()),
-            continuations: std::collections::HashMap::new(),
-            weak_finalizers: Vec::new(),
-            promises: std::collections::HashMap::new(),
-            handler_scopes: std::collections::HashMap::new(),
-            json_writer_ancestors: std::collections::HashMap::new(),
-        })));
-        // SAFETY: the Box keeps its address when Vm moves. Vm drops its root
-        // registration first; collection stops mutators before scanning state.
-        let registration = unsafe {
-            gc::RootRegistration::new_with_conditional_roots(
-                roots.0.get().cast(),
-                scan_vm_roots,
-                continuation_roots::CALLBACKS,
-            )
-        };
-        Self {
-            _roots: registration,
-            roots,
-            state,
-        }
+    pub fn active_task_count(&self) -> usize {
+        let _operation = self.operation();
+        self.scheduler().active_task_count()
+    }
+
+    pub fn occupied_task_count(&self) -> usize {
+        let _operation = self.operation();
+        self.scheduler().task_count()
+    }
+
+    pub fn promise_count(&self) -> usize {
+        let _operation = self.operation();
+        self.shared.roots.promises.len()
     }
 
     /// Set command-line arguments visible to Nessa programs via `ENV_ARGS`.
     pub fn set_script_args(&mut self, args: Vec<String>) {
-        self.state.script_args = args;
+        self.with_exclusive_shared_mut(|shared| {
+            shared.script_args = args;
+        });
     }
 
     /// Access the host-owned monotonic resource registry.
-    pub fn resources(&self) -> &resources::VmResourceTable {
-        &self.state.resources
+    pub fn resources(&self) -> MutexGuard<'_, resources::VmResourceTable> {
+        self.shared.resources.lock()
     }
 
     /// Mutably access the host-owned monotonic resource registry.
-    pub fn resources_mut(&mut self) -> &mut resources::VmResourceTable {
-        &mut self.state.resources
+    pub fn resources_mut(&mut self) -> MutexGuard<'_, resources::VmResourceTable> {
+        self.shared.resources.lock()
     }
 
-    /// Current active native C/host frame nesting depth.
+    /// Current active native C/host frame nesting depth on this worker.
     pub fn native_frame_depth(&self) -> u32 {
-        self.state.native_frame_depth
+        self.worker.native_frame_depth
     }
 
     /// Execute `f` under an RAII native-frame guard (`native_frame_depth > 0`),
@@ -371,28 +1066,28 @@ impl Vm {
         struct NativeFrameScope(*mut u32);
         impl Drop for NativeFrameScope {
             fn drop(&mut self) {
-                // SAFETY: `VmState` is boxed at a stable address and outlives `f`.
+                // SAFETY: `WorkerState` is boxed at a stable address and outlives `f`.
                 unsafe {
                     *self.0 -= 1;
                 }
             }
         }
-        self.state.native_frame_depth = self
-            .state
+        self.worker.native_frame_depth = self
+            .worker
             .native_frame_depth
             .checked_add(1)
             .ok_or(VmError::NumericOverflow)?;
-        let _guard = NativeFrameScope(&raw mut self.state.native_frame_depth);
+        let _guard = NativeFrameScope(&raw mut self.worker.native_frame_depth);
         f(self)
     }
 
     /// Configure an optional runtime FFI library allowlist (`None` allows all manifest-authorized libraries).
     pub fn set_ffi_allowlist(&mut self, allowlist: Option<std::collections::HashSet<String>>) {
-        self.state.ffi_allowlist = allowlist;
+        *self.shared.ffi_allowlist.write() = allowlist;
     }
 
     pub fn is_ffi_library_allowed(&self, name: &str) -> bool {
-        match &self.state.ffi_allowlist {
+        match &*self.shared.ffi_allowlist.read() {
             None => true,
             Some(allowed) => allowed.contains(name),
         }
@@ -435,54 +1130,35 @@ impl Vm {
 
     /// Return the configured script command-line arguments.
     pub fn script_args(&self) -> &[String] {
-        &self.state.script_args
+        &self.shared.script_args
     }
 
     /// Install an embedder [`HostHandler`] invoked by privileged `__host_call` invocations.
     pub fn set_host_handler(&mut self, handler: Box<dyn HostHandler>) {
-        self.state.host_handler = Some(handler);
+        *self.shared.host_handler.lock() = Some(handler);
     }
 
     /// Remove and return the currently installed [`HostHandler`], if any.
     pub fn take_host_handler(&mut self) -> Option<Box<dyn HostHandler>> {
-        self.state.host_handler.take()
+        self.shared.host_handler.lock().take()
     }
 
     /// Resume a suspended task (`TaskId`) onto the scheduler ready queue.
     pub fn wake_task(&mut self, task_id: TaskId) -> bool {
         let _operation = self.operation();
-        let can_wake = self.roots.scheduler.get_task(task_id).is_some_and(|t| {
-            matches!(
-                t.status,
-                runtime::TaskStatus::Suspended | runtime::TaskStatus::Waiting
-            )
-        });
-        if can_wake {
-            self.roots.scheduler.resume(task_id);
-        }
-        can_wake
+        self.scheduler().wake(task_id)
     }
 
     /// Return whether at least one task is currently in the ready queue.
     pub fn has_ready_tasks(&self) -> bool {
         let _operation = self.operation();
-        self.roots.scheduler.has_other_ready_tasks()
+        self.scheduler().has_other_ready_tasks()
     }
 
     /// Return whether any task is currently suspended waiting for wakeup.
     pub fn has_suspended_tasks(&self) -> bool {
         let _operation = self.operation();
-        (0..self.roots.scheduler.task_count()).any(|raw| {
-            self.roots
-                .scheduler
-                .get_task(TaskId(raw as u64))
-                .is_some_and(|t| {
-                    matches!(
-                        t.status,
-                        runtime::TaskStatus::Suspended | runtime::TaskStatus::Waiting
-                    )
-                })
-        })
+        self.scheduler().has_suspended_tasks()
     }
 
     pub(crate) fn format_backtrace(
@@ -491,11 +1167,7 @@ impl Vm {
         msg: Option<&str>,
         skip_frames: usize,
     ) -> Result<String, VmError> {
-        let task = self
-            .roots
-            .scheduler
-            .get_task(task_id)
-            .ok_or(VmError::InvalidTask)?;
+        let task = self.task_ref(task_id).ok_or(VmError::InvalidTask)?;
 
         let mut frames: Vec<(FuncId, u32)> = Vec::new();
         for segment in task.stacks.active_chain() {
@@ -533,13 +1205,14 @@ impl Vm {
     }
 
     fn describe_function_frame(&self, func_id: FuncId) -> Option<String> {
-        for raw in 0..self.state.type_pool.len() {
+        let tp = self.type_pool_read();
+        for raw in 0..tp.len() {
             let ty = TypeIndex::from_raw(raw as u32);
-            for slot in self.state.type_pool.methods_of(ty) {
+            for slot in tp.methods_of(ty) {
                 if slot.func_id == func_id.0
                     && let Some(method_name) = str_interner::try_get(slot.name)
                 {
-                    if let Some(owner_name) = self.state.type_pool.display_name(ty) {
+                    if let Some(owner_name) = tp.display_name(ty) {
                         return Some(format!("{owner_name}.{method_name}"));
                     }
                     return Some(method_name.to_string());
@@ -552,13 +1225,19 @@ impl Vm {
     /// Register a native builtin implementation.
     pub fn register_builtin(&mut self, id: BuiltinFnId, f: BuiltinFn) {
         let _operation = self.operation();
-        self.state.builtins.register(id, f);
+        self.with_exclusive_shared_mut(|shared| {
+            shared.builtins.register(id, f);
+        });
     }
 
     /// Add a compiled function to the VM.
     pub fn add_function(&mut self, code: FunctionCode) -> FuncId {
         let _operation = self.operation();
-        self.state.bytecode.add_function(code)
+        self.with_exclusive_shared_mut(|shared| {
+            let id = shared.bytecode.add_function(code);
+            shared.metadata_epoch.fetch_add(1, Ordering::Release);
+            id
+        })
     }
 
     /// Allocate a heap string and return its TaggedValue.
@@ -571,17 +1250,15 @@ impl Vm {
         u16::try_from(payload_bytes.div_ceil(8)).map_err(|_| VmError::ObjectTooLarge)
     }
 
-    fn alloc_string(&mut self, s: &str) -> Result<TaggedValue, VmError> {
+    pub(crate) fn alloc_string(&mut self, s: &str) -> Result<TaggedValue, VmError> {
         let bytes = s.as_bytes();
         let payload_words = Self::string_payload_words(bytes.len())?;
-        let str_type = self.state.type_pool.intrinsic(Intrinsic::Str);
+        let str_type = self.type_pool_read().intrinsic(Intrinsic::Str);
         // SAFETY: callers hold an operation, and publish the initialized value
-        // before ending it. There is no managed allocation during initialization.
-        match unsafe { self.state.heap.alloc_object(str_type, payload_words) } {
+        // before ending it. No lock is held across allocation.
+        match unsafe { self.worker.heap.alloc_object(str_type, payload_words) } {
             Some(ptr) => unsafe {
-                // Write length prefix.
                 *(ptr.as_ptr() as *mut u64) = bytes.len() as u64;
-                // Write UTF-8 bytes after the length.
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().add(8), bytes.len());
                 Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
             },
@@ -592,85 +1269,262 @@ impl Vm {
     /// Spawn a root task that starts executing the given function.
     pub fn spawn_root(&mut self, func_id: FuncId) -> TaskId {
         let _operation = self.operation();
-        let task = self.roots.scheduler.spawn(func_id, None);
-        self.state.pending_root_entries.insert(task);
+        let task = self.scheduler().spawn(func_id, None);
+        if self.shared.pending_root_entries.lock().insert(task) {
+            self.shared
+                .pending_root_count
+                .fetch_add(1, Ordering::Release);
+        }
         task
     }
 
-    /// Run the VM until all tasks have finished.
+    /// Run the VM until all runnable tasks finish, an uncaught root error occurs, or deadlock is detected.
     pub fn run(&mut self) -> VmResult {
-        // SAFETY: &mut Vm owns the operation and keeps its Heap alive. Every
-        // instruction publishes results in registered slots before polling.
-        let _operation = match self.execution_operation() {
+        // Validate upfront that no foreign VM holds an active operation on this thread,
+        // then drop the session so Worker #0 holds no active mutator session while parked.
+        drop(match self.execution_operation() {
             Ok(operation) => operation,
             Err(error) => return VmResult::Error(error),
-        };
+        });
+
+        self.scheduler().clear_abort();
+        let wake_immediately =
+            self.shared.configured_workers > 1 && self.scheduler().ready_count() > 1;
+        self.shared.epoch_sync.begin_run_epoch(wake_immediately);
+        if wake_immediately {
+            self.ensure_aux_workers_started();
+        }
+
+        let primary_exit = self.run_worker_loop();
+        if primary_exit == WorkerLoopExit::Deadlock {
+            self.shared.epoch_sync.record_deadlock();
+        }
+
+        let (first_error, saw_deadlock) = self.shared.epoch_sync.end_run_epoch();
+        self.scheduler().clear_abort();
+
+        if let Some(error) = first_error {
+            if let Ok(_op) = self.execution_operation() {
+                self.drain_cancelled_tasks_on_abort();
+            }
+            return VmResult::Error(error);
+        }
+        if saw_deadlock {
+            return VmResult::Error(VmError::DeadlockDetected);
+        }
+
+        let had_uncollected = self
+            .shared
+            .roots
+            .uncollected_terminal_promises
+            .swap(0, Ordering::AcqRel)
+            > 0;
+        if (had_uncollected || self.shared.roots.promises.len() > 0)
+            && let Ok(_op) = self.execution_operation()
+        {
+            // SAFETY: All workers have exited the run epoch and all live values reside in VM roots.
+            unsafe {
+                self.worker.heap.collect_garbage();
+            }
+        }
+        VmResult::Finished
+    }
+
+    fn run_worker_loop(&mut self) -> WorkerLoopExit {
+        let shared = Arc::clone(&self.shared);
+        let lease = shared
+            .roots
+            .scheduler
+            .lease_worker_queue(self.worker.worker_id);
+        let queue_ptr = NonNull::from(lease.queue());
+        self.worker.local_queue_ptr = Some(queue_ptr);
+        let guard = ScopedWorkerQueueGuard { vm: self };
+        let mut tick: u64 = guard.vm.worker.worker_id as u64;
+        let mut active_op: Option<gc::MutatorSession<'static>> = None;
+
         loop {
-            let Some(task_id) = self.roots.scheduler.next_ready() else {
-                return VmResult::Finished;
+            if active_op.is_some() {
+                guard.vm.worker.heap.safe_point();
+            }
+            let task_id = match shared.roots.scheduler.try_claim_for_worker(
+                guard.vm.worker.worker_id,
+                lease.queue(),
+                &mut tick,
+            ) {
+                Some(id) => id,
+                None => {
+                    // Release mutator session before spinning/parking in `next_for_worker`
+                    // so STW GC never waits on a sleeping worker.
+                    active_op = None;
+                    let next = shared.roots.scheduler.next_for_worker(
+                        guard.vm.worker.worker_id,
+                        lease.queue(),
+                        &mut tick,
+                    );
+                    match next {
+                        WorkerNext::Task(id) => id,
+                        WorkerNext::AllFinished => return WorkerLoopExit::AllFinished,
+                        WorkerNext::Deadlock => return WorkerLoopExit::Deadlock,
+                        WorkerNext::Aborted => return WorkerLoopExit::Aborted,
+                    }
+                }
             };
-            self.roots.scheduler.set_running(task_id);
-            if self.state.pending_root_entries.remove(&task_id) {
-                let function = self
-                    .roots
-                    .scheduler
-                    .get_task(task_id)
-                    .expect("scheduled task exists")
-                    .current_func;
-                if let Err(error) = self
-                    .check_entry_environment(function, None)
-                    .and_then(|()| self.check_user_argument_abi(function, 0))
-                {
-                    self.roots.scheduler.finish(task_id);
-                    return VmResult::Error(error);
+
+            if active_op.is_none() {
+                match guard.vm.execution_operation() {
+                    Ok(op) => active_op = Some(op),
+                    Err(err) => {
+                        shared.roots.scheduler.finish(task_id);
+                        shared.epoch_sync.record_error(err);
+                        shared.roots.scheduler.request_abort();
+                        return WorkerLoopExit::Aborted;
+                    }
                 }
             }
-            let result = self.execute_task(task_id);
+
+            let prev_reclaimed = shared
+                .roots
+                .uncollected_terminal_promises
+                .load(Ordering::Relaxed);
+            if prev_reclaimed >= 32_768
+                && shared
+                    .roots
+                    .uncollected_terminal_promises
+                    .compare_exchange(prev_reclaimed, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                // SAFETY: Between task slices, `task_id` and all other tasks hold all managed
+                // references in registered `VmRoots` (`TaskArena`, globals, constants, worker_roots).
+                unsafe {
+                    guard.vm.worker.heap.collect_garbage();
+                }
+            }
+
+            let is_pending_root = shared.pending_root_count.load(Ordering::Acquire) > 0 && {
+                let removed = shared.pending_root_entries.lock().remove(&task_id);
+                if removed {
+                    shared.pending_root_count.fetch_sub(1, Ordering::AcqRel);
+                }
+                removed
+            };
+            if is_pending_root {
+                let function = guard
+                    .vm
+                    .task_ref(task_id)
+                    .expect("scheduled task exists")
+                    .current_func;
+                if let Err(error) = guard
+                    .vm
+                    .check_entry_environment(function, None)
+                    .and_then(|()| guard.vm.check_user_argument_abi(function, 0))
+                {
+                    shared.roots.scheduler.finish(task_id);
+                    shared.epoch_sync.record_error(error);
+                    shared.roots.scheduler.request_abort();
+                    return WorkerLoopExit::Aborted;
+                }
+            }
+
+            let result = guard.vm.execute_task(task_id);
             match result {
                 ExecOutcome::Finished => {
-                    let (spawned_promise, val) = self
-                        .roots
-                        .scheduler
-                        .get_task(task_id)
+                    let (spawned_promise, val) = guard
+                        .vm
+                        .task_ref(task_id)
                         .map(|t| (t.spawned_promise, t.registers.get(Reg(0))))
                         .unwrap_or((None, TaggedValue::UNIT));
-                    self.roots.scheduler.finish(task_id);
                     if let Some(fid) = spawned_promise {
-                        self.complete_promise(fid, val);
+                        guard.vm.complete_promise(fid, val);
+                        shared.roots.scheduler.reap_task(task_id);
+                    } else {
+                        shared.roots.scheduler.finish(task_id);
                     }
                 }
                 ExecOutcome::Error(e) => {
-                    let spawned_promise = self
-                        .roots
-                        .scheduler
-                        .get_task(task_id)
-                        .and_then(|t| t.spawned_promise);
+                    let spawned_promise = shared.roots.scheduler.task_spawned_promise(task_id);
+                    let children = shared.roots.scheduler.task_children(task_id);
+                    for child in children {
+                        guard.vm.request_cancel_task_subtree(child);
+                    }
                     if let Some(fid) = spawned_promise {
-                        let children = self
-                            .roots
-                            .scheduler
-                            .get_task(task_id)
-                            .map(|t| t.children.clone())
-                            .unwrap_or_default();
-                        for child in children {
-                            self.cancel_task_subtree(child);
-                        }
-                        self.roots.scheduler.finish(task_id);
-                        self.fail_promise(fid, e);
+                        guard.vm.fail_promise(fid, e);
+                        shared.roots.scheduler.reap_task(task_id);
                     } else {
-                        self.roots.scheduler.finish(task_id);
-                        return VmResult::Error(e);
+                        shared.roots.scheduler.finish(task_id);
+                        shared.epoch_sync.record_error(e);
+                        shared.roots.scheduler.request_abort();
+                        return WorkerLoopExit::Aborted;
                     }
                 }
                 ExecOutcome::Yield => {
-                    self.roots.scheduler.yield_task(task_id);
+                    shared.roots.scheduler.yield_task(task_id);
                 }
                 ExecOutcome::Suspend => {
-                    self.roots.scheduler.suspend(task_id);
+                    shared
+                        .roots
+                        .scheduler
+                        .suspend_running(Some(lease.queue()), task_id);
                 }
                 ExecOutcome::Cancelled => {
-                    self.cancel_task_subtree(task_id);
-                    self.roots.scheduler.finish(task_id);
+                    let spawned_promise = shared.roots.scheduler.task_spawned_promise(task_id);
+                    if let Some(fid) = spawned_promise {
+                        guard.vm.finish_cancelled_promise(fid);
+                        shared.roots.scheduler.reap_task(task_id);
+                    } else {
+                        shared.roots.scheduler.finish(task_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_cancelled_tasks_on_abort(&mut self) {
+        let remaining = self.scheduler().active_task_ids();
+        for tid in remaining {
+            self.request_cancel_task_subtree(tid);
+        }
+        while let Some(task_id) = self.scheduler().next_ready() {
+            self.scheduler().set_running(task_id);
+            match self.execute_task(task_id) {
+                ExecOutcome::Finished => {
+                    let (spawned_promise, val) = self
+                        .task_ref(task_id)
+                        .map(|t| (t.spawned_promise, t.registers.get(Reg(0))))
+                        .unwrap_or((None, TaggedValue::UNIT));
+                    if let Some(fid) = spawned_promise {
+                        self.complete_promise(fid, val);
+                        self.scheduler().reap_task(task_id);
+                    } else {
+                        self.scheduler().finish(task_id);
+                    }
+                }
+                ExecOutcome::Cancelled => {
+                    let spawned_promise = self.scheduler().task_spawned_promise(task_id);
+                    if let Some(fid) = spawned_promise {
+                        self.finish_cancelled_promise(fid);
+                        self.scheduler().reap_task(task_id);
+                    } else {
+                        self.scheduler().finish(task_id);
+                    }
+                }
+                ExecOutcome::Error(err) => {
+                    let spawned_promise = self.scheduler().task_spawned_promise(task_id);
+                    let children = self.scheduler().task_children(task_id);
+                    for child in children {
+                        self.request_cancel_task_subtree(child);
+                    }
+                    if let Some(fid) = spawned_promise {
+                        self.fail_promise(fid, err);
+                        self.scheduler().reap_task(task_id);
+                    } else {
+                        self.scheduler().finish(task_id);
+                    }
+                }
+                ExecOutcome::Yield => {
+                    self.scheduler().yield_task(task_id);
+                }
+                ExecOutcome::Suspend => {
+                    self.scheduler().suspend(task_id);
                 }
             }
         }
@@ -678,18 +1532,26 @@ impl Vm {
 
     /// Execute one task until it finishes, suspends, errors, or yields.
     fn execute_task(&mut self, task_id: TaskId) -> ExecOutcome {
-        const SLICE_SAFEPOINT_BUDGET: u32 = 64;
-        self.state.slice_safepoints = SLICE_SAFEPOINT_BUDGET;
+        const SLICE_SAFEPOINT_BUDGET: u32 = 4096;
+        self.worker.slice_safepoints = SLICE_SAFEPOINT_BUDGET;
+        self.shared.worker_slices[self.worker.worker_id]
+            .0
+            .fetch_add(1, Ordering::Relaxed);
+        if self.scheduler().is_cancelled(task_id)
+            && let Some(task) = self.task_mut(task_id)
+        {
+            task.cancelled = true;
+        }
         // Bytecode is immutable while a task runs, so a function's checked
         // entry contract only needs revalidation when control changes function.
         let mut validated_func = None;
         let mut last_entered_frame: Option<(FuncId, usize, usize)> = None;
         loop {
             // No instruction temporaries or mutable task borrows survive here.
-            self.state.heap.safe_point();
-            // Get current task's PC, function, and active frame identity.
-            let (mut pc, func_id, is_cancelled, frame_sig) = {
-                let task = match self.roots.scheduler.get_task(task_id) {
+            self.worker.heap.safe_point();
+            // Get current task's PC, function, active frame identity, and cooperative unwind flags.
+            let (mut pc, func_id, is_cancelled, unwinding_cancel, paused_in_unwind_step, frame_sig) = {
+                let task = match self.task_ref(task_id) {
                     Some(t) => t,
                     None => return ExecOutcome::Error(VmError::InvalidTask),
                 };
@@ -698,15 +1560,41 @@ impl Vm {
                     task.pc,
                     task.current_func,
                     task.cancelled,
+                    task.unwinding_cancel,
+                    task.paused_in_unwind_step,
                     (task.current_func, task.call_stack.len(), ctx_addr),
                 )
             };
-            if is_cancelled {
-                return ExecOutcome::Cancelled;
+            if paused_in_unwind_step {
+                if let Some(task) = self.task_mut(task_id) {
+                    task.paused_in_unwind_step = false;
+                }
+                match self.step_cancel_unwind(task_id) {
+                    futures::CancelUnwindAction::ContinueBytecode => {
+                        validated_func = None;
+                        continue;
+                    }
+                    futures::CancelUnwindAction::Suspend => return ExecOutcome::Suspend,
+                    futures::CancelUnwindAction::Done => return ExecOutcome::Cancelled,
+                }
+            }
+            if is_cancelled && !unwinding_cancel {
+                self.shared.roots.scheduler.cancel_task_waiters(task_id);
+                if let Some(task) = self.task_mut(task_id) {
+                    task.unwinding_cancel = true;
+                }
+                match self.step_cancel_unwind(task_id) {
+                    futures::CancelUnwindAction::ContinueBytecode => {
+                        validated_func = None;
+                        continue;
+                    }
+                    futures::CancelUnwindAction::Suspend => return ExecOutcome::Suspend,
+                    futures::CancelUnwindAction::Done => return ExecOutcome::Cancelled,
+                }
             }
 
             let checked = if validated_func == Some(func_id) {
-                self.state
+                self.shared
                     .bytecode
                     .try_get_function(func_id)
                     .ok_or(VmError::InvalidFunction(func_id))
@@ -722,42 +1610,49 @@ impl Vm {
                 return ExecOutcome::Finished;
             }
 
-            if last_entered_frame != Some(frame_sig) {
+            if !unwinding_cancel && last_entered_frame != Some(frame_sig) {
                 last_entered_frame = Some(frame_sig);
                 if pc == 0 {
                     self.maybe_compile_on_hotness(func_id, jit::ENTRY_HOTNESS_INCREMENT);
                 }
             }
 
-            if let Some(jit_outcome) = self.try_run_jit(task_id, func_id, pc) {
+            if !unwinding_cancel && let Some(jit_outcome) = self.try_run_jit(task_id, func_id, pc) {
                 match jit_outcome {
                     jit_bridge::JitStepOutcome::Finished => return ExecOutcome::Finished,
                     jit_bridge::JitStepOutcome::Return { ret_pc, val } => {
-                        if let Some(outcome) = self.complete_return(task_id, ret_pc, val) {
+                        if let Some(outcome) =
+                            self.complete_return(task_id, ret_pc, val, &mut validated_func)
+                        {
                             return outcome;
                         }
                         continue;
                     }
                     jit_bridge::JitStepOutcome::TierUp(osr_pc) => {
                         self.compile_jit_function(func_id, true);
-                        if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                        if let Some(task) = self.task_mut(task_id) {
                             task.pc = osr_pc;
                         }
                         continue;
                     }
                     jit_bridge::JitStepOutcome::Yield(resume_pc) => {
-                        if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                        if let Some(task) = self.task_mut(task_id) {
                             task.pc = resume_pc;
                         }
                         return ExecOutcome::Yield;
                     }
                     jit_bridge::JitStepOutcome::SuspendRetry(retry_pc) => {
-                        if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                        if let Some(task) = self.task_mut(task_id) {
                             task.pc = retry_pc;
                         }
                         return ExecOutcome::Suspend;
                     }
-                    jit_bridge::JitStepOutcome::Cancelled => return ExecOutcome::Cancelled,
+                    jit_bridge::JitStepOutcome::Cancelled => {
+                        if let Some(task) = self.task_mut(task_id) {
+                            task.cancelled = true;
+                        }
+                        continue;
+                    }
                     jit_bridge::JitStepOutcome::Error(err) => return ExecOutcome::Error(err),
                     jit_bridge::JitStepOutcome::InterpretOne(interp_pc) => {
                         pc = interp_pc;
@@ -768,32 +1663,58 @@ impl Vm {
                 }
             }
 
-            let word = self.state.bytecode.get_function(func_id).instructions[pc as usize];
-            let instr = match Instruction::decode(word) {
+            let instr_word = self.shared.bytecode.get_function(func_id).instructions[pc as usize];
+            let instr = match Instruction::decode(instr_word) {
                 Some(i) => i,
-                None => return ExecOutcome::Error(VmError::InvalidInstruction(word)),
+                None => return ExecOutcome::Error(VmError::InvalidInstruction(instr_word)),
             };
 
             // Advance PC before executing (jumps will override).
-            if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+            if let Some(task) = self.task_mut(task_id) {
                 task.pc = pc + 1;
             }
 
             match self.dispatch(task_id, instr) {
                 DispatchResult::Continue => {}
                 DispatchResult::Return(val) => {
-                    if let Some(outcome) = self.complete_return(task_id, pc, val) {
+                    if let Some(outcome) =
+                        self.complete_return(task_id, pc, val, &mut validated_func)
+                    {
                         return outcome;
                     }
                 }
                 DispatchResult::Yield => return ExecOutcome::Yield,
                 DispatchResult::SuspendRetry => {
-                    if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                    if let Some(task) = self.task_mut(task_id) {
                         task.pc = pc;
                     }
                     return ExecOutcome::Suspend;
                 }
-                DispatchResult::Cancelled => return ExecOutcome::Cancelled,
+                DispatchResult::StartCancelUnwind => {
+                    self.shared.roots.scheduler.cancel_task_waiters(task_id);
+                    if let Some(task) = self.task_mut(task_id) {
+                        task.unwinding_cancel = true;
+                    }
+                    match self.step_cancel_unwind(task_id) {
+                        futures::CancelUnwindAction::ContinueBytecode => {
+                            validated_func = None;
+                        }
+                        futures::CancelUnwindAction::Suspend => return ExecOutcome::Suspend,
+                        futures::CancelUnwindAction::Done => return ExecOutcome::Cancelled,
+                    }
+                }
+                DispatchResult::ResumeCancelUnwind => {
+                    if let Some(task) = self.task_mut(task_id) {
+                        task.is_unwind_target = false;
+                    }
+                    match self.step_cancel_unwind(task_id) {
+                        futures::CancelUnwindAction::ContinueBytecode => {
+                            validated_func = None;
+                        }
+                        futures::CancelUnwindAction::Suspend => return ExecOutcome::Suspend,
+                        futures::CancelUnwindAction::Done => return ExecOutcome::Cancelled,
+                    }
+                }
                 DispatchResult::Error(e) => return ExecOutcome::Error(e),
             }
         }
@@ -804,19 +1725,34 @@ impl Vm {
         task_id: TaskId,
         ret_pc: u32,
         val: TaggedValue,
+        validated_func: &mut Option<FuncId>,
     ) -> Option<ExecOutcome> {
+        let return_inside_unwind_defer = self
+            .task_ref(task_id)
+            .is_some_and(|t| t.unwinding_cancel && t.is_unwind_target);
+        if return_inside_unwind_defer {
+            if let Some(task) = self.task_mut(task_id) {
+                task.is_unwind_target = false;
+            }
+            return match self.step_cancel_unwind(task_id) {
+                futures::CancelUnwindAction::ContinueBytecode => {
+                    *validated_func = None;
+                    None
+                }
+                futures::CancelUnwindAction::Suspend => Some(ExecOutcome::Suspend),
+                futures::CancelUnwindAction::Done => Some(ExecOutcome::Cancelled),
+            };
+        }
         if let Err(error) = self.check_display_return(task_id, val) {
             return Some(ExecOutcome::Error(error));
         }
         let at_root = self
-            .roots
-            .scheduler
-            .get_task(task_id)
+            .task_ref(task_id)
             .is_some_and(|t| t.stacks.is_at_task_root());
         if at_root {
             match self.check_task_root_return(task_id, val) {
                 Ok(Some(_)) => {
-                    if let Some(task) = self.roots.scheduler.get_task_mut(task_id) {
+                    if let Some(task) = self.task_mut(task_id) {
                         task.pc = ret_pc;
                     }
                     return Some(ExecOutcome::Suspend);
@@ -825,13 +1761,16 @@ impl Vm {
                 Err(err) => return Some(ExecOutcome::Error(err)),
             }
         }
+        // Pop call frame.
         let should_finish = {
-            let task = self.roots.scheduler.get_task_mut(task_id).unwrap();
+            let task = self.task_mut(task_id).unwrap();
             if let Some(frame) = task.call_stack.pop() {
                 task.pc = frame.return_pc;
                 task.current_func = frame.func_id;
                 task.local_slots = frame.local_slots;
                 task.display_state = frame.display_state;
+                task.unwind_stack = frame.unwind_stack;
+                task.is_unwind_target = frame.is_unwind_target;
                 for (reg, saved_val) in &frame.saved_regs {
                     task.registers.set(*reg, *saved_val);
                 }
@@ -840,7 +1779,11 @@ impl Vm {
             } else if task.stacks.return_from_delimiter(val) {
                 false
             } else {
+                task.registers.regs.fill(TaggedValue::UNIT);
                 task.registers.set(Reg(0), val);
+                task.local_slots = Vec::new();
+                task.display_state = None;
+                task.unwind_stack.clear();
                 true
             }
         };
@@ -851,39 +1794,64 @@ impl Vm {
         }
     }
 
+    #[inline]
+    fn poll_safepoint(&mut self, task_id: TaskId) -> DispatchResult {
+        self.worker.heap.safe_point();
+        let slot_cancelled = self.scheduler().is_cancelled(task_id);
+        let should_unwind = if let Some(task) = self.task_mut(task_id) {
+            if slot_cancelled {
+                task.cancelled = true;
+            }
+            task.cancelled && !task.unwinding_cancel
+        } else {
+            false
+        };
+        if should_unwind {
+            return DispatchResult::StartCancelUnwind;
+        }
+        if self.scheduler().is_aborted() || GC_FLAGS.preempt_requested.load(Ordering::Relaxed) {
+            return DispatchResult::Yield;
+        }
+        self.worker.slice_safepoints = self.worker.slice_safepoints.saturating_sub(1);
+        if self.worker.slice_safepoints == 0 {
+            self.worker.slice_safepoints = 4096;
+            if self.scheduler().has_other_ready_tasks() {
+                return DispatchResult::Yield;
+            }
+        }
+        DispatchResult::Continue
+    }
+
     /// Dispatch a single instruction.
     fn dispatch(&mut self, task_id: TaskId, instr: Instruction) -> DispatchResult {
-        // PC belongs to the executing frame, including after continuation resume.
-        // Restore the ambient query context even on yield or a language error.
-        // Installation admits scope entries only for covered opcodes.
         let scope = if nsbc::instruction_requires_scope(instr.opcode) {
-            let found = self.roots.scheduler.get_task(task_id).and_then(|task| {
+            let found = self.task_ref(task_id).and_then(|task| {
                 task.pc.checked_sub(1).and_then(|pc| {
-                    self.state
+                    self.shared
                         .method_call_scopes
                         .get(&(task.current_func, pc as usize))
                         .copied()
                 })
             });
-            if found.is_none() && !self.state.type_pool.scopes().is_empty() {
+            let has_scopes = !self.type_pool_read().scopes().is_empty();
+            if found.is_none() && has_scopes {
                 return DispatchResult::Error(VmError::MissingMethodContext);
             }
             found
         } else {
             None
         };
-        let previous = self.state.type_query_scope;
-        self.state.type_query_scope = scope;
+        let previous = self.worker.type_query_scope;
+        self.worker.type_query_scope = scope;
         let result = self.dispatch_in_scope(task_id, instr);
-        self.state.type_query_scope = previous;
+        self.worker.type_query_scope = previous;
         result
     }
 
     fn dispatch_in_scope(&mut self, task_id: TaskId, instr: Instruction) -> DispatchResult {
-        // Helper macro to get task mutably.
         macro_rules! task {
             () => {
-                self.roots.scheduler.get_task_mut(task_id).unwrap()
+                self.task_mut(task_id).unwrap()
             };
         }
 
@@ -960,10 +1928,7 @@ impl Vm {
             Opcode::Load => {
                 let (dst, _, imm12) = a_fields(&instr);
                 let val = match instr.amode {
-                    AddrMode::Imm => {
-                        // Sign-extend 12-bit immediate to i64.
-                        TaggedValue::from_i64(Instruction::sext_imm12(imm12) as i64)
-                    }
+                    AddrMode::Imm => TaggedValue::from_i64(Instruction::sext_imm12(imm12) as i64),
                     AddrMode::Const => match self.constant_value(imm12 as u32) {
                         Ok(value) => value,
                         Err(error) => return DispatchResult::Error(error),
@@ -1079,7 +2044,7 @@ impl Vm {
                 } else {
                     imm12 as u32
                 };
-                let val = match self.roots.globals.get(gidx) {
+                let val = match self.shared.roots.globals.get(gidx) {
                     Ok(value) => value,
                     Err(error) => return DispatchResult::Error(error.into()),
                 };
@@ -1106,31 +2071,30 @@ impl Vm {
             // ── Object creation (A-type) ──────────────────────────
             Opcode::NewObject => {
                 let (dst, _, imm12) = a_fields(&instr);
-                let Some(type_idx) = self
-                    .state
-                    .type_pool
-                    .canonical_type(TypeIndex::from_raw(imm12 as u32))
-                else {
-                    return DispatchResult::Error(VmError::TypeError);
+                let (type_idx, words) = {
+                    let tp = self.type_pool_read();
+                    let Some(type_idx) = tp.canonical_type(TypeIndex::from_raw(imm12 as u32))
+                    else {
+                        return DispatchResult::Error(VmError::TypeError);
+                    };
+                    if tp.is_reserved_collection_role(type_idx) {
+                        return DispatchResult::Error(VmError::TypeError);
+                    }
+                    let words = match &tp.get(type_idx).kind {
+                        type_pool::TypeKind::Struct { fields, .. } => fields.len(),
+                        type_pool::TypeKind::Tuple { elements } => elements.len(),
+                        type_pool::TypeKind::Newtype { .. } => 1,
+                        _ => return DispatchResult::Error(VmError::TypeError),
+                    };
+                    let Ok(words) = u16::try_from(words) else {
+                        return DispatchResult::Error(VmError::TypeError);
+                    };
+                    (type_idx, words)
                 };
-                if self.state.type_pool.is_reserved_collection_role(type_idx) {
-                    return DispatchResult::Error(VmError::TypeError);
-                }
-                let words = match &self.state.type_pool.get(type_idx).kind {
-                    type_pool::TypeKind::Struct { fields, .. } => fields.len(),
-                    type_pool::TypeKind::Tuple { elements } => elements.len(),
-                    type_pool::TypeKind::Newtype { .. } => 1,
-                    _ => return DispatchResult::Error(VmError::TypeError),
-                };
-                let Ok(words) = u16::try_from(words) else {
-                    return DispatchResult::Error(VmError::TypeError);
-                };
-                // SAFETY: run owns an operation and writes the result to dst
-                // before the next instruction boundary can stop the mutator.
-                match unsafe { self.state.heap.alloc_object(type_idx, words) } {
+                // SAFETY: slice owns an execution operation, no lock is held across allocation,
+                // and all payload slots are initialized before publishing to `dst`.
+                match unsafe { self.worker.heap.alloc_object(type_idx, words) } {
                     Some(ptr) => {
-                        // SAFETY: the allocation contains exactly `words`
-                        // aligned payload slots; initialize them before exposure.
                         for index in 0..words as usize {
                             unsafe {
                                 ptr.as_ptr()
@@ -1258,6 +2222,7 @@ impl Vm {
                 };
                 if offset <= 0 {
                     self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
+                    return self.poll_safepoint(task_id);
                 }
                 DispatchResult::Continue
             }
@@ -1277,6 +2242,7 @@ impl Vm {
                     && offset <= 0
                 {
                     self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
+                    return self.poll_safepoint(task_id);
                 }
                 DispatchResult::Continue
             }
@@ -1296,6 +2262,7 @@ impl Vm {
                     && offset <= 0
                 {
                     self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
+                    return self.poll_safepoint(task_id);
                 }
                 DispatchResult::Continue
             }
@@ -1315,6 +2282,7 @@ impl Vm {
                     && offset <= 0
                 {
                     self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
+                    return self.poll_safepoint(task_id);
                 }
                 DispatchResult::Continue
             }
@@ -1334,6 +2302,7 @@ impl Vm {
                     && offset <= 0
                 {
                     self.maybe_compile_on_hotness(cur_fn, jit::BACKEDGE_HOTNESS_INCREMENT);
+                    return self.poll_safepoint(task_id);
                 }
                 DispatchResult::Continue
             }
@@ -1342,11 +2311,18 @@ impl Vm {
             Opcode::Call => {
                 let payload = c_payload(&instr);
                 let (arg_count, func_id_raw) = Instruction::c_arg_count_func_id(payload);
-                if arg_count as usize > runtime::GP_REGISTER_COUNT {
+                let arg_len = arg_count as usize;
+                if arg_len > runtime::GP_REGISTER_COUNT {
                     return DispatchResult::Error(VmError::TypeError);
                 }
-                let arguments = task!().registers.regs[..arg_count as usize].to_vec();
-                self.invoke_closure_physical(task_id, FuncId(func_id_raw), None, &arguments)
+                let mut arg_buf = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+                arg_buf[..arg_len].copy_from_slice(&task!().registers.regs[..arg_len]);
+                self.invoke_closure_physical(
+                    task_id,
+                    FuncId(func_id_raw),
+                    None,
+                    &arg_buf[..arg_len],
+                )
             }
 
             Opcode::CallFar => {
@@ -1356,11 +2332,18 @@ impl Vm {
                     Ok(id) => id,
                     Err(error) => return DispatchResult::Error(error),
                 };
-                if arg_count as usize > runtime::GP_REGISTER_COUNT {
+                let arg_len = arg_count as usize;
+                if arg_len > runtime::GP_REGISTER_COUNT {
                     return DispatchResult::Error(VmError::TypeError);
                 }
-                let arguments = task!().registers.regs[..arg_count as usize].to_vec();
-                self.invoke_closure_physical(task_id, FuncId(func_id_raw), None, &arguments)
+                let mut arg_buf = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+                arg_buf[..arg_len].copy_from_slice(&task!().registers.regs[..arg_len]);
+                self.invoke_closure_physical(
+                    task_id,
+                    FuncId(func_id_raw),
+                    None,
+                    &arg_buf[..arg_len],
+                )
             }
 
             Opcode::CallIndirect | Opcode::CallIndirectProof => {
@@ -1371,8 +2354,6 @@ impl Vm {
                 let payload_ptr = match closure_val.as_heap_ptr() {
                     Some(p) => p,
                     None => {
-                        // Callable nominal values can use immediate storage,
-                        // notably nullary Enum variants.
                         return if instr.opcode == Opcode::CallIndirectProof {
                             self.exec_call_apply_proof(task_id, closure_reg, arg_count)
                         } else {
@@ -1393,7 +2374,6 @@ impl Vm {
                     return DispatchResult::Error(VmError::TypeError);
                 }
                 if header.type_index != Intrinsic::Closure.type_index() {
-                    // Dynamic calls include continuations and callable objects.
                     return if instr.opcode == Opcode::CallIndirectProof {
                         self.exec_call_apply_proof(task_id, closure_reg, arg_count)
                     } else {
@@ -1410,22 +2390,43 @@ impl Vm {
                 }
                 // SAFETY: the initialized ClosureEnv layout was checked above.
                 let func_id = unsafe { ClosureEnv::func_id(payload_ptr) };
-                let explicit_args = task!().registers.regs[..arg_count as usize].to_vec();
-                let mut physical = if instr.opcode == Opcode::CallIndirectProof {
-                    explicit_args
-                } else {
-                    match self.expand_logical_arguments(func_id, &explicit_args) {
-                        Ok(arguments) => arguments,
-                        Err(error) => return DispatchResult::Error(error),
+                let arg_len = arg_count as usize;
+                let mut arg_buf = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+                arg_buf[..arg_len].copy_from_slice(&task!().registers.regs[..arg_len]);
+                let all_value_params = instr.opcode == Opcode::CallIndirectProof
+                    || self.checked_function(func_id).is_ok_and(|code| {
+                        code.abi.parameters.len() == arg_len
+                            && code
+                                .abi
+                                .parameters
+                                .iter()
+                                .all(|p| *p == ParameterAbi::Value)
+                    });
+                if all_value_params {
+                    if let Err(error) =
+                        self.prepare_indirect_arguments(func_id, &mut arg_buf[..arg_len])
+                    {
+                        return DispatchResult::Error(error);
                     }
-                };
-                if let Err(error) = self.prepare_indirect_arguments(func_id, &mut physical) {
-                    return DispatchResult::Error(error);
+                    let closure_val = task!().registers.get(closure_reg);
+                    self.invoke_closure_physical(
+                        task_id,
+                        func_id,
+                        Some(closure_val),
+                        &arg_buf[..arg_len],
+                    )
+                } else {
+                    let mut physical =
+                        match self.expand_logical_arguments(func_id, &arg_buf[..arg_len]) {
+                            Ok(arguments) => arguments,
+                            Err(error) => return DispatchResult::Error(error),
+                        };
+                    if let Err(error) = self.prepare_indirect_arguments(func_id, &mut physical) {
+                        return DispatchResult::Error(error);
+                    }
+                    let closure_val = task!().registers.get(closure_reg);
+                    self.invoke_closure_physical(task_id, func_id, Some(closure_val), &physical)
                 }
-                // Conversions may collect; read the environment from its actual
-                // registered slot again before publishing the callee frame.
-                let closure_val = task!().registers.get(closure_reg);
-                self.invoke_closure_physical(task_id, func_id, Some(closure_val), &physical)
             }
 
             Opcode::TraitProof | Opcode::TraitAssert | Opcode::TraitProject => {
@@ -1498,26 +2499,7 @@ impl Vm {
             Opcode::AwaitFuture => self.dispatch_await_future(task_id, &instr),
 
             // ── System (E-type) ───────────────────────────────────
-            Opcode::Safepoint => {
-                self.state.heap.safe_point();
-                if task!().cancelled {
-                    return DispatchResult::Cancelled;
-                }
-                if GC_FLAGS
-                    .preempt_requested
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    return DispatchResult::Yield;
-                }
-                self.state.slice_safepoints = self.state.slice_safepoints.saturating_sub(1);
-                if self.state.slice_safepoints == 0 {
-                    self.state.slice_safepoints = 64;
-                    if self.roots.scheduler.has_other_ready_tasks() {
-                        return DispatchResult::Yield;
-                    }
-                }
-                DispatchResult::Continue
-            }
+            Opcode::Safepoint => self.poll_safepoint(task_id),
             Opcode::Unreachable => DispatchResult::Error(VmError::UnreachableExecuted),
             Opcode::Nop => DispatchResult::Continue,
         }
@@ -1534,10 +2516,10 @@ impl Vm {
             Ok(state) => state,
             Err(error) => return DispatchResult::Error(error),
         };
-        let t = self.roots.scheduler.get_task_mut(task_id).unwrap();
-        let mut saved = Vec::with_capacity(Reg::CALLEE_SAVED.len());
+        let t = self.task_mut(task_id).unwrap();
+        let mut saved = runtime::SavedRegs::new();
         for &r in Reg::CALLEE_SAVED {
-            saved.push((Reg(r), t.registers.get(Reg(r))));
+            saved.push(Reg(r), t.registers.get(Reg(r)));
         }
         let frame = CallFrame {
             display_state: t.display_state.take(),
@@ -1545,6 +2527,8 @@ impl Vm {
             func_id: t.current_func,
             saved_regs: saved,
             local_slots: std::mem::take(&mut t.local_slots),
+            unwind_stack: std::mem::take(&mut t.unwind_stack),
+            is_unwind_target: std::mem::replace(&mut t.is_unwind_target, false),
         };
         t.call_stack.push(frame);
         t.current_func = target;
@@ -1567,13 +2551,7 @@ impl Vm {
         method_str_id: StrId,
         arg_count: u8,
     ) -> DispatchResult {
-        let receiver = self
-            .roots
-            .scheduler
-            .get_task_mut(task_id)
-            .unwrap()
-            .registers
-            .get(recv_reg);
+        let receiver = self.task_mut(task_id).unwrap().registers.get(recv_reg);
         let recv_type = match self.reflected_type(receiver) {
             Ok(ty) => ty,
             Err(error) => return DispatchResult::Error(error),
@@ -1585,17 +2563,13 @@ impl Vm {
         };
         if let Some(method) = selected {
             let target_func_id = FuncId(method.func_id);
-            let function = match self.checked_function(target_func_id) {
-                Ok(function) => function,
+            let logical_count = match self.checked_function(target_func_id) {
+                Ok(function) => function.abi.logical_parameter_count(),
                 Err(error) => return DispatchResult::Error(error),
             };
-            let logical_count = function.abi.logical_parameter_count();
             if let Err(error) = self.check_entry_environment(target_func_id, None) {
                 return DispatchResult::Error(error);
             }
-            // A normal instance method takes self before its explicit arguments.
-            // Reject both malformed calls and register overflow before shifting
-            // any argument or publishing the receiver to r0.
             if arg_count as usize >= runtime::GP_REGISTER_COUNT {
                 return DispatchResult::Error(VmError::ArityError {
                     expected: (runtime::GP_REGISTER_COUNT - 1) as u8,
@@ -1611,18 +2585,19 @@ impl Vm {
                     got: arg_count,
                 });
             }
-            // Intrinsic collection methods keep their checked integer-index
-            // ABI after visibility/ambiguity selection. Calling the std wrapper
-            // would assert usize before accepting the existing signed indices.
             if let Some(result) =
                 self.exec_collection_call(task_id, receiver, recv_type, method_str_id, arg_count)
             {
                 return result;
             }
-            let t = self.roots.scheduler.get_task(task_id).unwrap();
-            let mut arguments = vec![receiver];
-            arguments.extend_from_slice(&t.registers.regs[..arg_count as usize]);
-            self.invoke_closure(task_id, target_func_id, None, &arguments)
+            let arg_len = arg_count as usize;
+            let mut arg_buf = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+            arg_buf[0] = receiver;
+            {
+                let t = self.task_ref(task_id).unwrap();
+                arg_buf[1..1 + arg_len].copy_from_slice(&t.registers.regs[..arg_len]);
+            }
+            self.invoke_closure(task_id, target_func_id, None, &arg_buf[..1 + arg_len])
         } else {
             if let Some(result) =
                 self.exec_collection_call(task_id, receiver, recv_type, method_str_id, arg_count)
@@ -1649,9 +2624,7 @@ impl Vm {
                             });
                         }
                         let value = self
-                            .roots
-                            .scheduler
-                            .get_task(task_id)
+                            .task_ref(task_id)
                             .expect("dispatched task exists")
                             .registers
                             .get(Reg(0));
@@ -1672,9 +2645,7 @@ impl Vm {
         arg_count: u8,
     ) -> DispatchResult {
         let receiver = self
-            .roots
-            .scheduler
-            .get_task(task_id)
+            .task_ref(task_id)
             .expect("dispatched task exists")
             .registers
             .get(recv_reg);
@@ -1722,7 +2693,7 @@ impl Vm {
                     vec![proof, receiver]
                 }
             };
-            let t = self.roots.scheduler.get_task(task_id).unwrap();
+            let t = self.task_ref(task_id).unwrap();
             physical.extend_from_slice(&t.registers.regs[..arg_count as usize]);
             if let Err(error) = self.prepare_indirect_arguments(target_func_id, &mut physical) {
                 return DispatchResult::Error(error);
@@ -1741,17 +2712,18 @@ impl Vm {
                 Ok(ty) => ty,
                 Err(error) => return DispatchResult::Error(error),
             };
-            if matches!(
-                self.state.type_pool.get(input_ty).kind,
+            let is_trait_input = matches!(
+                self.type_pool_read().get(input_ty).kind,
                 type_pool::TypeKind::Trait { .. }
-            ) {
+            );
+            if is_trait_input {
                 if arg_count != 2 {
                     return DispatchResult::Error(VmError::ArityError {
                         expected: 2,
                         got: arg_count,
                     });
                 }
-                let t = self.roots.scheduler.get_task(task_id).unwrap();
+                let t = self.task_ref(task_id).unwrap();
                 let proof = t.registers.get(Reg(0));
                 let value = t.registers.get(Reg(1));
                 if let Err(error) = self.assert_trait_pair(proof, value, input_ty) {
@@ -1766,9 +2738,7 @@ impl Vm {
                 });
             }
             let value = self
-                .roots
-                .scheduler
-                .get_task(task_id)
+                .task_ref(task_id)
                 .expect("dispatched task exists")
                 .registers
                 .get(Reg(0));
@@ -1792,9 +2762,7 @@ impl Vm {
             return DispatchResult::Error(error);
         }
         let captures = self
-            .roots
-            .scheduler
-            .get_task(task_id)
+            .task_ref(task_id)
             .expect("dispatched task exists")
             .registers
             .regs[..capture_count as usize]
@@ -1805,11 +2773,11 @@ impl Vm {
         let payload_words = ClosureEnv::payload_words(capture_count);
         let closure_type = Intrinsic::Closure.type_index();
 
-        // SAFETY: run holds an operation. Captures are read from rooted registers
-        // after allocation, and the completed closure is published to dst.
-        match unsafe { self.state.heap.alloc_object(closure_type, payload_words) } {
+        // SAFETY: slice holds an operation. Captures are re-read from rooted registers
+        // after allocation, and the completed closure is published to `dst`.
+        match unsafe { self.worker.heap.alloc_object(closure_type, payload_words) } {
             Some(ptr) => {
-                let t = self.roots.scheduler.get_task_mut(task_id).unwrap();
+                let t = self.task_mut(task_id).unwrap();
                 let mut captures = Vec::with_capacity(capture_count as usize);
                 for i in 0..capture_count {
                     captures.push(t.registers.get(Reg(i as u8)));
@@ -1833,7 +2801,7 @@ impl Vm {
         builtin_id: u32,
         arg_count: u8,
     ) -> DispatchResult {
-        let Some(f) = self.state.builtins.get(builtin_id) else {
+        let Some(f) = self.shared.builtins.get(builtin_id) else {
             return DispatchResult::Error(VmError::UnknownBuiltin(builtin_id));
         };
         let mut ctx = BuiltinCtx::new(self, task_id, arg_count);
@@ -1844,10 +2812,97 @@ impl Vm {
             BuiltinOutcome::Continue => DispatchResult::Continue,
             BuiltinOutcome::Yield => DispatchResult::Yield,
             BuiltinOutcome::SuspendRetry => DispatchResult::SuspendRetry,
+            BuiltinOutcome::StartCancelUnwind => DispatchResult::StartCancelUnwind,
+            BuiltinOutcome::ResumeCancelUnwind => DispatchResult::ResumeCancelUnwind,
             BuiltinOutcome::Exit(code) => {
                 std::process::exit(code);
             }
             BuiltinOutcome::Panic(msg) => DispatchResult::Error(VmError::Panic(msg)),
+        }
+    }
+}
+
+fn aux_worker_thread_main(
+    worker_id: usize,
+    total_aux: usize,
+    gc_config: GcConfig,
+    weak_shared: Weak<SharedVm>,
+    sync: Arc<AuxEpochSync>,
+) {
+    let mut worker = Some(Box::new(WorkerState {
+        worker_id,
+        heap: gc::gc_init(&gc_config),
+        type_query_scope: None,
+        slice_safepoints: 64,
+        native_frame_depth: 0,
+        local_queue_ptr: None,
+        meta_cache: RefCell::new(WorkerMetaCache::default()),
+        jit: Vm::new_default_jit(),
+        jit_synced_epoch: 0,
+        jit_reported_fns: 0,
+        jit_reported_bytes: 0,
+        jit_reported_deopts: 0,
+    }));
+    let mut last_epoch = 0u64;
+
+    loop {
+        {
+            let mut guard = sync.lock.lock();
+            while (!guard.epoch_running || guard.run_epoch == last_epoch) && !guard.shutdown {
+                sync.start_cv.wait(&mut guard);
+            }
+            if guard.shutdown {
+                break;
+            }
+            last_epoch = guard.run_epoch;
+            guard.active_aux_workers += 1;
+            if guard.active_aux_workers >= total_aux {
+                sync.all_aux_entered.store(true, Ordering::Release);
+            }
+        }
+
+        if let Some(shared) = weak_shared.upgrade() {
+            let shared_for_panic = Arc::clone(&shared);
+            let mut aux_vm = Vm {
+                _aux_shutdown: None,
+                _roots: None,
+                worker: worker.take().expect("aux worker state present"),
+                shared,
+            };
+            let run_res =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| aux_vm.run_worker_loop()));
+            let Vm {
+                worker: returned_worker,
+                shared,
+                ..
+            } = aux_vm;
+            worker = Some(returned_worker);
+            drop(shared);
+            match run_res {
+                Ok(WorkerLoopExit::Deadlock) => {
+                    sync.record_deadlock();
+                }
+                Ok(_) => {}
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "auxiliary worker panicked".to_string()
+                    };
+                    eprintln!("NESSA AUX WORKER {worker_id} PANIC: {msg}");
+                    sync.record_error(VmError::Panic(msg));
+                    shared_for_panic.roots.scheduler.request_abort();
+                }
+            }
+            drop(shared_for_panic);
+        }
+
+        let mut guard = sync.lock.lock();
+        guard.active_aux_workers -= 1;
+        if guard.active_aux_workers == 0 {
+            sync.done_cv.notify_all();
         }
     }
 }
@@ -1905,7 +2960,6 @@ fn is_truthy(val: TaggedValue) -> bool {
     if let Some(number) = unsafe { Number::from_tagged(val) } {
         return number.partial_cmp_numeric(Number::I64(0)) != Some(std::cmp::Ordering::Equal);
     }
-    // Heap objects and everything else are truthy.
     true
 }
 
@@ -1919,7 +2973,8 @@ enum DispatchResult {
     Return(TaggedValue),
     Yield,
     SuspendRetry,
-    Cancelled,
+    StartCancelUnwind,
+    ResumeCancelUnwind,
     Error(VmError),
 }
 
@@ -1945,6 +3000,8 @@ pub enum VmError {
     InvalidInstruction(u32),
     InvalidTask,
     TaskCancelled,
+    CrossTaskContinuationCapture,
+    DeadlockDetected,
     InvalidFunction(FuncId),
     InvalidSlot(u32),
     InvalidField(u32),
@@ -2000,6 +3057,12 @@ impl std::fmt::Display for VmError {
             Self::InvalidInstruction(word) => write!(f, "invalid instruction {word:#010x}"),
             Self::InvalidTask => f.write_str("invalid task"),
             Self::TaskCancelled => f.write_str("awaited task was cancelled"),
+            Self::CrossTaskContinuationCapture => {
+                f.write_str("cannot capture a continuation across an async task boundary")
+            }
+            Self::DeadlockDetected => f.write_str(
+                "deadlock detected: all remaining tasks are suspended with no active I/O or runnable wakers",
+            ),
             Self::InvalidFunction(id) => write!(f, "invalid function id {}", id.0),
             Self::InvalidSlot(index) => write!(f, "invalid local slot {index}"),
             Self::InvalidField(index) => write!(f, "invalid field index {index}"),
@@ -2062,61 +3125,81 @@ impl std::error::Error for VmError {}
 /// Root scan callback owned by Vm's lifetime-bound registration.
 ///
 /// Walks all root sources in the Vm:
-///   1. Global variable table, constant pool, and temporary value roots
-///   2. Active and pending-delimiter stack contexts across all scheduled tasks
-///   3. Native pinning roots
-///
-/// Each TaggedValue that might hold a heap pointer is presented to the
-/// visitor as a `NessaSlot` pointing at the memory location of the value.
+///   1. Global variable table, constant pool, and per-worker temporary value roots
+///   2. Completed promises still holding unconsumed values for waiters
+///   3. Active/pending-delimiter stack contexts and inherited `ancestor_handlers` across all tasks
+///   4. Per-worker native pinning roots
 unsafe fn scan_vm_roots(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) {
-    // SAFETY: RootCell is stable UnsafeCell storage. STW and the registration
-    // lock provide exclusive access, with no outstanding mutator root borrows.
-    // Slot addresses remain stable until this collection completes.
+    // SAFETY: `RootCell` is stable `UnsafeCell` storage. MMTk STW stops all mutators
+    // (and no mutator ever holds `constants` or `promises` locks across allocation/safepoints),
+    // giving exclusive access to `VmRoots` until collection finishes.
     let vm = unsafe { &mut *context.cast::<VmRoots>().cast_mut() };
-    let mut visit = |value: &mut TaggedValue| {
+    vm.globals.visit_raw_slots_mut(|slot_ptr: *mut u64| {
+        // SAFETY: `slot_ptr` is an aligned `u64` slot inside `GlobalTable` stable across STW.
+        visitor(unsafe { NessaSlot::from_raw_ptr(slot_ptr) });
+    });
+
+    fn visit_tagged_slot(visitor: &mut dyn FnMut(NessaSlot), value: &mut TaggedValue) {
         // SAFETY: this exclusive aligned value slot lives until tracing ends.
         visitor(unsafe { NessaSlot::from_raw_ptr((value as *mut TaggedValue).cast::<u64>()) });
-    };
-    for value in vm.globals.values_mut() {
-        visit(value);
     }
-    for value in vm.constants.values_mut() {
-        visit(value);
+
+    // SAFETY: Under STW, no mutator is reading or writing `constants` or `promises`.
+    let constants = unsafe { &mut *vm.constants.data_ptr() };
+    for value in constants.values_mut() {
+        visit_tagged_slot(visitor, value);
     }
-    for value in vm.temporary_values.get_mut() {
-        visit(value);
-    }
-    for entry in vm.promises.values_mut() {
-        if let futures::PromiseState::Completed(ref mut value) = entry.state {
-            visit(value);
+
+    for slot in vm.worker_roots.iter_mut() {
+        let worker_roots = slot.0.get_mut();
+        for value in worker_roots.temporary_values.get_mut() {
+            visit_tagged_slot(visitor, value);
         }
     }
-    for stack in vm.json_writer_ancestors.values_mut() {
+
+    // SAFETY: Under STW, no mutator is reading or writing `json_writer_ancestors`.
+    let json_ancestors = unsafe { &mut *vm.json_writer_ancestors.data_ptr() };
+    for stack in json_ancestors.values_mut() {
         for value in stack.iter_mut() {
-            visit(value);
+            visit_tagged_slot(visitor, value);
         }
     }
-    // Copy only scalar task IDs; scheduler storage is neither resized nor moved
-    // during stopped-world enumeration or subsequent root processing.
-    let tasks: Vec<_> = vm
-        .scheduler
-        .all_tasks()
-        .iter()
-        .map(|task| task.id)
-        .collect();
-    for task_id in tasks {
-        let task = vm
-            .scheduler
-            .get_task_mut(task_id)
-            .expect("enumerated task remains alive under STW");
+
+    // SAFETY: Under STW, all mutator threads are parked and hold no promise shard locks.
+    unsafe {
+        vm.promises.for_each_shard_stopped_mut(|promises| {
+            for entry in promises.values_mut() {
+                if (!entry.waiters.is_empty() || !entry.all_waiters.is_empty())
+                    && let futures::PromiseState::Completed(ref mut value) = entry.state
+                {
+                    visit_tagged_slot(visitor, value);
+                }
+            }
+        });
+    }
+
+    vm.sync.visit_roots_stopped(|value| {
+        visit_tagged_slot(visitor, value);
+    });
+
+    for task in vm.scheduler.iter_tasks_mut() {
+        for handler in &mut task.ancestor_handlers {
+            visit_tagged_slot(visitor, &mut handler.closure_env);
+        }
         for stack_context in task.stacks.root_contexts_mut() {
             continuation_roots::visit_stack_slots(stack_context, visitor);
         }
     }
-    for value in vm.native_pins.get_mut() {
-        // SAFETY: only copied values handed to a live native call enter this
-        // buffer. Their addresses and native lifetime remain fixed under STW.
-        visitor(unsafe { NessaSlot::from_pinning_root((value as *mut TaggedValue).cast::<u64>()) });
+
+    for slot in vm.worker_roots.iter_mut() {
+        let worker_roots = slot.0.get_mut();
+        for value in worker_roots.native_pins.get_mut() {
+            // SAFETY: only copied values handed to a live native call enter this
+            // buffer. Their addresses and native lifetime remain fixed under STW.
+            visitor(unsafe {
+                NessaSlot::from_pinning_root((value as *mut TaggedValue).cast::<u64>())
+            });
+        }
     }
 }
 
@@ -2150,10 +3233,11 @@ mod tests {
     }
 
     pub(super) fn make_vm() -> TestVm {
-        let vm = Vm::new(
+        let vm = Vm::new_with_workers(
             TypePool::with_intrinsics(),
             &GcConfig::default(),
             Arc::new(StackPool::new()),
+            1,
         );
         let operation = vm.operation();
         TestVm {
@@ -2169,7 +3253,6 @@ mod tests {
     #[test]
     fn simple_add_and_return() {
         let mut vm = make_vm();
-        // r0 = 10, r1 = 32, r2 = r0 + r1, return r2
         let code = encode_instrs(&[
             Instruction::load_imm(Reg(0), 10),
             Instruction::load_imm(Reg(1), 32),
@@ -2191,8 +3274,7 @@ mod tests {
         let result = vm.run();
         assert!(matches!(result, VmResult::Finished));
         let val = vm
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task_id)
             .unwrap()
             .registers
@@ -2222,7 +3304,7 @@ mod tests {
         });
         let task = vm.spawn_root(FuncId(0));
         assert!(matches!(vm.run(), VmResult::Finished));
-        let task = vm.roots.scheduler.get_task(task).unwrap();
+        let task = vm.scheduler().get_task(task).unwrap();
         assert_eq!(task.registers.get(Reg(0)).as_i64(), Some(42));
         assert_eq!(task.local_slots.capacity(), 0);
     }
@@ -2246,7 +3328,7 @@ mod tests {
             });
             vm.spawn_root(FuncId(0));
             assert!(matches!(vm.run(), VmResult::Error(VmError::InvalidSlot(1))));
-            assert_eq!(vm.roots.scheduler.stack_pool().active_count(), 0);
+            assert_eq!(vm.scheduler().stack_pool().active_count(), 0);
         }
     }
 
@@ -2254,7 +3336,7 @@ mod tests {
     fn invalid_field_access_cannot_read_or_write_past_the_object() {
         for store in [false, true] {
             let mut vm = make_vm();
-            let ty = vm.state.type_pool.register(type_pool::TypeInfo {
+            let ty = vm.type_pool_write().register(type_pool::TypeInfo {
                 kind: type_pool::TypeKind::Tuple {
                     elements: vec![Intrinsic::I64.type_index()],
                 },
@@ -2288,13 +3370,12 @@ mod tests {
     #[test]
     fn conditional_jump() {
         let mut vm = make_vm();
-        // r0 = true, if r0 jump +2, r1 = 0, return r1, r1 = 42, return r1
         let code = encode_instrs(&[
-            Instruction::load_true(Reg(0)),    // 0
-            Instruction::jmp_if(Reg(0), 2),    // 1: jump to 3 (1+2=3, but -1 for pre-inc → pc=3)
-            Instruction::load_imm(Reg(1), 0),  // 2: skipped
-            Instruction::load_imm(Reg(1), 42), // 3: target
-            Instruction::ret(Reg(1)),          // 4
+            Instruction::load_true(Reg(0)),
+            Instruction::jmp_if(Reg(0), 2),
+            Instruction::load_imm(Reg(1), 0),
+            Instruction::load_imm(Reg(1), 42),
+            Instruction::ret(Reg(1)),
         ]);
         let func = FunctionCode {
             display_owner: None,
@@ -2309,10 +3390,8 @@ mod tests {
         vm.add_function(func);
         let task_id = vm.spawn_root(FuncId(0));
         vm.run();
-        // r1 = 42, returned into r0
         let val = vm
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task_id)
             .unwrap()
             .registers
@@ -2355,8 +3434,7 @@ mod tests {
         let task_id = vm.spawn_root(FuncId(0));
         vm.run();
         let val = vm
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task_id)
             .unwrap()
             .registers
@@ -2381,8 +3459,7 @@ mod tests {
         let task_id = vm.spawn_root(FuncId(0));
         vm.run();
         let val = vm
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task_id)
             .unwrap()
             .registers
@@ -2393,7 +3470,8 @@ mod tests {
     #[test]
     fn globals_load_store() {
         let mut vm = make_vm();
-        let gidx = vm.roots.globals.alloc(TaggedValue::UNIT);
+        let gidx =
+            vm.with_exclusive_shared_mut(|shared| shared.roots.globals.alloc(TaggedValue::UNIT));
         let code = encode_instrs(&[
             Instruction::load_imm(Reg(2), 99),
             Instruction::store_global(gidx as u16, Reg(2)),
@@ -2413,8 +3491,7 @@ mod tests {
         let task_id = vm.spawn_root(FuncId(0));
         assert!(matches!(vm.run(), VmResult::Finished));
         let val = vm
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task_id)
             .unwrap()
             .registers
@@ -2444,8 +3521,7 @@ mod tests {
         let task_id = vm.spawn_root(FuncId(0));
         vm.run();
         let val = vm
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task_id)
             .unwrap()
             .registers
@@ -2481,8 +3557,7 @@ mod tests {
         let result = vm.run();
         assert!(matches!(result, VmResult::Finished));
         let val = vm
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task_id)
             .unwrap()
             .registers
@@ -2536,7 +3611,7 @@ mod tests {
             drop(missing);
 
             let mut non_int = make_vm();
-            non_int.roots.constants.push(TaggedValue::TRUE);
+            non_int.roots().constants.write().push(TaggedValue::TRUE);
             non_int.add_function(FunctionCode {
                 display_owner: None,
                 abi: FunctionAbi::value_only(0),
@@ -2556,8 +3631,7 @@ mod tests {
     fn scalar_cmp_eq_rejects_non_scalar_heap_tuples() {
         let mut vm = make_vm();
         let tuple_ty = vm
-            .state
-            .type_pool
+            .type_pool_write()
             .intern_structural(type_pool::TypeKind::Tuple {
                 elements: vec![Intrinsic::I64.type_index()],
             });

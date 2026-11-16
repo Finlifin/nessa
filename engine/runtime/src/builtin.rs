@@ -8,7 +8,7 @@ pub type BuiltinFnId = u32;
 
 /// Version of the stable builtin IDs and calling semantics stored in artifacts.
 /// Increment when an ID changes meaning or compilation requires new native capabilities.
-pub const BUILTIN_ABI_VERSION: u32 = 11;
+pub const BUILTIN_ABI_VERSION: u32 = 12;
 
 // ---------------------------------------------------------------------------
 // Stable builtin function IDs (sparse ranges by domain)
@@ -1144,7 +1144,7 @@ pub mod ids {
     /// Execute a shell command with optional `stdin` and optional `cwd`.
     pub const PROC_SHELL_CWD: BuiltinFnId = 647;
 
-    // ── Compact Bytes, Safe C FFI, Native JSON & JIT Introspection (ABI11) ──
+    // ── Compact Bytes, Safe C FFI, Native JSON & JIT Introspection (648..=691) ──
     pub const BYTES_NEW: BuiltinFnId = 648;
     pub const BYTES_LEN: BuiltinFnId = 649;
     pub const BYTES_CAP: BuiltinFnId = 650;
@@ -1192,6 +1192,82 @@ pub mod ids {
     pub const RT_JIT_COMPILED_FNS: BuiltinFnId = 689;
     pub const RT_JIT_CODE_BYTES: BuiltinFnId = 690;
     pub const RT_JIT_DEOPT_COUNT: BuiltinFnId = 691;
+
+    // ── Concurrency, cancellation unwinding & async primitives (800..=864) ──
+    /// Record a `defer` cleanup PC on the frame unwind stack; returns `false` normally, `true` on cancel unwind.
+    pub const DEFER_PUSH: BuiltinFnId = 800;
+    /// Pop the top `defer` cleanup PC before running a normal lexical scope exit `defer`.
+    pub const DEFER_POP: BuiltinFnId = 801;
+    /// Resume deterministic cancellation unwinding after a `defer` block completes.
+    pub const DEFER_RESUME_UNWIND: BuiltinFnId = 802;
+    /// Return the current task's generational `TaskId` as `i64`.
+    pub const TASK_CURRENT_ID: BuiltinFnId = 803;
+    /// Render a deterministic tree snapshot of all active tasks in the scheduler.
+    pub const TASK_TREE_SNAPSHOT: BuiltinFnId = 804;
+
+    // ── `std.sync` task-aware synchronization & lock-free atomics (805..=846) ──
+    pub const SYNC_CHAN_NEW: BuiltinFnId = 805;
+    pub const SYNC_CHAN_SEND: BuiltinFnId = 806;
+    pub const SYNC_CHAN_TRY_SEND: BuiltinFnId = 807;
+    pub const SYNC_CHAN_RECV: BuiltinFnId = 808;
+    pub const SYNC_CHAN_TRY_RECV: BuiltinFnId = 809;
+    pub const SYNC_CHAN_CLOSE: BuiltinFnId = 810;
+    pub const SYNC_CHAN_IS_CLOSED: BuiltinFnId = 811;
+    pub const SYNC_CHAN_LEN: BuiltinFnId = 812;
+    pub const SYNC_MUTEX_NEW: BuiltinFnId = 813;
+    pub const SYNC_MUTEX_LOCK: BuiltinFnId = 814;
+    pub const SYNC_MUTEX_TRY_LOCK: BuiltinFnId = 815;
+    pub const SYNC_MUTEX_UNLOCK: BuiltinFnId = 816;
+    pub const SYNC_MUTEX_GET: BuiltinFnId = 817;
+    pub const SYNC_MUTEX_SET: BuiltinFnId = 818;
+    pub const SYNC_MUTEX_IS_LOCKED: BuiltinFnId = 819;
+    pub const SYNC_RWLOCK_NEW: BuiltinFnId = 820;
+    pub const SYNC_RWLOCK_READ_LOCK: BuiltinFnId = 821;
+    pub const SYNC_RWLOCK_TRY_READ_LOCK: BuiltinFnId = 822;
+    pub const SYNC_RWLOCK_READ_UNLOCK: BuiltinFnId = 823;
+    pub const SYNC_RWLOCK_WRITE_LOCK: BuiltinFnId = 824;
+    pub const SYNC_RWLOCK_TRY_WRITE_LOCK: BuiltinFnId = 825;
+    pub const SYNC_RWLOCK_WRITE_UNLOCK: BuiltinFnId = 826;
+    pub const SYNC_RWLOCK_GET: BuiltinFnId = 827;
+    pub const SYNC_RWLOCK_SET: BuiltinFnId = 828;
+    pub const SYNC_SEM_NEW: BuiltinFnId = 829;
+    pub const SYNC_SEM_ACQUIRE: BuiltinFnId = 830;
+    pub const SYNC_SEM_TRY_ACQUIRE: BuiltinFnId = 831;
+    pub const SYNC_SEM_RELEASE: BuiltinFnId = 832;
+    pub const SYNC_SEM_AVAILABLE: BuiltinFnId = 833;
+    pub const SYNC_ONCE_NEW: BuiltinFnId = 834;
+    pub const SYNC_ONCE_BEGIN: BuiltinFnId = 835;
+    pub const SYNC_ONCE_COMPLETE: BuiltinFnId = 836;
+    pub const SYNC_ONCE_ABORT: BuiltinFnId = 837;
+    pub const SYNC_ONCE_GET: BuiltinFnId = 838;
+    pub const SYNC_BARRIER_NEW: BuiltinFnId = 839;
+    pub const SYNC_BARRIER_WAIT: BuiltinFnId = 840;
+    pub const SYNC_ATOMIC_NEW: BuiltinFnId = 841;
+    pub const SYNC_ATOMIC_LOAD: BuiltinFnId = 842;
+    pub const SYNC_ATOMIC_STORE: BuiltinFnId = 843;
+    pub const SYNC_ATOMIC_SWAP: BuiltinFnId = 844;
+    pub const SYNC_ATOMIC_FETCH_ADD: BuiltinFnId = 845;
+    pub const SYNC_ATOMIC_CAS: BuiltinFnId = 846;
+
+    // ── `std.net` non-blocking TCP / UDP / DNS builtins on `libuv` (847..=864) ──
+    pub const NET_TCP_LISTEN: BuiltinFnId = 847;
+    pub const NET_TCP_ACCEPT: BuiltinFnId = 848;
+    pub const NET_TCP_CONNECT: BuiltinFnId = 849;
+    pub const NET_TCP_READ: BuiltinFnId = 850;
+    pub const NET_TCP_READ_LINE: BuiltinFnId = 851;
+    pub const NET_TCP_WRITE_STR: BuiltinFnId = 852;
+    pub const NET_TCP_WRITE_BYTES: BuiltinFnId = 853;
+    pub const NET_TCP_SET_NODELAY: BuiltinFnId = 854;
+    pub const NET_TCP_LOCAL_ADDR: BuiltinFnId = 855;
+    pub const NET_TCP_PEER_ADDR: BuiltinFnId = 856;
+    pub const NET_TCP_CLOSE: BuiltinFnId = 857;
+    pub const NET_UDP_BIND: BuiltinFnId = 858;
+    pub const NET_UDP_SEND_STR: BuiltinFnId = 859;
+    pub const NET_UDP_SEND_BYTES: BuiltinFnId = 860;
+    pub const NET_UDP_RECV: BuiltinFnId = 861;
+    pub const NET_UDP_LOCAL_ADDR: BuiltinFnId = 862;
+    pub const NET_UDP_CLOSE: BuiltinFnId = 863;
+    pub const NET_RESOLVE_HOST: BuiltinFnId = 864;
 }
 
 /// Static metadata for a builtin function (no function pointer).
@@ -3611,6 +3687,266 @@ pub const BUILTIN_FN_META: &[BuiltinFnMeta] = &[
         id: ids::RT_JIT_DEOPT_COUNT,
         name: "__rt_jit_deopt_count",
     },
+    BuiltinFnMeta {
+        id: ids::DEFER_PUSH,
+        name: "__defer_push",
+    },
+    BuiltinFnMeta {
+        id: ids::DEFER_POP,
+        name: "__defer_pop",
+    },
+    BuiltinFnMeta {
+        id: ids::DEFER_RESUME_UNWIND,
+        name: "__defer_resume_unwind",
+    },
+    BuiltinFnMeta {
+        id: ids::TASK_CURRENT_ID,
+        name: "__task_current_id",
+    },
+    BuiltinFnMeta {
+        id: ids::TASK_TREE_SNAPSHOT,
+        name: "__task_tree_snapshot",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_NEW,
+        name: "__sync_chan_new",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_SEND,
+        name: "__sync_chan_send",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_TRY_SEND,
+        name: "__sync_chan_try_send",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_RECV,
+        name: "__sync_chan_recv",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_TRY_RECV,
+        name: "__sync_chan_try_recv",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_CLOSE,
+        name: "__sync_chan_close",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_IS_CLOSED,
+        name: "__sync_chan_is_closed",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_CHAN_LEN,
+        name: "__sync_chan_len",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_MUTEX_NEW,
+        name: "__sync_mutex_new",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_MUTEX_LOCK,
+        name: "__sync_mutex_lock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_MUTEX_TRY_LOCK,
+        name: "__sync_mutex_try_lock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_MUTEX_UNLOCK,
+        name: "__sync_mutex_unlock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_MUTEX_GET,
+        name: "__sync_mutex_get",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_MUTEX_SET,
+        name: "__sync_mutex_set",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_MUTEX_IS_LOCKED,
+        name: "__sync_mutex_is_locked",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_NEW,
+        name: "__sync_rwlock_new",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_READ_LOCK,
+        name: "__sync_rwlock_read_lock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_TRY_READ_LOCK,
+        name: "__sync_rwlock_try_read_lock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_READ_UNLOCK,
+        name: "__sync_rwlock_read_unlock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_WRITE_LOCK,
+        name: "__sync_rwlock_write_lock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_TRY_WRITE_LOCK,
+        name: "__sync_rwlock_try_write_lock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_WRITE_UNLOCK,
+        name: "__sync_rwlock_write_unlock",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_GET,
+        name: "__sync_rwlock_get",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_RWLOCK_SET,
+        name: "__sync_rwlock_set",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_SEM_NEW,
+        name: "__sync_sem_new",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_SEM_ACQUIRE,
+        name: "__sync_sem_acquire",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_SEM_TRY_ACQUIRE,
+        name: "__sync_sem_try_acquire",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_SEM_RELEASE,
+        name: "__sync_sem_release",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_SEM_AVAILABLE,
+        name: "__sync_sem_available",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ONCE_NEW,
+        name: "__sync_once_new",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ONCE_BEGIN,
+        name: "__sync_once_begin",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ONCE_COMPLETE,
+        name: "__sync_once_complete",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ONCE_ABORT,
+        name: "__sync_once_abort",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ONCE_GET,
+        name: "__sync_once_get",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_BARRIER_NEW,
+        name: "__sync_barrier_new",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_BARRIER_WAIT,
+        name: "__sync_barrier_wait",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ATOMIC_NEW,
+        name: "__sync_atomic_new",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ATOMIC_LOAD,
+        name: "__sync_atomic_load",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ATOMIC_STORE,
+        name: "__sync_atomic_store",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ATOMIC_SWAP,
+        name: "__sync_atomic_swap",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ATOMIC_FETCH_ADD,
+        name: "__sync_atomic_fetch_add",
+    },
+    BuiltinFnMeta {
+        id: ids::SYNC_ATOMIC_CAS,
+        name: "__sync_atomic_cas",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_LISTEN,
+        name: "__net_tcp_listen",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_ACCEPT,
+        name: "__net_tcp_accept",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_CONNECT,
+        name: "__net_tcp_connect",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_READ,
+        name: "__net_tcp_read",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_READ_LINE,
+        name: "__net_tcp_read_line",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_WRITE_STR,
+        name: "__net_tcp_write_str",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_WRITE_BYTES,
+        name: "__net_tcp_write_bytes",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_SET_NODELAY,
+        name: "__net_tcp_set_nodelay",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_LOCAL_ADDR,
+        name: "__net_tcp_local_addr",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_PEER_ADDR,
+        name: "__net_tcp_peer_addr",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_TCP_CLOSE,
+        name: "__net_tcp_close",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_UDP_BIND,
+        name: "__net_udp_bind",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_UDP_SEND_STR,
+        name: "__net_udp_send_str",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_UDP_SEND_BYTES,
+        name: "__net_udp_send_bytes",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_UDP_RECV,
+        name: "__net_udp_recv",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_UDP_LOCAL_ADDR,
+        name: "__net_udp_local_addr",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_UDP_CLOSE,
+        name: "__net_udp_close",
+    },
+    BuiltinFnMeta {
+        id: ids::NET_RESOLVE_HOST,
+        name: "__net_resolve_host",
+    },
 ];
 
 /// Look up a builtin function id by its language-facing name.
@@ -3633,7 +3969,7 @@ mod tests {
 
     #[test]
     fn fn_ids_are_stable_and_named() {
-        assert_eq!(BUILTIN_ABI_VERSION, 11);
+        assert_eq!(BUILTIN_ABI_VERSION, 12);
         assert!(lookup_builtin_fn_meta(120).is_none());
         assert_eq!(lookup_builtin_fn_id("print"), Some(ids::PRINT));
         assert_eq!(lookup_builtin_fn_id("str_concat"), Some(ids::STR_CONCAT));
@@ -3654,7 +3990,9 @@ mod tests {
             );
             assert_eq!(lookup_builtin_fn_id(meta.name), Some(meta.id));
         }
-        for id in ids::SCALAR_HASH..=ids::RT_JIT_DEOPT_COUNT {
+        for id in (ids::SCALAR_HASH..=ids::RT_JIT_DEOPT_COUNT)
+            .chain(ids::DEFER_PUSH..=ids::NET_RESOLVE_HOST)
+        {
             let meta = lookup_builtin_fn_meta(id)
                 .unwrap_or_else(|| panic!("missing metadata for builtin id {id}"));
             assert_eq!(lookup_builtin_fn_id(meta.name), Some(id));

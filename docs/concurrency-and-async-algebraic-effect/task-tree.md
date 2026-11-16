@@ -119,89 +119,59 @@ Created → Running → Completed
     ▼
 ```
 
-## Promise 集
+## Promise 注册表与代际 Task 槽表
 
-每个 task 维护一个 **promise 集**，记录所有由它发出的 async effect call 对应的 promise：
+运行时通过分片代际槽表（`TaskArena`）与双引用计数 `PromiseRegistry` 管理任务和异步结果生命周期：
 
-```nessa
--- task 内部结构 (概念模型)
-struct Task {
-    id: TaskId,
-    parent: ?TaskId,
-    children: List<TaskId>,
-    promise_set: Map<EffectCallId, Promise>,
-    state: TaskState,
-    -- ...
-}
-```
+- **代际 `TaskId`**：编码为 `[32-bit generation | 32-bit slot_index]`，任务检索为 $O(1)$ 数组下标访问并防止悬垂 `TaskId` 误唤醒（ABA）。
+- **自动回收（零长稳泄漏）**：子任务完成后立即从父任务的活跃 `pending_children` 中压缩移除；当对应的 `Future` 句柄被消费/GC 回收且离开 handler 作用域后，`PromiseEntry` 与子任务槽位立即归还复用。
 
-### Effect Call ID
+## 多核 Work-Stealing 调度与 I/O Reactor
 
-每个 async effect call 都有一个唯一的 ID，用于：
-- 在 promise 集中标识对应的 promise
-- 将子 task 的结果路由到正确的 promise
-- 将 future 与 promise 关联
+nessa 运行时采用 **$M:N$ 多核 Work-Stealing 调度器 + 每 Worker 独立 MMTk Mutator + `libuv` 异步 I/O Reactor** 架构：
 
-## 调度模型
+1. **Worker 线程池**：默认启动与逻辑 CPU 核数相等的 Worker 线程（可通过 `NESSA_WORKER_THREADS` 或 `SchedulerConfig` 配置为单线程确定性模式）。每个 Worker 持有本地双端队列（LIFO 亲和局部性 + 跨线程 FIFO 窃取）和独立的 MMTk bump-pointer 分配器。
+2. **收敛 Safe-Point**：编译器在**循环回边**（`while` / `for`）与**函数入口**插入 `Safepoint` 指令。在 safe-point 处，Worker 通过单次原子标志与时间片预算检查协作响应移动式 GC Stop-The-World 握手、任务取消与时间片轮转让出。
+3. **`libuv` I/O Reactor 与全局死锁检测**：定时器（`task.sleep` / `time.sleep_ms`）、子进程（`std.process`）、文件系统（`std.fs`）与网络套接字（`std.net`）统一通过后台 `libuv` Reactor 非阻塞驱动，绝不阻塞计算 Worker 线程。若所有就绪任务耗尽、存在挂起等待的任务且没有任何活跃 Reactor 句柄或外部唤醒源，运行时立即报告 `VmError::DeadlockDetected`（包含等待链信息），避免静默挂死或误退出。
 
-nessa 使用**基于 safe-point 的抢占式**调度模型：
+### 为什么是 Safe-Point 而非硬件信号硬抢占
 
-### Safe-Point
+硬件信号完全抢占可以在任意机器指令处打断线程，但无法低成本维护精确移动式 GC 根映射。Safe-point 方式：
 
-编译器在以下位置自动插入 safe-point：
+- **精确 GC 友好**：只在寄存器/槽位状态已知的位置响应 STW，支持 MMTk Immix 移动式压缩回收
+- **超低热路径开销**：普通分支基本块不发射冗余 `Safepoint`，无 GC/抢占请求时仅需一次轻量检查
+- **覆盖完整执行流**：循环回边 + 函数入口覆盖所有迭代与递归计算路径
 
-1. **循环回边** (loop back-edges)：`while` 和 `for` 循环每次迭代之前
-2. **函数调用点**：每次函数调用前
+## 动态效应查找与单 Task 定界延续边界
 
-在 safe-point，task 会执行以下检查：
-
-```
-[safe-point 检查]
-    │
-    ├── 有待处理的中断？
-    │   ├── Yes → 处理中断（填充 promise、更新状态等）
-    │   └── No  → 继续执行
-    │
-    ├── 调度器要求让出？
-    │   ├── Yes → 让出执行权，task 进入就绪队列
-    │   └── No  → 继续执行
-    │
-    └── 继续当前 task 的执行
-```
-
-### 为什么是 Safe-Point 而非完全抢占
-
-完全抢占（如 OS 线程）可以在任意指令处暂停，但这需要保存完整的 CPU 状态，开销大且实现复杂。Safe-point 方式：
-
-- **可预测**：只在已知位置暂停，VM 状态一致
-- **轻量**：不需要保存/恢复完整的机器状态
-- **足够频繁**：循环回边 + 函数调用覆盖了几乎所有长时间运行的代码路径
-- **低延迟**：在任何有循环或函数调用的代码中，两个 safe-point 之间的间隔很短
-
-## 动态效应查找与 Task 树
-
-当 evidence 为 `null`（[动态效应调用](../algebraic-effect-and-multi-prompt-delimited-continuation/dynamic-effect-call.md) 场景）时，运行时沿 task 树向上查找 handler：
+当效应调用需要动态分派（参见 [动态效应调用](../algebraic-effect-and-multi-prompt-delimited-continuation/dynamic-effect-call.md)）时，子 task 在派生时以 $O(1)$ 继承父 task 当前的**不可变祖先 Handler 链快照**，无需跨线程遍历正在运行的父 task 调用栈：
 
 ```
 [Root Task] ← handles(log)
 ├── [Task A]
 │   └── [Task B]
-│       └── [Task C] ← log("hello")# 动态查找
-│           向上搜索: C → B → A → Root ← 找到 handler!
+│       └── [Task C] ← log("hello")# 命中继承的祖先快照 → Root handler!
 ```
 
-Task 树为动态 handler 查找提供了明确的搜索路径，从发出效应的 task 逐级向上直到 root task。
+跨任务效应分派严格遵守以下并发安全边界：
 
-## Task 树的可视化
+1. **祖先 `async effect` Handler**：允许任意后代 task 触发，在调用方 task 下继续派生新的子 task。
+2. **祖先无 `catch` 的同步 `effect` Handler**：允许后代 task 直接调用（共享堆容器与全局/捕获槽由运行时原子槽与对象锁保护，绝不产生数据竞争 UB）。
+3. **定界延续（`catch k`）严格归属单 Task**：每个 task 可以独立使用局部 `catch k`、`k.clone()` 与 `std.coroutine` 有状态协程，栈段在各自 task 内安全切换与移动式 GC 扫描；但**禁止跨 task 捕获祖先栈段或跨 task 恢复他人的 `Continuation`**，违者确定性报错 `VmError::CrossTaskContinuationCapture`。
 
-在调试模式下，可以查看当前的 task 树状态：
+## Task 树内省与可视化
 
+标准库 [`std.task`](../standard-library/task.md) 提供运行时可观测 API：
+
+- `task.current_id() -> i64`：返回当前正在执行的代际 `TaskId`。
+- `task.tree_snapshot() -> String`：生成当前活跃 task 树的层次状态快照（含父子缩进、`TaskId` 与运行/挂起/取消状态），便于诊断慢任务与并发拓扑：
+
+```nessa
+use std.task
+
+println(task.tree_snapshot())
+-- 示例输出:
+-- [Task #1] Running
+--   ├── [Task #2] Waiting
+--   └── [Task #3] Running
 ```
-[Root Task #0] Running
-├── [Task #1] Running  ← fetch("/api/users")
-│   └── [Task #3] Running  ← tcp_connect("api.example.com:443")
-├── [Task #2] Completed  ← fetch("/api/posts") → Response(200)
-└── [Task #4] Running  ← parse(data)
-```
-
-这种清晰的层次结构使得并发程序的行为更容易理解和调试。

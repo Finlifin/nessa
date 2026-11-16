@@ -1,5 +1,7 @@
 //! Checked field access against both the allocation and its declared layout.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use gc::ObjectHeader;
 use runtime::TaggedValue;
 use type_pool::{TypeIndex, TypeKind};
@@ -18,27 +20,28 @@ impl Vm {
         if !header.is_ordinary() {
             return Err(VmError::TypeError);
         }
-        let ty = self
-            .state
-            .type_pool
-            .canonical_type(header.type_index)
-            .ok_or(VmError::TypeError)?;
-        if self.state.type_pool.is_reserved_collection_role(ty) {
-            return Err(VmError::TypeError);
-        }
-        let field = match &self.state.type_pool.get(ty).kind {
-            TypeKind::Struct { fields, .. } if header.payload_words() == fields.len() => {
-                fields.get(index as usize).map(|field| field.ty)
+        let field = {
+            let tp = self.type_pool_read();
+            let ty = tp
+                .canonical_type(header.type_index)
+                .ok_or(VmError::TypeError)?;
+            if tp.is_reserved_collection_role(ty) {
+                return Err(VmError::TypeError);
             }
-            TypeKind::Tuple { elements } if header.payload_words() == elements.len() => {
-                elements.get(index as usize).copied()
+            match &tp.get(ty).kind {
+                TypeKind::Struct { fields, .. } if header.payload_words() == fields.len() => {
+                    fields.get(index as usize).map(|field| field.ty)
+                }
+                TypeKind::Tuple { elements } if header.payload_words() == elements.len() => {
+                    elements.get(index as usize).copied()
+                }
+                TypeKind::Newtype { inner, .. } if header.payload_words() == 1 => {
+                    (index == 0).then_some(*inner)
+                }
+                _ => return Err(VmError::TypeError),
             }
-            TypeKind::Newtype { inner, .. } if header.payload_words() == 1 => {
-                (index == 0).then_some(*inner)
-            }
-            _ => return Err(VmError::TypeError),
-        }
-        .ok_or(VmError::InvalidField(index))?;
+            .ok_or(VmError::InvalidField(index))?
+        };
         if index as usize >= header.payload_words() {
             return Err(VmError::InvalidField(index));
         }
@@ -51,8 +54,10 @@ impl Vm {
         index: u32,
     ) -> Result<TaggedValue, VmError> {
         let (pointer, ty) = self.field_layout(object, index)?;
-        // SAFETY: field_layout checked allocation bounds and payload alignment.
-        let value = unsafe { pointer.cast::<u64>().add(index as usize).read() };
+        // SAFETY: `field_layout` checked allocation bounds and 8-byte payload alignment;
+        // atomic `Acquire` load prevents data-race UB on shared heap structs across workers.
+        let value =
+            unsafe { (&*pointer.cast::<AtomicU64>().add(index as usize)).load(Ordering::Acquire) };
         self.assert_value_type(TaggedValue::from_raw(value), ty)
     }
 
@@ -63,20 +68,17 @@ impl Vm {
         value: TaggedValue,
     ) -> Result<(), VmError> {
         let (_, ty) = self.field_layout(object, index)?;
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[object, value], |vm| {
-            let value = vm.roots.temporary_values.borrow()[root + 1];
+            let value = vm.worker_roots().temporary_values.borrow()[root + 1];
             let value = vm.assert_value_type(value, ty)?;
-            let object = vm.roots.temporary_values.borrow()[root];
+            let object = vm.worker_roots().temporary_values.borrow()[root];
             let (pointer, _) = vm.field_layout(object, index)?;
-            // SAFETY: receiver reloaded after conversion and exact field bounds
-            // rechecked. No allocation occurs before publishing the fresh value.
+            // SAFETY: receiver reloaded after conversion and exact field bounds rechecked;
+            // atomic `Release` store publishes the 64-bit `TaggedValue` without tearing or UB.
             unsafe {
-                pointer
-                    .cast_mut()
-                    .cast::<u64>()
-                    .add(index as usize)
-                    .write(value.raw());
+                (&*pointer.cast::<AtomicU64>().add(index as usize))
+                    .store(value.raw(), Ordering::Release);
             }
             Ok(())
         })
@@ -96,7 +98,7 @@ mod tests {
     fn field_stores_reject_wrong_types_and_reads_reject_uninitialized_values() {
         for store in [false, true] {
             let mut vm = make_vm();
-            let ty = vm.state.type_pool.register(TypeInfo {
+            let ty = vm.type_pool_write().register(TypeInfo {
                 kind: TypeKind::Tuple {
                     elements: vec![Intrinsic::I64.type_index()],
                 },

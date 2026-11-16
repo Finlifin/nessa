@@ -70,6 +70,11 @@ pub const fn builtin_requires_list_roles(id: runtime::BuiltinFnId) -> bool {
             | runtime::ids::BYTES_FROM_LIST
             | runtime::ids::BYTES_TO_LIST
             | runtime::ids::FFI_CALL
+            | runtime::ids::NET_TCP_READ
+            | runtime::ids::NET_TCP_WRITE_BYTES
+            | runtime::ids::NET_UDP_SEND_BYTES
+            | runtime::ids::NET_UDP_RECV
+            | runtime::ids::NET_RESOLVE_HOST
     )
 }
 
@@ -267,7 +272,21 @@ mod tests {
 
     #[test]
     fn non_current_builtin_abi_revisions_and_retired_derived_display_id_are_rejected() {
-        for revision in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
+        for revision in [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            runtime::BUILTIN_ABI_VERSION + 1,
+        ] {
             let artifact = artifact_with_import(
                 revision,
                 type_pool::TypePool::with_intrinsics(),

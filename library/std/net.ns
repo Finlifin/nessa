@@ -1,0 +1,254 @@
+-- std.net — non-blocking TCP, UDP, and DNS networking on the libuv I/O reactor.
+
+use .builtin.*
+use .io.{IoError, io_error_from_code}
+use .traits.*
+
+private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+private const _str_contains: fn(String, String) -> bool = .str_contains'builtin
+private const _from_utf8_lossy: fn(List) -> String = .str_from_utf8_lossy'builtin
+
+private const _net_tcp_listen: fn(String, i64, i64) -> (i64, String, i64, String, i64) = .__net_tcp_listen'builtin
+private const _net_tcp_accept: fn(i64) -> (i64, String, i64, String, i64) = .__net_tcp_accept'builtin
+private const _net_tcp_connect: fn(String, i64) -> (i64, String, i64, String, i64) = .__net_tcp_connect'builtin
+private const _net_tcp_read: fn(i64, i64) -> (i64, String, List) = .__net_tcp_read'builtin
+private const _net_tcp_read_line: fn(i64) -> (i64, String, ?String) = .__net_tcp_read_line'builtin
+private const _net_tcp_write_str: fn(i64, String) -> (i64, String, i64) = .__net_tcp_write_str'builtin
+private const _net_tcp_write_bytes: fn(i64, List) -> (i64, String, i64) = .__net_tcp_write_bytes'builtin
+private const _net_tcp_set_nodelay: fn(i64, bool) -> (i64, String, i64) = .__net_tcp_set_nodelay'builtin
+private const _net_tcp_local_addr: fn(i64) -> (i64, String, String, i64) = .__net_tcp_local_addr'builtin
+private const _net_tcp_peer_addr: fn(i64) -> (i64, String, String, i64) = .__net_tcp_peer_addr'builtin
+private const _net_tcp_close: fn(i64) -> Unit = .__net_tcp_close'builtin
+
+private const _net_udp_bind: fn(String, i64) -> (i64, String, i64, String, i64) = .__net_udp_bind'builtin
+private const _net_udp_send_str: fn(i64, String, i64, String) -> (i64, String, i64) = .__net_udp_send_str'builtin
+private const _net_udp_send_bytes: fn(i64, String, i64, List) -> (i64, String, i64) = .__net_udp_send_bytes'builtin
+private const _net_udp_recv: fn(i64, i64) -> (i64, String, List, String, i64) = .__net_udp_recv'builtin
+private const _net_udp_local_addr: fn(i64) -> (i64, String, String, i64) = .__net_udp_local_addr'builtin
+private const _net_udp_close: fn(i64) -> Unit = .__net_udp_close'builtin
+
+private const _net_resolve_host: fn(String) -> (i64, String, List) = .__net_resolve_host'builtin
+
+pub struct SocketAddr {
+    pub host: String,
+    pub port: i64,
+}
+derive Eq, PartialEq for SocketAddr
+
+impl Display for SocketAddr {
+    pub fn to_string(self) -> String {
+        if _str_contains(self.host, ":") {
+            "[" ++ self.host ++ "]:" ++ _to_string_raw(self.port)
+        } else {
+            self.host ++ ":" ++ _to_string_raw(self.port)
+        }
+    }
+}
+
+impl SocketAddr {
+    pub fn new(host: String, port: i64) -> SocketAddr = SocketAddr { host: host, port: port }
+}
+
+pub struct TcpListener {
+    handle_id: i64,
+}
+derive Eq, PartialEq for TcpListener
+
+impl Display for TcpListener {
+    pub fn to_string(self) -> String {
+        "TcpListener(#" ++ _to_string_raw(self.handle_id) ++ ")"
+    }
+}
+
+impl TcpListener {
+    pub fn bind(host: String, port: i64, .backlog: i64 = 128) -> !IoError TcpListener {
+        let (code, msg, id, _, _) = _net_tcp_listen(host, port, backlog)
+        if code == 0 {
+            TcpListener { handle_id: id }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn accept(self) -> !IoError TcpStream {
+        let (code, msg, stream_id, _, _) = _net_tcp_accept(self.handle_id)
+        if code == 0 {
+            TcpStream { handle_id: stream_id }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn local_addr(self) -> !IoError SocketAddr {
+        let (code, msg, ip, p) = _net_tcp_local_addr(self.handle_id)
+        if code == 0 {
+            SocketAddr { host: ip, port: p }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn close(self) -> Unit = _net_tcp_close(self.handle_id)
+}
+
+pub struct TcpStream {
+    handle_id: i64,
+}
+derive Eq, PartialEq for TcpStream
+
+impl Display for TcpStream {
+    pub fn to_string(self) -> String {
+        "TcpStream(#" ++ _to_string_raw(self.handle_id) ++ ")"
+    }
+}
+
+impl TcpStream {
+    pub fn connect(host: String, port: i64) -> !IoError TcpStream {
+        let (code, msg, stream_id, _, _) = _net_tcp_connect(host, port)
+        if code == 0 {
+            TcpStream { handle_id: stream_id }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn read_bytes(self, .max_bytes: i64 = 65536) -> !IoError List {
+        let (code, msg, bytes) = _net_tcp_read(self.handle_id, max_bytes)
+        if code == 0 { bytes } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn read_to_string(self, .max_bytes: i64 = 65536) -> !IoError String {
+        let (code, msg, bytes) = _net_tcp_read(self.handle_id, max_bytes)
+        if code == 0 {
+            _from_utf8_lossy(bytes)
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn read_line(self) -> !IoError ?String {
+        let (code, msg, line) = _net_tcp_read_line(self.handle_id)
+        if code == 0 { line } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn write(self, data: String) -> !IoError i64 {
+        let (code, msg, count) = _net_tcp_write_str(self.handle_id, data)
+        if code == 0 { count } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn write_str(self, data: String) -> !IoError i64 {
+        self.write(data)
+    }
+
+    pub fn write_line(self, line: String) -> !IoError i64 {
+        self.write(line ++ "\n")
+    }
+
+    pub fn write_bytes(self, bytes: List) -> !IoError i64 {
+        let (code, msg, count) = _net_tcp_write_bytes(self.handle_id, bytes)
+        if code == 0 { count } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn set_nodelay(self, enable: bool) -> !IoError Unit {
+        let (code, msg, _) = _net_tcp_set_nodelay(self.handle_id, enable)
+        if code == 0 { () } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn local_addr(self) -> !IoError SocketAddr {
+        let (code, msg, ip, p) = _net_tcp_local_addr(self.handle_id)
+        if code == 0 {
+            SocketAddr { host: ip, port: p }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn peer_addr(self) -> !IoError SocketAddr {
+        let (code, msg, ip, p) = _net_tcp_peer_addr(self.handle_id)
+        if code == 0 {
+            SocketAddr { host: ip, port: p }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn close(self) -> Unit = _net_tcp_close(self.handle_id)
+}
+
+pub struct UdpDatagram {
+    pub data: List,
+    pub addr: SocketAddr,
+}
+
+impl PartialEq for UdpDatagram {
+    pub fn eq(self, other: Self) -> bool {
+        self.addr == other.addr and self.data == other.data
+    }
+}
+
+impl Display for UdpDatagram {
+    pub fn to_string(self) -> String {
+        "UdpDatagram(from=" ++ self.addr.to_string() ++ ")"
+    }
+}
+
+impl UdpDatagram {
+    pub fn text(self) -> String = _from_utf8_lossy(self.data)
+}
+
+pub struct UdpSocket {
+    handle_id: i64,
+}
+derive Eq, PartialEq for UdpSocket
+
+impl Display for UdpSocket {
+    pub fn to_string(self) -> String {
+        "UdpSocket(#" ++ _to_string_raw(self.handle_id) ++ ")"
+    }
+}
+
+impl UdpSocket {
+    pub fn bind(host: String, port: i64) -> !IoError UdpSocket {
+        let (code, msg, id, _, _) = _net_udp_bind(host, port)
+        if code == 0 {
+            UdpSocket { handle_id: id }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn send_to_str(self, host: String, port: i64, data: String) -> !IoError i64 {
+        let (code, msg, count) = _net_udp_send_str(self.handle_id, host, port, data)
+        if code == 0 { count } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn send_to_bytes(self, host: String, port: i64, bytes: List) -> !IoError i64 {
+        let (code, msg, count) = _net_udp_send_bytes(self.handle_id, host, port, bytes)
+        if code == 0 { count } else { error io_error_from_code(code, msg) }
+    }
+
+    pub fn recv_from(self, .max_bytes: i64 = 65535) -> !IoError UdpDatagram {
+        let (code, msg, bytes, ip, p) = _net_udp_recv(self.handle_id, max_bytes)
+        if code == 0 {
+            UdpDatagram { data: bytes, addr: SocketAddr { host: ip, port: p } }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn local_addr(self) -> !IoError SocketAddr {
+        let (code, msg, ip, p) = _net_udp_local_addr(self.handle_id)
+        if code == 0 {
+            SocketAddr { host: ip, port: p }
+        } else {
+            error io_error_from_code(code, msg)
+        }
+    }
+
+    pub fn close(self) -> Unit = _net_udp_close(self.handle_id)
+}
+
+pub fn resolve_host(host: String) -> !IoError List {
+    let (code, msg, addrs) = _net_resolve_host(host)
+    if code == 0 { addrs } else { error io_error_from_code(code, msg) }
+}

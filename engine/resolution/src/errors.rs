@@ -145,7 +145,17 @@ pub(crate) fn construction(
 ) -> Option<TypeIndex> {
     let operand = ast.fixed_children(node)[0];
     typing::resolve_types(r, ast, operand);
-    let payload = *r.node_types.get(&operand)?;
+    let Some(&payload) = r.node_types.get(&operand) else {
+        if !r.diag_ctx.has_errors() {
+            report(
+                r,
+                ast,
+                node,
+                "error construction requires an instantiable payload type",
+            );
+        }
+        return None;
+    };
     let payload = crate::default_methods::checked_self_value_type(r, ast, operand, payload);
     let payload = r.type_pool.canonical_type(payload)?;
     let dynamic = r.type_pool.as_intrinsic(payload) == Some(Intrinsic::Any);
@@ -353,7 +363,17 @@ pub(crate) fn callable(r: &Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option<N
 pub(crate) fn propagate(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Option<TypeIndex> {
     let operand = ast.fixed_children(node)[0];
     typing::resolve_types(r, ast, operand);
-    let input = *r.node_types.get(&operand)?;
+    let Some(&input) = r.node_types.get(&operand) else {
+        if !r.diag_ctx.has_errors() {
+            report(
+                r,
+                ast,
+                node,
+                "Error propagation requires an Error-qualified operand",
+            );
+        }
+        return None;
+    };
     let Some(shape) = r.type_pool.error_shape(input).ok().flatten() else {
         report(
             r,
@@ -1056,5 +1076,21 @@ mod tests {
             "enum E{bad,};fn take(value:!E i64)->!E i64{value};fn main(){let value:!E i64=42;let whole=value;take(whole)}",
         );
         assert!(errors.is_empty(), "{errors:?}");
+    }
+    #[test]
+    fn diverging_error_elimination_arm_preserves_inner_type_for_defer_methods() {
+        let (resolved, errors) = resolve(
+            "enum E{bad,};struct Handle{id:i64,};impl Handle{fn open()->!E Handle{Handle{id:1}};fn flush(self)->!E Unit{()}};fn main()->i64{let h=Handle.open()!{_=>return -1};defer{let _=h.flush()!{_=>()}};h.id}",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(resolved.error_eliminations.len(), 2);
+
+        let (_, dynamic_errors) = resolve("fn main(x:Any)->i64{x.unknown()!{_=>0}}");
+        assert!(
+            dynamic_errors
+                .iter()
+                .any(|e| e.contains("Error elimination requires an Error-qualified operand")),
+            "{dynamic_errors:?}"
+        );
     }
 }

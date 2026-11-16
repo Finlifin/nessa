@@ -2,8 +2,8 @@
 //!
 //! Each Nessa stack segment gets an 8 MB virtual memory slot. A task may own
 //! several segments, including detached continuation stacks.
-//! Physical pages are demand-paged by the OS; only the first 8 KB is
-//! pre-committed via `madvise(WILLNEED)`.
+//! Physical pages are demand-paged lazily by the OS on first touch and
+//! reclaimed on deallocation via `madvise(MADV_DONTNEED)`.
 //!
 //! The pool grows in segments that double in capacity (64 → 128 → 256 …).
 //! Each segment is an independent `mmap` region with guard pages between
@@ -28,7 +28,7 @@
 
 use std::ptr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,11 +37,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Size of a single stack slot (8 MB).
 const SLOT_SIZE: usize = 8 * 1024 * 1024;
 
-/// Number of bytes pre-committed on allocation (8 KB).
-const PRE_COMMIT_SIZE: usize = 8 * 1024;
-
 /// Initial segment capacity (number of slots).
 const INITIAL_SEGMENT_SLOTS: usize = 64;
+
+/// Maximum slots per newly grown segment (caps VMA split burst while allowing >1M total slots).
+const MAX_SEGMENT_SLOTS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // SlotId — unique identifier for an allocated stack slot
@@ -111,6 +111,8 @@ struct Segment {
     mmap_size: usize,
     /// Slot in the lock-free signal guard table.
     guard_slot: Option<usize>,
+    /// Tracks whether each slot's guard page has been `mprotect(PROT_NONE)`-initialized.
+    guarded: Box<[AtomicBool]>,
 }
 
 // SAFETY: Segment exclusively owns its mmap reservation, which has no thread
@@ -139,28 +141,15 @@ impl Segment {
         );
         let base = base as *mut u8;
 
-        // Set up guard pages at the bottom of every slot.
-        let page_size = page_size();
-        for i in 0..slot_count {
-            let guard_addr = unsafe { base.add(i * SLOT_SIZE) };
-            let rc = unsafe {
-                libc::mprotect(guard_addr as *mut libc::c_void, page_size, libc::PROT_NONE)
-            };
-            assert!(rc == 0, "mprotect guard page failed for slot {i}");
-        }
-
-        // Advise the OS that most of the region won't be touched soon.
-        unsafe {
-            libc::madvise(base as *mut libc::c_void, mmap_size, libc::MADV_DONTNEED);
-        }
-
         let guard_slot = register_guard_segment(base as usize, mmap_size);
+        let guarded: Vec<AtomicBool> = (0..slot_count).map(|_| AtomicBool::new(false)).collect();
 
         Self {
             base,
             slot_count,
             mmap_size,
             guard_slot,
+            guarded: guarded.into_boxed_slice(),
         }
     }
 
@@ -237,32 +226,39 @@ impl StackPool {
     /// Allocate a stack slot from the pool.
     ///
     /// Returns a `StackHandle` with the guard page, usable base, and top.
-    /// Pre-commits the first 8 KB of the stack for immediate use.
+    /// Physical pages are demand-paged lazily on first touch.
     pub fn alloc(&self) -> StackHandle {
-        let mut inner = self.inner.lock().unwrap();
+        let (handle, need_guard) = {
+            let mut inner = self.inner.lock().unwrap();
 
-        // If free list is empty, grow by adding a new segment.
-        if inner.free_list.is_empty() {
-            inner.grow();
-        }
+            // If free list is empty, grow by adding a new segment.
+            if inner.free_list.is_empty() {
+                inner.grow();
+            }
 
-        let slot_id = inner
-            .free_list
-            .pop()
-            .expect("free list should not be empty after grow");
-        inner.active_count += 1;
+            let slot_id = inner
+                .free_list
+                .pop()
+                .expect("free list should not be empty after grow");
+            inner.active_count += 1;
 
-        let seg = &inner.segments[slot_id.segment as usize];
-        let mut handle = seg.slot_layout(slot_id.offset as usize);
-        handle.id = slot_id;
+            let seg = &inner.segments[slot_id.segment as usize];
+            let mut handle = seg.slot_layout(slot_id.offset as usize);
+            handle.id = slot_id;
+            let need_guard = !seg.guarded[slot_id.offset as usize].swap(true, Ordering::AcqRel);
+            (handle, need_guard)
+        };
 
-        // Pre-commit the top 8 KB of the stack (stack grows downward).
-        let commit_start = unsafe { handle.top.sub(PRE_COMMIT_SIZE) };
-        unsafe {
-            libc::madvise(
-                commit_start as *mut libc::c_void,
-                PRE_COMMIT_SIZE,
-                libc::MADV_WILLNEED,
+        if need_guard {
+            let ps = page_size();
+            // SAFETY: `handle` is exclusively owned by this caller, and `handle.guard`
+            // is page-aligned within the owning `Segment`'s live `mmap` reservation.
+            let rc =
+                unsafe { libc::mprotect(handle.guard as *mut libc::c_void, ps, libc::PROT_NONE) };
+            assert!(
+                rc == 0,
+                "mprotect guard page failed for slot {:?}",
+                handle.id
             );
         }
 
@@ -271,17 +267,16 @@ impl StackPool {
 
     /// Return a stack slot to the pool for reuse.
     ///
-    /// Releases physical pages via `madvise(DONTNEED)` but keeps the
-    /// virtual address reservation and guard page intact.
+    /// Releases any faulted physical pages via `madvise(DONTNEED)` before
+    /// returning the slot to `free_list`, keeping the virtual address
+    /// reservation and guard page intact without holding the pool mutex across
+    /// the syscall.
     pub fn dealloc(&self, handle: &StackHandle) {
-        let mut inner = self.inner.lock().unwrap();
-        let seg = &inner.segments[handle.id.segment as usize];
-        let slot_base = unsafe { seg.base.add(handle.id.offset as usize * SLOT_SIZE) };
-        let page_size = page_size();
-
-        // Release all physical pages in the usable region (above guard page).
-        let usable_start = unsafe { slot_base.add(page_size) };
-        let usable_size = SLOT_SIZE - page_size;
+        let usable_start = handle.base;
+        let usable_size = handle.usable_size();
+        // SAFETY: The caller exclusively owns `handle` until its `SlotId` is pushed back
+        // onto `free_list` below, and `[handle.base, handle.top)` is the usable mmap region
+        // above the slot's guard page.
         unsafe {
             libc::madvise(
                 usable_start as *mut libc::c_void,
@@ -290,6 +285,15 @@ impl StackPool {
             );
         }
 
+        let mut inner = self.inner.lock().unwrap();
+        inner.active_count -= 1;
+        inner.free_list.push(handle.id);
+    }
+
+    /// Return a stack slot whose `[base, top)` pages were never written to,
+    /// avoiding a redundant `madvise(MADV_DONTNEED)` syscall on clean demand-zero pages.
+    pub fn dealloc_untouched(&self, handle: &StackHandle) {
+        let mut inner = self.inner.lock().unwrap();
         inner.active_count -= 1;
         inner.free_list.push(handle.id);
     }
@@ -339,10 +343,10 @@ impl Default for StackPool {
 }
 
 impl PoolInner {
-    /// Grow the pool by adding a new segment with doubled capacity.
+    /// Grow the pool by adding a new segment with doubled capacity (up to `MAX_SEGMENT_SLOTS`).
     fn grow(&mut self) {
         let new_slot_count = match self.segments.last() {
-            Some(last) => last.slot_count * 2,
+            Some(last) => (last.slot_count * 2).min(MAX_SEGMENT_SLOTS),
             None => INITIAL_SEGMENT_SLOTS,
         };
         let seg_idx = self.segments.len();

@@ -357,21 +357,21 @@ continuation 保留它自己的栈段链。栈池的 slot 分配单位是栈段�
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.4 Scheduler (Work-Stealing)
+### 5.4 Scheduler (Work-Stealing) & I/O Reactor
 
 ```
 ┌──────────────────── Scheduler Architecture ──────────────────────┐
 │                                                                    │
 │  ┌────────────────────────────────────────────────────────────┐   │
-│  │ Main Thread (libuv event loop)                              │   │
-│  │   - I/O 事件分发                                            │   │
-│  │   - Timer 管理                                              │   │
-│  │   - 外部回调入口                                            │   │
+│  │ Dedicated I/O Reactor Thread (libuv uv_loop_t)              │   │
+│  │   - uv_async_t 门铃接收跨线程异步命令                         │   │
+│  │   - 非阻塞定时器 (uv_timer_t)、子进程 (uv_process_t/pipe)   │   │
+│  │   - 异步文件系统 (uv_fs_t) 与 TCP/UDP/DNS (std.net)         │   │
 │  └────────────┬───────────────────────────────────────────────┘   │
-│               │ wake up / submit ready tasks                      │
+│               │ wake up / inject ready TaskId                      │
 │               ▼                                                    │
 │  ┌────────────────────────────────────────────────────────────┐   │
-│  │ Worker Threads (N = CPU cores)                              │   │
+│  │ Worker Threads (N = CPU cores, 独立 MMTk Mutator)          │   │
 │  │                                                             │   │
 │  │  Worker 0          Worker 1          Worker 2               │   │
 │  │  ┌───────────┐    ┌───────────┐    ┌───────────┐           │   │
@@ -383,14 +383,14 @@ continuation 保留它自己的栈段链。栈池的 slot 分配单位是栈段�
 │  │                         │                                   │   │
 │  └────────────────────────────────────────────────────────────┘   │
 │                                                                    │
-│  调度策略:                                                         │
-│    - 每个 Worker 拥有本地双端队列                                   │
-│    - 新 task 优先 push 到当前 worker                               │
-│    - 空闲 worker 从其他 worker 的队列尾部 steal                     │
-│    - Safe-point 调度：在循环回边和函数调用处检查抢占标志              │
-│    - Task 状态机: Ready → Running → Suspended/Waiting → Finished  │
+│  调度与生命周期策略:                                               │
+│    - TaskArena 采用 [32-bit gen | 32-bit slot] 代际槽表，O(1) 寻址 │
+│    - 每个 Worker 持有本地双端队列 + 全局 Injector 防饥饿轮询       │
+│    - Safe-point 仅在循环回边与函数入口发射，单次预算/标志检查      │
+│    - PromiseRegistry 双引用计数自动回收已完成任务与 Promise 条目   │
+│    - 全局死锁检测：无就绪任务且无活跃 I/O 唤醒源时报告死锁         │
 │                                                                    │
-│  Task Tree:                                                        │
+│  Task Tree & 取消安全:                                             │
 │    main()                                                          │
 │    ├── Task A (handler for async effect X)                         │
 │    │   ├── Task A1                                                 │
@@ -399,9 +399,11 @@ continuation 保留它自己的栈段链。栈池的 slot 分配单位是栈段�
 │        └── Task B1                                                 │
 │                                                                    │
 │    保证:                                                           │
-│    - 父 task 退出时自动 cancel 所有子 task                          │
-│    - handler 作用域边界自动 implicit await                          │
-│    - 通过 task tree 进行 dynamic effect handler 查找                │
+│    - 父 task 退出时级联取消未完成子树并等待子任务收敛              │
+│    - 取消进入 UnwindingCancel，按 LIFO 执行全部已登记 defer 块     │
+│    - handler 作用域边界自动 implicit await                         │
+│    - 子任务 O(1) 继承祖先不可变 Handler 链快照；跨任务捕获         │
+│      catch k 定界延续明确报 CrossTaskContinuationCapture           │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -923,19 +925,9 @@ bootstrap 按已加载作用域的依赖初始化，最后调用用户 main 并�
 变量进入捕获列表；VM 校验 schema、槽索引、初始化状态、写入类型和 const 限制，
 globals 参与真实 GC 根扫描。initializer 的分支、循环与 break/continue 已接通。
 
-这仍不是上文完整的 core/alloc/std 分层：Newtype/Impl/Extend 关联作用域初始化、
-通用包发现、完整数据类型/traits、泛型函数签名尚未完成。动态间接初始化依赖
-仍由受检读取兜底。完整 `CompiledArtifact` 持久化已 finalize 的 `TypePool`（`TPOL 11` 稳定
-`TypeId`）、必需的 `FunctionAbi` 与词法作用域表（`NSAM 6`）、全局 schema、入口、方法名称重定位
-及 `BUILTIN_ABI_VERSION = 9` 清单；源码与归档共用 driver 安装路径，CLI 可独立执行 `.nsbc`。
-旧低层 `write_archive` 与历史过渡版本兼容分支已移除。
+这仍不是上文完整的 core/alloc/std 分层：通用跨注册中心远程包获取、泛型用户函数定义签名与原生 SP/FP continuation 栈切换尚未完成。完整 `CompiledArtifact` 持久化已 finalize 的 `TypePool`（`TPOL 11` 稳定 `TypeId`）、必需的 `FunctionAbi` 与词法作用域表（`NSAM 6`）、全局 schema、入口、方法名称重定位及 `BUILTIN_ABI_VERSION = 11` 清单（覆盖 `std.sync`、`std.net`、`std.task` 与 `libuv` 非阻塞 I/O 内建）；源码与归档共用 driver 安装路径，CLI 可独立执行 `.nsbc`。旧低层 `write_archive` 与历史过渡版本兼容分支已移除。
 
-容器强制生成并验证非零 SHA-256（`Container v4`），完整加载检查 target、元数据/字节码引用及入口，
-拒绝不兼容 builtin manifest。STACK_MAPS 保存 safepoint PC，运行采用明确的
-tagged-root 扫描模式；精确 stackmap、DEBUG_INFO、文本字节码及跨包
-imports/exports 链接仍未完成。多 worker/事件循环、完整启动关闭
-流程与原生 SP/FP continuation 栈切换仍是设计目标。
-自包含归档可执行不等于上文整个引擎和包系统完成。
+容器强制生成并验证非零 SHA-256（`Container v4`），完整加载检查 target、元数据/字节码引用及入口，拒绝不兼容 builtin manifest。STACK_MAPS 保存 safepoint PC，运行采用明确的 tagged-root 扫描模式；多核 Work-Stealing 调度器、每 Worker 独立 MMTk Immix Mutator、`libuv` I/O Reactor、任务取消 `defer` 栈展开以及 `std.sync` / `std.net` / `std.task` 已落地并通过发布门禁验证。精确 stackmap、DEBUG_INFO、文本字节码及原生 SP/FP continuation 栈切换仍是后续演进目标。
 
 
 结构体构造与关联命名空间实现补充（2026-10-07）：resolution 的 `structs` 生成

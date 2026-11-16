@@ -65,7 +65,7 @@ impl Vm {
             return Ok(None);
         };
         let ty = self.canonical_type(ty)?;
-        if !matches!(self.state.type_pool.get(ty).kind, TypeKind::Tuple { .. }) {
+        if !matches!(self.type_pool_read().get(ty).kind, TypeKind::Tuple { .. }) {
             return Ok(None);
         }
         self.tuple_values(value).map(|values| Some(values.len()))
@@ -99,13 +99,13 @@ mod tests {
         let one = TaggedValue::from_i64(1);
         let text = vm.alloc_string("1").unwrap();
         let other_text = vm.alloc_string("1").unwrap();
-        let tuple_type = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+        let tuple_type = vm.type_pool_write().intern_structural(TypeKind::Tuple {
             elements: vec![Intrinsic::I64.type_index()],
         });
         // SAFETY: the test VM holds an operation; the one-word payload is
         // initialized before any other allocation can move or collect it.
         let tuple = unsafe {
-            let payload = vm.state.heap.alloc_object(tuple_type, 1).unwrap();
+            let payload = vm.heap_mut().alloc_object(tuple_type, 1).unwrap();
             payload.as_ptr().cast::<u64>().write(one.raw());
             TaggedValue::from_heap_ptr(payload.as_ptr())
         };

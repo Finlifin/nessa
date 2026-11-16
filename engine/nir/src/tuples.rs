@@ -136,6 +136,36 @@ pub(crate) fn bind_pattern(
         }
         NodeKind::Id => {
             if let Some(symbol) = builder.node_symbol(resolved, pattern) {
+                let value = if let Some(coercion) = builder.coercion(resolved, pattern) {
+                    let target = builder.coercion_target(pattern, coercion.target);
+                    let coerced = builder.alloc_local();
+                    if let Some(view) = crate::trait_parameters::bare_trait(resolved, target) {
+                        let proof = crate::trait_parameters::proof_for(
+                            resolved, pattern, value, view, builder, block,
+                        );
+                        let NirValue::Local(proof) = proof else {
+                            unreachable!("proof construction returns a local")
+                        };
+                        builder.value_proofs.insert(coerced, (proof, view));
+                        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                            coerced,
+                            NirExpr::TraitAssert(value, NirValue::Local(proof), view)
+                                .in_source_scope(resolved, pattern),
+                        ));
+                    } else {
+                        let expression = match coercion.kind {
+                            resolution::CoercionKind::Assert => NirExpr::TypeAssert(value, target),
+                            resolution::CoercionKind::Convert => NirExpr::TypeCast(value, target),
+                        };
+                        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                            coerced,
+                            expression.in_source_scope(resolved, pattern),
+                        ));
+                    }
+                    NirValue::Local(coerced)
+                } else {
+                    value
+                };
                 if let Some(&global) = builder.global_map.get(&symbol) {
                     builder.blocks[block.0 as usize].stmts.push(
                         NirStmt::StoreGlobal(global, value).in_source_scope(resolved, pattern),

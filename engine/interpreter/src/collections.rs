@@ -2,17 +2,31 @@
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gc::ObjectHeader;
-use runtime::{Number, TaggedValue};
+use nsbc::Reg;
+use runtime::{Number, TaggedValue, TaskId};
+use str_interner::StrId;
 use type_pool::CollectionRole;
 
 use crate::{DispatchResult, Vm, VmError};
-use nsbc::Reg;
-use runtime::TaskId;
-use str_interner::StrId;
 
 const MAX_CAPACITY: usize = u16::MAX as usize;
+
+#[inline]
+pub(super) fn read_u64_atomic(base: *const u64, index: usize) -> u64 {
+    // SAFETY: Caller verified `base.add(index)` points to an aligned `u64` payload slot
+    // within a live managed object under an active mutator operation.
+    unsafe { (&*base.cast::<AtomicU64>().add(index)).load(Ordering::Acquire) }
+}
+
+#[inline]
+pub(super) fn write_u64_atomic(base: *mut u64, index: usize, raw: u64) {
+    // SAFETY: Caller verified `base.add(index)` points to an aligned `u64` payload slot
+    // within a live managed object under exclusive ownership or stripe write lock.
+    unsafe { (&*base.cast::<AtomicU64>().add(index)).store(raw, Ordering::Release) }
+}
 
 pub(super) struct ListLayout {
     wrapper: *mut u64,
@@ -21,8 +35,7 @@ pub(super) struct ListLayout {
     capacity: usize,
 }
 
-/// The independently boxed RootCell remains stable throughout the private VM
-/// operations using this guard. No callback can replace or drop that root domain.
+/// Guard restoring this worker's `temporary_values` root stack on normal exit, error, or unwind.
 struct TemporaryRootScope {
     roots: NonNull<RefCell<Vec<TaggedValue>>>,
     base: usize,
@@ -30,10 +43,8 @@ struct TemporaryRootScope {
 
 impl Drop for TemporaryRootScope {
     fn drop(&mut self) {
-        // SAFETY: with_temporary_roots creates this guard from the stable RootCell,
-        // then calls only internal List operations before dropping the guard.
-        // No RefCell borrow spans an allocation, callback, or this cleanup; the
-        // enclosing mutator operation also excludes concurrent root scanning.
+        // SAFETY: `roots` points to the current worker's `WorkerRootSlot` inside the stable
+        // `RootCell` allocation, accessed exclusively by this worker thread during execution.
         unsafe { self.roots.as_ref() }
             .borrow_mut()
             .truncate(self.base);
@@ -51,36 +62,43 @@ impl Vm {
         method: StrId,
         argument_count: u8,
     ) -> Option<DispatchResult> {
-        match self.state.type_pool.checked_collection_role(ty) {
-            Ok(Some(CollectionRole::List | CollectionRole::Map)) => {}
-            Ok(_) => return None,
-            Err(_) => return Some(DispatchResult::Error(VmError::TypeError)),
+        static APPLY_UPDATE_IDS: std::sync::OnceLock<(StrId, StrId)> = std::sync::OnceLock::new();
+        let &(apply_id, update_id) = APPLY_UPDATE_IDS.get_or_init(|| {
+            (
+                str_interner::intern("apply"),
+                str_interner::intern("update"),
+            )
+        });
+        let expected = if method == apply_id {
+            1
+        } else if method == update_id {
+            2
+        } else {
+            return None;
+        };
+        match self.cached_heap_type_meta(ty) {
+            Ok(crate::CachedHeapTypeMeta::Collection(
+                CollectionRole::List | CollectionRole::Map,
+            )) => {}
+            Ok(_) => match self.type_pool_read().checked_collection_role(ty) {
+                Ok(Some(CollectionRole::List | CollectionRole::Map)) => {}
+                Ok(_) => return None,
+                Err(_) => return Some(DispatchResult::Error(VmError::TypeError)),
+            },
+            Err(error) => return Some(DispatchResult::Error(error)),
         }
-        let method = match str_interner::try_get(method) {
-            Some(method) => method,
-            None => return Some(DispatchResult::Error(VmError::MethodNotFound)),
-        };
-        let expected = match method.as_str() {
-            "apply" => 1,
-            "update" => 2,
-            _ => return None,
-        };
         if argument_count != expected {
             return Some(DispatchResult::Error(VmError::ArityError {
                 expected,
                 got: argument_count,
             }));
         }
-        let Some(registers) = self
-            .roots
-            .scheduler
-            .get_task(task)
-            .map(|task| &task.registers)
+        let Some((index, value)) = self
+            .task_ref(task)
+            .map(|t| (t.registers.get(Reg(0)), t.registers.get(Reg(1))))
         else {
             return Some(DispatchResult::Error(VmError::InvalidTask));
         };
-        let index = registers.get(Reg(0));
-        let value = registers.get(Reg(1));
         let result = if expected == 1 {
             self.collection_get(receiver, index)
         } else {
@@ -89,7 +107,7 @@ impl Vm {
         };
         Some(match result {
             Ok(value) => {
-                if let Some(task) = self.roots.scheduler.get_task_mut(task) {
+                if let Some(task) = self.task_mut(task) {
                     task.registers.set(Reg(0), value);
                     DispatchResult::Continue
                 } else {
@@ -107,8 +125,12 @@ impl Vm {
         if !header.is_ordinary() {
             return Err(VmError::TypeError);
         }
-        self.state
-            .type_pool
+        if let Ok(crate::CachedHeapTypeMeta::Collection(role)) =
+            self.cached_heap_type_meta(header.type_index)
+        {
+            return Ok(role);
+        }
+        self.type_pool_read()
             .checked_collection_role(header.type_index)
             .map_err(|_| VmError::TypeError)?
             .ok_or(VmError::TypeError)
@@ -144,44 +166,56 @@ impl Vm {
         values: &[TaggedValue],
         action: impl FnOnce(&mut Self) -> Result<T, VmError>,
     ) -> Result<T, VmError> {
-        let base = self.roots.temporary_values.borrow().len();
+        let roots_ref = &self.worker_roots().temporary_values;
+        let base = roots_ref.borrow().len();
         let _scope = TemporaryRootScope {
-            roots: NonNull::from(&self.roots.temporary_values),
+            roots: NonNull::from(roots_ref),
             base,
         };
-        self.roots
-            .temporary_values
-            .borrow_mut()
-            .extend_from_slice(values);
+        roots_ref.borrow_mut().extend_from_slice(values);
         action(self)
     }
 
-    pub(super) fn list_layout(&self, value: TaggedValue) -> Result<ListLayout, VmError> {
+    #[inline]
+    fn cached_list_roles(&self) -> Option<(type_pool::TypeIndex, type_pool::TypeIndex)> {
+        {
+            let cache = self.sync_meta_cache();
+            if let Some(cached) = cache.list_roles {
+                return cached;
+            }
+        }
+        let pair = {
+            let tp = self.type_pool_read();
+            tp.list_type().zip(tp.list_buffer_type())
+        };
+        self.sync_meta_cache().list_roles = Some(pair);
+        pair
+    }
+
+    /// Inspect `ListLayout` when caller already holds `stripe_read`/`stripe_write` (or owns a fresh list).
+    pub(super) fn list_layout_unlocked(&self, value: TaggedValue) -> Result<ListLayout, VmError> {
         let pointer = value.as_heap_ptr().ok_or(VmError::TypeError)?;
         // SAFETY: operands are live registered VM roots within an execution operation.
         let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
-        if !header.is_ordinary() {
+        if !header.is_ordinary() || header.payload_words() != 3 {
             return Err(VmError::TypeError);
         }
-        if self
-            .state
-            .type_pool
-            .checked_collection_role(header.type_index)
-            .map_err(|_| VmError::TypeError)?
-            != Some(CollectionRole::List)
-            || header.payload_words() != 3
-        {
+        let fast_roles = self.cached_list_roles();
+        let is_list = if fast_roles.is_some_and(|(lt, _)| header.type_index == lt) {
+            true
+        } else {
+            self.type_pool_read()
+                .checked_collection_role(header.type_index)
+                .map_err(|_| VmError::TypeError)?
+                == Some(CollectionRole::List)
+        };
+        if !is_list {
             return Err(VmError::TypeError);
         }
         let wrapper = pointer.cast_mut().cast::<u64>();
-        // SAFETY: the checked header provides exactly three aligned payload words.
-        let (length, capacity, buffer) = unsafe {
-            (
-                TaggedValue::from_raw(wrapper.read()),
-                TaggedValue::from_raw(wrapper.add(1).read()),
-                TaggedValue::from_raw(wrapper.add(2).read()),
-            )
-        };
+        let length = TaggedValue::from_raw(read_u64_atomic(wrapper, 0));
+        let capacity = TaggedValue::from_raw(read_u64_atomic(wrapper, 1));
+        let buffer = TaggedValue::from_raw(read_u64_atomic(wrapper, 2));
         let length = length
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
@@ -207,17 +241,18 @@ impl Vm {
         let buffer = buffer.as_heap_ptr().ok_or(VmError::TypeError)?;
         // SAFETY: this managed reference came from the rooted wrapper's tagged slot.
         let header = unsafe { ObjectHeader::from_payload_ptr(buffer) };
-        if !header.is_ordinary() {
+        if !header.is_ordinary() || header.payload_words() != capacity {
             return Err(VmError::TypeError);
         }
-        if self
-            .state
-            .type_pool
-            .checked_collection_role(header.type_index)
-            .map_err(|_| VmError::TypeError)?
-            != Some(CollectionRole::Buffer)
-            || header.payload_words() != capacity
-        {
+        let is_buf = if fast_roles.is_some_and(|(_, bt)| header.type_index == bt) {
+            true
+        } else {
+            self.type_pool_read()
+                .checked_collection_role(header.type_index)
+                .map_err(|_| VmError::TypeError)?
+                == Some(CollectionRole::Buffer)
+        };
+        if !is_buf {
             return Err(VmError::TypeError);
         }
         Ok(ListLayout {
@@ -228,25 +263,37 @@ impl Vm {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn list_layout(&self, value: TaggedValue) -> Result<ListLayout, VmError> {
+        let _guard = self.stripe_read(value)?;
+        self.list_layout_unlocked(value)
+    }
+
+    pub(super) fn snapshot_list_elements(
+        &self,
+        list: TaggedValue,
+    ) -> Result<Vec<TaggedValue>, VmError> {
+        let _guard = self.stripe_read(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        let mut out = Vec::with_capacity(layout.length);
+        for index in 0..layout.length {
+            out.push(TaggedValue::from_raw(read_u64_atomic(layout.buffer, index)));
+        }
+        Ok(out)
+    }
+
     fn list_buffer(&mut self, capacity: usize) -> Result<TaggedValue, VmError> {
         let words = u16::try_from(capacity).map_err(|_| VmError::ObjectTooLarge)?;
         let ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .list_buffer_type()
             .ok_or(VmError::TypeError)?;
-        // SAFETY: execution owns the mutator; initialize without another allocation.
+        // SAFETY: execution owns the mutator and holds no lock across allocation.
         let pointer =
-            unsafe { self.state.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+            unsafe { self.worker.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+        let base = pointer.as_ptr().cast::<u64>();
         for index in 0..capacity {
-            // SAFETY: index is within the newly allocated aligned payload.
-            unsafe {
-                pointer
-                    .as_ptr()
-                    .cast::<u64>()
-                    .add(index)
-                    .write(TaggedValue::UNIT.raw());
-            }
+            write_u64_atomic(base, index, TaggedValue::UNIT.raw());
         }
         // SAFETY: this allocation is aligned and live, with all slots initialized.
         Ok(unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) })
@@ -256,52 +303,41 @@ impl Vm {
         if length > MAX_CAPACITY {
             return Err(VmError::ObjectTooLarge);
         }
-        let ty = self.state.type_pool.list_type().ok_or(VmError::TypeError)?;
-        self.state
-            .type_pool
-            .list_buffer_type()
-            .ok_or(VmError::TypeError)?;
+        let ty = {
+            let tp = self.type_pool_read();
+            let list_ty = tp.list_type().ok_or(VmError::TypeError)?;
+            tp.list_buffer_type().ok_or(VmError::TypeError)?;
+            list_ty
+        };
         // SAFETY: initialize this fresh wrapper before another allocation or safepoint.
-        let pointer = unsafe { self.state.heap.alloc_object(ty, 3) }.ok_or(VmError::OutOfMemory)?;
-        // SAFETY: exactly three aligned words were allocated above.
-        unsafe {
-            pointer
-                .as_ptr()
-                .cast::<u64>()
-                .write(TaggedValue::from_u64(0).raw());
-            pointer
-                .as_ptr()
-                .cast::<u64>()
-                .add(1)
-                .write(TaggedValue::from_u64(0).raw());
-            pointer
-                .as_ptr()
-                .cast::<u64>()
-                .add(2)
-                .write(TaggedValue::NULL.raw());
-        }
+        let pointer =
+            unsafe { self.worker.heap.alloc_object(ty, 3) }.ok_or(VmError::OutOfMemory)?;
+        let wrapper_init = pointer.as_ptr().cast::<u64>();
+        write_u64_atomic(wrapper_init, 0, TaggedValue::from_u64(0).raw());
+        write_u64_atomic(wrapper_init, 1, TaggedValue::from_u64(0).raw());
+        write_u64_atomic(wrapper_init, 2, TaggedValue::NULL.raw());
         // SAFETY: wrapper is live and initialized; the next allocation roots it.
         let value = unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) };
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[value], |vm| {
             if length != 0 {
                 let buffer = vm.list_buffer(length)?;
-                vm.roots.temporary_values.borrow_mut().push(buffer);
-                let value = vm.roots.temporary_values.borrow()[root];
-                let layout = vm.list_layout(value)?;
-                // SAFETY: no allocation follows, and the rooted wrapper has three words.
-                unsafe {
-                    layout
-                        .wrapper
-                        .write(TaggedValue::from_u64(length as u64).raw());
-                    layout
-                        .wrapper
-                        .add(1)
-                        .write(TaggedValue::from_u64(length as u64).raw());
-                    layout.wrapper.add(2).write(buffer.raw());
-                }
+                vm.worker_roots().temporary_values.borrow_mut().push(buffer);
+                let value = vm.worker_roots().temporary_values.borrow()[root];
+                let layout = vm.list_layout_unlocked(value)?;
+                write_u64_atomic(
+                    layout.wrapper,
+                    0,
+                    TaggedValue::from_u64(length as u64).raw(),
+                );
+                write_u64_atomic(
+                    layout.wrapper,
+                    1,
+                    TaggedValue::from_u64(length as u64).raw(),
+                );
+                write_u64_atomic(layout.wrapper, 2, buffer.raw());
             }
-            Ok(vm.roots.temporary_values.borrow()[root])
+            Ok(vm.worker_roots().temporary_values.borrow()[root])
         })
     }
 
@@ -322,7 +358,8 @@ impl Vm {
     }
 
     pub(super) fn list_len(&self, list: TaggedValue) -> Result<usize, VmError> {
-        Ok(self.list_layout(list)?.length)
+        let _guard = self.stripe_read(list)?;
+        Ok(self.list_layout_unlocked(list)?.length)
     }
 
     pub(super) fn list_get(
@@ -331,14 +368,12 @@ impl Vm {
         index: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let index = Self::list_index(index)?;
-        let layout = self.list_layout(list)?;
+        let _guard = self.stripe_read(list)?;
+        let layout = self.list_layout_unlocked(list)?;
         if index >= layout.length {
             return Err(VmError::InvalidIndex);
         }
-        // SAFETY: validated buffer bounds, with no safepoint during this read.
-        Ok(TaggedValue::from_raw(unsafe {
-            layout.buffer.add(index).read()
-        }))
+        Ok(TaggedValue::from_raw(read_u64_atomic(layout.buffer, index)))
     }
 
     pub(super) fn list_set(
@@ -348,14 +383,12 @@ impl Vm {
         value: TaggedValue,
     ) -> Result<(), VmError> {
         let index = Self::list_index(index)?;
-        let layout = self.list_layout(list)?;
+        let _guard = self.stripe_write(list)?;
+        let layout = self.list_layout_unlocked(list)?;
         if index >= layout.length {
             return Err(VmError::InvalidIndex);
         }
-        // SAFETY: validated slot in rooted buffer, no allocation during mutation.
-        unsafe {
-            layout.buffer.add(index).write(value.raw());
-        }
+        write_u64_atomic(layout.buffer, index, value.raw());
         Ok(())
     }
 
@@ -364,88 +397,99 @@ impl Vm {
         list: TaggedValue,
         value: TaggedValue,
     ) -> Result<(), VmError> {
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[list, value], |vm| {
-            let list = vm.roots.temporary_values.borrow()[root];
-            let layout = vm.list_layout(list)?;
-            if layout.length == MAX_CAPACITY {
-                return Err(VmError::ObjectTooLarge);
-            }
-            if layout.length == layout.capacity {
-                let capacity = layout
-                    .capacity
-                    .checked_mul(2)
-                    .ok_or(VmError::ObjectTooLarge)?
-                    .clamp(4, MAX_CAPACITY);
-                let buffer = vm.list_buffer(capacity)?;
-                vm.roots.temporary_values.borrow_mut().push(buffer);
-                // Re-read after allocation: no raw pointer crosses a GC boundary.
-                let list = vm.roots.temporary_values.borrow()[root];
-                let old = vm.list_layout(list)?;
+            loop {
+                let needed_cap = {
+                    let list = vm.worker_roots().temporary_values.borrow()[root];
+                    let value = vm.worker_roots().temporary_values.borrow()[root + 1];
+                    let _guard = vm.stripe_write(list)?;
+                    let layout = vm.list_layout_unlocked(list)?;
+                    if layout.length == MAX_CAPACITY {
+                        return Err(VmError::ObjectTooLarge);
+                    }
+                    if layout.length < layout.capacity {
+                        write_u64_atomic(layout.buffer, layout.length, value.raw());
+                        write_u64_atomic(
+                            layout.wrapper,
+                            0,
+                            TaggedValue::from_u64((layout.length + 1) as u64).raw(),
+                        );
+                        return Ok(());
+                    }
+                    layout
+                        .capacity
+                        .checked_mul(2)
+                        .ok_or(VmError::ObjectTooLarge)?
+                        .clamp(4, MAX_CAPACITY)
+                };
+
+                // Allocate outside the stripe lock so GC safepoints never wait on stripe locks.
+                let buffer = vm.list_buffer(needed_cap)?;
+                let buf_slot = vm.worker_roots().temporary_values.borrow().len();
+                vm.worker_roots().temporary_values.borrow_mut().push(buffer);
+
+                let list = vm.worker_roots().temporary_values.borrow()[root];
+                let value = vm.worker_roots().temporary_values.borrow()[root + 1];
+                let buffer = vm.worker_roots().temporary_values.borrow()[buf_slot];
+                let _guard = vm.stripe_write(list)?;
+                let old = vm.list_layout_unlocked(list)?;
+                if old.length == MAX_CAPACITY {
+                    return Err(VmError::ObjectTooLarge);
+                }
+                if old.length < old.capacity {
+                    write_u64_atomic(old.buffer, old.length, value.raw());
+                    write_u64_atomic(
+                        old.wrapper,
+                        0,
+                        TaggedValue::from_u64((old.length + 1) as u64).raw(),
+                    );
+                    return Ok(());
+                }
+                if old.length >= needed_cap {
+                    continue;
+                }
                 let pointer = buffer
                     .as_heap_ptr()
                     .ok_or(VmError::TypeError)?
                     .cast_mut()
                     .cast::<u64>();
-                // SAFETY: fresh buffer and old buffer are disjoint; lengths fit both.
-                // No allocation occurs before the replacement is published.
-                unsafe {
-                    if old.length != 0 {
-                        std::ptr::copy_nonoverlapping(old.buffer, pointer, old.length);
-                    }
-                    old.wrapper
-                        .add(1)
-                        .write(TaggedValue::from_u64(capacity as u64).raw());
-                    old.wrapper.add(2).write(buffer.raw());
+                for i in 0..old.length {
+                    write_u64_atomic(pointer, i, read_u64_atomic(old.buffer, i));
                 }
+                write_u64_atomic(pointer, old.length, value.raw());
+                write_u64_atomic(
+                    old.wrapper,
+                    0,
+                    TaggedValue::from_u64((old.length + 1) as u64).raw(),
+                );
+                write_u64_atomic(
+                    old.wrapper,
+                    1,
+                    TaggedValue::from_u64(needed_cap as u64).raw(),
+                );
+                write_u64_atomic(old.wrapper, 2, buffer.raw());
+                return Ok(());
             }
-            let list = vm.roots.temporary_values.borrow()[root];
-            let value = vm.roots.temporary_values.borrow()[root + 1];
-            let layout = vm.list_layout(list)?;
-            // SAFETY: spare capacity was established and no allocation intervenes.
-            unsafe {
-                layout.buffer.add(layout.length).write(value.raw());
-                layout
-                    .wrapper
-                    .write(TaggedValue::from_u64((layout.length + 1) as u64).raw());
-            }
-            Ok(())
         })
     }
 
     pub(super) fn list_pop(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
-        let layout = self.list_layout(list)?;
+        let _guard = self.stripe_write(list)?;
+        let layout = self.list_layout_unlocked(list)?;
         if layout.length == 0 {
             return Ok(TaggedValue::NULL);
         }
         let index = layout.length - 1;
-        // SAFETY: the last occupied slot is in bounds; clear it so GC does not
-        // retain removed objects through unused buffer capacity.
-        unsafe {
-            let value = TaggedValue::from_raw(layout.buffer.add(index).read());
-            layout.buffer.add(index).write(TaggedValue::UNIT.raw());
-            layout
-                .wrapper
-                .write(TaggedValue::from_u64(index as u64).raw());
-            Ok(value)
-        }
+        let value = TaggedValue::from_raw(read_u64_atomic(layout.buffer, index));
+        write_u64_atomic(layout.buffer, index, TaggedValue::UNIT.raw());
+        write_u64_atomic(layout.wrapper, 0, TaggedValue::from_u64(index as u64).raw());
+        Ok(value)
     }
 
-    fn list_slot(&self, list: TaggedValue, index: usize) -> Result<TaggedValue, VmError> {
-        let layout = self.list_layout(list)?;
-        if index >= layout.length {
-            return Err(VmError::InvalidIndex);
-        }
-        // SAFETY: the index is inside the occupied prefix, and this read does not allocate.
-        Ok(TaggedValue::from_raw(unsafe {
-            layout.buffer.add(index).read()
-        }))
-    }
-
-    /// Shallow copy of `start..end`. The source must already be rooted.
-    fn copy_list_range(
+    fn new_list_from_rooted_slice(
         &mut self,
-        source: TaggedValue,
+        root_base: usize,
         start: usize,
         end: usize,
     ) -> Result<TaggedValue, VmError> {
@@ -457,33 +501,34 @@ impl Vm {
         if length == 0 {
             return Ok(copy);
         }
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[source, copy], |vm| {
-            for offset in 0..length {
-                let source = vm.roots.temporary_values.borrow()[root];
-                let value = vm.list_slot(source, start + offset)?;
-                let copy = vm.roots.temporary_values.borrow()[root + 1];
-                vm.list_set(copy, TaggedValue::from_u64(offset as u64), value)?;
-            }
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
-        })
+        let layout = self.list_layout_unlocked(copy)?;
+        let roots = self.worker_roots().temporary_values.borrow();
+        for offset in 0..length {
+            write_u64_atomic(
+                layout.buffer,
+                offset,
+                roots[root_base + start + offset].raw(),
+            );
+        }
+        Ok(copy)
     }
 
-    fn list_of_ranges(
+    fn list_of_ranges_from_snapshot(
         &mut self,
-        source: TaggedValue,
+        elems: &[TaggedValue],
         ranges: &[(usize, usize)],
     ) -> Result<TaggedValue, VmError> {
-        let outer = self.new_list(ranges.len())?;
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[source, outer], |vm| {
+        let elem_base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(elems, |vm| {
+            let outer = vm.new_list(ranges.len())?;
+            let outer_slot = vm.worker_roots().temporary_values.borrow().len();
+            vm.worker_roots().temporary_values.borrow_mut().push(outer);
             for (index, &(start, end)) in ranges.iter().enumerate() {
-                let source = vm.roots.temporary_values.borrow()[root];
-                let piece = vm.copy_list_range(source, start, end)?;
-                let outer = vm.roots.temporary_values.borrow()[root + 1];
+                let piece = vm.new_list_from_rooted_slice(elem_base, start, end)?;
+                let outer = vm.worker_roots().temporary_values.borrow()[outer_slot];
                 vm.list_set(outer, TaggedValue::from_u64(index as u64), piece)?;
             }
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+            Ok(vm.worker_roots().temporary_values.borrow()[outer_slot])
         })
     }
 
@@ -504,13 +549,14 @@ impl Vm {
         if size == 0 {
             return Err(VmError::InvalidArgument("window size must not be zero"));
         }
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         let count = if size > len { 0 } else { len - size + 1 };
         let mut ranges = Vec::with_capacity(count);
         for start in 0..count {
             ranges.push((start, start + size));
         }
-        self.list_of_ranges(list, &ranges)
+        self.list_of_ranges_from_snapshot(&elems, &ranges)
     }
 
     pub(super) fn list_chunks(
@@ -520,7 +566,8 @@ impl Vm {
     ) -> Result<TaggedValue, VmError> {
         let size = Self::list_index(size)?;
         Self::require_chunk_size(size)?;
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         let mut ranges = Vec::new();
         let mut start = 0;
         while start < len {
@@ -528,7 +575,7 @@ impl Vm {
             ranges.push((start, end));
             start = end;
         }
-        self.list_of_ranges(list, &ranges)
+        self.list_of_ranges_from_snapshot(&elems, &ranges)
     }
 
     pub(super) fn list_chunks_exact(
@@ -538,14 +585,14 @@ impl Vm {
     ) -> Result<TaggedValue, VmError> {
         let size = Self::list_index(size)?;
         Self::require_chunk_size(size)?;
-        let len = self.list_len(list)?;
-        let count = len / size;
+        let elems = self.snapshot_list_elements(list)?;
+        let count = elems.len() / size;
         let mut ranges = Vec::with_capacity(count);
         for index in 0..count {
             let start = index * size;
             ranges.push((start, start + size));
         }
-        self.list_of_ranges(list, &ranges)
+        self.list_of_ranges_from_snapshot(&elems, &ranges)
     }
 
     pub(super) fn list_rchunks(
@@ -555,15 +602,15 @@ impl Vm {
     ) -> Result<TaggedValue, VmError> {
         let size = Self::list_index(size)?;
         Self::require_chunk_size(size)?;
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
         let mut ranges = Vec::new();
-        let mut end = len;
+        let mut end = elems.len();
         while end > 0 {
             let start = end.saturating_sub(size);
             ranges.push((start, end));
             end = start;
         }
-        self.list_of_ranges(list, &ranges)
+        self.list_of_ranges_from_snapshot(&elems, &ranges)
     }
 
     pub(super) fn list_rchunks_exact(
@@ -573,7 +620,8 @@ impl Vm {
     ) -> Result<TaggedValue, VmError> {
         let size = Self::list_index(size)?;
         Self::require_chunk_size(size)?;
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         let remainder = len % size;
         let mut ranges = Vec::new();
         let mut end = len;
@@ -582,7 +630,7 @@ impl Vm {
             ranges.push((start, end));
             end = start;
         }
-        self.list_of_ranges(list, &ranges)
+        self.list_of_ranges_from_snapshot(&elems, &ranges)
     }
 
     pub(super) fn list_chunks_remainder(
@@ -592,9 +640,14 @@ impl Vm {
     ) -> Result<TaggedValue, VmError> {
         let size = Self::list_index(size)?;
         Self::require_chunk_size(size)?;
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         let start = len - (len % size);
-        self.copy_list_range(list, start, len)
+        let tail = &elems[start..len];
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(tail, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, tail.len())
+        })
     }
 
     pub(super) fn list_rchunks_remainder(
@@ -604,8 +657,12 @@ impl Vm {
     ) -> Result<TaggedValue, VmError> {
         let size = Self::list_index(size)?;
         Self::require_chunk_size(size)?;
-        let len = self.list_len(list)?;
-        self.copy_list_range(list, 0, len % size)
+        let elems = self.snapshot_list_elements(list)?;
+        let head = &elems[0..elems.len() % size];
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(head, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, head.len())
+        })
     }
 
     pub(super) fn list_split_at(
@@ -614,11 +671,12 @@ impl Vm {
         index: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let index = Self::list_index(index)?;
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         if index > len {
             return Err(VmError::InvalidIndex);
         }
-        self.list_of_ranges(list, &[(0, index), (index, len)])
+        self.list_of_ranges_from_snapshot(&elems, &[(0, index), (index, len)])
     }
 
     fn rotated_list(
@@ -627,7 +685,8 @@ impl Vm {
         distance: usize,
         right: bool,
     ) -> Result<TaggedValue, VmError> {
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         if distance > len {
             return Err(VmError::InvalidArgument("rotate distance is out of range"));
         }
@@ -636,20 +695,15 @@ impl Vm {
         } else {
             len - distance
         };
-        if len == 0 || start == 0 || start == len {
-            return self.copy_list_range(list, 0, len);
-        }
-        let copy = self.new_list(len)?;
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[list, copy], |vm| {
-            for index in 0..len {
-                let source_index = (start + index) % len;
-                let source = vm.roots.temporary_values.borrow()[root];
-                let value = vm.list_slot(source, source_index)?;
-                let copy = vm.roots.temporary_values.borrow()[root + 1];
-                vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
+        let mut rotated = Vec::with_capacity(len);
+        if len > 0 {
+            for idx in 0..len {
+                rotated.push(elems[(start + idx) % len]);
             }
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        }
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&rotated, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, rotated.len())
         })
     }
 
@@ -676,27 +730,30 @@ impl Vm {
         list: TaggedValue,
         count: usize,
     ) -> Result<TaggedValue, VmError> {
-        let len = self.list_len(list)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         let total = len.checked_mul(count).ok_or(VmError::ObjectTooLarge)?;
         if total > MAX_CAPACITY {
             return Err(VmError::ObjectTooLarge);
         }
-        let copy = self.new_list(total)?;
-        if total == 0 {
-            return Ok(copy);
-        }
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[list, copy], |vm| {
+        let elem_base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&elems, |vm| {
+            let copy = vm.new_list(total)?;
+            if total == 0 {
+                return Ok(copy);
+            }
+            let layout = vm.list_layout_unlocked(copy)?;
+            let roots = vm.worker_roots().temporary_values.borrow();
             for block in 0..count {
                 for offset in 0..len {
-                    let source = vm.roots.temporary_values.borrow()[root];
-                    let value = vm.list_slot(source, offset)?;
-                    let copy = vm.roots.temporary_values.borrow()[root + 1];
-                    let index = block * len + offset;
-                    vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
+                    write_u64_atomic(
+                        layout.buffer,
+                        block * len + offset,
+                        roots[elem_base + offset].raw(),
+                    );
                 }
             }
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+            Ok(copy)
         })
     }
 
@@ -706,20 +763,19 @@ impl Vm {
         len: TaggedValue,
     ) -> Result<(), VmError> {
         let new_len = Self::list_index(len)?;
-        let layout = self.list_layout(list)?;
+        let _guard = self.stripe_write(list)?;
+        let layout = self.list_layout_unlocked(list)?;
         if new_len >= layout.length {
             return Ok(());
         }
-        // SAFETY: both indexes are inside the occupied prefix. Clearing the tail
-        // drops GC edges that truncate removed. No allocation follows.
-        unsafe {
-            for index in new_len..layout.length {
-                layout.buffer.add(index).write(TaggedValue::UNIT.raw());
-            }
-            layout
-                .wrapper
-                .write(TaggedValue::from_u64(new_len as u64).raw());
+        for index in new_len..layout.length {
+            write_u64_atomic(layout.buffer, index, TaggedValue::UNIT.raw());
         }
+        write_u64_atomic(
+            layout.wrapper,
+            0,
+            TaggedValue::from_u64(new_len as u64).raw(),
+        );
         Ok(())
     }
 
@@ -728,9 +784,10 @@ impl Vm {
         list: TaggedValue,
         value: TaggedValue,
     ) -> Result<(), VmError> {
-        let len = self.list_len(list)?;
-        for index in 0..len {
-            self.list_set(list, TaggedValue::from_u64(index as u64), value)?;
+        let _guard = self.stripe_write(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        for index in 0..layout.length {
+            write_u64_atomic(layout.buffer, index, value.raw());
         }
         Ok(())
     }
@@ -741,16 +798,23 @@ impl Vm {
         index: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let index = Self::list_index(index)?;
-        let len = self.list_len(list)?;
-        if index >= len {
+        let _guard = self.stripe_write(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        if index >= layout.length {
             return Err(VmError::InvalidIndex);
         }
-        let removed = self.list_slot(list, index)?;
-        if index + 1 != len {
-            let last = self.list_slot(list, len - 1)?;
-            self.list_set(list, TaggedValue::from_u64(index as u64), last)?;
+        let last_idx = layout.length - 1;
+        let removed = TaggedValue::from_raw(read_u64_atomic(layout.buffer, index));
+        if index != last_idx {
+            let last_val = read_u64_atomic(layout.buffer, last_idx);
+            write_u64_atomic(layout.buffer, index, last_val);
         }
-        self.list_pop(list)?;
+        write_u64_atomic(layout.buffer, last_idx, TaggedValue::UNIT.raw());
+        write_u64_atomic(
+            layout.wrapper,
+            0,
+            TaggedValue::from_u64(last_idx as u64).raw(),
+        );
         Ok(removed)
     }
 
@@ -760,16 +824,27 @@ impl Vm {
         index: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let index = Self::list_index(index)?;
-        let len = self.list_len(list)?;
-        if index > len {
-            return Err(VmError::InvalidIndex);
-        }
-        let tail = self.copy_list_range(list, index, len)?;
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[list, tail], |vm| {
-            let list = vm.roots.temporary_values.borrow()[root];
-            vm.list_truncate(list, TaggedValue::from_u64(index as u64))?;
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        let root = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&[list], |vm| {
+            let tail_elems = {
+                let list = vm.worker_roots().temporary_values.borrow()[root];
+                let _guard = vm.stripe_write(list)?;
+                let layout = vm.list_layout_unlocked(list)?;
+                if index > layout.length {
+                    return Err(VmError::InvalidIndex);
+                }
+                let mut out = Vec::with_capacity(layout.length - index);
+                for pos in index..layout.length {
+                    out.push(TaggedValue::from_raw(read_u64_atomic(layout.buffer, pos)));
+                    write_u64_atomic(layout.buffer, pos, TaggedValue::UNIT.raw());
+                }
+                write_u64_atomic(layout.wrapper, 0, TaggedValue::from_u64(index as u64).raw());
+                out
+            };
+            let tail_base = vm.worker_roots().temporary_values.borrow().len();
+            vm.with_temporary_roots(&tail_elems, |vm| {
+                vm.new_list_from_rooted_slice(tail_base, 0, tail_elems.len())
+            })
         })
     }
 
@@ -783,16 +858,16 @@ impl Vm {
         if new_len > MAX_CAPACITY {
             return Err(VmError::ObjectTooLarge);
         }
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[list, value], |vm| {
-            let list = vm.roots.temporary_values.borrow()[root];
+            let list = vm.worker_roots().temporary_values.borrow()[root];
             let current = vm.list_len(list)?;
             if new_len <= current {
                 return vm.list_truncate(list, TaggedValue::from_u64(new_len as u64));
             }
             for _ in current..new_len {
-                let list = vm.roots.temporary_values.borrow()[root];
-                let value = vm.roots.temporary_values.borrow()[root + 1];
+                let list = vm.worker_roots().temporary_values.borrow()[root];
+                let value = vm.worker_roots().temporary_values.borrow()[root + 1];
                 vm.list_push(list, value)?;
             }
             Ok(())
@@ -800,25 +875,19 @@ impl Vm {
     }
 
     pub(super) fn list_copy(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
-        let len = self.list_len(list)?;
-        self.copy_list_range(list, 0, len)
+        let elems = self.snapshot_list_elements(list)?;
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&elems, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, elems.len())
+        })
     }
 
     pub(super) fn list_reverse(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
-        let len = self.list_len(list)?;
-        let copy = self.new_list(len)?;
-        if len == 0 {
-            return Ok(copy);
-        }
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[list, copy], |vm| {
-            for index in 0..len {
-                let source = vm.roots.temporary_values.borrow()[root];
-                let value = vm.list_slot(source, len - 1 - index)?;
-                let copy = vm.roots.temporary_values.borrow()[root + 1];
-                vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
-            }
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+        let mut elems = self.snapshot_list_elements(list)?;
+        elems.reverse();
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&elems, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, elems.len())
         })
     }
 
@@ -827,34 +896,19 @@ impl Vm {
         left: TaggedValue,
         right: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
-        let left_len = self.list_len(left)?;
-        let right_len = self.list_len(right)?;
-        let total = left_len
-            .checked_add(right_len)
+        let mut elems = self.snapshot_list_elements(left)?;
+        let right_elems = self.snapshot_list_elements(right)?;
+        let total = elems
+            .len()
+            .checked_add(right_elems.len())
             .ok_or(VmError::ObjectTooLarge)?;
         if total > MAX_CAPACITY {
             return Err(VmError::ObjectTooLarge);
         }
-        let copy = self.new_list(total)?;
-        if total == 0 {
-            return Ok(copy);
-        }
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[left, right, copy], |vm| {
-            for index in 0..total {
-                let source_is_left = index < left_len;
-                let source_index = if source_is_left {
-                    index
-                } else {
-                    index - left_len
-                };
-                let source =
-                    vm.roots.temporary_values.borrow()[root + usize::from(!source_is_left)];
-                let value = vm.list_slot(source, source_index)?;
-                let copy = vm.roots.temporary_values.borrow()[root + 2];
-                vm.list_set(copy, TaggedValue::from_u64(index as u64), value)?;
-            }
-            Ok(vm.roots.temporary_values.borrow()[root + 2])
+        elems.extend_from_slice(&right_elems);
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&elems, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, elems.len())
         })
     }
 
@@ -866,17 +920,18 @@ impl Vm {
     ) -> Result<(), VmError> {
         let left = Self::list_index(left)?;
         let right = Self::list_index(right)?;
-        let len = self.list_len(list)?;
-        if left >= len || right >= len {
+        let _guard = self.stripe_write(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        if left >= layout.length || right >= layout.length {
             return Err(VmError::InvalidIndex);
         }
         if left == right {
             return Ok(());
         }
-        let first = self.list_slot(list, left)?;
-        let second = self.list_slot(list, right)?;
-        self.list_set(list, TaggedValue::from_u64(left as u64), second)?;
-        self.list_set(list, TaggedValue::from_u64(right as u64), first)?;
+        let first = read_u64_atomic(layout.buffer, left);
+        let second = read_u64_atomic(layout.buffer, right);
+        write_u64_atomic(layout.buffer, left, second);
+        write_u64_atomic(layout.buffer, right, first);
         Ok(())
     }
 
@@ -891,27 +946,96 @@ impl Vm {
         value: TaggedValue,
     ) -> Result<(), VmError> {
         let index = Self::list_index(index)?;
-        let len = self.list_len(list)?;
-        if index > len {
-            return Err(VmError::InvalidIndex);
-        }
-        if index == len {
-            return self.list_push(list, value);
-        }
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[list, value], |vm| {
-            let list = vm.roots.temporary_values.borrow()[root];
-            let last = vm.list_slot(list, len - 1)?;
-            vm.list_push(list, last)?;
-            for cursor in (index + 1..len).rev() {
-                let list = vm.roots.temporary_values.borrow()[root];
-                let previous = vm.list_slot(list, cursor - 1)?;
-                vm.list_set(list, TaggedValue::from_u64(cursor as u64), previous)?;
+            loop {
+                let needed_cap = {
+                    let list = vm.worker_roots().temporary_values.borrow()[root];
+                    let value = vm.worker_roots().temporary_values.borrow()[root + 1];
+                    let _guard = vm.stripe_write(list)?;
+                    let layout = vm.list_layout_unlocked(list)?;
+                    if index > layout.length {
+                        return Err(VmError::InvalidIndex);
+                    }
+                    if layout.length == MAX_CAPACITY {
+                        return Err(VmError::ObjectTooLarge);
+                    }
+                    if layout.length < layout.capacity {
+                        for cursor in (index..layout.length).rev() {
+                            let prev = read_u64_atomic(layout.buffer, cursor);
+                            write_u64_atomic(layout.buffer, cursor + 1, prev);
+                        }
+                        write_u64_atomic(layout.buffer, index, value.raw());
+                        write_u64_atomic(
+                            layout.wrapper,
+                            0,
+                            TaggedValue::from_u64((layout.length + 1) as u64).raw(),
+                        );
+                        return Ok(());
+                    }
+                    layout
+                        .capacity
+                        .checked_mul(2)
+                        .ok_or(VmError::ObjectTooLarge)?
+                        .clamp(4, MAX_CAPACITY)
+                };
+
+                let buffer = vm.list_buffer(needed_cap)?;
+                let buf_slot = vm.worker_roots().temporary_values.borrow().len();
+                vm.worker_roots().temporary_values.borrow_mut().push(buffer);
+
+                let list = vm.worker_roots().temporary_values.borrow()[root];
+                let value = vm.worker_roots().temporary_values.borrow()[root + 1];
+                let buffer = vm.worker_roots().temporary_values.borrow()[buf_slot];
+                let _guard = vm.stripe_write(list)?;
+                let old = vm.list_layout_unlocked(list)?;
+                if index > old.length {
+                    return Err(VmError::InvalidIndex);
+                }
+                if old.length == MAX_CAPACITY {
+                    return Err(VmError::ObjectTooLarge);
+                }
+                if old.length < old.capacity {
+                    for cursor in (index..old.length).rev() {
+                        let prev = read_u64_atomic(old.buffer, cursor);
+                        write_u64_atomic(old.buffer, cursor + 1, prev);
+                    }
+                    write_u64_atomic(old.buffer, index, value.raw());
+                    write_u64_atomic(
+                        old.wrapper,
+                        0,
+                        TaggedValue::from_u64((old.length + 1) as u64).raw(),
+                    );
+                    return Ok(());
+                }
+                if old.length >= needed_cap {
+                    continue;
+                }
+                let pointer = buffer
+                    .as_heap_ptr()
+                    .ok_or(VmError::TypeError)?
+                    .cast_mut()
+                    .cast::<u64>();
+                for i in 0..index {
+                    write_u64_atomic(pointer, i, read_u64_atomic(old.buffer, i));
+                }
+                write_u64_atomic(pointer, index, value.raw());
+                for i in index..old.length {
+                    write_u64_atomic(pointer, i + 1, read_u64_atomic(old.buffer, i));
+                }
+                write_u64_atomic(
+                    old.wrapper,
+                    0,
+                    TaggedValue::from_u64((old.length + 1) as u64).raw(),
+                );
+                write_u64_atomic(
+                    old.wrapper,
+                    1,
+                    TaggedValue::from_u64(needed_cap as u64).raw(),
+                );
+                write_u64_atomic(old.wrapper, 2, buffer.raw());
+                return Ok(());
             }
-            let list = vm.roots.temporary_values.borrow()[root];
-            let value = vm.roots.temporary_values.borrow()[root + 1];
-            vm.list_set(list, TaggedValue::from_u64(index as u64), value)?;
-            Ok(())
         })
     }
 
@@ -921,22 +1045,24 @@ impl Vm {
         index: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let index = Self::list_index(index)?;
-        let len = self.list_len(list)?;
-        if index >= len {
+        let _guard = self.stripe_write(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        if index >= layout.length {
             return Err(VmError::InvalidIndex);
         }
-        let removed = self.list_slot(list, index)?;
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[list, removed], |vm| {
-            for cursor in index + 1..len {
-                let list = vm.roots.temporary_values.borrow()[root];
-                let next = vm.list_slot(list, cursor)?;
-                vm.list_set(list, TaggedValue::from_u64((cursor - 1) as u64), next)?;
-            }
-            let list = vm.roots.temporary_values.borrow()[root];
-            vm.list_pop(list)?;
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
-        })
+        let removed = TaggedValue::from_raw(read_u64_atomic(layout.buffer, index));
+        for cursor in index + 1..layout.length {
+            let next = read_u64_atomic(layout.buffer, cursor);
+            write_u64_atomic(layout.buffer, cursor - 1, next);
+        }
+        let last_idx = layout.length - 1;
+        write_u64_atomic(layout.buffer, last_idx, TaggedValue::UNIT.raw());
+        write_u64_atomic(
+            layout.wrapper,
+            0,
+            TaggedValue::from_u64(last_idx as u64).raw(),
+        );
+        Ok(removed)
     }
 
     pub(super) fn list_take(
@@ -945,8 +1071,13 @@ impl Vm {
         count: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let count = Self::list_index(count)?;
-        let len = self.list_len(list)?;
-        self.copy_list_range(list, 0, count.min(len))
+        let elems = self.snapshot_list_elements(list)?;
+        let end = count.min(elems.len());
+        let slice = &elems[..end];
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(slice, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, slice.len())
+        })
     }
 
     pub(super) fn list_drop(
@@ -955,24 +1086,35 @@ impl Vm {
         count: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
         let count = Self::list_index(count)?;
-        let len = self.list_len(list)?;
-        self.copy_list_range(list, count.min(len), len)
+        let elems = self.snapshot_list_elements(list)?;
+        let start = count.min(elems.len());
+        let slice = &elems[start..];
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(slice, |vm| {
+            vm.new_list_from_rooted_slice(base, 0, slice.len())
+        })
     }
 
     pub(super) fn list_first(&self, list: TaggedValue) -> Result<TaggedValue, VmError> {
-        if self.list_len(list)? == 0 {
+        let _guard = self.stripe_read(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        if layout.length == 0 {
             Ok(TaggedValue::NULL)
         } else {
-            self.list_slot(list, 0)
+            Ok(TaggedValue::from_raw(read_u64_atomic(layout.buffer, 0)))
         }
     }
 
     pub(super) fn list_last(&self, list: TaggedValue) -> Result<TaggedValue, VmError> {
-        let len = self.list_len(list)?;
-        if len == 0 {
+        let _guard = self.stripe_read(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        if layout.length == 0 {
             Ok(TaggedValue::NULL)
         } else {
-            self.list_slot(list, len - 1)
+            Ok(TaggedValue::from_raw(read_u64_atomic(
+                layout.buffer,
+                layout.length - 1,
+            )))
         }
     }
 
@@ -981,30 +1123,34 @@ impl Vm {
         list: TaggedValue,
         other: TaggedValue,
     ) -> Result<(), VmError> {
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[list, other], |vm| {
-            let other = vm.roots.temporary_values.borrow()[root + 1];
-            let extra = vm.list_len(other)?;
-            for index in 0..extra {
-                let other = vm.roots.temporary_values.borrow()[root + 1];
-                let value = vm.list_slot(other, index)?;
-                let list = vm.roots.temporary_values.borrow()[root];
-                vm.list_push(list, value)?;
-            }
-            Ok(())
+            let other = vm.worker_roots().temporary_values.borrow()[root + 1];
+            let extra_elems = vm.snapshot_list_elements(other)?;
+            let extra_base = vm.worker_roots().temporary_values.borrow().len();
+            vm.with_temporary_roots(&extra_elems, |vm| {
+                for offset in 0..extra_elems.len() {
+                    let list = vm.worker_roots().temporary_values.borrow()[root];
+                    let val = vm.worker_roots().temporary_values.borrow()[extra_base + offset];
+                    vm.list_push(list, val)?;
+                }
+                Ok(())
+            })
         })
     }
 
     pub(super) fn list_enumerate(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
-        let len = self.list_len(list)?;
-        let out = self.new_list(len)?;
+        let elems = self.snapshot_list_elements(list)?;
+        let len = elems.len();
         let i64_ty = type_pool::Intrinsic::I64.type_index();
         let any_ty = type_pool::Intrinsic::Any.type_index();
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[list, out], |vm| {
+        let elem_base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&elems, |vm| {
+            let out = vm.new_list(len)?;
+            let out_slot = vm.worker_roots().temporary_values.borrow().len();
+            vm.worker_roots().temporary_values.borrow_mut().push(out);
             for index in 0..len {
-                let list = vm.roots.temporary_values.borrow()[root];
-                let value = vm.list_slot(list, index)?;
+                let value = vm.worker_roots().temporary_values.borrow()[elem_base + index];
                 let pair = vm.alloc_tuple(
                     &[i64_ty, any_ty],
                     &[
@@ -1014,25 +1160,26 @@ impl Vm {
                         value,
                     ],
                 )?;
-                let out = vm.roots.temporary_values.borrow()[root + 1];
+                let out = vm.worker_roots().temporary_values.borrow()[out_slot];
                 vm.list_set(out, TaggedValue::from_u64(index as u64), pair)?;
             }
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+            Ok(vm.worker_roots().temporary_values.borrow()[out_slot])
         })
     }
 
     pub(super) fn list_flatten(&mut self, list: TaggedValue) -> Result<TaggedValue, VmError> {
-        let len = self.list_len(list)?;
-        let out = self.new_list(0)?;
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[list, out], |vm| {
-            for index in 0..len {
-                let list = vm.roots.temporary_values.borrow()[root];
-                let inner = vm.list_slot(list, index)?;
-                let out = vm.roots.temporary_values.borrow()[root + 1];
+        let inners = self.snapshot_list_elements(list)?;
+        let inner_base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&inners, |vm| {
+            let out = vm.new_list(0)?;
+            let out_slot = vm.worker_roots().temporary_values.borrow().len();
+            vm.worker_roots().temporary_values.borrow_mut().push(out);
+            for index in 0..inners.len() {
+                let inner = vm.worker_roots().temporary_values.borrow()[inner_base + index];
+                let out = vm.worker_roots().temporary_values.borrow()[out_slot];
                 vm.list_append(out, inner)?;
             }
-            Ok(vm.roots.temporary_values.borrow()[root + 1])
+            Ok(vm.worker_roots().temporary_values.borrow()[out_slot])
         })
     }
 
@@ -1041,30 +1188,33 @@ impl Vm {
         left: TaggedValue,
         right: TaggedValue,
     ) -> Result<TaggedValue, VmError> {
-        let root = self.roots.temporary_values.borrow().len();
-        self.with_temporary_roots(&[left, right], |vm| {
-            let left_len = vm.list_len(vm.roots.temporary_values.borrow()[root])?;
-            let right_len = vm.list_len(vm.roots.temporary_values.borrow()[root + 1])?;
-            let end = left_len.min(right_len);
+        let left_elems = self.snapshot_list_elements(left)?;
+        let right_elems = self.snapshot_list_elements(right)?;
+        let end = left_elems.len().min(right_elems.len());
+        let mut combined = Vec::with_capacity(end * 2);
+        combined.extend_from_slice(&left_elems[..end]);
+        combined.extend_from_slice(&right_elems[..end]);
+        let base = self.worker_roots().temporary_values.borrow().len();
+        self.with_temporary_roots(&combined, |vm| {
             let out = vm.new_list(end)?;
-            vm.with_temporary_roots(&[out], |vm| {
-                for index in 0..end {
-                    let left = vm.roots.temporary_values.borrow()[root];
-                    let right = vm.roots.temporary_values.borrow()[root + 1];
-                    let left_value = vm.list_slot(left, index)?;
-                    let right_value = vm.list_slot(right, index)?;
-                    let pair = vm.alloc_tuple(
-                        &[
-                            vm.reflected_type(left_value)?,
-                            vm.reflected_type(right_value)?,
-                        ],
-                        &[left_value, right_value],
-                    )?;
-                    let out = vm.roots.temporary_values.borrow()[root + 2];
-                    vm.list_set(out, TaggedValue::from_u64(index as u64), pair)?;
-                }
-                Ok(vm.roots.temporary_values.borrow()[root + 2])
-            })
+            let out_slot = vm.worker_roots().temporary_values.borrow().len();
+            vm.worker_roots().temporary_values.borrow_mut().push(out);
+            for index in 0..end {
+                let (left_value, right_value) = {
+                    let roots = vm.worker_roots().temporary_values.borrow();
+                    (roots[base + index], roots[base + end + index])
+                };
+                let pair = vm.alloc_tuple(
+                    &[
+                        vm.reflected_type(left_value)?,
+                        vm.reflected_type(right_value)?,
+                    ],
+                    &[left_value, right_value],
+                )?;
+                let out = vm.worker_roots().temporary_values.borrow()[out_slot];
+                vm.list_set(out, TaggedValue::from_u64(index as u64), pair)?;
+            }
+            Ok(vm.worker_roots().temporary_values.borrow()[out_slot])
         })
     }
 
@@ -1075,10 +1225,11 @@ impl Vm {
     ) -> Result<String, VmError> {
         let separator =
             crate::builtin_ctx::heap_string_to_owned(separator).ok_or(VmError::TypeError)?;
-        let len = self.list_len(list)?;
-        let mut pieces = Vec::with_capacity(len);
-        for index in 0..len {
-            let value = self.list_slot(list, index)?;
+        let _guard = self.stripe_read(list)?;
+        let layout = self.list_layout_unlocked(list)?;
+        let mut pieces = Vec::with_capacity(layout.length);
+        for index in 0..layout.length {
+            let value = TaggedValue::from_raw(read_u64_atomic(layout.buffer, index));
             let piece =
                 crate::builtin_ctx::heap_string_to_owned(value).ok_or(VmError::TypeError)?;
             pieces.push(piece);
@@ -1089,27 +1240,23 @@ impl Vm {
     /// Build a fresh List holding a new String for each piece, in order.
     pub(super) fn new_string_list(&mut self, pieces: &[&str]) -> Result<TaggedValue, VmError> {
         let list = self.new_list(pieces.len())?;
-        let root = self.roots.temporary_values.borrow().len();
+        let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[list], |vm| {
             for (index, piece) in pieces.iter().enumerate() {
                 let text = vm.alloc_string(piece)?;
-                // Reload after the allocation; list_set itself does not allocate.
-                let list = vm.roots.temporary_values.borrow()[root];
+                let list = vm.worker_roots().temporary_values.borrow()[root];
                 vm.list_set(list, TaggedValue::from_u64(index as u64), text)?;
             }
-            Ok(vm.roots.temporary_values.borrow()[root])
+            Ok(vm.worker_roots().temporary_values.borrow()[root])
         })
     }
 
     /// Build a fresh List of immediate char values; only the List allocates.
     pub(super) fn new_char_list(&mut self, text: &str) -> Result<TaggedValue, VmError> {
         let list = self.new_list(text.chars().count())?;
+        let layout = self.list_layout_unlocked(list)?;
         for (index, ch) in text.chars().enumerate() {
-            self.list_set(
-                list,
-                TaggedValue::from_u64(index as u64),
-                TaggedValue::from_char(ch),
-            )?;
+            write_u64_atomic(layout.buffer, index, TaggedValue::from_char(ch).raw());
         }
         Ok(list)
     }
@@ -1117,12 +1264,9 @@ impl Vm {
     /// Build a fresh List of immediate i64 values; only the List allocates.
     pub(super) fn new_i64_list(&mut self, values: &[i64]) -> Result<TaggedValue, VmError> {
         let list = self.new_list(values.len())?;
+        let layout = self.list_layout_unlocked(list)?;
         for (index, value) in values.iter().enumerate() {
-            self.list_set(
-                list,
-                TaggedValue::from_u64(index as u64),
-                TaggedValue::from_i64(*value),
-            )?;
+            write_u64_atomic(layout.buffer, index, TaggedValue::from_i64(*value).raw());
         }
         Ok(list)
     }
@@ -1137,16 +1281,16 @@ mod tests {
     fn lists_preserve_alias_identity_and_unit_elements_during_growth() {
         let mut vm = make_vm();
         let list = vm.new_list(2).unwrap();
-        let root = vm.roots.temporary_values.borrow().len();
+        let root = vm.worker_roots().temporary_values.borrow().len();
         vm.with_temporary_roots(&[list], |vm| {
-            let list = vm.roots.temporary_values.borrow()[root];
+            let list = vm.worker_roots().temporary_values.borrow()[root];
             assert!(vm.list_get(list, TaggedValue::from_u64(0))?.is_unit());
             vm.list_set(list, TaggedValue::from_u64(1), TaggedValue::TRUE)?;
             for _ in 0..20 {
-                let list = vm.roots.temporary_values.borrow()[root];
+                let list = vm.worker_roots().temporary_values.borrow()[root];
                 vm.list_push(list, TaggedValue::FALSE)?;
             }
-            let list = vm.roots.temporary_values.borrow()[root];
+            let list = vm.worker_roots().temporary_values.borrow()[root];
             assert_eq!(vm.list_len(list)?, 22);
             assert_eq!(
                 vm.list_get(list, TaggedValue::from_u64(1))?,
@@ -1162,7 +1306,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(vm.roots.temporary_values.borrow().is_empty());
+        assert!(vm.worker_roots().temporary_values.borrow().is_empty());
     }
 
     #[test]
@@ -1194,24 +1338,23 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(vm.roots.temporary_values.borrow().is_empty());
+        assert!(vm.worker_roots().temporary_values.borrow().is_empty());
         assert!(matches!(
             vm.new_list(MAX_CAPACITY + 1),
             Err(VmError::ObjectTooLarge)
         ));
     }
+
     #[test]
     fn malformed_list_header_is_rejected_before_buffer_access() {
         let mut vm = make_vm();
         let list = vm.new_list(0).unwrap();
         vm.with_temporary_roots(&[list], |vm| {
             let pointer = list.as_heap_ptr().unwrap().cast_mut().cast::<u64>();
-            // SAFETY: test intentionally corrupts one word of its live three-word wrapper.
             unsafe {
                 pointer.write(TaggedValue::from_u64(1).raw());
             }
             assert!(matches!(vm.list_len(list), Err(VmError::TypeError)));
-            // SAFETY: same validated test allocation; restore len then corrupt its unsigned tag.
             unsafe {
                 pointer.write(TaggedValue::from_i64(0).raw());
             }
@@ -1234,7 +1377,7 @@ mod tests {
             Opcode::LoadIndex,
         ] {
             let mut vm = make_vm();
-            let ty = vm.state.type_pool.list_type().unwrap();
+            let ty = vm.type_pool_read().list_type().unwrap();
             let mut instructions = vec![Instruction::a_type(
                 Opcode::NewList,
                 AddrMode::Imm,
@@ -1266,6 +1409,7 @@ mod tests {
             ));
         }
     }
+
     #[test]
     fn dynamic_list_apply_and_update_use_integer_collection_abi() {
         use crate::VmResult;
@@ -1336,6 +1480,7 @@ mod tests {
             ));
         }
     }
+
     #[test]
     fn list_display_formats_nested_values_and_shared_subgraphs() {
         let mut vm = make_vm();
@@ -1386,12 +1531,10 @@ mod tests {
                 Err(VmError::DisplayDepthExceeded)
             ));
             let pointer = list.as_heap_ptr().unwrap().cast_mut().cast::<u64>();
-            // SAFETY: corrupt the owned live wrapper to exercise checked display bounds.
             unsafe {
                 pointer.write(TaggedValue::from_u64(65535).raw());
             }
             assert!(matches!(vm.format_aggregate(list), Err(VmError::TypeError)));
-            // SAFETY: restore its sole occupied slot before testing internal buffer visibility.
             unsafe {
                 pointer.write(TaggedValue::from_u64(1).raw());
             }
@@ -1406,6 +1549,7 @@ mod tests {
         })
         .unwrap();
     }
+
     #[test]
     fn list_display_bounds_exponential_expansion_of_shared_values() {
         let mut vm = make_vm();
@@ -1426,26 +1570,27 @@ mod tests {
         })
         .unwrap();
     }
+
     #[test]
     fn list_root_scope_restores_existing_roots_on_errors_and_unwind() {
         let mut vm = make_vm();
-        vm.roots
+        vm.worker_roots()
             .temporary_values
             .borrow_mut()
             .push(TaggedValue::TRUE);
-        let baseline = vm.roots.temporary_values.borrow().clone();
+        let baseline = vm.worker_roots().temporary_values.borrow().clone();
         let result: Result<(), VmError> = vm.with_temporary_roots(&[TaggedValue::UNIT], |vm| {
-            vm.roots
+            vm.worker_roots()
                 .temporary_values
                 .borrow_mut()
                 .push(TaggedValue::FALSE);
             Err(VmError::TypeError)
         });
         assert!(matches!(result, Err(VmError::TypeError)));
-        assert_eq!(*vm.roots.temporary_values.borrow(), baseline);
+        assert_eq!(*vm.worker_roots().temporary_values.borrow(), baseline);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             vm.with_temporary_roots(&[TaggedValue::UNIT], |vm| -> Result<(), VmError> {
-                vm.roots
+                vm.worker_roots()
                     .temporary_values
                     .borrow_mut()
                     .push(TaggedValue::FALSE);
@@ -1453,6 +1598,6 @@ mod tests {
             })
         }));
         assert!(result.is_err());
-        assert_eq!(*vm.roots.temporary_values.borrow(), baseline);
+        assert_eq!(*vm.worker_roots().temporary_values.borrow(), baseline);
     }
 }

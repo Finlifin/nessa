@@ -8,13 +8,20 @@ use crate::{Vm, VmError};
 impl Vm {
     pub(super) fn checked_function(&self, id: FuncId) -> Result<&FunctionCode, VmError> {
         let function = self
-            .state
+            .shared
             .bytecode
             .try_get_function(id)
             .ok_or(VmError::InvalidFunction(id))?;
+        {
+            let cache = self.sync_meta_cache();
+            if cache.validated_funcs.get(id.0 as usize) == Some(&true) {
+                return Ok(function);
+            }
+        }
+        let tp = self.type_pool_read();
         if let Some(owner) = function.display_owner {
             nsbc::validate_display_owner(
-                &self.state.type_pool,
+                &tp,
                 id,
                 owner,
                 function.function_type,
@@ -27,9 +34,7 @@ impl Vm {
         let abi = &function.abi;
         for parameter in &abi.parameters {
             if let nsbc::ParameterAbi::Trait { view } = parameter
-                && self
-                    .state
-                    .type_pool
+                && tp
                     .trait_has_associated_types(*view)
                     .map_err(|_| VmError::InvalidTraitProof)?
             {
@@ -53,47 +58,29 @@ impl Vm {
                     }),
             )
         {
-            let view = self
-                .state
-                .type_pool
-                .canonical_type(*view)
-                .ok_or(VmError::InvalidTraitProof)?;
-            if !matches!(
-                self.state.type_pool.get(view).kind,
-                type_pool::TypeKind::Trait { .. }
-            ) {
+            let view = tp.canonical_type(*view).ok_or(VmError::InvalidTraitProof)?;
+            if !matches!(tp.get(view).kind, type_pool::TypeKind::Trait { .. }) {
                 return Err(VmError::InvalidTraitProof);
             }
         }
         if function.function_type != type_pool::TypeIndex::INVALID {
-            let ty = self
-                .state
-                .type_pool
+            let ty = tp
                 .canonical_type(function.function_type)
                 .ok_or(VmError::TypeError)?;
-            let type_pool::TypeKind::Function { params, .. } = &self.state.type_pool.get(ty).kind
-            else {
+            let type_pool::TypeKind::Function { params, .. } = &tp.get(ty).kind else {
                 return Err(VmError::TypeError);
             };
             for (parameter, &ty) in abi.parameters.iter().zip(params) {
                 if let nsbc::ParameterAbi::Trait { view } = parameter
-                    && self.state.type_pool.canonical_type(*view)
-                        != self.state.type_pool.canonical_type(ty)
+                    && tp.canonical_type(*view) != tp.canonical_type(ty)
                 {
                     return Err(VmError::InvalidTraitProof);
                 }
             }
             for (parameter, &ty) in abi.parameters.iter().zip(params) {
                 if matches!(parameter, nsbc::ParameterAbi::TraitSelf { .. }) {
-                    let concrete = self
-                        .state
-                        .type_pool
-                        .canonical_type(ty)
-                        .ok_or(VmError::TypeError)?;
-                    if matches!(
-                        self.state.type_pool.get(concrete).kind,
-                        type_pool::TypeKind::Trait { .. }
-                    ) {
+                    let concrete = tp.canonical_type(ty).ok_or(VmError::TypeError)?;
+                    if matches!(tp.get(concrete).kind, type_pool::TypeKind::Trait { .. }) {
                         return Err(VmError::TypeError);
                     }
                 }
@@ -119,6 +106,15 @@ impl Vm {
         {
             return Err(VmError::TypeError);
         }
+        drop(tp);
+        {
+            let mut cache = self.sync_meta_cache();
+            let idx = id.0 as usize;
+            if cache.validated_funcs.len() <= idx {
+                cache.validated_funcs.resize(idx + 1, false);
+            }
+            cache.validated_funcs[idx] = true;
+        }
         Ok(function)
     }
 
@@ -135,19 +131,28 @@ impl Vm {
         id: FuncId,
         environment: Option<TaggedValue>,
     ) -> Result<(), VmError> {
-        let count = match environment {
+        let code = self.checked_function(id)?;
+        let layout_opt = match environment {
             Some(environment) => {
                 let layout = Self::closure_layout(environment)?;
                 if layout.function != id {
                     return Err(VmError::TypeError);
                 }
-                layout.capture_count as usize
+                Some(layout)
             }
-            None => 0,
+            None => None,
         };
-        self.check_capture_abi(id, count)?;
-        if let Some(environment) = environment {
-            let layout = Self::closure_layout(environment)?;
+        let count = layout_opt.as_ref().map_or(0, |l| l.capture_count as usize);
+        if code.abi.capture_count() != count {
+            return Err(VmError::TypeError);
+        }
+        if let Some(layout) = layout_opt
+            && code
+                .abi
+                .captures
+                .iter()
+                .any(|c| *c != nsbc::CaptureAbi::Value)
+        {
             let values: Vec<_> = (0..layout.capture_count)
                 .map(|index| {
                     // SAFETY: closure layout proves the initialized capture range.
@@ -212,8 +217,7 @@ mod tests {
         // SAFETY: TestVm owns an operation. The fresh closure is initialized and
         // rooted in its task register before any further managed allocation.
         let pointer = unsafe {
-            vm.state
-                .heap
+            vm.heap_mut()
                 .alloc_object(
                     Intrinsic::Closure.type_index(),
                     ClosureEnv::payload_words(captures.len() as u16),
@@ -224,12 +228,7 @@ mod tests {
             ClosureEnv::write(pointer.as_ptr(), function, captures);
             TaggedValue::from_heap_ptr(pointer.as_ptr())
         };
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(Reg(20), value);
+        vm.task_mut(task).unwrap().registers.set(Reg(20), value);
         value
     }
 
@@ -259,14 +258,7 @@ mod tests {
             vm.invoke_closure(task, FuncId(1), Some(wrong), &[]),
             DispatchResult::Error(VmError::TypeError)
         ));
-        assert!(
-            vm.roots
-                .scheduler
-                .get_task(task)
-                .unwrap()
-                .call_stack
-                .is_empty()
-        );
+        assert!(vm.task_ref(task).unwrap().call_stack.is_empty());
     }
 
     #[test]
@@ -295,14 +287,7 @@ mod tests {
                 got: 2
             })
         ));
-        assert!(
-            vm.roots
-                .scheduler
-                .get_task(task)
-                .unwrap()
-                .call_stack
-                .is_empty()
-        );
+        assert!(vm.task_ref(task).unwrap().call_stack.is_empty());
     }
 
     #[test]
@@ -323,7 +308,7 @@ mod tests {
             vm.dispatch_reset_closure(task, &Instruction::reset_closure(Reg(20), 0)),
             DispatchResult::Error(VmError::TypeError)
         ));
-        let task = vm.roots.scheduler.get_task(task).unwrap();
+        let task = vm.task_ref(task).unwrap();
         assert!(task.handler_stack.is_empty());
         assert!(task.call_stack.is_empty());
     }
@@ -332,19 +317,16 @@ mod tests {
     fn missing_proof_values_and_signature_gaps_are_explicit_errors() {
         for captures in [false, true] {
             let mut vm = crate::tests::make_vm();
+            let eq_ty = vm.type_pool_read().well_known.eq;
             let abi = if captures {
                 FunctionAbi {
-                    captures: vec![CaptureAbi::TraitProof {
-                        view: vm.type_pool().well_known.eq,
-                    }],
+                    captures: vec![CaptureAbi::TraitProof { view: eq_ty }],
                     parameters: vec![],
                 }
             } else {
                 FunctionAbi {
                     captures: vec![],
-                    parameters: vec![ParameterAbi::Trait {
-                        view: vm.type_pool().well_known.eq,
-                    }],
+                    parameters: vec![ParameterAbi::Trait { view: eq_ty }],
                 }
             };
             vm.add_function(FunctionCode {
@@ -366,7 +348,7 @@ mod tests {
             ));
         }
         let mut vm = crate::tests::make_vm();
-        let function_type = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let function_type = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![Intrinsic::I64.type_index()],
             ret: Intrinsic::I64.type_index(),
         });
@@ -383,6 +365,7 @@ mod tests {
         vm.spawn_root(FuncId(0));
         assert!(matches!(vm.run(), VmResult::Error(VmError::TypeError)));
     }
+
     #[test]
     fn direct_calls_and_root_entries_check_explicit_user_arity() {
         for far in [false, true] {

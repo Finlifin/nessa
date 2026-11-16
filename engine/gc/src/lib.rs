@@ -61,7 +61,8 @@ pub enum PayloadRole {
 ///   - bits 0-2:   reserved for MMTk (mark bit, forwarding bits)
 ///   - bits 3-18:  payload word count low 16 bits (up to 65535 words for ordinary objects)
 ///   - bits 19-21: VM payload role (0 ordinary, 1 Error envelope, 2 No-Scan ByteBuffer)
-///   - bits 22-30: reserved for ordinary objects; high 9 bits of payload word count for ByteBuffer
+///   - bits 22-27: immutable concurrency stripe index (0..63) for ordinary/Error objects
+///   - bits 22-30: high 9 bits of payload word count for ByteBuffer (bits 28-30 reserved otherwise)
 ///   - bit  31:    pinned flag
 ///
 /// `hash_or_fwd`:  identity hash (normal) / forwarding pointer (during GC).
@@ -72,19 +73,36 @@ pub struct ObjectHeader {
     pub hash_or_fwd: u64,
 }
 
-fn next_object_hash() -> u64 {
+#[inline]
+fn next_object_id() -> u64 {
     static HASH_COUNTER: AtomicU64 = AtomicU64::new(1);
-    HASH_COUNTER.fetch_add(1, Ordering::Relaxed)
+    thread_local! {
+        static LOCAL_ID_RANGE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    LOCAL_ID_RANGE.with(|cell| {
+        let (cur, end) = cell.get();
+        if cur < end {
+            cell.set((cur + 1, end));
+            cur
+        } else {
+            const BATCH: u64 = 4096;
+            let base = HASH_COUNTER.fetch_add(BATCH, Ordering::Relaxed);
+            cell.set((base + 1, base + BATCH));
+            base
+        }
+    })
 }
 
 impl ObjectHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
     pub fn new(type_index: TypeIndex, payload_words: u16) -> Self {
+        let id = next_object_id();
+        let stripe = ((id ^ (id >> 13) ^ (id >> 27)) as u32) & 0x3F;
         Self {
             type_index,
-            gc_meta: (payload_words as u32) << 3,
-            hash_or_fwd: next_object_hash(),
+            gc_meta: ((payload_words as u32) << 3) | (stripe << 22),
+            hash_or_fwd: id,
         }
     }
 
@@ -98,8 +116,14 @@ impl ObjectHeader {
         Some(Self {
             type_index,
             gc_meta,
-            hash_or_fwd: next_object_hash(),
+            hash_or_fwd: next_object_id(),
         })
+    }
+
+    /// Immutable concurrency lock-stripe index (`0..64`), preserved across moving GC.
+    #[inline]
+    pub fn stripe_index(&self) -> usize {
+        ((self.gc_meta >> 22) & 0x3F) as usize
     }
 
     pub fn payload_role(&self) -> Option<PayloadRole> {
@@ -788,7 +812,8 @@ impl Heap {
         }
         let objref = unsafe { ObjectReference::from_raw_address_unchecked(payload_addr) };
         mmtk::memory_manager::post_alloc(mutator, objref, total_size, semantics);
-        self.alloc_count.fetch_add(1, Ordering::Relaxed);
+        let prev = *self.alloc_count.get_mut();
+        *self.alloc_count.get_mut() = prev.wrapping_add(1);
 
         NonNull::new(payload_addr.to_mut_ptr::<u8>())
     }
@@ -847,7 +872,8 @@ impl Heap {
         // SAFETY: `payload_addr` is non-zero and 8-byte aligned.
         let objref = unsafe { ObjectReference::from_raw_address_unchecked(payload_addr) };
         mmtk::memory_manager::post_alloc(mutator, objref, total_size, semantics);
-        self.alloc_count.fetch_add(1, Ordering::Relaxed);
+        let prev = *self.alloc_count.get_mut();
+        *self.alloc_count.get_mut() = prev.wrapping_add(1);
 
         NonNull::new(payload_addr.to_mut_ptr::<u8>())
     }

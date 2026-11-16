@@ -26,16 +26,21 @@ async effect 声明
 ```
 
 - **async effect**：异步效应声明，表示该效应的 handler 将在独立 task 中执行
-- **Future**：效应调用的惰性结果引用
-- **Task**：并发执行的调度单位
-- **Task 树**：task 的父子关系形成的树结构，是结构化并发的基础
-- **Safe-point**：编译器插入的调度检查点
+- **Future(T)**：效应调用的一等静态类型惰性结果引用
+- **Task**：并发执行的调度单位，由多核 Work-Stealing 调度器在 $M:N$ Worker 线程池上并行执行
+- **Task 树**：task 的父子关系形成的树结构，是结构化并发、级联取消与 `defer` 确定性清理的基础
+- **Safe-point**：编译器在循环回边与函数入口插入的低开销调度与移动式 GC 协作检查点
+- **I/O Reactor**：基于 `libuv` 事件循环的非阻塞定时器、子进程、文件系统与网络事件驱动器
 
 ## 本章内容
 
-- [异步代数效应](async-algebraic-effect.md)：async effect 的声明、调用、handler 执行模型
-- [Task 树](task-tree.md)：task 的生命周期、父子关系与调度
-- [结构化并发](structural-concurrency.md)：基于 task 树的结构化并发保证
+- [异步代数效应](async-algebraic-effect.md)：async effect 的声明、调用、handler 执行模型与组合子静态类型推导
+- [Task 树](task-tree.md)：代际 Task 槽表、生命周期、Work-Stealing 调度、I/O Reactor 与跨任务效应边界
+- [结构化并发](structural-concurrency.md)：自动等待、级联取消、`defer` 展开清理与竞速/超时模式
+- 标准库并发与网络模块：
+  - [`std.task`](../standard-library/task.md)：任务让出、非阻塞睡眠、强类型 `Future` 组合子、超时控制与任务树快照
+  - [`std.sync`](../standard-library/sync.md)：任务级非阻塞 `Channel`、`Mutex`、`RwLock`、`Semaphore`、`Once`、`Lazy`、`Barrier` 与原子类型
+  - [`std.net`](../standard-library/net.md)：基于 `libuv` 的非阻塞 TCP、UDP 与异步 DNS 解析
 
 ## 与同步效应的对比
 

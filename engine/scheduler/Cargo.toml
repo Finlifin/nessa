@@ -8,3 +8,5 @@ runtime = { path = "../runtime" }
 nsbc = { path = "../nsbc" }
 stack_pool = { path = "../stack_pool" }
 libuv-sys2 = "1.52"
+crossbeam-deque = "0.8.6"
+parking_lot = "0.12.5"

@@ -363,7 +363,7 @@ fn unfinalized_pool_and_legacy_tpol_revisions_are_rejected() {
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 11,
+        builtin_abi_version: 12,
         builtins: vec![BuiltinImport {
             id: 1,
             name: "println".into(),
@@ -612,7 +612,7 @@ fn finalized_abstract_holder_roundtrips_metadata_but_never_becomes_executable() 
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 11,
+        builtin_abi_version: 12,
         builtins: vec![],
     };
     let bytes = nsbc_io::write_artifact(&artifact).unwrap();

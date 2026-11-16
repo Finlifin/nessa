@@ -152,8 +152,50 @@ impl Coordinator {
         }
     }
 
+    fn begin_execution(&self, identity: usize) -> Result<MutatorSession<'_>, MutatorAccessError> {
+        let owner = std::thread::current().id();
+        let mut registry = self.registry.lock().unwrap();
+        let nested = registry
+            .entries
+            .iter()
+            .any(|(&id, entry)| id != identity && entry.owner == Some(owner) && entry.depth != 0);
+        if nested {
+            return Err(MutatorAccessError::CrossMutatorReentry);
+        }
+        loop {
+            let entry = registry
+                .entries
+                .get(&identity)
+                .expect("mutator is registered");
+            if entry.depth != 0
+                || registry.phase == Phase::Normal
+                || Self::thread_is_running(&registry)
+            {
+                break;
+            }
+            registry = self.changed.wait(registry).unwrap();
+        }
+        let entry = registry.entries.get_mut(&identity).unwrap();
+        if entry.depth != 0 {
+            assert_eq!(
+                entry.owner,
+                Some(owner),
+                "mutator operations must be exclusive"
+            );
+            assert!(!entry.stopped, "cannot reenter a stopped mutator");
+        }
+        entry.owner = Some(owner);
+        entry.depth += 1;
+        Ok(MutatorSession {
+            coordinator: self,
+            identity,
+            _thread_bound: PhantomData,
+        })
+    }
+
     fn end(&self, identity: usize) {
         let mut registry = self.registry.lock().unwrap();
+        let phase = registry.phase;
         let entry = registry
             .entries
             .get_mut(&identity)
@@ -163,7 +205,9 @@ impl Coordinator {
         entry.depth -= 1;
         if entry.depth == 0 {
             entry.owner = None;
-            self.changed.notify_all();
+            if cfg!(test) || phase != Phase::Normal {
+                self.changed.notify_all();
+            }
         }
     }
 
@@ -285,20 +329,7 @@ pub(crate) fn begin(tls: VMMutatorThread) -> MutatorSession<'static> {
 pub(crate) fn begin_execution(
     tls: VMMutatorThread,
 ) -> Result<MutatorSession<'static>, MutatorAccessError> {
-    let owner = std::thread::current().id();
-    let nested = COORDINATOR
-        .registry
-        .lock()
-        .unwrap()
-        .entries
-        .iter()
-        .any(|(&id, entry)| {
-            id != identity(tls.0) && entry.owner == Some(owner) && entry.depth != 0
-        });
-    if nested {
-        return Err(MutatorAccessError::CrossMutatorReentry);
-    }
-    Ok(begin(tls))
+    COORDINATOR.begin_execution(identity(tls.0))
 }
 
 pub(crate) fn poll(tls: VMMutatorThread) {

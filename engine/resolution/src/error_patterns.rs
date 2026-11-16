@@ -245,7 +245,17 @@ pub(crate) fn elimination(
 ) -> Option<TypeIndex> {
     let operand = ast.fixed_children(node)[0];
     typing::resolve_types(r, ast, operand);
-    let input = *r.node_types.get(&operand)?;
+    let Some(&input) = r.node_types.get(&operand) else {
+        if !r.diag_ctx.has_errors() {
+            errors::report(
+                r,
+                ast,
+                node,
+                "Error elimination requires an Error-qualified operand",
+            );
+        }
+        return None;
+    };
     let Some(shape) = r.type_pool.error_shape(input).ok().flatten() else {
         errors::report(
             r,
@@ -277,7 +287,11 @@ pub(crate) fn elimination(
         let reachable = shape.inner != Intrinsic::NoReturn.type_index()
             || ast.node(arm).kind == NodeKind::CatchArm
             || has_error_branch(ast, pattern);
-        if reachable && let Some(&ty) = r.node_types.get(&children[1]) {
+        if reachable
+            && !typing::definitely_diverges(r, ast, children[1])
+            && let Some(&ty) = r.node_types.get(&children[1])
+            && r.type_pool.as_intrinsic(ty) != Some(Intrinsic::NoReturn)
+        {
             body_types.push((children[1], ty));
         }
     }

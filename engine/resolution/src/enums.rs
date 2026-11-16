@@ -492,8 +492,20 @@ pub(crate) fn pattern(
                     "enum pattern arity does not match the variant fields",
                 );
             }
+            let refined_either = crate::task_combinators::refined_either_variant_field(
+                r,
+                node,
+                reference.type_index,
+                reference.variant_tag,
+            );
             for (&child, field) in children.iter().zip(variant.fields) {
-                pattern(r, ast, child, Some(field.ty));
+                let field_ty = refined_either.unwrap_or(field.ty);
+                pattern(r, ast, child, Some(field_ty));
+                if let Some(refined) = refined_either {
+                    crate::task_combinators::record_pattern_element_coercion(
+                        r, ast, child, refined,
+                    );
+                }
             }
         }
         NodeKind::Char

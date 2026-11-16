@@ -79,6 +79,13 @@ pub(crate) fn index_call(
                 .emit(r.diag_ctx);
         }
     }
+    if matches!(kind, CollectionKind::List) {
+        let receiver = ast.fixed_children(node)[0];
+        if let Some(elem_ty) = crate::task_combinators::lookup_await_all_element(r, ast, receiver) {
+            crate::task_combinators::emit_runtime_assert_on_expr(r, node, elem_ty);
+            return elem_ty;
+        }
+    }
     Intrinsic::Any.type_index()
 }
 

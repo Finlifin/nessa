@@ -1,9 +1,7 @@
 //! Dynamic method selection uses the lexical context of the executing call.
 
-use std::collections::HashMap;
-
 use nsbc::{Instruction, MethodCallScope};
-use runtime::TaskId;
+use runtime::{FastHashMap, TaskId};
 use str_interner::StrId;
 use type_pool::{MethodAccess, MethodAccessError, TypeIndex};
 
@@ -17,45 +15,52 @@ impl Vm {
         contexts: Vec<MethodCallScope>,
     ) -> Result<(), VmError> {
         let _operation = self.operation();
-        let mut scopes = HashMap::with_capacity(contexts.len());
-        for context in contexts {
-            if self.state.type_pool.scope_context(context.scope).is_none() {
-                return Err(VmError::MethodAccess(MethodAccessError::InvalidCaller(
-                    context.scope,
-                )));
-            }
-            let function = self
-                .state
-                .bytecode
-                .try_get_function(context.func_id)
-                .ok_or(VmError::InvalidFunction(context.func_id))?;
-            function
-                .instructions
-                .get(context.pc as usize)
-                .and_then(|&word| Instruction::decode(word))
-                .filter(|instruction| nsbc::instruction_requires_scope(instruction.opcode))
-                .ok_or(VmError::MissingMethodContext)?;
-            if scopes
-                .insert((context.func_id, context.pc as usize), context.scope)
-                .is_some()
-            {
-                return Err(VmError::MissingMethodContext);
-            }
-        }
-        for index in 0..self.state.bytecode.function_count() {
-            let func_id = nsbc::FuncId(index as u32);
-            let function = self.state.bytecode.get_function(func_id);
-            for (pc, &word) in function.instructions.iter().enumerate() {
-                if Instruction::decode(word)
-                    .is_some_and(|instruction| nsbc::instruction_requires_scope(instruction.opcode))
-                    && !scopes.contains_key(&(func_id, pc))
+        let mut scopes = FastHashMap::default();
+        scopes.reserve(contexts.len());
+        {
+            let tp = self.type_pool_read();
+            for context in contexts {
+                if tp.scope_context(context.scope).is_none() {
+                    return Err(VmError::MethodAccess(MethodAccessError::InvalidCaller(
+                        context.scope,
+                    )));
+                }
+                let function = self
+                    .shared
+                    .bytecode
+                    .try_get_function(context.func_id)
+                    .ok_or(VmError::InvalidFunction(context.func_id))?;
+                function
+                    .instructions
+                    .get(context.pc as usize)
+                    .and_then(|&word| Instruction::decode(word))
+                    .filter(|instruction| nsbc::instruction_requires_scope(instruction.opcode))
+                    .ok_or(VmError::MissingMethodContext)?;
+                if scopes
+                    .insert((context.func_id, context.pc as usize), context.scope)
+                    .is_some()
                 {
                     return Err(VmError::MissingMethodContext);
                 }
             }
+            for index in 0..self.shared.bytecode.function_count() {
+                let func_id = nsbc::FuncId(index as u32);
+                let function = self.shared.bytecode.get_function(func_id);
+                for (pc, &word) in function.instructions.iter().enumerate() {
+                    if Instruction::decode(word).is_some_and(|instruction| {
+                        nsbc::instruction_requires_scope(instruction.opcode)
+                    }) && !scopes.contains_key(&(func_id, pc))
+                    {
+                        return Err(VmError::MissingMethodContext);
+                    }
+                }
+            }
         }
-        self.state.method_call_scopes = scopes;
-        self.state.jit.invalidate_all();
+        self.with_exclusive_shared_mut(|shared| {
+            shared.method_call_scopes = scopes;
+        });
+        self.bump_metadata_epoch();
+        self.invalidate_jit();
         Ok(())
     }
 
@@ -65,33 +70,35 @@ impl Vm {
         receiver: TypeIndex,
         name: StrId,
     ) -> Result<Option<type_pool::MethodSlot>, VmError> {
-        let task = self
-            .roots
-            .scheduler
-            .get_task(task_id)
-            .ok_or(VmError::InvalidTask)?;
+        let task = self.task_ref(task_id).ok_or(VmError::InvalidTask)?;
+        let caller_func = task.current_func;
+        let caller_pc = task.pc;
+        let cache_key = (caller_func, caller_pc, receiver, name);
+        {
+            let cache = self.sync_meta_cache();
+            if let Some(cached) = cache.method_ic.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
         // Dispatch advances PC before executing the instruction. Restored
         // continuations retain their own function and PC, not handler authority.
-        let caller_scope = task.pc.checked_sub(1).and_then(|pc| {
-            self.state
+        let caller_scope = caller_pc.checked_sub(1).and_then(|pc| {
+            self.shared
                 .method_call_scopes
-                .get(&(task.current_func, pc as usize))
+                .get(&(caller_func, pc as usize))
                 .copied()
         });
+        let tp = self.type_pool_read();
         let mut selected = None;
         let mut found = false;
-        for method in self
-            .state
-            .type_pool
+        for method in tp
             .methods_of(receiver)
             .iter()
             .filter(|method| method.name == name)
         {
             found = true;
             let accessible = match caller_scope {
-                Some(scope) => self
-                    .state
-                    .type_pool
+                Some(scope) => tp
                     .method_accessible(method, scope)
                     .map_err(VmError::MethodAccess)?,
                 // Explicit public host methods on un-scoped intrinsic pools need
@@ -99,7 +106,7 @@ impl Vm {
                 // an installed instruction scope.
                 None if method.access == MethodAccess::Public
                     && method.visible_scope.is_none()
-                    && self.state.type_pool.scopes().is_empty() =>
+                    && tp.scopes().is_empty() =>
                 {
                     true
                 }
@@ -115,6 +122,10 @@ impl Vm {
         if found && selected.is_none() {
             return Err(VmError::MethodAccessDenied);
         }
+        drop(tp);
+        self.sync_meta_cache()
+            .method_ic
+            .insert(cache_key, selected.clone());
         Ok(selected)
     }
 }
@@ -135,8 +146,7 @@ mod tests {
     ) -> crate::tests::TestVm {
         let mut vm = crate::tests::make_vm();
         let ty = Intrinsic::Bool.type_index();
-        vm.state
-            .type_pool
+        vm.type_pool_write()
             .install_scopes(vec![
                 ScopeContext {
                     parent: None,
@@ -166,7 +176,7 @@ mod tests {
             ])
             .unwrap();
         let name = str_interner::intern("permission_probe");
-        vm.state.type_pool.add_method(
+        vm.type_pool_write().add_method(
             ty,
             MethodSlot {
                 name,
@@ -260,7 +270,7 @@ mod tests {
         ));
         drop(incomplete);
         let mut ambiguous = vm(MethodAccess::Public, None, Some(0));
-        ambiguous.state.type_pool.add_method(
+        ambiguous.type_pool_write().add_method(
             Intrinsic::Bool.type_index(),
             MethodSlot {
                 name: str_interner::intern("permission_probe"),
@@ -295,7 +305,7 @@ mod tests {
             vm.task_result_number(task).unwrap().to_i64_checked(),
             Some(42)
         );
-        let replacement = type_pool::TypePool::restore(vm.state.type_pool.snapshot()).unwrap();
+        let replacement = type_pool::TypePool::restore(vm.type_pool_read().snapshot()).unwrap();
         vm.install_type_pool(replacement);
         vm.spawn_root(FuncId(0));
         assert!(matches!(

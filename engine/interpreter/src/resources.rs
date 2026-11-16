@@ -8,8 +8,11 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use crate::VmError;
 
@@ -308,9 +311,13 @@ impl ManagedFile {
     }
 }
 
-pub struct VmFileTable {
+struct VmFileTableInner {
     next_id: i64,
-    files: HashMap<i64, ManagedFile>,
+    files: HashMap<i64, Arc<Mutex<ManagedFile>>>,
+}
+
+pub struct VmFileTable {
+    inner: Mutex<VmFileTableInner>,
 }
 
 impl Default for VmFileTable {
@@ -322,31 +329,41 @@ impl Default for VmFileTable {
 impl VmFileTable {
     pub fn new() -> Self {
         Self {
-            next_id: 3,
-            files: HashMap::new(),
+            inner: Mutex::new(VmFileTableInner {
+                next_id: 3,
+                files: HashMap::new(),
+            }),
         }
     }
 
-    fn alloc_id(&mut self, managed: ManagedFile) -> i64 {
-        let id = self.next_id;
-        self.next_id = self
+    fn alloc_id(&self, managed: ManagedFile) -> i64 {
+        let arc = Arc::new(Mutex::new(managed));
+        let mut inner = self.inner.lock();
+        let id = inner.next_id;
+        inner.next_id = inner
             .next_id
             .checked_add(1)
             .expect("file handle ID overflow");
-        self.files.insert(id, managed);
+        inner.files.insert(id, arc);
         id
     }
 
-    pub fn is_open(&self, id: i64) -> bool {
-        (STD_STDIN..=STD_STDERR).contains(&id) || self.files.contains_key(&id)
+    fn lookup_file(&self, id: i64) -> Option<Arc<Mutex<ManagedFile>>> {
+        self.inner.lock().files.get(&id).cloned()
     }
 
-    pub fn close(&mut self, id: i64) -> (i64, String) {
+    pub fn is_open(&self, id: i64) -> bool {
+        (STD_STDIN..=STD_STDERR).contains(&id) || self.inner.lock().files.contains_key(&id)
+    }
+
+    pub fn close(&self, id: i64) -> (i64, String) {
         if (STD_STDIN..=STD_STDERR).contains(&id) {
             return (IO_INVALID_INPUT, "cannot close standard stream".to_string());
         }
-        match self.files.remove(&id) {
-            Some(mut managed) => {
+        let removed = self.inner.lock().files.remove(&id);
+        match removed {
+            Some(file_lock) => {
+                let mut managed = file_lock.lock();
                 if managed.can_write
                     && let Err(err) = managed.file.flush()
                 {
@@ -358,7 +375,7 @@ impl VmFileTable {
         }
     }
 
-    pub fn open(&mut self, path: &str, mode: &str) -> (i64, i64, String) {
+    pub fn open(&self, path: &str, mode: &str) -> (i64, i64, String) {
         let mut opts = OpenOptions::new();
         let (can_read, can_write, append) = match mode {
             "r" | "rb" => {
@@ -411,10 +428,10 @@ impl VmFileTable {
         }
     }
 
-    pub fn create_temp(&mut self, rng: &mut VmRng) -> (i64, i64, String) {
+    pub fn create_temp(&self, rng: &Mutex<VmRng>) -> (i64, i64, String) {
         let dir = std::env::temp_dir();
         for _ in 0..64 {
-            let suffix = rng.next_u64();
+            let suffix = rng.lock().next_u64();
             let path = dir.join(format!("nessa_tmp_{}_{:016x}", std::process::id(), suffix));
             let mut opts = OpenOptions::new();
             opts.read(true).write(true).create_new(true);
@@ -449,7 +466,7 @@ impl VmFileTable {
         )
     }
 
-    pub fn flush(&mut self, id: i64) -> (i64, String) {
+    pub fn flush(&self, id: i64) -> (i64, String) {
         match id {
             STD_STDIN => (IO_OK, String::new()),
             STD_STDOUT => match io::stdout().flush() {
@@ -460,14 +477,14 @@ impl VmFileTable {
                 Ok(()) => (IO_OK, String::new()),
                 Err(err) => (io_error_code(&err), err.to_string()),
             },
-            _ => match self.files.get_mut(&id) {
-                Some(managed) => managed.flush(),
+            _ => match self.lookup_file(id) {
+                Some(file_lock) => file_lock.lock().flush(),
                 None => (IO_CLOSED, "closed file".to_string()),
             },
         }
     }
 
-    pub fn write_bytes(&mut self, id: i64, bytes: &[u8]) -> (i64, String) {
+    pub fn write_bytes(&self, id: i64, bytes: &[u8]) -> (i64, String) {
         match id {
             STD_STDIN => (
                 IO_INVALID_INPUT,
@@ -487,14 +504,14 @@ impl VmFileTable {
                     Err(err) => (io_error_code(&err), err.to_string()),
                 }
             }
-            _ => match self.files.get_mut(&id) {
-                Some(managed) => managed.write_bytes(bytes),
+            _ => match self.lookup_file(id) {
+                Some(file_lock) => file_lock.lock().write_bytes(bytes),
                 None => (IO_CLOSED, "closed file".to_string()),
             },
         }
     }
 
-    pub fn seek(&mut self, id: i64, whence: i64, offset: i64) -> (i64, i64, String) {
+    pub fn seek(&self, id: i64, whence: i64, offset: i64) -> (i64, i64, String) {
         if (STD_STDIN..=STD_STDERR).contains(&id) {
             return (
                 IO_INVALID_INPUT,
@@ -502,13 +519,13 @@ impl VmFileTable {
                 "cannot seek standard stream".to_string(),
             );
         }
-        match self.files.get_mut(&id) {
-            Some(managed) => managed.seek(whence, offset),
+        match self.lookup_file(id) {
+            Some(file_lock) => file_lock.lock().seek(whence, offset),
             None => (IO_CLOSED, -1, "closed file".to_string()),
         }
     }
 
-    pub fn read_all(&mut self, id: i64) -> Result<(i64, String), VmError> {
+    pub fn read_all(&self, id: i64) -> Result<(i64, String), VmError> {
         let mut raw = Vec::new();
         match id {
             STD_STDIN => {
@@ -525,9 +542,10 @@ impl VmFileTable {
                 ));
             }
             _ => {
-                let Some(managed) = self.files.get_mut(&id) else {
+                let Some(file_lock) = self.lookup_file(id) else {
                     return Ok((IO_CLOSED, "closed file".to_string()));
                 };
+                let mut managed = file_lock.lock();
                 if !managed.can_read {
                     return Ok((IO_INVALID_INPUT, "file is not open for reading".to_string()));
                 }
@@ -555,7 +573,7 @@ impl VmFileTable {
     }
 
     pub fn read_line(
-        &mut self,
+        &self,
         id: i64,
         keep_newline: bool,
     ) -> Result<(i64, Option<String>, String), VmError> {
@@ -598,9 +616,10 @@ impl VmFileTable {
                 ));
             }
             _ => {
-                let Some(managed) = self.files.get_mut(&id) else {
+                let Some(file_lock) = self.lookup_file(id) else {
                     return Ok((IO_CLOSED, None, "closed file".to_string()));
                 };
+                let mut managed = file_lock.lock();
                 if !managed.can_read {
                     return Ok((
                         IO_INVALID_INPUT,
@@ -651,7 +670,7 @@ impl VmFileTable {
     }
 
     pub fn read_chars(
-        &mut self,
+        &self,
         id: i64,
         count: i64,
     ) -> Result<(i64, Option<String>, String), VmError> {
@@ -676,9 +695,10 @@ impl VmFileTable {
                 "standard output stream is not open for reading".to_string(),
             )),
             _ => {
-                let Some(managed) = self.files.get_mut(&id) else {
+                let Some(file_lock) = self.lookup_file(id) else {
                     return Ok((IO_CLOSED, None, "closed file".to_string()));
                 };
+                let mut managed = file_lock.lock();
                 if !managed.can_read {
                     return Ok((
                         IO_INVALID_INPUT,
@@ -686,16 +706,12 @@ impl VmFileTable {
                         "file is not open for reading".to_string(),
                     ));
                 }
-                read_utf8_scalars(&mut ManagedByteSource(managed), count)
+                read_utf8_scalars(&mut ManagedByteSource(&mut managed), count)
             }
         }
     }
 
-    pub fn read_bytes(
-        &mut self,
-        id: i64,
-        max_bytes: i64,
-    ) -> Result<(i64, Vec<u8>, String), VmError> {
+    pub fn read_bytes(&self, id: i64, max_bytes: i64) -> Result<(i64, Vec<u8>, String), VmError> {
         let limit = if max_bytes < 0 {
             None
         } else {
@@ -745,9 +761,10 @@ impl VmFileTable {
                 ));
             }
             _ => {
-                let Some(managed) = self.files.get_mut(&id) else {
+                let Some(file_lock) = self.lookup_file(id) else {
                     return Ok((IO_CLOSED, Vec::new(), "closed file".to_string()));
                 };
+                let mut managed = file_lock.lock();
                 if !managed.can_read {
                     return Ok((
                         IO_INVALID_INPUT,
@@ -796,7 +813,7 @@ impl VmFileTable {
         Ok((IO_OK, raw, String::new()))
     }
 
-    pub fn read_number(&mut self, id: i64) -> (i64, Option<f64>, String) {
+    pub fn read_number(&self, id: i64) -> (i64, Option<f64>, String) {
         match id {
             STD_STDIN => {
                 let stdin = io::stdin();
@@ -809,9 +826,10 @@ impl VmFileTable {
                 "standard output stream is not open for reading".to_string(),
             ),
             _ => {
-                let Some(managed) = self.files.get_mut(&id) else {
+                let Some(file_lock) = self.lookup_file(id) else {
                     return (IO_CLOSED, None, "closed file".to_string());
                 };
+                let mut managed = file_lock.lock();
                 if !managed.can_read {
                     return (
                         IO_INVALID_INPUT,
@@ -819,7 +837,7 @@ impl VmFileTable {
                         "file is not open for reading".to_string(),
                     );
                 }
-                scan_number_token(&mut ManagedByteSource(managed))
+                scan_number_token(&mut ManagedByteSource(&mut managed))
             }
         }
     }
@@ -1214,11 +1232,11 @@ pub fn parse_hex_float(input: &str) -> Option<f64> {
 // VmResourceTable — Monotonic type-tagged host resource registry
 // ---------------------------------------------------------------------------
 
-type ResourceCleanup = Box<dyn FnOnce(Box<dyn std::any::Any>)>;
+type ResourceCleanup = Box<dyn FnOnce(Box<dyn std::any::Any + Send>) + Send>;
 
 struct ResourceEntry {
     type_tag: u64,
-    payload: Option<Box<dyn std::any::Any>>,
+    payload: Option<Box<dyn std::any::Any + Send>>,
     cleanup: Option<ResourceCleanup>,
 }
 
@@ -1247,7 +1265,7 @@ impl VmResourceTable {
         }
     }
 
-    pub fn insert<T: 'static>(&mut self, type_tag: u64, value: T) -> Result<i64, VmError> {
+    pub fn insert<T: Send + 'static>(&mut self, type_tag: u64, value: T) -> Result<i64, VmError> {
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -1264,11 +1282,11 @@ impl VmResourceTable {
         Ok(id)
     }
 
-    pub fn insert_with_cleanup<T: 'static>(
+    pub fn insert_with_cleanup<T: Send + 'static>(
         &mut self,
         type_tag: u64,
         value: T,
-        cleanup: impl FnOnce(T) + 'static,
+        cleanup: impl FnOnce(T) + Send + 'static,
     ) -> Result<i64, VmError> {
         let id = self.next_id;
         self.next_id = self
@@ -1304,7 +1322,7 @@ impl VmResourceTable {
         entry
             .payload
             .as_deref()
-            .and_then(|any| any.downcast_ref::<T>())
+            .and_then(|any| (any as &dyn std::any::Any).downcast_ref::<T>())
             .ok_or(VmError::InvalidArgument("resource payload type mismatch"))
     }
 
@@ -1322,7 +1340,7 @@ impl VmResourceTable {
         entry
             .payload
             .as_deref_mut()
-            .and_then(|any| any.downcast_mut::<T>())
+            .and_then(|any| (any as &mut dyn std::any::Any).downcast_mut::<T>())
             .ok_or(VmError::InvalidArgument("resource payload type mismatch"))
     }
 

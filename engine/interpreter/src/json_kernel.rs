@@ -1542,7 +1542,7 @@ fn write_scalar_value(vm: &Vm, val: TaggedValue, buf: &mut Vec<u8>) -> Result<()
     let ty_name = vm
         .reflected_type(val)
         .ok()
-        .and_then(|ty| vm.state.type_pool.display_name(ty))
+        .and_then(|ty| vm.type_pool_read().display_name(ty))
         .unwrap_or_else(|| "<unknown>".to_string());
     Err((
         JSON_ERR_UNSUPPORTED_VALUE,
@@ -1584,44 +1584,44 @@ fn materialize_dynamic_node(
             let start = *start as usize;
             let len = *len as usize;
             let list = vm.new_list(len)?;
-            let root_idx = vm.roots.temporary_values.borrow().len();
+            let root_idx = vm.worker_roots().temporary_values.borrow().len();
             vm.with_temporary_roots(&[list], |vm| {
                 for i in 0..len {
                     let child_node = tape.array_children[start + i] as usize;
                     let elem = materialize_dynamic_node(vm, tape, child_node)?;
-                    let elem_root = vm.roots.temporary_values.borrow().len();
+                    let elem_root = vm.worker_roots().temporary_values.borrow().len();
                     vm.with_temporary_roots(&[elem], |vm| {
-                        let cur_list = vm.roots.temporary_values.borrow()[root_idx];
-                        let cur_elem = vm.roots.temporary_values.borrow()[elem_root];
+                        let cur_list = vm.worker_roots().temporary_values.borrow()[root_idx];
+                        let cur_elem = vm.worker_roots().temporary_values.borrow()[elem_root];
                         vm.list_set(cur_list, TaggedValue::from_u64(i as u64), cur_elem)
                     })?;
                 }
-                Ok(vm.roots.temporary_values.borrow()[root_idx])
+                Ok(vm.worker_roots().temporary_values.borrow()[root_idx])
             })
         }
         TapeNode::Object { start, len, .. } => {
             let start = *start as usize;
             let len = *len as usize;
             let map = vm.new_map(len)?;
-            let map_root = vm.roots.temporary_values.borrow().len();
+            let map_root = vm.worker_roots().temporary_values.borrow().len();
             vm.with_temporary_roots(&[map], |vm| {
                 for i in 0..len {
                     let entry = tape.object_entries[start + i];
                     let key_val = vm.alloc_string(tape.str_slice(entry.key))?;
-                    let key_root = vm.roots.temporary_values.borrow().len();
+                    let key_root = vm.worker_roots().temporary_values.borrow().len();
                     vm.with_temporary_roots(&[key_val], |vm| {
                         let child_val =
                             materialize_dynamic_node(vm, tape, entry.val_node as usize)?;
-                        let val_root = vm.roots.temporary_values.borrow().len();
+                        let val_root = vm.worker_roots().temporary_values.borrow().len();
                         vm.with_temporary_roots(&[child_val], |vm| {
-                            let cur_map = vm.roots.temporary_values.borrow()[map_root];
-                            let cur_key = vm.roots.temporary_values.borrow()[key_root];
-                            let cur_val = vm.roots.temporary_values.borrow()[val_root];
+                            let cur_map = vm.worker_roots().temporary_values.borrow()[map_root];
+                            let cur_key = vm.worker_roots().temporary_values.borrow()[key_root];
+                            let cur_val = vm.worker_roots().temporary_values.borrow()[val_root];
                             vm.collection_set(cur_map, cur_key, cur_val)
                         })
                     })?;
                 }
-                Ok(vm.roots.temporary_values.borrow()[map_root])
+                Ok(vm.worker_roots().temporary_values.borrow()[map_root])
             })
         }
     }
@@ -1649,11 +1649,10 @@ fn stringify_dynamic_into(
         // performs zero managed heap allocations so no GC can run mid-traversal.
         let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
         if header.is_ordinary() {
-            match vm
-                .state
-                .type_pool
-                .checked_collection_role(header.type_index)
-            {
+            let role = vm
+                .type_pool_read()
+                .checked_collection_role(header.type_index);
+            match role {
                 Ok(Some(CollectionRole::List)) => {
                     if depth + 1 > MAX_JSON_DEPTH {
                         return Err((JSON_ERR_DEPTH_LIMIT, String::new()));
@@ -1661,19 +1660,19 @@ fn stringify_dynamic_into(
                     if ancestors.contains(&val.raw()) {
                         return Err((JSON_ERR_CYCLE_DETECTED, String::new()));
                     }
-                    let layout = vm.list_layout(val).map_err(|_| {
+                    let elems = vm.snapshot_list_elements(val).map_err(|_| {
                         (
                             JSON_ERR_UNSUPPORTED_VALUE,
                             "corrupt List layout".to_string(),
                         )
                     })?;
-                    if layout.length == 0 {
+                    if elems.is_empty() {
                         buf.extend_from_slice(b"[]");
                         return Ok(());
                     }
                     ancestors.push(val.raw());
                     buf.push(b'[');
-                    for i in 0..layout.length {
+                    for (i, &elem) in elems.iter().enumerate() {
                         if i > 0 {
                             buf.push(b',');
                         }
@@ -1681,8 +1680,6 @@ fn stringify_dynamic_into(
                             buf.push(b'\n');
                             write_spaces(buf, (depth + 1) * 2);
                         }
-                        // SAFETY: `i < layout.length` within the live List buffer.
-                        let elem = TaggedValue::from_raw(unsafe { layout.buffer.add(i).read() });
                         stringify_dynamic_into(vm, elem, pretty, depth + 1, ancestors, buf)?;
                     }
                     ancestors.pop();
@@ -1700,19 +1697,24 @@ fn stringify_dynamic_into(
                     if ancestors.contains(&val.raw()) {
                         return Err((JSON_ERR_CYCLE_DETECTED, String::new()));
                     }
-                    let layout = vm.map_layout(val).map_err(|_| {
-                        (JSON_ERR_UNSUPPORTED_VALUE, "corrupt Map layout".to_string())
-                    })?;
-                    if layout.length == 0 {
-                        buf.extend_from_slice(b"{}");
-                        return Ok(());
-                    }
-                    let mut entries = layout.snapshot_entries().map_err(|_| {
-                        (
-                            JSON_ERR_UNSUPPORTED_VALUE,
-                            "JSON object keys must be String".to_string(),
-                        )
-                    })?;
+                    let mut entries = {
+                        let _guard = vm.stripe_read(val).map_err(|_| {
+                            (JSON_ERR_UNSUPPORTED_VALUE, "corrupt Map layout".to_string())
+                        })?;
+                        let layout = vm.map_layout_unlocked(val).map_err(|_| {
+                            (JSON_ERR_UNSUPPORTED_VALUE, "corrupt Map layout".to_string())
+                        })?;
+                        if layout.length == 0 {
+                            buf.extend_from_slice(b"{}");
+                            return Ok(());
+                        }
+                        layout.snapshot_entries().map_err(|_| {
+                            (
+                                JSON_ERR_UNSUPPORTED_VALUE,
+                                "JSON object keys must be String".to_string(),
+                            )
+                        })?
+                    };
                     entries.sort_by(|a, b| a.0.cmp(&b.0));
                     ancestors.push(val.raw());
                     buf.push(b'{');
@@ -1748,7 +1750,7 @@ fn stringify_dynamic_into(
         let ty_name = vm
             .reflected_type(val)
             .ok()
-            .and_then(|ty| vm.state.type_pool.display_name(ty))
+            .and_then(|ty| vm.type_pool_read().display_name(ty))
             .unwrap_or_else(|| "Unit".to_string());
         return Err((
             JSON_ERR_UNSUPPORTED_VALUE,
@@ -1793,16 +1795,16 @@ impl BuiltinCtx<'_> {
         match scan_res {
             Ok(tape) => {
                 let parsed = materialize_dynamic_node(self.vm, &tape, 0)?;
-                let parsed_root = self.vm.roots.temporary_values.borrow().len();
+                let parsed_root = self.vm.worker_roots().temporary_values.borrow().len();
                 self.vm
                     .with_temporary_roots(&[parsed], |vm| {
                         let empty = vm.alloc_string("")?;
-                        let empty_root = vm.roots.temporary_values.borrow().len();
+                        let empty_root = vm.worker_roots().temporary_values.borrow().len();
                         vm.with_temporary_roots(&[empty], |vm| {
                             let code_v = vm.number_value(Number::I64(JSON_OK))?;
                             let off_v = vm.number_value(Number::I64(0))?;
-                            let msg_v = vm.roots.temporary_values.borrow()[empty_root];
-                            let val_v = vm.roots.temporary_values.borrow()[parsed_root];
+                            let msg_v = vm.worker_roots().temporary_values.borrow()[empty_root];
+                            let val_v = vm.worker_roots().temporary_values.borrow()[parsed_root];
                             vm.alloc_tuple(&elem_types, &[code_v, off_v, msg_v, val_v])
                         })
                     })
@@ -1810,15 +1812,15 @@ impl BuiltinCtx<'_> {
             }
             Err(err) => {
                 let msg_val = self.vm.alloc_string(&err.message)?;
-                let msg_root = self.vm.roots.temporary_values.borrow().len();
+                let msg_root = self.vm.worker_roots().temporary_values.borrow().len();
                 self.vm
                     .with_temporary_roots(&[msg_val], |vm| {
                         let code_v = vm.number_value(Number::I64(err.code))?;
-                        let code_root = vm.roots.temporary_values.borrow().len();
+                        let code_root = vm.worker_roots().temporary_values.borrow().len();
                         vm.with_temporary_roots(&[code_v], |vm| {
                             let off_v = vm.number_value(Number::I64(err.offset))?;
-                            let c = vm.roots.temporary_values.borrow()[code_root];
-                            let m = vm.roots.temporary_values.borrow()[msg_root];
+                            let c = vm.worker_roots().temporary_values.borrow()[code_root];
+                            let m = vm.worker_roots().temporary_values.borrow()[msg_root];
                             vm.alloc_tuple(&elem_types, &[c, off_v, m, TaggedValue::NULL])
                         })
                     })
@@ -1852,15 +1854,15 @@ impl BuiltinCtx<'_> {
         };
 
         let msg_v = self.vm.alloc_string(&msg_str)?;
-        let msg_root = self.vm.roots.temporary_values.borrow().len();
+        let msg_root = self.vm.worker_roots().temporary_values.borrow().len();
         self.vm
             .with_temporary_roots(&[msg_v], |vm| {
                 let out_v = vm.alloc_string(&out_str)?;
-                let out_root = vm.roots.temporary_values.borrow().len();
+                let out_root = vm.worker_roots().temporary_values.borrow().len();
                 vm.with_temporary_roots(&[out_v], |vm| {
                     let code_v = vm.number_value(Number::I64(code))?;
-                    let m = vm.roots.temporary_values.borrow()[msg_root];
-                    let o = vm.roots.temporary_values.borrow()[out_root];
+                    let m = vm.worker_roots().temporary_values.borrow()[msg_root];
+                    let o = vm.worker_roots().temporary_values.borrow()[out_root];
                     vm.alloc_tuple(&elem_types, &[code_v, m, o])
                 })
             })
@@ -1882,24 +1884,25 @@ impl BuiltinCtx<'_> {
 
         let (code, handle_or_off, msg) = match scan_res {
             Ok(tape) => {
-                let id = self.vm.state.json.next_tape_id;
-                self.vm.state.json.next_tape_id = id.wrapping_add(1).max(1);
-                self.vm.state.json.tapes.insert(id, tape);
+                let mut json = self.vm.shared.json.lock();
+                let id = json.next_tape_id;
+                json.next_tape_id = id.wrapping_add(1).max(1);
+                json.tapes.insert(id, tape);
                 (JSON_OK, id, String::new())
             }
             Err(err) => (err.code, err.offset, err.message),
         };
 
         let msg_v = self.vm.alloc_string(&msg)?;
-        let msg_root = self.vm.roots.temporary_values.borrow().len();
+        let msg_root = self.vm.worker_roots().temporary_values.borrow().len();
         self.vm
             .with_temporary_roots(&[msg_v], |vm| {
                 let c_v = vm.number_value(Number::I64(code))?;
-                let c_root = vm.roots.temporary_values.borrow().len();
+                let c_root = vm.worker_roots().temporary_values.borrow().len();
                 vm.with_temporary_roots(&[c_v], |vm| {
                     let h_v = vm.number_value(Number::I64(handle_or_off))?;
-                    let c = vm.roots.temporary_values.borrow()[c_root];
-                    let m = vm.roots.temporary_values.borrow()[msg_root];
+                    let c = vm.worker_roots().temporary_values.borrow()[c_root];
+                    let m = vm.worker_roots().temporary_values.borrow()[msg_root];
                     vm.alloc_tuple(&elem_types, &[c, h_v, m])
                 })
             })
@@ -1910,7 +1913,7 @@ impl BuiltinCtx<'_> {
     pub fn json_tape_close(&mut self) -> Result<(), VmError> {
         self.require_arity(1)?;
         let handle = self.arg_i64(0)?;
-        self.vm.state.json.tapes.remove(&handle);
+        self.vm.shared.json.lock().tapes.remove(&handle);
         self.return_unit();
         Ok(())
     }
@@ -1922,10 +1925,13 @@ impl BuiltinCtx<'_> {
         let node = self.arg_i64(1)?;
         let kind = if node < 0 {
             TAPE_KIND_INVALID
-        } else if let Some(tape) = self.vm.state.json.tapes.get(&handle) {
-            tape.node_kind_tag(node as usize)
         } else {
-            TAPE_KIND_INVALID
+            let json = self.vm.shared.json.lock();
+            if let Some(tape) = json.tapes.get(&handle) {
+                tape.node_kind_tag(node as usize)
+            } else {
+                TAPE_KIND_INVALID
+            }
         };
         let v = self.vm.number_value(Number::I64(kind))?;
         self.write_return(v);
@@ -1945,8 +1951,9 @@ impl BuiltinCtx<'_> {
         }
         let found = with_heap_string_str(key_val, |k| {
             self.vm
-                .state
+                .shared
                 .json
+                .lock()
                 .tapes
                 .get_mut(&handle)
                 .and_then(|tape| tape.object_lookup(node as usize, k.as_bytes()))
@@ -1969,10 +1976,8 @@ impl BuiltinCtx<'_> {
             Vec::new()
         } else if let Ok(tuple_elems) = self.vm.tuple_values(known_val) {
             tuple_elems
-        } else if let Ok(layout) = self.vm.list_layout(known_val) {
-            (0..layout.length)
-                .map(|i| TaggedValue::from_raw(unsafe { layout.buffer.add(i).read() }))
-                .collect()
+        } else if let Ok(list_elems) = self.vm.snapshot_list_elements(known_val) {
+            list_elems
         } else {
             return Err(VmError::TypeError);
         };
@@ -1981,7 +1986,8 @@ impl BuiltinCtx<'_> {
             if node < 0 {
                 return None;
             }
-            let tape = self.vm.state.json.tapes.get(&handle)?;
+            let json = self.vm.shared.json.lock();
+            let tape = json.tapes.get(&handle)?;
             let TapeNode::Object { start, len, .. } = tape.nodes.get(node as usize)? else {
                 return None;
             };
@@ -2024,7 +2030,8 @@ impl BuiltinCtx<'_> {
             if node < 0 {
                 return None;
             }
-            let tape = self.vm.state.json.tapes.get(&handle)?;
+            let json = self.vm.shared.json.lock();
+            let tape = json.tapes.get(&handle)?;
             let TapeNode::Object { start, len, .. } = tape.nodes.get(node as usize)? else {
                 return None;
             };
@@ -2041,11 +2048,11 @@ impl BuiltinCtx<'_> {
         let elem_types = [Intrinsic::I64.type_index(), Intrinsic::Str.type_index()];
         let (child_node, vname) = single.unwrap_or((-1, String::new()));
         let s_v = self.vm.alloc_string(&vname)?;
-        let s_root = self.vm.roots.temporary_values.borrow().len();
+        let s_root = self.vm.worker_roots().temporary_values.borrow().len();
         self.vm
             .with_temporary_roots(&[s_v], |vm| {
                 let n_v = vm.number_value(Number::I64(child_node))?;
-                let s = vm.roots.temporary_values.borrow()[s_root];
+                let s = vm.worker_roots().temporary_values.borrow()[s_root];
                 vm.alloc_tuple(&elem_types, &[n_v, s])
             })
             .map(|tuple| self.write_return(tuple))
@@ -2056,13 +2063,16 @@ impl BuiltinCtx<'_> {
         self.require_arity(2)?;
         let handle = self.arg_i64(0)?;
         let node = self.arg_i64(1)?;
-        let len = if node >= 0
-            && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-            && let Some(TapeNode::Array { len, .. }) = tape.nodes.get(node as usize)
-        {
-            i64::from(*len)
-        } else {
-            -1
+        let len = {
+            let json = self.vm.shared.json.lock();
+            if node >= 0
+                && let Some(tape) = json.tapes.get(&handle)
+                && let Some(TapeNode::Array { len, .. }) = tape.nodes.get(node as usize)
+            {
+                i64::from(*len)
+            } else {
+                -1
+            }
         };
         let v = self.vm.number_value(Number::I64(len))?;
         self.write_return(v);
@@ -2075,15 +2085,18 @@ impl BuiltinCtx<'_> {
         let handle = self.arg_i64(0)?;
         let node = self.arg_i64(1)?;
         let idx = self.arg_i64(2)?;
-        let child = if node >= 0
-            && idx >= 0
-            && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-            && let Some(TapeNode::Array { start, len }) = tape.nodes.get(node as usize)
-            && (idx as u64) < u64::from(*len)
-        {
-            i64::from(tape.array_children[*start as usize + idx as usize])
-        } else {
-            -1
+        let child = {
+            let json = self.vm.shared.json.lock();
+            if node >= 0
+                && idx >= 0
+                && let Some(tape) = json.tapes.get(&handle)
+                && let Some(TapeNode::Array { start, len }) = tape.nodes.get(node as usize)
+                && (idx as u64) < u64::from(*len)
+            {
+                i64::from(tape.array_children[*start as usize + idx as usize])
+            } else {
+                -1
+            }
         };
         let v = self.vm.number_value(Number::I64(child))?;
         self.write_return(v);
@@ -2096,19 +2109,22 @@ impl BuiltinCtx<'_> {
         let handle = self.arg_i64(0)?;
         let node = self.arg_i64(1)?;
 
-        let (code, flag, kind_name) = if node >= 0
-            && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-        {
-            match tape.nodes.get(node as usize) {
-                Some(TapeNode::Bool(b)) => (JSON_OK, *b, ""),
-                _ => (
-                    JSON_ERR_TYPE_MISMATCH,
-                    false,
-                    tape.node_kind_name(node as usize),
-                ),
+        let (code, flag, kind_name) = {
+            let json = self.vm.shared.json.lock();
+            if node >= 0
+                && let Some(tape) = json.tapes.get(&handle)
+            {
+                match tape.nodes.get(node as usize) {
+                    Some(TapeNode::Bool(b)) => (JSON_OK, *b, ""),
+                    _ => (
+                        JSON_ERR_TYPE_MISMATCH,
+                        false,
+                        tape.node_kind_name(node as usize),
+                    ),
+                }
+            } else {
+                (JSON_ERR_TYPE_MISMATCH, false, "invalid")
             }
-        } else {
-            (JSON_ERR_TYPE_MISMATCH, false, "invalid")
         };
 
         let elem_types = [
@@ -2117,11 +2133,11 @@ impl BuiltinCtx<'_> {
             Intrinsic::Str.type_index(),
         ];
         let k_v = self.vm.alloc_string(kind_name)?;
-        let k_root = self.vm.roots.temporary_values.borrow().len();
+        let k_root = self.vm.worker_roots().temporary_values.borrow().len();
         self.vm
             .with_temporary_roots(&[k_v], |vm| {
                 let c_v = vm.number_value(Number::I64(code))?;
-                let k = vm.roots.temporary_values.borrow()[k_root];
+                let k = vm.worker_roots().temporary_values.borrow()[k_root];
                 vm.alloc_tuple(&elem_types, &[c_v, TaggedValue::from_bool(flag), k])
             })
             .map(|tuple| self.write_return(tuple))
@@ -2141,28 +2157,32 @@ impl BuiltinCtx<'_> {
             OutOfRange(String),
         }
 
-        let outcome = if node >= 0
-            && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-        {
-            match tape.nodes.get(node as usize) {
-                Some(TapeNode::Number {
-                    offset,
-                    len,
-                    is_float: false,
-                }) => {
-                    let slice = &tape.input[*offset as usize..(*offset as usize + *len as usize)];
-                    match parse_exact_int(slice, target_kind) {
-                        Ok(parsed) => IntOutcome::Ok(parsed),
-                        Err(()) => IntOutcome::OutOfRange(
-                            std::str::from_utf8(slice).unwrap_or("").to_owned(),
-                        ),
+        let outcome = {
+            let json = self.vm.shared.json.lock();
+            if node >= 0
+                && let Some(tape) = json.tapes.get(&handle)
+            {
+                match tape.nodes.get(node as usize) {
+                    Some(TapeNode::Number {
+                        offset,
+                        len,
+                        is_float: false,
+                    }) => {
+                        let slice =
+                            &tape.input[*offset as usize..(*offset as usize + *len as usize)];
+                        match parse_exact_int(slice, target_kind) {
+                            Ok(parsed) => IntOutcome::Ok(parsed),
+                            Err(()) => IntOutcome::OutOfRange(
+                                std::str::from_utf8(slice).unwrap_or("").to_owned(),
+                            ),
+                        }
                     }
+                    Some(TapeNode::Number { is_float: true, .. }) => IntOutcome::Mismatch("float"),
+                    _ => IntOutcome::Mismatch(tape.node_kind_name(node as usize)),
                 }
-                Some(TapeNode::Number { is_float: true, .. }) => IntOutcome::Mismatch("float"),
-                _ => IntOutcome::Mismatch(tape.node_kind_name(node as usize)),
+            } else {
+                IntOutcome::Mismatch("invalid")
             }
-        } else {
-            IntOutcome::Mismatch("invalid")
         };
 
         let elem_types = [
@@ -2174,15 +2194,15 @@ impl BuiltinCtx<'_> {
         match outcome {
             IntOutcome::Ok(parsed) => {
                 let int_v = alloc_parsed_int(self.vm, target_kind, parsed)?;
-                let int_root = self.vm.roots.temporary_values.borrow().len();
+                let int_root = self.vm.worker_roots().temporary_values.borrow().len();
                 self.vm
                     .with_temporary_roots(&[int_v], |vm| {
                         let empty_v = vm.alloc_string("")?;
-                        let empty_root = vm.roots.temporary_values.borrow().len();
+                        let empty_root = vm.worker_roots().temporary_values.borrow().len();
                         vm.with_temporary_roots(&[empty_v], |vm| {
                             let c_v = vm.number_value(Number::I64(JSON_OK))?;
-                            let iv = vm.roots.temporary_values.borrow()[int_root];
-                            let ev = vm.roots.temporary_values.borrow()[empty_root];
+                            let iv = vm.worker_roots().temporary_values.borrow()[int_root];
+                            let ev = vm.worker_roots().temporary_values.borrow()[empty_root];
                             vm.alloc_tuple(&elem_types, &[c_v, iv, ev])
                         })
                     })
@@ -2190,7 +2210,7 @@ impl BuiltinCtx<'_> {
             }
             IntOutcome::Mismatch(actual) => {
                 let k_v = self.vm.alloc_string(actual)?;
-                let k_root = self.vm.roots.temporary_values.borrow().len();
+                let k_root = self.vm.worker_roots().temporary_values.borrow().len();
                 self.vm
                     .with_temporary_roots(&[k_v], |vm| {
                         let zero_v = alloc_parsed_int(
@@ -2210,11 +2230,11 @@ impl BuiltinCtx<'_> {
                                 ParsedInt::Signed(0)
                             },
                         )?;
-                        let z_root = vm.roots.temporary_values.borrow().len();
+                        let z_root = vm.worker_roots().temporary_values.borrow().len();
                         vm.with_temporary_roots(&[zero_v], |vm| {
                             let c_v = vm.number_value(Number::I64(JSON_ERR_TYPE_MISMATCH))?;
-                            let zv = vm.roots.temporary_values.borrow()[z_root];
-                            let kv = vm.roots.temporary_values.borrow()[k_root];
+                            let zv = vm.worker_roots().temporary_values.borrow()[z_root];
+                            let kv = vm.worker_roots().temporary_values.borrow()[k_root];
                             vm.alloc_tuple(&elem_types, &[c_v, zv, kv])
                         })
                     })
@@ -2222,7 +2242,7 @@ impl BuiltinCtx<'_> {
             }
             IntOutcome::OutOfRange(raw_tok) => {
                 let t_v = self.vm.alloc_string(&raw_tok)?;
-                let t_root = self.vm.roots.temporary_values.borrow().len();
+                let t_root = self.vm.worker_roots().temporary_values.borrow().len();
                 self.vm
                     .with_temporary_roots(&[t_v], |vm| {
                         let zero_v = alloc_parsed_int(
@@ -2242,11 +2262,11 @@ impl BuiltinCtx<'_> {
                                 ParsedInt::Signed(0)
                             },
                         )?;
-                        let z_root = vm.roots.temporary_values.borrow().len();
+                        let z_root = vm.worker_roots().temporary_values.borrow().len();
                         vm.with_temporary_roots(&[zero_v], |vm| {
                             let c_v = vm.number_value(Number::I64(JSON_ERR_INT_OUT_OF_RANGE))?;
-                            let zv = vm.roots.temporary_values.borrow()[z_root];
-                            let tv = vm.roots.temporary_values.borrow()[t_root];
+                            let zv = vm.worker_roots().temporary_values.borrow()[z_root];
+                            let tv = vm.worker_roots().temporary_values.borrow()[t_root];
                             vm.alloc_tuple(&elem_types, &[c_v, zv, tv])
                         })
                     })
@@ -2273,31 +2293,35 @@ impl BuiltinCtx<'_> {
             OutOfRange(String),
         }
 
-        let outcome = if node >= 0
-            && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-        {
-            match tape.nodes.get(node as usize) {
-                Some(TapeNode::Number { offset, len, .. }) => {
-                    let slice = &tape.input[*offset as usize..(*offset as usize + *len as usize)];
-                    let tok = std::str::from_utf8(slice).unwrap_or("0");
-                    let v64 = tok.parse::<f64>().unwrap_or(f64::NAN);
-                    if !v64.is_finite() {
-                        FloatOutcome::OutOfRange(tok.to_owned())
-                    } else if is_f32 {
-                        let v32 = v64 as f32;
-                        if !v32.is_finite() {
+        let outcome = {
+            let json = self.vm.shared.json.lock();
+            if node >= 0
+                && let Some(tape) = json.tapes.get(&handle)
+            {
+                match tape.nodes.get(node as usize) {
+                    Some(TapeNode::Number { offset, len, .. }) => {
+                        let slice =
+                            &tape.input[*offset as usize..(*offset as usize + *len as usize)];
+                        let tok = std::str::from_utf8(slice).unwrap_or("0");
+                        let v64 = tok.parse::<f64>().unwrap_or(f64::NAN);
+                        if !v64.is_finite() {
                             FloatOutcome::OutOfRange(tok.to_owned())
+                        } else if is_f32 {
+                            let v32 = v64 as f32;
+                            if !v32.is_finite() {
+                                FloatOutcome::OutOfRange(tok.to_owned())
+                            } else {
+                                FloatOutcome::Ok(f64::from(v32))
+                            }
                         } else {
-                            FloatOutcome::Ok(f64::from(v32))
+                            FloatOutcome::Ok(v64)
                         }
-                    } else {
-                        FloatOutcome::Ok(v64)
                     }
+                    _ => FloatOutcome::Mismatch(tape.node_kind_name(node as usize)),
                 }
-                _ => FloatOutcome::Mismatch(tape.node_kind_name(node as usize)),
+            } else {
+                FloatOutcome::Mismatch("invalid")
             }
-        } else {
-            FloatOutcome::Mismatch("invalid")
         };
 
         let elem_types = [
@@ -2313,15 +2337,15 @@ impl BuiltinCtx<'_> {
         };
 
         let flt_v = self.vm.typed_number_value(Number::F64(fval), target_kind)?;
-        let flt_root = self.vm.roots.temporary_values.borrow().len();
+        let flt_root = self.vm.worker_roots().temporary_values.borrow().len();
         self.vm
             .with_temporary_roots(&[flt_v], |vm| {
                 let s_v = vm.alloc_string(&info)?;
-                let s_root = vm.roots.temporary_values.borrow().len();
+                let s_root = vm.worker_roots().temporary_values.borrow().len();
                 vm.with_temporary_roots(&[s_v], |vm| {
                     let c_v = vm.number_value(Number::I64(code))?;
-                    let fv = vm.roots.temporary_values.borrow()[flt_root];
-                    let sv = vm.roots.temporary_values.borrow()[s_root];
+                    let fv = vm.worker_roots().temporary_values.borrow()[flt_root];
+                    let sv = vm.worker_roots().temporary_values.borrow()[s_root];
                     vm.alloc_tuple(&elem_types, &[c_v, fv, sv])
                 })
             })
@@ -2350,31 +2374,34 @@ impl BuiltinCtx<'_> {
         ];
 
         if want_raw_json {
-            let raw_res: Result<String, &'static str> = if node >= 0
-                && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-                && (node as usize) < tape.nodes.len()
-            {
-                let mut out = Vec::new();
-                write_tape_node_compact(tape, node as usize, &mut out);
-                Ok(String::from_utf8(out).unwrap_or_default())
-            } else {
-                Err("invalid")
+            let raw_res: Result<String, &'static str> = {
+                let json = self.vm.shared.json.lock();
+                if node >= 0
+                    && let Some(tape) = json.tapes.get(&handle)
+                    && (node as usize) < tape.nodes.len()
+                {
+                    let mut out = Vec::new();
+                    write_tape_node_compact(tape, node as usize, &mut out);
+                    Ok(String::from_utf8(out).unwrap_or_default())
+                } else {
+                    Err("invalid")
+                }
             };
             let (code, val_str, info_str) = match raw_res {
                 Ok(s) => (JSON_OK, s, ""),
                 Err(actual) => (JSON_ERR_TYPE_MISMATCH, String::new(), actual),
             };
             let v_s = self.vm.alloc_string(&val_str)?;
-            let v_root = self.vm.roots.temporary_values.borrow().len();
+            let v_root = self.vm.worker_roots().temporary_values.borrow().len();
             return self
                 .vm
                 .with_temporary_roots(&[v_s], |vm| {
                     let i_s = vm.alloc_string(info_str)?;
-                    let i_root = vm.roots.temporary_values.borrow().len();
+                    let i_root = vm.worker_roots().temporary_values.borrow().len();
                     vm.with_temporary_roots(&[i_s], |vm| {
                         let c_v = vm.number_value(Number::I64(code))?;
-                        let vs = vm.roots.temporary_values.borrow()[v_root];
-                        let is = vm.roots.temporary_values.borrow()[i_root];
+                        let vs = vm.worker_roots().temporary_values.borrow()[v_root];
+                        let is = vm.worker_roots().temporary_values.borrow()[i_root];
                         vm.alloc_tuple(&elem_types, &[c_v, vs, is])
                     })
                 })
@@ -2382,23 +2409,26 @@ impl BuiltinCtx<'_> {
         }
 
         if want_char {
-            let char_res: Result<char, &'static str> = if node >= 0
-                && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-            {
-                match tape.nodes.get(node as usize) {
-                    Some(TapeNode::Str(sref)) => {
-                        let s = tape.str_slice(*sref);
-                        let mut chars = s.chars();
-                        match (chars.next(), chars.next()) {
-                            (Some(ch), None) => Ok(ch),
-                            (None, _) => Err("empty string"),
-                            _ => Err("multi-character string"),
+            let char_res: Result<char, &'static str> = {
+                let json = self.vm.shared.json.lock();
+                if node >= 0
+                    && let Some(tape) = json.tapes.get(&handle)
+                {
+                    match tape.nodes.get(node as usize) {
+                        Some(TapeNode::Str(sref)) => {
+                            let s = tape.str_slice(*sref);
+                            let mut chars = s.chars();
+                            match (chars.next(), chars.next()) {
+                                (Some(ch), None) => Ok(ch),
+                                (None, _) => Err("empty string"),
+                                _ => Err("multi-character string"),
+                            }
                         }
+                        _ => Err(tape.node_kind_name(node as usize)),
                     }
-                    _ => Err(tape.node_kind_name(node as usize)),
+                } else {
+                    Err("invalid")
                 }
-            } else {
-                Err("invalid")
             };
 
             let (code, ch_val, info) = match char_res {
@@ -2406,26 +2436,29 @@ impl BuiltinCtx<'_> {
                 Err(actual) => (JSON_ERR_TYPE_MISMATCH, TaggedValue::from_char('\0'), actual),
             };
             let s_v = self.vm.alloc_string(info)?;
-            let s_root = self.vm.roots.temporary_values.borrow().len();
+            let s_root = self.vm.worker_roots().temporary_values.borrow().len();
             return self
                 .vm
                 .with_temporary_roots(&[s_v], |vm| {
                     let c_v = vm.number_value(Number::I64(code))?;
-                    let sv = vm.roots.temporary_values.borrow()[s_root];
+                    let sv = vm.worker_roots().temporary_values.borrow()[s_root];
                     vm.alloc_tuple(&elem_types, &[c_v, ch_val, sv])
                 })
                 .map(|tuple| self.write_return(tuple));
         }
 
-        let str_res: Result<String, &'static str> = if node >= 0
-            && let Some(tape) = self.vm.state.json.tapes.get(&handle)
-        {
-            match tape.nodes.get(node as usize) {
-                Some(TapeNode::Str(sref)) => Ok(tape.str_slice(*sref).to_owned()),
-                _ => Err(tape.node_kind_name(node as usize)),
+        let str_res: Result<String, &'static str> = {
+            let json = self.vm.shared.json.lock();
+            if node >= 0
+                && let Some(tape) = json.tapes.get(&handle)
+            {
+                match tape.nodes.get(node as usize) {
+                    Some(TapeNode::Str(sref)) => Ok(tape.str_slice(*sref).to_owned()),
+                    _ => Err(tape.node_kind_name(node as usize)),
+                }
+            } else {
+                Err("invalid")
             }
-        } else {
-            Err("invalid")
         };
 
         let (code, val_str, info_str) = match str_res {
@@ -2433,15 +2466,15 @@ impl BuiltinCtx<'_> {
             Err(actual) => (JSON_ERR_TYPE_MISMATCH, String::new(), actual),
         };
         let v_s = self.vm.alloc_string(&val_str)?;
-        let v_root = self.vm.roots.temporary_values.borrow().len();
+        let v_root = self.vm.worker_roots().temporary_values.borrow().len();
         self.vm
             .with_temporary_roots(&[v_s], |vm| {
                 let i_s = vm.alloc_string(info_str)?;
-                let i_root = vm.roots.temporary_values.borrow().len();
+                let i_root = vm.worker_roots().temporary_values.borrow().len();
                 vm.with_temporary_roots(&[i_s], |vm| {
                     let c_v = vm.number_value(Number::I64(code))?;
-                    let vs = vm.roots.temporary_values.borrow()[v_root];
-                    let is = vm.roots.temporary_values.borrow()[i_root];
+                    let vs = vm.worker_roots().temporary_values.borrow()[v_root];
+                    let is = vm.worker_roots().temporary_values.borrow()[i_root];
                     vm.alloc_tuple(&elem_types, &[c_v, vs, is])
                 })
             })
@@ -2452,14 +2485,18 @@ impl BuiltinCtx<'_> {
     pub fn json_writer_new(&mut self) -> Result<(), VmError> {
         self.require_arity(1)?;
         let indent = self.arg_i64(0)?;
-        let id = self.vm.state.json.next_writer_id;
-        self.vm.state.json.next_writer_id = id.wrapping_add(1).max(1);
+        let id = {
+            let mut json = self.vm.shared.json.lock();
+            let id = json.next_writer_id;
+            json.next_writer_id = id.wrapping_add(1).max(1);
+            json.writers.insert(id, JsonWriter::new(indent));
+            id
+        };
         self.vm
-            .state
-            .json
-            .writers
-            .insert(id, JsonWriter::new(indent));
-        self.vm.roots.json_writer_ancestors.insert(id, Vec::new());
+            .roots()
+            .json_writer_ancestors
+            .lock()
+            .insert(id, Vec::new());
         let v = self.vm.number_value(Number::I64(id))?;
         self.write_return(v);
         Ok(())
@@ -2478,73 +2515,85 @@ impl BuiltinCtx<'_> {
                 let cycle = is_tracked
                     && self
                         .vm
-                        .roots
+                        .roots()
                         .json_writer_ancestors
+                        .lock()
                         .get(&handle)
                         .is_some_and(|stack| stack.contains(&arg));
-                let Some(writer) = self.vm.state.json.writers.get_mut(&handle) else {
-                    let v = self
-                        .vm
-                        .number_value(Number::I64(JSON_ERR_UNSUPPORTED_VALUE))?;
-                    self.write_return(v);
-                    return Ok(());
-                };
-                if writer.err.is_some() {
-                    writer.status()
-                } else if cycle {
-                    writer.set_err(JSON_ERR_CYCLE_DETECTED, "")
-                } else {
-                    let st = if op == WRITER_OP_BEGIN_OBJ {
-                        writer.begin_obj()
+                let st = {
+                    let mut json = self.vm.shared.json.lock();
+                    if let Some(writer) = json.writers.get_mut(&handle) {
+                        if writer.err.is_some() {
+                            writer.status()
+                        } else if cycle {
+                            writer.set_err(JSON_ERR_CYCLE_DETECTED, "")
+                        } else if op == WRITER_OP_BEGIN_OBJ {
+                            writer.begin_obj()
+                        } else {
+                            writer.begin_arr()
+                        }
                     } else {
-                        writer.begin_arr()
-                    };
-                    if st == JSON_OK
-                        && let Some(stack) = self.vm.roots.json_writer_ancestors.get_mut(&handle)
-                    {
-                        stack.push(if is_tracked { arg } else { TaggedValue::NULL });
+                        JSON_ERR_UNSUPPORTED_VALUE
                     }
-                    st
+                };
+                if st == JSON_OK
+                    && let Some(stack) = self
+                        .vm
+                        .roots()
+                        .json_writer_ancestors
+                        .lock()
+                        .get_mut(&handle)
+                {
+                    stack.push(if is_tracked { arg } else { TaggedValue::NULL });
                 }
+                st
             }
             WRITER_OP_END_OBJ | WRITER_OP_END_ARR => {
-                let Some(writer) = self.vm.state.json.writers.get_mut(&handle) else {
-                    let v = self
-                        .vm
-                        .number_value(Number::I64(JSON_ERR_UNSUPPORTED_VALUE))?;
-                    self.write_return(v);
-                    return Ok(());
-                };
-                if writer.err.is_some() {
-                    writer.status()
-                } else {
-                    if let Some(stack) = self.vm.roots.json_writer_ancestors.get_mut(&handle) {
-                        stack.pop();
-                    }
-                    if op == WRITER_OP_END_OBJ {
-                        writer.end_obj()
+                let mut should_pop = false;
+                let st = {
+                    let mut json = self.vm.shared.json.lock();
+                    if let Some(writer) = json.writers.get_mut(&handle) {
+                        if writer.err.is_some() {
+                            writer.status()
+                        } else {
+                            should_pop = true;
+                            if op == WRITER_OP_END_OBJ {
+                                writer.end_obj()
+                            } else {
+                                writer.end_arr()
+                            }
+                        }
                     } else {
-                        writer.end_arr()
+                        JSON_ERR_UNSUPPORTED_VALUE
                     }
+                };
+                if should_pop
+                    && let Some(stack) = self
+                        .vm
+                        .roots()
+                        .json_writer_ancestors
+                        .lock()
+                        .get_mut(&handle)
+                {
+                    stack.pop();
                 }
+                st
             }
             WRITER_OP_FIELD_KEY => {
                 let key = heap_string_to_owned(arg).ok_or(VmError::TypeError)?;
-                let Some(writer) = self.vm.state.json.writers.get_mut(&handle) else {
-                    let v = self
-                        .vm
-                        .number_value(Number::I64(JSON_ERR_UNSUPPORTED_VALUE))?;
-                    self.write_return(v);
-                    return Ok(());
-                };
-                writer.write_field_key(&key)
+                let mut json = self.vm.shared.json.lock();
+                if let Some(writer) = json.writers.get_mut(&handle) {
+                    writer.write_field_key(&key)
+                } else {
+                    JSON_ERR_UNSUPPORTED_VALUE
+                }
             }
             WRITER_OP_SCALAR => {
-                // Check writer error first before formatting scalar.
                 let already_err = self
                     .vm
-                    .state
+                    .shared
                     .json
+                    .lock()
                     .writers
                     .get(&handle)
                     .map_or(Some(JSON_ERR_UNSUPPORTED_VALUE), |w| {
@@ -2556,45 +2605,50 @@ impl BuiltinCtx<'_> {
                     let mut tmp = Vec::with_capacity(32);
                     match write_scalar_value(self.vm, arg, &mut tmp) {
                         Ok(()) => {
-                            let writer = self.vm.state.json.writers.get_mut(&handle).unwrap();
-                            writer.before_value();
-                            writer.buf.extend_from_slice(&tmp);
-                            JSON_OK
+                            let mut json = self.vm.shared.json.lock();
+                            if let Some(writer) = json.writers.get_mut(&handle) {
+                                writer.before_value();
+                                writer.buf.extend_from_slice(&tmp);
+                                JSON_OK
+                            } else {
+                                JSON_ERR_UNSUPPORTED_VALUE
+                            }
                         }
                         Err((code, msg)) => {
-                            let writer = self.vm.state.json.writers.get_mut(&handle).unwrap();
-                            writer.set_err(code, msg)
+                            let mut json = self.vm.shared.json.lock();
+                            if let Some(writer) = json.writers.get_mut(&handle) {
+                                writer.set_err(code, msg)
+                            } else {
+                                JSON_ERR_UNSUPPORTED_VALUE
+                            }
                         }
                     }
                 }
             }
             WRITER_OP_RAW_JSON => {
                 let raw = heap_string_to_owned(arg).ok_or(VmError::TypeError)?;
-                let Some(writer) = self.vm.state.json.writers.get_mut(&handle) else {
-                    let v = self
-                        .vm
-                        .number_value(Number::I64(JSON_ERR_UNSUPPORTED_VALUE))?;
-                    self.write_return(v);
-                    return Ok(());
-                };
-                writer.write_raw_json(raw.as_bytes())
+                let mut json = self.vm.shared.json.lock();
+                if let Some(writer) = json.writers.get_mut(&handle) {
+                    writer.write_raw_json(raw.as_bytes())
+                } else {
+                    JSON_ERR_UNSUPPORTED_VALUE
+                }
             }
             WRITER_OP_REFORMAT_JSON => {
                 let raw = heap_string_to_owned(arg).ok_or(VmError::TypeError)?;
-                let Some(writer) = self.vm.state.json.writers.get_mut(&handle) else {
-                    let v = self
-                        .vm
-                        .number_value(Number::I64(JSON_ERR_UNSUPPORTED_VALUE))?;
-                    self.write_return(v);
-                    return Ok(());
-                };
-                if writer.err.is_some() {
-                    writer.status()
-                } else {
-                    match reformat_json_into(raw.as_bytes(), &mut writer.buf, writer.indent, 0) {
-                        Ok(()) => JSON_OK,
-                        Err((code, msg)) => writer.set_err(code, msg),
+                let mut json = self.vm.shared.json.lock();
+                if let Some(writer) = json.writers.get_mut(&handle) {
+                    if writer.err.is_some() {
+                        writer.status()
+                    } else {
+                        match reformat_json_into(raw.as_bytes(), &mut writer.buf, writer.indent, 0)
+                        {
+                            Ok(()) => JSON_OK,
+                            Err((code, msg)) => writer.set_err(code, msg),
+                        }
                     }
+                } else {
+                    JSON_ERR_UNSUPPORTED_VALUE
                 }
             }
             _ => return Err(VmError::TypeError),
@@ -2609,8 +2663,9 @@ impl BuiltinCtx<'_> {
     pub fn json_writer_finish(&mut self) -> Result<(), VmError> {
         self.require_arity(1)?;
         let handle = self.arg_i64(0)?;
-        self.vm.roots.json_writer_ancestors.remove(&handle);
-        let (code, msg, out) = match self.vm.state.json.writers.remove(&handle) {
+        self.vm.roots().json_writer_ancestors.lock().remove(&handle);
+        let removed = self.vm.shared.json.lock().writers.remove(&handle);
+        let (code, msg, out) = match removed {
             Some(writer) => match writer.err {
                 Some((code, msg)) => (code, msg, String::new()),
                 None => (
@@ -2632,15 +2687,15 @@ impl BuiltinCtx<'_> {
             Intrinsic::Str.type_index(),
         ];
         let m_v = self.vm.alloc_string(&msg)?;
-        let m_root = self.vm.roots.temporary_values.borrow().len();
+        let m_root = self.vm.worker_roots().temporary_values.borrow().len();
         self.vm
             .with_temporary_roots(&[m_v], |vm| {
                 let o_v = vm.alloc_string(&out)?;
-                let o_root = vm.roots.temporary_values.borrow().len();
+                let o_root = vm.worker_roots().temporary_values.borrow().len();
                 vm.with_temporary_roots(&[o_v], |vm| {
                     let c_v = vm.number_value(Number::I64(code))?;
-                    let mv = vm.roots.temporary_values.borrow()[m_root];
-                    let ov = vm.roots.temporary_values.borrow()[o_root];
+                    let mv = vm.worker_roots().temporary_values.borrow()[m_root];
+                    let ov = vm.worker_roots().temporary_values.borrow()[o_root];
                     vm.alloc_tuple(&elem_types, &[c_v, mv, ov])
                 })
             })
@@ -2651,8 +2706,8 @@ impl BuiltinCtx<'_> {
     pub fn json_writer_close(&mut self) -> Result<(), VmError> {
         self.require_arity(1)?;
         let handle = self.arg_i64(0)?;
-        self.vm.state.json.writers.remove(&handle);
-        self.vm.roots.json_writer_ancestors.remove(&handle);
+        self.vm.shared.json.lock().writers.remove(&handle);
+        self.vm.roots().json_writer_ancestors.lock().remove(&handle);
         self.return_unit();
         Ok(())
     }

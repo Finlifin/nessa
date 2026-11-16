@@ -4,6 +4,8 @@
 //! after their weak wrapper is reached; repeated weak passes compute chains of
 //! owners without retaining isolated cycles.
 
+use std::sync::atomic::Ordering;
+
 use gc::{ConditionalRootCallbacks, NessaSlot, WeakObject};
 use runtime::{ContinuationId, StackContext, StackError, TaggedValue, TaskId};
 use type_pool::TypeIndex;
@@ -11,12 +13,12 @@ use type_pool::TypeIndex;
 use crate::{Vm, VmError, VmRoots};
 
 #[derive(Clone, Copy)]
-pub(super) struct ContinuationInputContract {
+pub(crate) struct ContinuationInputContract {
     pub input: TypeIndex,
     pub scope: Option<u32>,
 }
 
-pub(super) struct ManagedContinuation {
+pub(crate) struct ManagedContinuation {
     task: TaskId,
     owner: WeakObject,
     traced: bool,
@@ -51,17 +53,19 @@ impl Vm {
         handle: ContinuationId,
     ) -> Result<ContinuationInputContract, VmError> {
         let invalid = || VmError::Stack(StackError::InvalidContinuation);
-        let continuation = self.roots.continuations.get(&handle).ok_or_else(invalid)?;
-        if continuation.task != task
+        let (owner_task, contract) = {
+            let guard = self.roots().continuations.lock();
+            let continuation = guard.get(&handle).ok_or_else(invalid)?;
+            (continuation.task, continuation.contract)
+        };
+        if owner_task != task
             || !self
-                .roots
-                .scheduler
-                .get_task(task)
+                .task_ref(task)
                 .is_some_and(|task| task.stacks.has_capture(handle))
         {
             return Err(invalid());
         }
-        Ok(continuation.contract)
+        Ok(contract)
     }
 
     pub(super) fn own_continuation(
@@ -71,10 +75,7 @@ impl Vm {
         value: TaggedValue,
         contract: ContinuationInputContract,
     ) {
-        let roots = &mut *self.roots;
-        roots
-            .scheduler
-            .get_task_mut(task)
+        self.task_mut(task)
             .expect("continuation belongs to a live task")
             .stacks
             .promote_language_capture(handle)
@@ -82,7 +83,7 @@ impl Vm {
         // SAFETY: the wrapper is initialized, and this registry removes dead
         // owners at every weak fixed point before mutators resume.
         let owner = unsafe { WeakObject::new(value.as_heap_ptr().expect("continuation wrapper")) };
-        let previous = roots.continuations.insert(
+        let previous = self.roots().continuations.lock().insert(
             handle,
             ManagedContinuation {
                 task,
@@ -103,7 +104,7 @@ impl Vm {
         // SAFETY: `target` is a live rooted heap object during the active mutator operation;
         // `sweep` / `VmRoots::drop` removes unreachable entries before mutators resume.
         let owner = unsafe { WeakObject::new(ptr) };
-        self.roots.weak_finalizers.push(WeakFinalizer {
+        self.roots().weak_finalizers.lock().push(WeakFinalizer {
             owner,
             reachable: false,
             cleanup: Some(Box::new(cleanup)),
@@ -116,11 +117,21 @@ unsafe fn prepare(context: *const ()) {
     // SAFETY: the registered UnsafeCell is stable; STW gives exclusive access,
     // and preparation runs before ordinary root scanning starts.
     let roots = unsafe { &mut *context.cast::<VmRoots>().cast_mut() };
-    for continuation in roots.continuations.values_mut() {
+    let continuations = unsafe { &mut *roots.continuations.data_ptr() };
+    for continuation in continuations.values_mut() {
         continuation.traced = false;
     }
-    for finalizer in &mut roots.weak_finalizers {
+    let finalizers = unsafe { &mut *roots.weak_finalizers.data_ptr() };
+    for finalizer in finalizers.iter_mut() {
         finalizer.reachable = false;
+    }
+    // SAFETY: STW preparation runs with all mutators stopped and no shard locks held.
+    unsafe {
+        roots.promises.for_each_shard_stopped_mut(|promises| {
+            for entry in promises.values_mut() {
+                entry.traced = false;
+            }
+        });
     }
 }
 
@@ -129,13 +140,12 @@ unsafe fn trace(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) -> bool 
     // the registration lock keeps this UnsafeCell backing state alive.
     let roots = unsafe { &mut *context.cast::<VmRoots>().cast_mut() };
     let scheduler = &mut roots.scheduler;
+    let continuations = unsafe { &mut *roots.continuations.data_ptr() };
     let mut changed = false;
-    roots.continuations.retain(|&handle, continuation| {
+    continuations.retain(|&handle, continuation| {
         let Some(task) = scheduler.get_task_mut(continuation.task) else {
             return false;
         };
-        // Consumed/finished handles must be removed before consulting a weak
-        // pointer that no longer owns any captured stack.
         if !task.stacks.has_capture(handle) {
             return false;
         };
@@ -153,7 +163,36 @@ unsafe fn trace(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) -> bool 
         }
         true
     });
-    for finalizer in &mut roots.weak_finalizers {
+    // SAFETY: exclusive STW weak tracing pass with all mutators parked.
+    unsafe {
+        roots.promises.for_each_shard_stopped_mut(|promises| {
+            for entry in promises.values_mut() {
+                if !entry.traced
+                    && let Some(ref mut owner) = entry.owner
+                {
+                    // SAFETY: current closure is complete; unswept `Future` owners hold
+                    // valid pre-forwarding heap addresses under exclusive STW access.
+                    if owner.is_reachable() {
+                        owner.forward();
+                        entry.traced = true;
+                        if entry.waiters.is_empty()
+                            && entry.all_waiters.is_empty()
+                            && let crate::futures::PromiseState::Completed(ref mut val) =
+                                entry.state
+                        {
+                            // SAFETY: exclusive STW slot visit updates the promise value in place.
+                            visitor(NessaSlot::from_raw_ptr(
+                                (val as *mut TaggedValue).cast::<u64>(),
+                            ));
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        });
+    }
+    let finalizers = unsafe { &mut *roots.weak_finalizers.data_ptr() };
+    for finalizer in finalizers.iter_mut() {
         if !finalizer.reachable {
             // SAFETY: `owner` tracks an unswept heap object under STW after closure completion.
             if unsafe { finalizer.owner.is_reachable() } {
@@ -170,7 +209,8 @@ unsafe fn sweep(context: *const ()) {
     // no tracing work retains slots in the chains discarded below.
     let roots = unsafe { &mut *context.cast::<VmRoots>().cast_mut() };
     let scheduler = &mut roots.scheduler;
-    roots.continuations.retain(|&handle, continuation| {
+    let continuations = unsafe { &mut *roots.continuations.data_ptr() };
+    continuations.retain(|&handle, continuation| {
         if continuation.traced {
             return true;
         }
@@ -183,7 +223,8 @@ unsafe fn sweep(context: *const ()) {
         }
         false
     });
-    roots.weak_finalizers.retain_mut(|finalizer| {
+    let finalizers = unsafe { &mut *roots.weak_finalizers.data_ptr() };
+    finalizers.retain_mut(|finalizer| {
         if finalizer.reachable {
             true
         } else {
@@ -191,13 +232,34 @@ unsafe fn sweep(context: *const ()) {
             false
         }
     });
+    // SAFETY: exclusive STW sweep pass with all mutators parked.
+    unsafe {
+        roots.promises.for_each_shard_stopped_mut(|promises| {
+            promises.retain(|_, entry| {
+                if !entry.traced {
+                    entry.owner = None;
+                }
+                entry.traced
+                    || matches!(entry.state, crate::futures::PromiseState::Pending)
+                    || !entry.waiters.is_empty()
+                    || !entry.all_waiters.is_empty()
+                    || (entry.in_handler_scope
+                        && matches!(entry.state, crate::futures::PromiseState::Failed(_))
+                        && !entry.observed_failure)
+            });
+        });
+    }
+    roots
+        .uncollected_terminal_promises
+        .store(0, Ordering::Relaxed);
 }
 
 unsafe fn forward(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) {
     // SAFETY: the collector's forwarding phase follows weak closure/sweep,
     // retaining only reachable owners, with exclusive stopped state.
     let roots = unsafe { &mut *context.cast::<VmRoots>().cast_mut() };
-    for (&handle, continuation) in &mut roots.continuations {
+    let continuations = unsafe { &mut *roots.continuations.data_ptr() };
+    for (&handle, continuation) in continuations.iter_mut() {
         unsafe { continuation.owner.forward() };
         if let Some(task) = roots.scheduler.get_task_mut(continuation.task)
             && task.stacks.has_capture(handle)
@@ -207,9 +269,31 @@ unsafe fn forward(context: *const (), visitor: &mut dyn FnMut(NessaSlot)) {
                 .expect("retained owner has a capture");
         }
     }
-    for finalizer in &mut roots.weak_finalizers {
+    let finalizers = unsafe { &mut *roots.weak_finalizers.data_ptr() };
+    for finalizer in finalizers.iter_mut() {
         // SAFETY: only reachable finalizers survived `sweep`.
         unsafe { finalizer.owner.forward() };
+    }
+    // SAFETY: exclusive STW forwarding pass with all mutators parked.
+    unsafe {
+        roots.promises.for_each_shard_stopped_mut(|promises| {
+            for entry in promises.values_mut() {
+                if let Some(ref mut owner) = entry.owner {
+                    // SAFETY: only reachable owners remain `Some` after `sweep`.
+                    owner.forward();
+                }
+                if entry.traced
+                    && entry.waiters.is_empty()
+                    && entry.all_waiters.is_empty()
+                    && let crate::futures::PromiseState::Completed(ref mut val) = entry.state
+                {
+                    // SAFETY: exclusive STW forwarding pass updates retained slot in place.
+                    visitor(NessaSlot::from_raw_ptr(
+                        (val as *mut TaggedValue).cast::<u64>(),
+                    ));
+                }
+            }
+        });
     }
 }
 

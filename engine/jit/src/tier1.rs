@@ -225,7 +225,8 @@ pub(crate) fn emit_inline_safepoint(
     asm.or_rr(GpReg::Rax, GpReg::Rcx);
     asm.jcc(Cond::Ne, slow_lbl);
 
-    // Decrement `slice_safepoints`.
+    // Decrement `slice_safepoints`; when budget expires, enter `helper_safepoint`
+    // so live `is_cancelled(task_id)` and `has_other_ready_tasks()` are always polled.
     asm.mov_rm32(GpReg::Rax, GpReg::R12, JitRuntimeCtx::OFF_SLICE_SAFEPOINTS);
     asm.sub_ri32(GpReg::Rax, 1);
     asm.jcc(Cond::Be, budget_zero_lbl);
@@ -233,13 +234,6 @@ pub(crate) fn emit_inline_safepoint(
     asm.jmp(done_lbl);
 
     asm.bind(budget_zero_lbl);
-    asm.movzx_rm8(GpReg::Rax, GpReg::R12, JitRuntimeCtx::OFF_HAS_OTHER_READY);
-    asm.test_rr(GpReg::Rax, GpReg::Rax);
-    let yield_lbl = asm.new_label();
-    asm.jcc(Cond::Ne, yield_lbl);
-    asm.mov_mi32(GpReg::R12, JitRuntimeCtx::OFF_SLICE_SAFEPOINTS, 64);
-    asm.jmp(done_lbl);
-    asm.bind(yield_lbl);
     asm.mov_mi32(GpReg::R12, JitRuntimeCtx::OFF_SLICE_SAFEPOINTS, 1);
 
     asm.bind(slow_lbl);
@@ -283,7 +277,7 @@ pub(crate) fn emit_baseline_instruction(
 
     match instr.opcode {
         // ── R-type integer fast-path arithmetic ──────────────────────────
-        Opcode::Add | Opcode::Sub | Opcode::Mul => {
+        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Mod => {
             let InstructionData::R { dst, src1, src2 } = instr.data else {
                 unreachable!()
             };
@@ -323,6 +317,24 @@ pub(crate) fn emit_baseline_instruction(
                     asm.imul_rr(GpReg::Rdx, GpReg::Rsi);
                     asm.jcc(Cond::O, slow_lbl);
                     asm.or_ri32(GpReg::Rdx, 1);
+                }
+                Opcode::Mod => {
+                    asm.sar_ri8(GpReg::Rax, 7);
+                    asm.sar_ri8(GpReg::Rcx, 7);
+                    asm.test_rr(GpReg::Rcx, GpReg::Rcx);
+                    asm.jcc(Cond::E, slow_lbl);
+                    let not_neg1_lbl = asm.new_label();
+                    let mod_done_lbl = asm.new_label();
+                    asm.cmp_ri32(GpReg::Rcx, -1);
+                    asm.jcc(Cond::Ne, not_neg1_lbl);
+                    asm.mov_ri64(GpReg::Rdx, IMM_I_SMALL_TAG);
+                    asm.jmp(mod_done_lbl);
+                    asm.bind(not_neg1_lbl);
+                    asm.cqo();
+                    asm.idiv_r(GpReg::Rcx);
+                    asm.shl_ri8(GpReg::Rdx, 7);
+                    asm.or_ri32(GpReg::Rdx, 1);
+                    asm.bind(mod_done_lbl);
                 }
                 _ => unreachable!(),
             }
@@ -400,7 +412,7 @@ pub(crate) fn emit_baseline_instruction(
             asm.bind(done_lbl);
         }
 
-        Opcode::Div | Opcode::Mod | Opcode::Shl | Opcode::Shr | Opcode::UShr => {
+        Opcode::Div | Opcode::Shl | Opcode::Shr | Opcode::UShr => {
             emit_numeric_slow_call(asm, input, pc as u32, word, epilogue_lbl);
         }
 

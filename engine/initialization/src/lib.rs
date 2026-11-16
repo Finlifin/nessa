@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use gc::GcConfig;
-use interpreter::Vm;
 pub use interpreter::{JitConfig, JitMode, JitStats};
+use interpreter::{Vm, VmTypePoolRef};
 use stack_pool::StackPool;
 use type_pool::TypePool;
 
@@ -38,8 +38,13 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Initialize a new engine with the given configuration.
+    /// Initialize a new engine with the given configuration and default hardware worker pool.
     pub fn new(config: EngineConfig) -> Self {
+        Self::new_with_workers(config, Vm::default_worker_threads())
+    }
+
+    /// Initialize a new engine with an explicit number of OS worker threads (`>= 1`).
+    pub fn new_with_workers(config: EngineConfig, worker_threads: usize) -> Self {
         // Create TypePool with all intrinsic types pre-registered.
         let type_pool = TypePool::with_intrinsics();
 
@@ -49,8 +54,13 @@ impl Engine {
         // Install the SIGSEGV handler for guard page detection across live pools.
         stack_pool::install_guard_page_handler();
 
-        // Create the VM with MMTk-backed GC and shared stack pool.
-        let mut vm = Vm::new(type_pool, &config.gc, Arc::clone(&stack_pool));
+        // Create the VM with MMTk-backed GC, shared stack pool, and configured worker count.
+        let mut vm = Vm::new_with_workers(
+            type_pool,
+            &config.gc,
+            Arc::clone(&stack_pool),
+            worker_threads.max(1),
+        );
         vm.set_jit_config(config.jit);
 
         // Register all native builtins (fn pointers + type catalog names).
@@ -68,8 +78,8 @@ impl Engine {
         Self::new(EngineConfig::default())
     }
 
-    /// Get a reference to the type pool.
-    pub fn type_pool(&self) -> &TypePool {
+    /// Get a read guard to the type pool.
+    pub fn type_pool(&self) -> VmTypePoolRef<'_> {
         self.vm.type_pool()
     }
 

@@ -4,16 +4,19 @@
 //! - Wrapper (`CollectionRole::Bytes`, `PayloadRole::Ordinary`, 4 words):
 //!   `[len: u64, offset: u64, capacity: u64, buffer: Any]`
 //! - Backing storage (`CollectionRole::BytesBuffer`, `PayloadRole::ByteBuffer`):
-//!   `[share_count: u64][raw bytes: capacity]`
+//!   `[share_count: AtomicU64][raw bytes: capacity]`
 //!
 //! Because backing storage uses `PayloadRole::ByteBuffer`, MMTk never scans its
 //! bytes as `TaggedValue` pointers and seamlessly allocates buffers larger than
 //! `LARGE_OBJECT_THRESHOLD` in Large Object Space (LOS) up to ~256 MiB.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use gc::{MAX_BYTE_BUFFER_BYTES, ObjectHeader, PayloadRole};
 use runtime::{Number, TaggedValue};
 use type_pool::{CollectionRole, Intrinsic};
 
+use crate::collections::{read_u64_atomic, write_u64_atomic};
 use crate::{Vm, VmError};
 
 /// Maximum data byte capacity of a single `Bytes` buffer (8 bytes reserved for `share_count`).
@@ -26,6 +29,44 @@ pub(crate) struct BytesLayout {
     pub(crate) length: usize,
     pub(crate) offset: usize,
     pub(crate) capacity: usize,
+}
+
+#[inline]
+unsafe fn atomic_share_count<'a>(buffer_payload: *mut u8) -> &'a AtomicU64 {
+    // SAFETY: `ByteBuffer` payload starts at an 8-byte aligned address with at least 8 bytes.
+    unsafe { &*buffer_payload.cast::<AtomicU64>() }
+}
+
+#[inline]
+unsafe fn inc_share_count(buffer_payload: *mut u8) {
+    // SAFETY: caller verified `buffer_payload` is non-null and live.
+    let atom = unsafe { atomic_share_count(buffer_payload) };
+    let mut cur = atom.load(Ordering::Acquire);
+    loop {
+        if cur == u64::MAX {
+            return;
+        }
+        match atom.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+#[inline]
+unsafe fn dec_share_count(buffer_payload: *mut u8) {
+    // SAFETY: caller verified `buffer_payload` is non-null and live.
+    let atom = unsafe { atomic_share_count(buffer_payload) };
+    let mut cur = atom.load(Ordering::Acquire);
+    loop {
+        if cur <= 1 || cur == u64::MAX {
+            return;
+        }
+        match atom.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 impl BytesLayout {
@@ -46,7 +87,7 @@ impl BytesLayout {
             0
         } else {
             // SAFETY: `bytes_layout` verified at least 8 bytes precede `data_ptr`.
-            unsafe { self.buffer_payload.cast::<u64>().read() }
+            unsafe { atomic_share_count(self.buffer_payload).load(Ordering::Acquire) }
         }
     }
 }
@@ -116,11 +157,10 @@ impl Vm {
         if !header.is_ordinary() {
             return Ok(false);
         }
-        match self
-            .state
-            .type_pool
-            .checked_collection_role(header.type_index)
-        {
+        let role = self
+            .type_pool_read()
+            .checked_collection_role(header.type_index);
+        match role {
             Ok(Some(CollectionRole::Bytes)) => {
                 self.bytes_layout(value)?;
                 Ok(true)
@@ -136,8 +176,7 @@ impl Vm {
         let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
         if !header.is_ordinary()
             || self
-                .state
-                .type_pool
+                .type_pool_read()
                 .checked_collection_role(header.type_index)
                 .map_err(|_| VmError::TypeError)?
                 != Some(CollectionRole::Bytes)
@@ -146,15 +185,13 @@ impl Vm {
             return Err(VmError::TypeError);
         }
         let wrapper = pointer.cast_mut().cast::<u64>();
-        // SAFETY: validated `Bytes` header guarantees four aligned `TaggedValue` words.
-        let (length, offset, capacity, buffer) = unsafe {
-            (
-                TaggedValue::from_raw(wrapper.read()),
-                TaggedValue::from_raw(wrapper.add(1).read()),
-                TaggedValue::from_raw(wrapper.add(2).read()),
-                TaggedValue::from_raw(wrapper.add(3).read()),
-            )
-        };
+        let wrapper_const = wrapper.cast_const();
+        let (length, offset, capacity, buffer) = (
+            TaggedValue::from_raw(read_u64_atomic(wrapper_const, 0)),
+            TaggedValue::from_raw(read_u64_atomic(wrapper_const, 1)),
+            TaggedValue::from_raw(read_u64_atomic(wrapper_const, 2)),
+            TaggedValue::from_raw(read_u64_atomic(wrapper_const, 3)),
+        );
         let length = length
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
@@ -189,8 +226,7 @@ impl Vm {
         let buf_header = unsafe { ObjectHeader::from_payload_ptr(buf_ptr) };
         if buf_header.payload_role() != Some(PayloadRole::ByteBuffer)
             || self
-                .state
-                .type_pool
+                .type_pool_read()
                 .checked_collection_role(buf_header.type_index)
                 .map_err(|_| VmError::TypeError)?
                 != Some(CollectionRole::BytesBuffer)
@@ -222,16 +258,15 @@ impl Vm {
             return Err(VmError::ObjectTooLarge);
         }
         let buf_ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .bytes_buffer_type()
             .ok_or(VmError::TypeError)?;
         // SAFETY: active execution operation owns mutator; initialized before return.
-        let ptr = unsafe { self.state.heap.alloc_byte_buffer(buf_ty, 8 + capacity) }
+        let ptr = unsafe { self.worker.heap.alloc_byte_buffer(buf_ty, 8 + capacity) }
             .ok_or(VmError::OutOfMemory)?;
         // SAFETY: at least 8 bytes were allocated and 8-byte aligned; set `share_count = 1`.
         unsafe {
-            ptr.as_ptr().cast::<u64>().write(1);
+            atomic_share_count(ptr.as_ptr()).store(1, Ordering::Release);
             Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
         }
     }
@@ -247,36 +282,30 @@ impl Vm {
             ));
         }
         let bytes_ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .bytes_type()
             .ok_or(VmError::TypeError)?;
         let buffer = self.alloc_bytes_buffer(capacity)?;
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[buffer], |vm| {
             // SAFETY: `buffer` is rooted in `temporary_values` across `alloc_object`.
             let wrapper_ptr =
-                unsafe { vm.state.heap.alloc_object(bytes_ty, 4) }.ok_or(VmError::OutOfMemory)?;
-            let reloaded_buf = vm.roots.temporary_values.borrow()[base];
+                unsafe { vm.worker.heap.alloc_object(bytes_ty, 4) }.ok_or(VmError::OutOfMemory)?;
+            let reloaded_buf = vm.worker_roots().temporary_values.borrow()[base];
             let wrapper = wrapper_ptr.as_ptr().cast::<u64>();
+            write_u64_atomic(wrapper, 0, TaggedValue::from_u64(initial_len as u64).raw());
+            write_u64_atomic(wrapper, 1, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(wrapper, 2, TaggedValue::from_u64(capacity as u64).raw());
+            write_u64_atomic(wrapper, 3, reloaded_buf.raw());
             // SAFETY: 4-word wrapper was just allocated and is initialized before safe points.
-            unsafe {
-                wrapper.write(TaggedValue::from_u64(initial_len as u64).raw());
-                wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-                wrapper
-                    .add(2)
-                    .write(TaggedValue::from_u64(capacity as u64).raw());
-                wrapper.add(3).write(reloaded_buf.raw());
-                Ok(TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()))
-            }
+            Ok(unsafe { TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()) })
         })
     }
 
     pub(crate) fn alloc_bytes_from_slice(&mut self, data: &[u8]) -> Result<TaggedValue, VmError> {
         let len = data.len();
         let bytes_ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .bytes_type()
             .ok_or(VmError::TypeError)?;
         let buffer = self.alloc_bytes_buffer(len)?;
@@ -288,23 +317,19 @@ impl Vm {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.cast_mut().add(8), len);
             }
         }
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[buffer], |vm| {
             // SAFETY: `buffer` is rooted in `temporary_values` across `alloc_object`.
             let wrapper_ptr =
-                unsafe { vm.state.heap.alloc_object(bytes_ty, 4) }.ok_or(VmError::OutOfMemory)?;
-            let reloaded_buf = vm.roots.temporary_values.borrow()[base];
+                unsafe { vm.worker.heap.alloc_object(bytes_ty, 4) }.ok_or(VmError::OutOfMemory)?;
+            let reloaded_buf = vm.worker_roots().temporary_values.borrow()[base];
             let wrapper = wrapper_ptr.as_ptr().cast::<u64>();
+            write_u64_atomic(wrapper, 0, TaggedValue::from_u64(len as u64).raw());
+            write_u64_atomic(wrapper, 1, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(wrapper, 2, TaggedValue::from_u64(len as u64).raw());
+            write_u64_atomic(wrapper, 3, reloaded_buf.raw());
             // SAFETY: 4-word wrapper is initialized before publication.
-            unsafe {
-                wrapper.write(TaggedValue::from_u64(len as u64).raw());
-                wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-                wrapper
-                    .add(2)
-                    .write(TaggedValue::from_u64(len as u64).raw());
-                wrapper.add(3).write(reloaded_buf.raw());
-                Ok(TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()))
-            }
+            Ok(unsafe { TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()) })
         })
     }
 
@@ -335,8 +360,8 @@ impl Vm {
                             layout.length,
                         );
                     }
-                    layout.wrapper.add(1).write(TaggedValue::from_u64(0).raw());
                 }
+                write_u64_atomic(layout.wrapper, 1, TaggedValue::from_u64(0).raw());
             }
             return Ok(bytes_val);
         }
@@ -353,10 +378,10 @@ impl Vm {
                 .clamp(16, MAX_BYTES_CAPACITY)
         };
 
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[bytes_val], |vm| {
             let new_buf = vm.alloc_bytes_buffer(new_cap)?;
-            let reloaded_bytes = vm.roots.temporary_values.borrow()[base];
+            let reloaded_bytes = vm.worker_roots().temporary_values.borrow()[base];
             let old = vm.bytes_layout(reloaded_bytes)?;
             let new_buf_ptr = new_buf
                 .as_heap_ptr()
@@ -373,17 +398,12 @@ impl Vm {
                     );
                 }
                 if !old.buffer_payload.is_null() {
-                    let sc = old.buffer_payload.cast::<u64>().read();
-                    if sc > 1 && sc < u64::MAX {
-                        old.buffer_payload.cast::<u64>().write(sc - 1);
-                    }
+                    dec_share_count(old.buffer_payload);
                 }
-                old.wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-                old.wrapper
-                    .add(2)
-                    .write(TaggedValue::from_u64(new_cap as u64).raw());
-                old.wrapper.add(3).write(new_buf.raw());
             }
+            write_u64_atomic(old.wrapper, 1, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(old.wrapper, 2, TaggedValue::from_u64(new_cap as u64).raw());
+            write_u64_atomic(old.wrapper, 3, new_buf.raw());
             Ok(reloaded_bytes)
         })
     }
@@ -433,10 +453,12 @@ impl Vm {
         // SAFETY: `ensure_bytes_unique` reserved `offset + new_len <= capacity` with unique owner.
         unsafe {
             layout.data_ptr.add(layout.offset + old_len).write(byte);
-            layout
-                .wrapper
-                .write(TaggedValue::from_u64(new_len as u64).raw());
         }
+        write_u64_atomic(
+            layout.wrapper,
+            0,
+            TaggedValue::from_u64(new_len as u64).raw(),
+        );
         Ok(())
     }
 
@@ -444,23 +466,17 @@ impl Vm {
         let layout = self.bytes_layout(bytes_val)?;
         if !layout.buffer_payload.is_null() && layout.share_count() > 1 {
             // Detach shared buffer so later pushes on this cleared wrapper cannot clobber views.
-            // SAFETY: `layout` validated both `wrapper` and `buffer_payload`.
+            // SAFETY: `layout` validated `buffer_payload`.
             unsafe {
-                let sc = layout.buffer_payload.cast::<u64>().read();
-                if sc < u64::MAX {
-                    layout.buffer_payload.cast::<u64>().write(sc - 1);
-                }
-                layout.wrapper.write(TaggedValue::from_u64(0).raw());
-                layout.wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-                layout.wrapper.add(2).write(TaggedValue::from_u64(0).raw());
-                layout.wrapper.add(3).write(TaggedValue::NULL.raw());
+                dec_share_count(layout.buffer_payload);
             }
+            write_u64_atomic(layout.wrapper, 0, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(layout.wrapper, 1, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(layout.wrapper, 2, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(layout.wrapper, 3, TaggedValue::NULL.raw());
         } else {
-            // SAFETY: uniquely owned wrapper; reset `len = 0, offset = 0` retaining capacity.
-            unsafe {
-                layout.wrapper.write(TaggedValue::from_u64(0).raw());
-                layout.wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-            }
+            write_u64_atomic(layout.wrapper, 0, TaggedValue::from_u64(0).raw());
+            write_u64_atomic(layout.wrapper, 1, TaggedValue::from_u64(0).raw());
         }
         Ok(())
     }
@@ -481,53 +497,39 @@ impl Vm {
             return self.new_bytes_with_len(0, 0);
         }
         let bytes_ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .bytes_type()
             .ok_or(VmError::TypeError)?;
         // Increment share count before allocating wrapper; rollback if wrapper allocation fails.
         // SAFETY: `slice_len > 0` implies `layout.buffer_payload` is non-null and valid.
         unsafe {
-            let sc = layout.buffer_payload.cast::<u64>().read();
-            layout
-                .buffer_payload
-                .cast::<u64>()
-                .write(sc.saturating_add(1));
+            inc_share_count(layout.buffer_payload);
         }
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[bytes_val], |vm| {
             // SAFETY: `bytes_val` is rooted in `temporary_values` across `alloc_object`.
-            let Some(wrapper_ptr) = (unsafe { vm.state.heap.alloc_object(bytes_ty, 4) }) else {
-                let reloaded = vm.roots.temporary_values.borrow()[base];
+            let Some(wrapper_ptr) = (unsafe { vm.worker.heap.alloc_object(bytes_ty, 4) }) else {
+                let reloaded = vm.worker_roots().temporary_values.borrow()[base];
                 if let Ok(reloaded_layout) = vm.bytes_layout(reloaded)
                     && !reloaded_layout.buffer_payload.is_null()
                 {
                     unsafe {
-                        let sc = reloaded_layout.buffer_payload.cast::<u64>().read();
-                        if sc > 1 && sc < u64::MAX {
-                            reloaded_layout.buffer_payload.cast::<u64>().write(sc - 1);
-                        }
+                        dec_share_count(reloaded_layout.buffer_payload);
                     }
                 }
                 return Err(VmError::OutOfMemory);
             };
-            let reloaded = vm.roots.temporary_values.borrow()[base];
+            let reloaded = vm.worker_roots().temporary_values.borrow()[base];
             let old = vm.bytes_layout(reloaded)?;
             let new_offset = old.offset + start;
             let wrapper = wrapper_ptr.as_ptr().cast::<u64>();
-            // SAFETY: both `old` and `wrapper_ptr` are live with no intervening allocation.
-            unsafe {
-                let buf_val = old.wrapper.add(3).read();
-                wrapper.write(TaggedValue::from_u64(slice_len as u64).raw());
-                wrapper
-                    .add(1)
-                    .write(TaggedValue::from_u64(new_offset as u64).raw());
-                wrapper
-                    .add(2)
-                    .write(TaggedValue::from_u64(old.capacity as u64).raw());
-                wrapper.add(3).write(buf_val);
-                Ok(TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()))
-            }
+            let buf_val = read_u64_atomic(old.wrapper.cast_const(), 3);
+            write_u64_atomic(wrapper, 0, TaggedValue::from_u64(slice_len as u64).raw());
+            write_u64_atomic(wrapper, 1, TaggedValue::from_u64(new_offset as u64).raw());
+            write_u64_atomic(wrapper, 2, TaggedValue::from_u64(old.capacity as u64).raw());
+            write_u64_atomic(wrapper, 3, buf_val);
+            // SAFETY: `wrapper_ptr` is initialized before publication.
+            Ok(unsafe { TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()) })
         })
     }
 
@@ -538,14 +540,13 @@ impl Vm {
             return self.new_bytes_with_len(0, 0);
         }
         let bytes_ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .bytes_type()
             .ok_or(VmError::TypeError)?;
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[bytes_val], |vm| {
             let new_buf = vm.alloc_bytes_buffer(len)?;
-            let src_val = vm.roots.temporary_values.borrow()[base];
+            let src_val = vm.worker_roots().temporary_values.borrow()[base];
             let src_layout = vm.bytes_layout(src_val)?;
             let new_buf_ptr = new_buf.as_heap_ptr().expect("len > 0").cast_mut();
             // SAFETY: no allocation between `bytes_layout` and copy; buffers are distinct.
@@ -556,22 +557,19 @@ impl Vm {
                     len,
                 );
             }
-            let inner_base = vm.roots.temporary_values.borrow().len();
+            let inner_base = vm.worker_roots().temporary_values.borrow().len();
             vm.with_temporary_roots(&[new_buf], |vm| {
                 // SAFETY: `new_buf` is rooted across wrapper allocation.
-                let wrapper_ptr = unsafe { vm.state.heap.alloc_object(bytes_ty, 4) }
+                let wrapper_ptr = unsafe { vm.worker.heap.alloc_object(bytes_ty, 4) }
                     .ok_or(VmError::OutOfMemory)?;
-                let reloaded_buf = vm.roots.temporary_values.borrow()[inner_base];
+                let reloaded_buf = vm.worker_roots().temporary_values.borrow()[inner_base];
                 let wrapper = wrapper_ptr.as_ptr().cast::<u64>();
-                unsafe {
-                    wrapper.write(TaggedValue::from_u64(len as u64).raw());
-                    wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-                    wrapper
-                        .add(2)
-                        .write(TaggedValue::from_u64(len as u64).raw());
-                    wrapper.add(3).write(reloaded_buf.raw());
-                    Ok(TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()))
-                }
+                write_u64_atomic(wrapper, 0, TaggedValue::from_u64(len as u64).raw());
+                write_u64_atomic(wrapper, 1, TaggedValue::from_u64(0).raw());
+                write_u64_atomic(wrapper, 2, TaggedValue::from_u64(len as u64).raw());
+                write_u64_atomic(wrapper, 3, reloaded_buf.raw());
+                // SAFETY: `wrapper_ptr` is initialized before publication.
+                Ok(unsafe { TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()) })
             })
         })
     }
@@ -595,11 +593,11 @@ impl Vm {
         let new_len = dst_len
             .checked_add(src_len)
             .ok_or(VmError::ObjectTooLarge)?;
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[dst, src], |vm| {
-            let dst_root = vm.roots.temporary_values.borrow()[base];
+            let dst_root = vm.worker_roots().temporary_values.borrow()[base];
             let unique_dst = vm.ensure_bytes_unique(dst_root, new_len)?;
-            let reloaded_src = vm.roots.temporary_values.borrow()[base + 1];
+            let reloaded_src = vm.worker_roots().temporary_values.borrow()[base + 1];
             let dst_layout = vm.bytes_layout(unique_dst)?;
             if src_is_str {
                 let s = heap_str_slice(reloaded_src).ok_or(VmError::TypeError)?;
@@ -623,12 +621,11 @@ impl Vm {
                     );
                 }
             }
-            // SAFETY: `dst_layout.wrapper` is live and `new_len <= dst_layout.capacity`.
-            unsafe {
-                dst_layout
-                    .wrapper
-                    .write(TaggedValue::from_u64(new_len as u64).raw());
-            }
+            write_u64_atomic(
+                dst_layout.wrapper,
+                0,
+                TaggedValue::from_u64(new_len as u64).raw(),
+            );
             Ok(())
         })
     }
@@ -639,36 +636,32 @@ impl Vm {
             return self.new_bytes_with_len(0, 0);
         }
         let bytes_ty = self
-            .state
-            .type_pool
+            .type_pool_read()
             .bytes_type()
             .ok_or(VmError::TypeError)?;
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[str_val], |vm| {
             let buf = vm.alloc_bytes_buffer(str_len)?;
-            let reloaded_str = vm.roots.temporary_values.borrow()[base];
+            let reloaded_str = vm.worker_roots().temporary_values.borrow()[base];
             let src_slice = heap_str_slice(reloaded_str).ok_or(VmError::TypeError)?;
             let buf_ptr = buf.as_heap_ptr().expect("str_len > 0").cast_mut();
             // SAFETY: no allocation between `heap_str_slice` and `copy_nonoverlapping`.
             unsafe {
                 std::ptr::copy_nonoverlapping(src_slice.as_ptr(), buf_ptr.add(8), str_len);
             }
-            let inner_base = vm.roots.temporary_values.borrow().len();
+            let inner_base = vm.worker_roots().temporary_values.borrow().len();
             vm.with_temporary_roots(&[buf], |vm| {
                 // SAFETY: `buf` is rooted across wrapper allocation.
-                let wrapper_ptr = unsafe { vm.state.heap.alloc_object(bytes_ty, 4) }
+                let wrapper_ptr = unsafe { vm.worker.heap.alloc_object(bytes_ty, 4) }
                     .ok_or(VmError::OutOfMemory)?;
-                let reloaded_buf = vm.roots.temporary_values.borrow()[inner_base];
+                let reloaded_buf = vm.worker_roots().temporary_values.borrow()[inner_base];
                 let wrapper = wrapper_ptr.as_ptr().cast::<u64>();
-                unsafe {
-                    wrapper.write(TaggedValue::from_u64(str_len as u64).raw());
-                    wrapper.add(1).write(TaggedValue::from_u64(0).raw());
-                    wrapper
-                        .add(2)
-                        .write(TaggedValue::from_u64(str_len as u64).raw());
-                    wrapper.add(3).write(reloaded_buf.raw());
-                    Ok(TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()))
-                }
+                write_u64_atomic(wrapper, 0, TaggedValue::from_u64(str_len as u64).raw());
+                write_u64_atomic(wrapper, 1, TaggedValue::from_u64(0).raw());
+                write_u64_atomic(wrapper, 2, TaggedValue::from_u64(str_len as u64).raw());
+                write_u64_atomic(wrapper, 3, reloaded_buf.raw());
+                // SAFETY: `wrapper_ptr` is initialized before publication.
+                Ok(unsafe { TaggedValue::from_heap_ptr(wrapper_ptr.as_ptr()) })
             })
         })
     }
@@ -704,17 +697,17 @@ impl Vm {
             return Err(VmError::ObjectTooLarge);
         }
         let list = self.new_list(raw.len())?;
-        let base = self.roots.temporary_values.borrow().len();
+        let base = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(&[list], |vm| {
             for (idx, b) in raw.into_iter().enumerate() {
-                let reloaded_list = vm.roots.temporary_values.borrow()[base];
+                let reloaded_list = vm.worker_roots().temporary_values.borrow()[base];
                 vm.list_set(
                     reloaded_list,
                     TaggedValue::from_u64(idx as u64),
                     TaggedValue::from_i64(i64::from(b)),
                 )?;
             }
-            Ok(vm.roots.temporary_values.borrow()[base])
+            Ok(vm.worker_roots().temporary_values.borrow()[base])
         })
     }
 
@@ -729,7 +722,6 @@ impl Vm {
         let needle_slice: &[u8] = if let Some(s) = heap_str_slice(needle) {
             s
         } else {
-            // Need `needle_layout` to live across `memmem::find`.
             let needle_layout = self.bytes_layout(needle)?;
             if start > hay_slice.len() {
                 return Ok(None);

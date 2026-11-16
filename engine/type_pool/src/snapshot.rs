@@ -82,9 +82,19 @@ impl TypePool {
     /// identity sharing is permitted only by transparent aliases of one type.
     pub fn restore(snapshot: TypePoolSnapshot) -> Result<Self, SnapshotError> {
         snapshot.validate()?;
+        let future_types = snapshot
+            .types
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, info)| {
+                matches!(info.kind, TypeKind::Future { .. }).then_some(TypeIndex(idx as u32))
+            })
+            .collect();
         let mut pool = Self {
             types: snapshot.types,
             structural_types: snapshot.structural_types,
+            future_types,
+            future_index_dirty: false,
             id_to_index: HashMap::new(),
             methods: snapshot.methods,
             scope_packages: snapshot.scopes.iter().map(|scope| scope.package).collect(),

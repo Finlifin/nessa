@@ -24,8 +24,7 @@ impl Vm {
     pub fn task_result_number(&mut self, task: TaskId) -> Result<Number, VmError> {
         let _operation = self.operation();
         let value = self
-            .roots
-            .scheduler
+            .scheduler()
             .get_task(task)
             .ok_or(VmError::InvalidTask)?
             .registers
@@ -61,7 +60,7 @@ impl Vm {
         };
         // SAFETY: callers hold execution operations. Inputs are owned scalar
         // snapshots; GC can scan existing roots while allocation is stopped.
-        let payload = unsafe { self.state.heap.alloc_object(kind.type_index(), words) }
+        let payload = unsafe { self.worker.heap.alloc_object(kind.type_index(), words) }
             .ok_or(VmError::OutOfMemory)?;
         // SAFETY: this fresh allocation has one or two aligned u64 words.
         // No allocation or safepoint occurs between initialization and publication.
@@ -81,12 +80,7 @@ impl Vm {
     pub(crate) fn dispatch_numeric(&mut self, task: TaskId, instr: Instruction) -> DispatchResult {
         let (destination, left, right) = r_regs(&instr);
         let result = (|| {
-            let registers = &self
-                .roots
-                .scheduler
-                .get_task(task)
-                .ok_or(VmError::InvalidTask)?
-                .registers;
+            let registers = &self.task_ref(task).ok_or(VmError::InvalidTask)?.registers;
             // SAFETY: execution owns the mutator operation; register values are
             // rooted, and both reads finish before the next managed allocation.
             let a =
@@ -104,13 +98,12 @@ impl Vm {
         })();
         match result {
             Ok(value) => {
-                self.roots
-                    .scheduler
-                    .get_task_mut(task)
-                    .unwrap()
-                    .registers
-                    .set(destination, value);
-                DispatchResult::Continue
+                if let Some(t) = self.task_mut(task) {
+                    t.registers.set(destination, value);
+                    DispatchResult::Continue
+                } else {
+                    DispatchResult::Error(VmError::InvalidTask)
+                }
             }
             Err(error) => DispatchResult::Error(error),
         }
@@ -177,53 +170,49 @@ impl Vm {
         instr: Instruction,
     ) -> DispatchResult {
         let (destination, left, right) = r_regs(&instr);
-        let registers = &self.roots.scheduler.get_task(task).unwrap().registers;
-        let (a, b) = (registers.get(left), registers.get(right));
+        let Some(task_ref) = self.task_ref(task) else {
+            return DispatchResult::Error(VmError::InvalidTask);
+        };
+        let (a, b) = (task_ref.registers.get(left), task_ref.registers.get(right));
         if matches!(instr.opcode, Opcode::CmpEq | Opcode::CmpNe) {
             match self.error_equal(a, b, 0) {
                 Ok(Some(equal)) => {
-                    self.roots
-                        .scheduler
-                        .get_task_mut(task)
-                        .unwrap()
-                        .registers
-                        .set(
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(
                             destination,
                             TaggedValue::from_bool(equal == (instr.opcode == Opcode::CmpEq)),
                         );
-                    return DispatchResult::Continue;
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
                 }
                 Err(error) => return DispatchResult::Error(error),
                 Ok(None) => {}
             }
             match self.enum_equal(a, b) {
                 Ok(Some(equal)) => {
-                    self.roots
-                        .scheduler
-                        .get_task_mut(task)
-                        .unwrap()
-                        .registers
-                        .set(
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(
                             destination,
                             TaggedValue::from_bool(equal == (instr.opcode == Opcode::CmpEq)),
                         );
-                    return DispatchResult::Continue;
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
                 }
                 Err(error) => return DispatchResult::Error(error),
                 Ok(None) => {}
             }
             match self.scalar_equal(a, b) {
                 Ok(equal) => {
-                    self.roots
-                        .scheduler
-                        .get_task_mut(task)
-                        .unwrap()
-                        .registers
-                        .set(
+                    if let Some(t) = self.task_mut(task) {
+                        t.registers.set(
                             destination,
                             TaggedValue::from_bool(equal == (instr.opcode == Opcode::CmpEq)),
                         );
-                    return DispatchResult::Continue;
+                        return DispatchResult::Continue;
+                    }
+                    return DispatchResult::Error(VmError::InvalidTask);
                 }
                 Err(error) => return DispatchResult::Error(error),
             }
@@ -239,13 +228,12 @@ impl Vm {
             Opcode::CmpGe => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
             _ => return DispatchResult::Error(VmError::InvalidInstruction(instr.encode())),
         };
-        self.roots
-            .scheduler
-            .get_task_mut(task)
-            .unwrap()
-            .registers
-            .set(destination, TaggedValue::from_bool(result));
-        DispatchResult::Continue
+        if let Some(t) = self.task_mut(task) {
+            t.registers.set(destination, TaggedValue::from_bool(result));
+            DispatchResult::Continue
+        } else {
+            DispatchResult::Error(VmError::InvalidTask)
+        }
     }
 
     /// Coherent 64-bit hash across scalar values (`Unit`, `null`, `bool`, `char`,

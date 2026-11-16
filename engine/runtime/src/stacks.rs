@@ -1,13 +1,12 @@
 //! Delimiter-owned stacks. Capture and resume change links, never copy frames.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nsbc::{FuncId, Reg};
 use stack_pool::{StackHandle, StackPool};
 
-use crate::{CallFrame, EffectHandler, RegisterFile, TaggedValue};
+use crate::{CallFrame, EffectHandler, FastHashMap, FastHashSet, RegisterFile, TaggedValue};
 
 /// A prompt identifies a delimiter, with nearest matching prompt semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +50,10 @@ pub struct StackContext {
     pub pc: u32,
     pub current_func: FuncId,
     pub handler_stack: Vec<EffectHandler>,
+    /// LIFO stack of registered `defer` PCs and `EffectHandler` scopes in the active frame.
+    pub unwind_stack: Vec<crate::UnwindEntry>,
+    /// True when the active frame is currently running a cancellation `defer` block.
+    pub is_unwind_target: bool,
 }
 
 impl StackContext {
@@ -63,6 +66,8 @@ impl StackContext {
             pc: 0,
             current_func: func_id,
             handler_stack: Vec::new(),
+            unwind_stack: Vec::new(),
+            is_unwind_target: false,
         }
     }
 
@@ -102,11 +107,16 @@ impl StackContext {
 struct OwnedStack {
     handle: StackHandle,
     pool: Arc<StackPool>,
+    touched: bool,
 }
 
 impl Drop for OwnedStack {
     fn drop(&mut self) {
-        self.pool.dealloc(&self.handle);
+        if self.touched {
+            self.pool.dealloc(&self.handle);
+        } else {
+            self.pool.dealloc_untouched(&self.handle);
+        }
     }
 }
 
@@ -133,7 +143,7 @@ pub struct TaskStacks {
     segments: Vec<Option<Box<Segment>>>,
     vacant: Vec<usize>,
     active: usize,
-    captured: HashMap<ContinuationId, CapturedStack>,
+    captured: FastHashMap<ContinuationId, CapturedStack>,
     pool: Option<Arc<StackPool>>,
 }
 
@@ -158,7 +168,7 @@ impl TaskStacks {
             }))],
             active: 0,
             vacant: Vec::new(),
-            captured: HashMap::new(),
+            captured: FastHashMap::default(),
             pool: None,
         }
     }
@@ -169,6 +179,7 @@ impl TaskStacks {
         stacks.segment_mut(0).allocation = Some(OwnedStack {
             handle: pool.alloc(),
             pool: Arc::clone(&pool),
+            touched: false,
         });
         stacks.pool = Some(pool);
         stacks
@@ -241,15 +252,17 @@ impl TaskStacks {
         }
     }
 
-    pub fn effective_handlers(&self) -> Vec<EffectHandler> {
-        let mut handlers = Vec::new();
-        let mut seen = HashSet::new();
+    pub fn write_effective_handlers(&self, handlers: &mut Vec<EffectHandler>) {
+        handlers.clear();
         let mut current = Some(self.active);
         while let Some(index) = current {
             let segment = self.segment(index);
             for handler in segment.context.handler_stack.iter().rev() {
-                if seen.insert(handler.effect_type) {
-                    handlers.push(handler.clone());
+                if !handlers
+                    .iter()
+                    .any(|existing: &EffectHandler| existing.effect_type == handler.effect_type)
+                {
+                    handlers.push(*handler);
                 }
             }
             current = segment.parent;
@@ -257,7 +270,40 @@ impl TaskStacks {
         // Retain only the visible binding for each effect. Repeated ancestor
         // snapshots would otherwise grow the environment at every nesting.
         handlers.reverse();
+    }
+
+    pub fn effective_handlers(&self) -> Vec<EffectHandler> {
+        let mut handlers = Vec::new();
+        self.write_effective_handlers(&mut handlers);
         handlers
+    }
+
+    /// Collect visible handlers across active delimiter segments into `buf` (innermost first),
+    /// returning `Some(len)` if `<= N` handlers exist, or `None` if `> N`.
+    pub fn collect_effective_handlers_inline<const N: usize>(
+        &self,
+        buf: &mut [EffectHandler; N],
+    ) -> Option<usize> {
+        let mut len = 0usize;
+        let mut current = Some(self.active);
+        while let Some(index) = current {
+            let segment = self.segment(index);
+            for handler in segment.context.handler_stack.iter().rev() {
+                if !buf[..len]
+                    .iter()
+                    .any(|existing| existing.effect_type == handler.effect_type)
+                {
+                    if len >= N {
+                        return None;
+                    }
+                    buf[len] = *handler;
+                    len += 1;
+                }
+            }
+            current = segment.parent;
+        }
+        buf[..len].reverse();
+        Some(len)
     }
 
     /// Enumerate all owned contexts, including conditionally rooted language templates.
@@ -268,8 +314,11 @@ impl TaskStacks {
             .filter_map(|segment| segment.as_deref().map(|segment| &segment.context))
     }
 
-    fn conditional_segments(&self) -> HashSet<usize> {
-        let mut conditional = HashSet::new();
+    fn conditional_segments(&self) -> FastHashSet<usize> {
+        let mut conditional = FastHashSet::default();
+        if self.captured.is_empty() {
+            return conditional;
+        }
         for captured in self
             .captured
             .values()
@@ -394,6 +443,7 @@ impl TaskStacks {
         let allocation = self.pool.as_ref().map(|pool| OwnedStack {
             handle: pool.alloc(),
             pool: Arc::clone(pool),
+            touched: false,
         });
         let index = self.insert_segment(Segment {
             context,
@@ -486,6 +536,7 @@ impl TaskStacks {
             let allocation = self.pool.as_ref().map(|pool| OwnedStack {
                 handle: pool.alloc(),
                 pool: Arc::clone(pool),
+                touched: false,
             });
             let index = self.insert_segment(Segment {
                 context,
@@ -557,11 +608,31 @@ impl TaskStacks {
         self.vacant.clear();
         let root = self.segment_mut(0);
         root.allocation.take();
+        root.prompts.clear();
+        root.parent = None;
         root.context.call_stack.clear();
         root.context.local_slots = Vec::new();
         root.context.handler_stack.clear();
+        root.context.unwind_stack.clear();
+        root.context.is_unwind_target = false;
         root.context.display_state = None;
         self.active = 0;
+    }
+
+    /// Reinitialize an already-finished `TaskStacks` in place for a newly spawned task,
+    /// reusing the boxed root `Segment` without heap reallocation.
+    pub fn reinit_for_spawn(&mut self, func_id: FuncId, pool: Option<Arc<StackPool>>) {
+        self.finish();
+        let root = self.segment_mut(0);
+        root.context.registers.regs.fill(TaggedValue::UNIT);
+        root.context.pc = 0;
+        root.context.current_func = func_id;
+        root.allocation = pool.as_ref().map(|p| OwnedStack {
+            handle: p.alloc(),
+            pool: Arc::clone(p),
+            touched: false,
+        });
+        self.pool = pool;
     }
 }
 
@@ -736,8 +807,10 @@ mod tests {
             display_state: None,
             return_pc: 9,
             func_id: FuncId(2),
-            saved_regs: vec![(Reg(20), TaggedValue::from_i64(123))],
+            saved_regs: crate::SavedRegs::from_slice(&[(Reg(20), TaggedValue::from_i64(123))]),
             local_slots: vec![TaggedValue::from_i64(88)],
+            unwind_stack: Vec::new(),
+            is_unwind_target: false,
         });
         let context_address = stacks.active() as *const StackContext;
         let frame_address = stacks.active().call_stack.as_ptr();
@@ -870,8 +943,10 @@ mod tests {
             display_state: None,
             return_pc: 4,
             func_id: FuncId(1),
-            saved_regs: vec![(Reg(20), TaggedValue::from_i64(10))],
+            saved_regs: crate::SavedRegs::from_slice(&[(Reg(20), TaggedValue::from_i64(10))]),
             local_slots: vec![TaggedValue::from_i64(30)],
+            unwind_stack: Vec::new(),
+            is_unwind_target: false,
         });
         stacks.active_mut().local_slots = vec![TaggedValue::from_i64(40)];
         let original_locals = stacks.active().local_slots.as_ptr();
@@ -1037,8 +1112,10 @@ mod tests {
             }),
             return_pc: 0,
             func_id: FuncId(0),
-            saved_regs: vec![(Reg(1), TaggedValue::from_i64(5))],
+            saved_regs: crate::SavedRegs::from_slice(&[(Reg(1), TaggedValue::from_i64(5))]),
             local_slots: vec![TaggedValue::from_i64(6)],
+            unwind_stack: Vec::new(),
+            is_unwind_target: false,
         });
         context.handler_stack.push(EffectHandler {
             effect_type: type_pool::TypeIndex::from_raw(1),

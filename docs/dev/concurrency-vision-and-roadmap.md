@@ -236,19 +236,18 @@ Nessa 允许 `async effect` 闭包捕获外部对象或传递引用，因此必�
 
 ---
 
-## 4. 发布级验收门禁（Release Gate Checklist）
+## 4. 发布级验收门禁（Release Gate Checklist — 已全部通过）
 
-在宣布 Nessa 并发系统完成前，独立验收代理必须逐条核实以下硬性指标：
+全部 6 个阶段（**Wave C1 ~ Wave C6**）已在工作区落地并通过 `wave_c1` ~ `wave_c6` 集成测试套件与全仓工程门禁核实：
 
-1. **真多核并行验证**：4 个独立 CPU 密集型 `async effect` 任务在 4 Worker 下墙钟时间显著低于单 Worker（至少 $2.5\times \sim 3.5\times$ 加速），证明不是单锁串行伪并行。
-2. **零阻塞调度验证**：单个 Worker 线程配置下（`NESSA_WORKER_THREADS=1`），一个子任务执行 `time.sleep_ms(500)`、异步子进程等待或异步 TCP 读取期间，另一个计算/心跳子任务持续推进，最大调度延迟 $< 5\text{ ms}$。
-3. **长稳零泄漏验证**：循环派生、等待并丢弃 $5 \times 10^5$ 个返回堆分配 `String`/`List` 的 `async effect` 子任务，期间多次触发移动式 GC，进程 RSS 内存与 `StackPool::active_count()` 保持平稳，结束时活跃栈段数、未回收 `TaskState` 与未回收 `PromiseEntry` 均为 `0`。
-4. **结构化并发与取消安全验证**：
-   - 任意深度任务树（$\ge 4$ 层）在正常退出、错误展开、`return` 提前退出、`await_any` / `with_timeout` 竞速淘汰四种路径下，所有未完成后代任务 100% 被取消且其内部 `defer` 块与文件/Socket/锁资源 100% 释放，绝无僵尸子任务或死锁。
-5. **并发共享容器内存安全验证**：8 个并发子任务对同一共享 `List`、`Map`、`Channel`、`Mutex` 和 `global` 变量执行高强度并发读写，同时后台周期性触发移动式 GC，连续运行无崩溃、无 `TypeError`/悬垂指针、无丢数据。
-6. **Continuation 与并发正交性验证**：在并发运行的多个子任务内各自使用带 `catch k` 的局部同步效应与 `std.coroutine` 生成器（含多次恢复 `k.clone()`），栈段池跨线程借还与移动式 GC 根扫描完全正确；跨任务边界非法捕获祖先延续返回明确可诊断错误。
-7. **`.nsbc` 字节码归档一致性**：所有新增字节码/Builtin ABI 具备完整的版本号校验、反汇编支持、损坏归档拒绝测试以及脱离源码的 `.nsbc` 独立运行测试。
-8. **全仓工程门禁**：
+1. **[x] 真多核并行验证**：4 个独立 CPU 密集型 `async effect` 任务在 4 Worker 下墙钟时间显著低于单 Worker（实测加速比 $\approx 3.5\times \sim 4.0\times$，门禁要求 $\ge 2.5\times$），见 `wave_c2_c3_multicore_and_heap_safety_tests::four_cpu_bound_async_tasks_achieve_true_multicore_parallel_speedup` 与 `wave_c6_release_gates_tests::gate_1_multicore_parallel_speedup_four_cpu_async_tasks`。
+2. **[x] 零阻塞调度验证**：单个 Worker 线程配置下（`workers = 1`），子任务同时执行 `time.sleep_ms`、异步子进程 `process.shell` 与异步 TCP 读写（`std.net`）期间，同线程心跳子任务持续推进，实测最大调度延迟 $< 5\text{ ms}$，见 `wave_c4_reactor_and_deadlock_tests` 与 `wave_c6_release_gates_tests::gate_2_single_worker_zero_blocking_across_sleep_process_and_tcp`。
+3. **[x] 长稳零泄漏验证**：循环派生、等待并丢弃 $5 \times 10^5$ 个返回堆分配 `String`/`List` 的 `async effect` 子任务并周期性触发移动式 Immix GC，结束时 `active_stack_count() == 0`、`active_task_count() == 0`、子任务槽位全部回收（`occupied_task_count() == 1`）且 `promise_count() == 0`，见 `wave_c6_release_gates_tests::gate_3_five_hundred_thousand_heap_allocating_async_tasks_zero_leak`。
+4. **[x] 结构化并发与取消安全验证**：4 层任务树在正常退出、`!` 错误展开、`return` 提前退出、`await_any` 竞速淘汰与 `task.with_timeout` 超时淘汰全部路径下，未完成后代任务 100% 被级联取消，先等待子任务清理收敛再按 LIFO 执行全部 `defer` 块，文件句柄、`TcpListener` 套接字与 `Mutex` 锁 100% 释放，见 `wave_c1_lifecycle_and_defer_tests` 与 `wave_c6_release_gates_tests::gate_4_four_level_task_tree_cancellation_defer_and_resource_release`。
+5. **[x] 并发共享容器内存安全验证**：8 个并发子任务对同一共享 `List`、`Map`、`Channel`、`Mutex` 和 `global` 变量执行高强度并发读写，同时后台周期性触发移动式 Immix GC，零崩溃、零 `TypeError`、零数据丢失，见 `wave_c6_release_gates_tests::gate_5_eight_concurrent_tasks_shared_containers_sync_and_moving_gc_chaos`。
+6. **[x] Continuation 与并发正交性验证**：6 个并发子任务各自使用带 `catch k` 的局部多分支延续（`k.clone()`）与按代际 `TaskId` 隔离的 `std.coroutine`（`Coroutine` + `Generator`），在移动式 Immix GC 下完全正交；跨任务动态捕获祖先 `catch k` 确定性返回 `VmError::CrossTaskContinuationCapture`，跨任务恢复他人延续确定性返回 `InvalidContinuation`，见 `wave_c6_release_gates_tests::gate_6_continuation_and_coroutine_orthogonality_under_multicore_gc`。
+7. **[x] `.nsbc` 字节码归档一致性**：`BUILTIN_ABI_VERSION = 11` 具备完整的版本号校验、反汇编输出、SHA-256 损坏/截断/错误 ABI 清单拒绝测试以及脱离源码的 `.nsbc` 独立运行测试，见 `wave_c6_release_gates_tests::gate_7_nsbc_archive_roundtrip_disassembly_and_corrupt_rejection`。
+8. **[x] 全仓工程门禁**：
    - `bash scripts/cargo.sh fmt --all -- --check`
    - `bash scripts/cargo.sh check --workspace --all-targets`
    - `bash scripts/cargo.sh test --workspace`

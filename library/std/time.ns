@@ -21,6 +21,7 @@ pub fn difftime(t2: i64, t1: i64) -> f64 = (t2 - t1).as(f64)
 pub fn monotonic_nanos() -> i64 = _time_monotonic_nanos()
 pub fn cpu_secs() -> f64 = _time_cpu_secs()
 pub fn sleep_ms(ms: i64) -> Unit = _time_sleep_ms(ms)
+pub fn sleep(dur: Duration) -> Unit = _time_sleep_ms(dur.as_millis())
 
 pub struct Duration {
     pub nanos: i64,

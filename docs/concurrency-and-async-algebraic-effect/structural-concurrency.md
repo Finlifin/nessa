@@ -64,34 +64,33 @@ fn main() {
 └── [Task C] ← 自动取消
 ```
 
-## 取消机制
+## 取消机制与确定性 `defer` 展开
 
 ### 取消的实现
 
-task 被取消时，不会立刻终止——它会在下一个 **safe-point** 处检查取消标志，然后：
+当 task 因父作用域提前 `return`、错误 `!` 传播、`await_any` / `await_first` 竞速淘汰或 `task.with_timeout` 到期而被标记取消时，它会在下一个 **safe-point** 或挂起原语（`libuv` I/O、`std.sync` 等待队列、`.await`）处立即感知取消信号，并进入受保护的 **`UnwindingCancel` 展开阶段**：
 
-1. 停止执行当前逻辑
-2. 取消所有子 task（级联取消）
-3. 等待子 task 全部停止
-4. 清理资源，进入 `Cancelled` 状态
+1. **停止正常控制流**并唤醒/撤销当前正在等待的定时器、子进程、TCP/UDP 套接字或 `Channel`/`Mutex`/`Semaphore` 队列条目
+2. **级联取消并等待所有子 task 收敛**：确保子任务的资源清理先于父任务完成（严格内层先于外层析构顺序）
+3. **自顶向下按 LIFO 逆序执行当前任务所有活跃栈帧中的 `defer` 块与 handler 弹出清理**（期间屏蔽重复取消中断，确保 `defer { file.close() }`、`defer { sock.close() }`、`Mutex.with_lock` 解锁等 RAII 逻辑 100% 完整执行）
+4. **归还栈段至 `StackPool`**，状态收敛为 `Cancelled`
 
 ```
 [被取消的 Task]
     │
-    ├── 继续执行...
+    ├── [safe-point / 挂起原语唤醒] 检测到 cancelled == true
+    │   └── 撤销未决 I/O 句柄 / 同步等待队列节点（若有活跃子进程则终止并回收）
     │
-    ├── [safe-point] 检查取消标志 → 发现被取消
+    ├── 向下级联取消所有子 task，并等待子 task 全部完成清理
     │
-    ├── 向所有子 task 发送取消信号
+    ├── 进入 UnwindingCancel：沿调用栈按 LIFO 顺序执行全部已注册 defer 块
     │
-    ├── 等待子 task 停止
-    │
-    └── 清理资源 → 状态变为 Cancelled
+    └── 弹出 handler 帧、归还栈段 → 状态变为 Cancelled
 ```
 
 ### 安全取消
 
-由于取消只发生在 safe-point，task 的状态在取消时是**一致的**。不会在一个操作执行到一半时被强制终止（区别于线程的 `kill`）。
+由于取消只在 safe-point 或显式任务挂起点生效，且严格执行 `defer` 栈展开，任务不会在半条字节码或容器扩容中途被强杀（区别于裸线程 `pthread_cancel`），也不会泄漏锁、文件描述符、套接字或外部子进程。
 
 ## 与 Task 树的关系
 
@@ -146,22 +145,19 @@ fn race_fetch(urls: List) -> #fetch Response {
 
 ### 超时
 
-结合 async effect 实现超时控制：
+可以直接使用标准库 `std.task.with_timeout(ms, thunk)`（内部基于 `libuv` 非阻塞定时器与结构化子任务自动取消），或使用 `task.await_first` 自定义竞速：
 
 ```nessa
-async effect timeout(duration: Duration) -> Unit
+use std.task
+use std.task.TimeoutError
+
 async effect fetch(url: String) -> !NetErr Response
 
-fn fetch_with_timeout(url: String, dur: Duration) -> #[fetch, timeout] !TimeoutErr Response {
-    let data_future = fetch(url)#
-    let timeout_future = timeout(dur)#
-
-    -- 哪个先完成就用哪个的结果
-    -- 如果 timeout 先完成，fetch 的子 task 被取消
-    await_first(data_future, timeout_future) match {
-        Left(response) => response!,
-        Right(_) => error TimeoutErr.Expired,
-    }
+fn fetch_with_timeout(url: String, ms: i64) -> #fetch ![TimeoutError, NetErr] Response {
+    -- 若超过 ms 毫秒未完成，内部工作子任务及其打开的套接字/子任务会被自动级联取消并执行 defer
+    task.with_timeout(ms, || -> !NetErr Response {
+        fetch(url)#.await!
+    })!
 }
 ```
 

@@ -185,8 +185,7 @@ mod tests {
             // SAFETY: the fixture holds an operation and does not allocate or
             // collect while inspecting the newly initialized test payload.
             let pointer = unsafe {
-                vm.state
-                    .heap
+                vm.heap_mut()
                     .alloc_object(Intrinsic::Closure.type_index(), words)
             }
             .unwrap();

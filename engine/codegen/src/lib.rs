@@ -363,14 +363,44 @@ impl Codegen {
 
         emitter.call_scope = None;
 
-        // Compute block order (simple linear order).
+        // Compute block order (simple linear order) and identify precise safepoint blocks:
+        //   1. Function entry (block 0) covers all direct and mutual recursion.
+        //   2. Backward-jump targets (`target.0 <= block.id.0`) cover all loop back-edges.
         let block_count = func.blocks.len();
         emitter.block_offsets = vec![0u32; block_count];
+        let mut safepoint_blocks = vec![false; block_count];
+        if !safepoint_blocks.is_empty() {
+            safepoint_blocks[0] = true;
+        }
+        for block in &func.blocks {
+            match &block.terminator {
+                Terminator::Goto(target) => {
+                    if target.0 <= block.id.0 && (target.0 as usize) < block_count {
+                        safepoint_blocks[target.0 as usize] = true;
+                    }
+                }
+                Terminator::Branch(_, then_target, else_target) => {
+                    if then_target.0 <= block.id.0 && (then_target.0 as usize) < block_count {
+                        safepoint_blocks[then_target.0 as usize] = true;
+                    }
+                    if else_target.0 <= block.id.0 && (else_target.0 as usize) < block_count {
+                        safepoint_blocks[else_target.0 as usize] = true;
+                    }
+                }
+                Terminator::Return(_) | Terminator::Unreachable | Terminator::MatchFail => {}
+            }
+        }
 
         // First pass: emit code for each block.
         for block in &func.blocks {
-            emitter.block_offsets[block.id.0 as usize] = emitter.current_pc();
-            self.emit_block(block, &mut emitter, &mut layout);
+            let block_idx = block.id.0 as usize;
+            emitter.block_offsets[block_idx] = emitter.current_pc();
+            self.emit_block(
+                block,
+                safepoint_blocks[block_idx],
+                &mut emitter,
+                &mut layout,
+            );
         }
 
         // Second pass: fix up jump offsets.
@@ -433,9 +463,16 @@ impl Codegen {
         }
     }
 
-    fn emit_block(&mut self, block: &BasicBlock, emitter: &mut Emitter, layout: &mut FrameLayout) {
-        // Emit safepoint at block entry (for GC coordination).
-        emitter.emit_safepoint();
+    fn emit_block(
+        &mut self,
+        block: &BasicBlock,
+        emit_safepoint: bool,
+        emitter: &mut Emitter,
+        layout: &mut FrameLayout,
+    ) {
+        if emit_safepoint {
+            emitter.emit_safepoint();
+        }
 
         // Emit statements.
         for stmt in &block.stmts {
@@ -1623,12 +1660,8 @@ mod tests {
                 }
             );
             let destination = (hop_pc as i64 + offset as i64) as usize;
-            assert_eq!(
-                Instruction::decode(words[destination]).unwrap().opcode,
-                Opcode::Safepoint
-            );
             let nsbc::InstructionData::A { imm12, .. } =
-                Instruction::decode(words[destination + 1]).unwrap().data
+                Instruction::decode(words[destination]).unwrap().data
             else {
                 panic!("expected result load")
             };

@@ -1,16 +1,36 @@
--- std.task — cooperative task control and structured Future combinators.
+-- std.task — cooperative task control, structured Future combinators, timeouts, and introspection.
 
 use .builtin.*
 use .collections.*
+use .time.Duration
 use .traits.*
 
 private const _panic: fn(Any) -> NoReturn = .panic'builtin
 private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+private const _time_sleep_ms: fn(i64) -> Unit = .__time_sleep_ms'builtin
 private const _task_yield: fn() -> Unit = .__task_yield'builtin
 private const _task_await_all: fn(List) -> List = .__task_await_all'builtin
 private const _task_await_any: fn(List) -> Any = .__task_await_any'builtin
 private const _task_is_ready: fn(Future) -> bool = .__task_is_ready'builtin
 private const _task_await_indexed: fn(List) -> (i64, Any) = .__task_await_indexed'builtin
+private const _task_current_id: fn() -> i64 = .__task_current_id'builtin
+private const _task_tree_snapshot: fn() -> String = .__task_tree_snapshot'builtin
+
+private async effect _TimeoutWork() -> Any
+private async effect _TimeoutTimer(ms: i64) -> Unit
+
+pub struct TimeoutError {
+    pub millis: i64,
+
+    pub fn new(millis: i64) -> TimeoutError = TimeoutError { millis: millis }
+}
+derive Eq, PartialEq for TimeoutError
+
+impl Display for TimeoutError {
+    pub fn to_string(self) -> String {
+        "TimeoutError(" ++ _to_string_raw(self.millis) ++ "ms)"
+    }
+}
 
 pub enum Either {
     pub Left(value: Any),
@@ -69,6 +89,22 @@ pub fn yield_now() -> Unit {
     _task_yield()
 }
 
+pub fn sleep_ms(ms: i64) -> Unit {
+    _time_sleep_ms(ms)
+}
+
+pub fn sleep(dur: Duration) -> Unit {
+    _time_sleep_ms(dur.as_millis())
+}
+
+pub fn current_id() -> i64 {
+    _task_current_id()
+}
+
+pub fn tree_snapshot() -> String {
+    _task_tree_snapshot()
+}
+
 pub fn is_ready(f: Future) -> bool {
     _task_is_ready(f)
 }
@@ -90,5 +126,28 @@ pub fn await_first(first: Future, second: Future) -> Either {
         Either.Left(value)
     } else {
         Either.Right(value)
+    }
+}
+
+private fn _make_timeout_err(ms: i64) -> !TimeoutError Any {
+    error TimeoutError.new(ms)
+}
+
+pub fn with_timeout(ms: i64, thunk: fn() -> Any) -> Any {
+    if ms < 0 {
+        let e: Any = _make_timeout_err(ms)
+        return e
+    }
+    handles _TimeoutWork() => thunk()
+    handles _TimeoutTimer(d: i64) => _time_sleep_ms(d)
+    let pair = List()
+    pair.push(_TimeoutWork())
+    pair.push(_TimeoutTimer(ms))
+    let (idx, value) = _task_await_indexed(pair)
+    if idx == 0 {
+        value
+    } else {
+        let e: Any = _make_timeout_err(ms)
+        e
     }
 }

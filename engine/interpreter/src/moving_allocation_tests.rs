@@ -5,14 +5,14 @@ use type_pool::{FieldInfo, Intrinsic, TypeId, TypeInfo, TypeKind, VariantInfo};
 use crate::{Vm, builtin_ctx::heap_string_to_owned, tests::make_vm};
 
 fn root(vm: &mut Vm, value: TaggedValue) -> usize {
-    let mut roots = vm.roots.temporary_values.borrow_mut();
+    let mut roots = vm.worker_roots().temporary_values.borrow_mut();
     let index = roots.len();
     roots.push(value);
     index
 }
 
 fn load(vm: &Vm, index: usize) -> TaggedValue {
-    vm.roots.temporary_values.borrow()[index]
+    vm.worker_roots().temporary_values.borrow()[index]
 }
 
 #[test]
@@ -20,13 +20,18 @@ fn allocation_slow_paths_reload_moved_receivers_and_payloads() {
     const MARKER: &str = "NESSA_ALLOCATION_MOVEMENT_CHILD";
     if std::env::var_os(MARKER).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "moving_allocation_tests::allocation_slow_paths_reload_moved_receivers_and_payloads", "--nocapture"])
+            .args([
+                "--exact",
+                "moving_allocation_tests::allocation_slow_paths_reload_moved_receivers_and_payloads",
+                "--nocapture",
+            ])
             .env(MARKER, "1")
             .env("MMTK_STRESS_FACTOR", "1")
             .env("MMTK_PRECISE_STRESS", "true")
             .env("MMTK_IMMIX_ALWAYS_DEFRAG", "true")
             .env("MMTK_IMMIX_DEFRAG_EVERY_BLOCK", "true")
-            .output().unwrap();
+            .output()
+            .unwrap();
         eprintln!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -44,28 +49,32 @@ fn allocation_slow_paths_reload_moved_receivers_and_payloads() {
         has_default: false,
         offset,
     };
-    let tuple = vm.state.type_pool.intern_structural(TypeKind::Tuple {
-        elements: vec![Intrinsic::F64.type_index()],
-    });
-    let choice = vm.state.type_pool.register(TypeInfo {
-        kind: TypeKind::Enum {
-            name: str_interner::intern("MovingChoice"),
-            variants: vec![VariantInfo {
-                name: str_interner::intern("some"),
-                fields: vec![
-                    field("text", Intrinsic::Str.type_index(), 0),
-                    field("number", tuple, 1),
-                ],
-                tag: 0,
-            }],
-        },
-        type_id: TypeId(811, 42),
-        size: 24,
-        align: 8,
-    });
-    let receiver_type = vm.state.type_pool.intern_structural(TypeKind::Tuple {
-        elements: vec![tuple],
-    });
+    let (choice, receiver_type) = {
+        let mut type_pool = vm.type_pool_write();
+        let tuple = type_pool.intern_structural(TypeKind::Tuple {
+            elements: vec![Intrinsic::F64.type_index()],
+        });
+        let choice = type_pool.register(TypeInfo {
+            kind: TypeKind::Enum {
+                name: str_interner::intern("MovingChoice"),
+                variants: vec![VariantInfo {
+                    name: str_interner::intern("some"),
+                    fields: vec![
+                        field("text", Intrinsic::Str.type_index(), 0),
+                        field("number", tuple, 1),
+                    ],
+                    tag: 0,
+                }],
+            },
+            type_id: TypeId(811, 42),
+            size: 24,
+            align: 8,
+        });
+        let receiver_type = type_pool.intern_structural(TypeKind::Tuple {
+            elements: vec![tuple],
+        });
+        (choice, receiver_type)
+    };
     let before = vm.completed_collections();
     let string = vm.alloc_string("kept payload").unwrap();
     let text = root(vm, string);
@@ -140,10 +149,10 @@ fn allocation_slow_paths_reload_moved_receivers_and_payloads() {
         heap_string_to_owned(vm.list_get(keys, TaggedValue::from_u64(0)).unwrap()).as_deref(),
         Some("kept payload")
     );
-    let raw_tuple_type = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+    let raw_tuple_type = vm.type_pool_write().intern_structural(TypeKind::Tuple {
         elements: vec![Intrinsic::I64.type_index()],
     });
-    let pointer = unsafe { vm.state.heap.alloc_object(raw_tuple_type, 1) }.unwrap();
+    let pointer = unsafe { vm.heap_mut().alloc_object(raw_tuple_type, 1) }.unwrap();
     // SAFETY: initialize the fresh one-word allocation before another allocation.
     unsafe {
         pointer
@@ -152,10 +161,10 @@ fn allocation_slow_paths_reload_moved_receivers_and_payloads() {
             .write(TaggedValue::from_i64(42).raw());
     }
     let input = root(vm, unsafe { TaggedValue::from_heap_ptr(pointer.as_ptr()) });
-    let argument_type = vm.state.type_pool.intern_structural(TypeKind::Tuple {
+    let argument_type = vm.type_pool_write().intern_structural(TypeKind::Tuple {
         elements: vec![Intrinsic::Str.type_index(), raw_tuple_type],
     });
-    let pointer = unsafe { vm.state.heap.alloc_object(argument_type, 2) }.unwrap();
+    let pointer = unsafe { vm.heap_mut().alloc_object(argument_type, 2) }.unwrap();
     // SAFETY: initialize both fresh fields from roots updated by this allocation.
     unsafe {
         pointer.as_ptr().cast::<u64>().write(load(vm, text).raw());
@@ -187,7 +196,7 @@ fn allocation_slow_paths_reload_moved_receivers_and_payloads() {
         unsafe { runtime::Number::from_tagged(vm.load_field_value(number, 0).unwrap()) },
         Some(runtime::Number::F64(42.0))
     );
-    let pointer = unsafe { vm.state.heap.alloc_object(receiver_type, 1) }.unwrap();
+    let pointer = unsafe { vm.heap_mut().alloc_object(receiver_type, 1) }.unwrap();
     unsafe {
         pointer
             .as_ptr()

@@ -6,6 +6,7 @@ use gc::ObjectHeader;
 use runtime::TaggedValue;
 use type_pool::{CollectionRole, Intrinsic, TypeIndex, TypeKind};
 
+use crate::collections::read_u64_atomic;
 use crate::{Vm, VmError};
 
 const MAX_DISPLAY_BYTES: usize = 1024 * 1024;
@@ -13,7 +14,7 @@ const MAX_DISPLAY_DEPTH: usize = 128;
 
 enum AggregateShape {
     List,
-    Map(Vec<usize>),
+    Map(Vec<TaggedValue>),
     Bytes(usize),
     Tuple,
     Enum(String),
@@ -21,8 +22,7 @@ enum AggregateShape {
 }
 
 struct AggregateLayout {
-    pointer: *const u64,
-    length: usize,
+    elements: Vec<TaggedValue>,
     shape: AggregateShape,
     element_types: Option<Vec<TypeIndex>>,
 }
@@ -30,11 +30,8 @@ struct AggregateLayout {
 impl Vm {
     fn aggregate_layout(&self, value: TaggedValue) -> Result<Option<AggregateLayout>, VmError> {
         if let Some(layout) = self.error_layout(value, 0)? {
-            let pointer = value.as_heap_ptr().ok_or(VmError::TypeError)?;
-            // SAFETY: checked Error layout contains exactly the payload slot.
             return Ok(Some(AggregateLayout {
-                pointer: unsafe { pointer.cast::<u64>().add(2) },
-                length: 1,
+                elements: vec![layout.payload],
                 shape: AggregateShape::Error(layout.tag != type_pool::TypeId::ZERO),
                 element_types: None,
             }));
@@ -42,9 +39,13 @@ impl Vm {
         if let Some(layout) = self.enum_layout(value)? {
             let name = str_interner::try_get(layout.name).ok_or(VmError::TypeError)?;
             let variant = str_interner::try_get(layout.variant_name).ok_or(VmError::TypeError)?;
+            let len = layout.fields.len();
+            let mut elements = Vec::with_capacity(len);
+            for i in 0..len {
+                elements.push(TaggedValue::from_raw(read_u64_atomic(layout.pointer, i)));
+            }
             return Ok(Some(AggregateLayout {
-                pointer: layout.pointer,
-                length: layout.fields.len(),
+                elements,
                 shape: AggregateShape::Enum(format!("{name}.{variant}")),
                 element_types: Some(layout.fields.iter().map(|field| field.ty).collect()),
             }));
@@ -54,36 +55,42 @@ impl Vm {
         };
         // SAFETY: caller retains this live value through a rooted aggregate graph.
         let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
-        match self
-            .state
-            .type_pool
+        let role = self
+            .type_pool_read()
             .checked_collection_role(header.type_index)
-            .map_err(|_| VmError::TypeError)?
-        {
+            .map_err(|_| VmError::TypeError)?;
+        match role {
             Some(CollectionRole::List) => {
-                let layout = self.list_layout(value)?;
+                let elements = self.snapshot_list_elements(value)?;
                 return Ok(Some(AggregateLayout {
-                    pointer: layout.buffer,
-                    length: layout.length,
+                    elements,
                     shape: AggregateShape::List,
                     element_types: None,
                 }));
             }
             Some(CollectionRole::Map) => {
-                let layout = self.map_layout(value)?;
-                let buckets = layout.occupied_buckets()?;
+                let (keys, elements) = {
+                    let _guard = self.stripe_read(value)?;
+                    let layout = self.map_layout_unlocked(value)?;
+                    let buckets = layout.occupied_buckets()?;
+                    let mut keys = Vec::with_capacity(buckets.len());
+                    let mut vals = Vec::with_capacity(buckets.len());
+                    for bucket in buckets {
+                        keys.push(layout.slot(bucket, 2));
+                        vals.push(layout.slot(bucket, 3));
+                    }
+                    (keys, vals)
+                };
                 return Ok(Some(AggregateLayout {
-                    pointer: layout.buffer,
-                    length: layout.length,
-                    shape: AggregateShape::Map(buckets),
+                    elements,
+                    shape: AggregateShape::Map(keys),
                     element_types: None,
                 }));
             }
             Some(CollectionRole::Bytes) => {
                 let layout = self.bytes_layout(value)?;
                 return Ok(Some(AggregateLayout {
-                    pointer: std::ptr::null(),
-                    length: 0,
+                    elements: Vec::new(),
                     shape: AggregateShape::Bytes(layout.length),
                     element_types: None,
                 }));
@@ -95,20 +102,28 @@ impl Vm {
             }
             None => {}
         }
-        let ty = self
-            .state
-            .type_pool
-            .canonical_type(header.type_index)
-            .ok_or(VmError::TypeError)?;
-        if let TypeKind::Tuple { elements } = &self.state.type_pool.get(ty).kind {
-            if header.payload_words() != elements.len() {
+        let tuple_elem_types = {
+            let tp = self.type_pool_read();
+            let ty = tp
+                .canonical_type(header.type_index)
+                .ok_or(VmError::TypeError)?;
+            match &tp.get(ty).kind {
+                TypeKind::Tuple { elements } => Some(elements.clone()),
+                _ => None,
+            }
+        };
+        if let Some(elem_types) = tuple_elem_types {
+            if header.payload_words() != elem_types.len() {
                 return Err(VmError::TypeError);
             }
+            let base = pointer as *const u64;
+            let elements = (0..elem_types.len())
+                .map(|i| TaggedValue::from_raw(read_u64_atomic(base, i)))
+                .collect();
             return Ok(Some(AggregateLayout {
-                pointer: pointer.cast(),
-                length: elements.len(),
+                elements,
                 shape: AggregateShape::Tuple,
-                element_types: Some(elements.clone()),
+                element_types: Some(elem_types),
             }));
         }
         Ok(None)
@@ -138,6 +153,7 @@ impl Vm {
             return Err(VmError::DisplayDepthExceeded);
         }
         visiting.insert(value.raw());
+        let len = layout.elements.len();
         let mut output = match &layout.shape {
             AggregateShape::Error(error) => {
                 if *error {
@@ -150,24 +166,17 @@ impl Vm {
             AggregateShape::Map(_) => String::from("{"),
             AggregateShape::Bytes(len) => format!("Bytes(len={len})"),
             AggregateShape::Tuple => String::from("("),
-            AggregateShape::Enum(name) if layout.length == 0 => name.clone(),
+            AggregateShape::Enum(name) if len == 0 => name.clone(),
             AggregateShape::Enum(name) => format!("{name}("),
         };
         if output.len() > MAX_DISPLAY_BYTES {
             return Err(VmError::DisplaySizeExceeded);
         }
         let tuple = matches!(layout.shape, AggregateShape::Tuple);
-        for index in 0..layout.length {
+        for (index, &element) in layout.elements.iter().enumerate() {
             if index != 0 {
                 output.push_str(", ");
             }
-            // SAFETY: layout checked payload bounds. The recursive formatter
-            // cannot allocate a managed object or stop the active operation.
-            let offset = match &layout.shape {
-                AggregateShape::Map(buckets) => buckets[index] * 4 + 3,
-                _ => index,
-            };
-            let element = TaggedValue::from_raw(unsafe { layout.pointer.add(offset).read() });
             if let Some(types) = &layout.element_types
                 && !self.value_matches_type(element, types[index], 0)?
             {
@@ -182,15 +191,13 @@ impl Vm {
             } else {
                 self.format_aggregate_element(element, depth + 1, visiting)?
             };
-            let rendered = if matches!(layout.shape, AggregateShape::Map(_)) {
-                // SAFETY: the checked bucket key immediately precedes its value.
-                let key = TaggedValue::from_raw(unsafe { layout.pointer.add(offset - 1).read() });
-                let key = self.format_aggregate_element(key, depth + 1, visiting)?;
+            let rendered = if let AggregateShape::Map(keys) = &layout.shape {
+                let key = self.format_aggregate_element(keys[index], depth + 1, visiting)?;
                 format!("{key}: {rendered}")
             } else {
                 rendered
             };
-            let suffix = if tuple && layout.length == 1 { 2 } else { 1 };
+            let suffix = if tuple && len == 1 { 2 } else { 1 };
             if output
                 .len()
                 .checked_add(rendered.len() + suffix)
@@ -200,14 +207,14 @@ impl Vm {
             }
             output.push_str(&rendered);
         }
-        if tuple && layout.length == 1 {
+        if tuple && len == 1 {
             output.push(',');
         }
         match layout.shape {
             AggregateShape::List => output.push(']'),
             AggregateShape::Map(_) => output.push('}'),
             AggregateShape::Tuple => output.push(')'),
-            AggregateShape::Enum(_) if layout.length != 0 => output.push(')'),
+            AggregateShape::Enum(_) if len != 0 => output.push(')'),
             AggregateShape::Enum(_) | AggregateShape::Error(_) | AggregateShape::Bytes(_) => {}
         }
         visiting.remove(&value.raw());
@@ -222,8 +229,7 @@ impl Vm {
     ) -> Result<String, VmError> {
         if let Some(ty) = value.as_type() {
             return self
-                .state
-                .type_pool
+                .type_pool_read()
                 .display_name(ty)
                 .ok_or(VmError::InvalidType(ty));
         }

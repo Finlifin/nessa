@@ -89,7 +89,12 @@ pub(crate) fn emit_scope_defers_mode(
         }
         match action {
             CleanupAction::Defer(defer_body) => {
-                run_defer_node(resolved, defer_body, builder, block)
+                let pop_tmp = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    pop_tmp,
+                    NirExpr::CallBuiltin(runtime::ids::DEFER_POP, Vec::new()),
+                ));
+                run_defer_node(resolved, defer_body, builder, block);
             }
             CleanupAction::PopHandler => {
                 builder.blocks[block.0 as usize]
@@ -521,10 +526,35 @@ pub(crate) fn lower_stmt(
         // ── Defer statement ────────────────────────────────────────
         NodeKind::DeferStatement => {
             let defer_body = ast.fixed_children(node_idx)[0];
-            if !defer_body.is_null()
-                && let Some(scope) = builder.defer_scopes.last_mut()
-            {
-                scope.push(CleanupAction::Defer(defer_body));
+            if !defer_body.is_null() {
+                let is_unwinding = builder.alloc_local();
+                builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                    is_unwinding,
+                    NirExpr::CallBuiltin(runtime::ids::DEFER_PUSH, Vec::new()),
+                ));
+                let mut unwind_block = builder.new_block();
+                let continue_block = builder.new_block();
+                builder.blocks[block.0 as usize].terminator =
+                    Terminator::Branch(NirValue::Local(is_unwinding), unwind_block, continue_block);
+
+                run_defer_node(resolved, defer_body, builder, &mut unwind_block);
+                if matches!(
+                    builder.blocks[unwind_block.0 as usize].terminator,
+                    Terminator::Unreachable
+                ) {
+                    let resume_tmp = builder.alloc_local();
+                    builder.blocks[unwind_block.0 as usize]
+                        .stmts
+                        .push(NirStmt::Assign(
+                            resume_tmp,
+                            NirExpr::CallBuiltin(runtime::ids::DEFER_RESUME_UNWIND, Vec::new()),
+                        ));
+                }
+
+                *block = continue_block;
+                if let Some(scope) = builder.defer_scopes.last_mut() {
+                    scope.push(CleanupAction::Defer(defer_body));
+                }
             }
             if is_last
                 && matches!(

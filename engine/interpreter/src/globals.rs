@@ -16,23 +16,30 @@ impl Vm {
         if schema.len() > (1 << 17) {
             return Err(VmError::ObjectTooLarge);
         }
-        for global in schema {
-            if self
-                .state
-                .type_pool
-                .canonical_type(global.type_index)
-                .is_none()
-            {
-                return Err(VmError::InvalidType(global.type_index));
+        {
+            let tp = self.type_pool_read();
+            for global in schema {
+                if tp.canonical_type(global.type_index).is_none() {
+                    return Err(VmError::InvalidType(global.type_index));
+                }
             }
         }
-        self.roots.globals.initialize(schema).map_err(VmError::from)
+        self.with_exclusive_shared_mut(|shared| {
+            shared
+                .roots
+                .globals
+                .initialize(schema)
+                .map_err(VmError::from)
+        })
     }
 
     pub(super) fn store_global(&mut self, index: u32, value: TaggedValue) -> Result<(), VmError> {
-        let info = self.roots.globals.check_store(index)?;
+        let info = self.roots().globals.check_store(index)?;
         let value = self.assert_value_type(value, info.type_index)?;
-        self.roots.globals.set(index, value).map_err(VmError::from)
+        self.roots()
+            .globals
+            .set(index, value)
+            .map_err(VmError::from)
     }
 }
 
@@ -130,7 +137,7 @@ mod tests {
             result,
             VmResult::Error(VmError::ImmutableGlobal(0))
         ));
-        assert_eq!(vm.roots.globals.get(0).unwrap().as_i64(), Some(42));
+        assert_eq!(vm.roots().globals.get(0).unwrap().as_i64(), Some(42));
     }
 
     #[test]
@@ -165,13 +172,16 @@ mod tests {
             vm.store_global(0, TaggedValue::TRUE),
             Err(VmError::TypeError)
         ));
-        assert_eq!(vm.roots.globals.get(0), Err(GlobalError::Uninitialized(0)));
+        assert_eq!(
+            vm.roots().globals.get(0),
+            Err(GlobalError::Uninitialized(0))
+        );
         assert!(matches!(
             vm.store_global(u32::MAX, TaggedValue::TRUE),
             Err(VmError::InvalidGlobal(u32::MAX))
         ));
         vm.store_global(0, TaggedValue::from_i64(42)).unwrap();
-        assert_eq!(vm.roots.globals.get(0).unwrap().as_i64(), Some(42));
+        assert_eq!(vm.roots().globals.get(0).unwrap().as_i64(), Some(42));
         assert!(matches!(
             vm.initialize_globals(&[]),
             Err(VmError::GlobalsAlreadyInitialized)
@@ -213,11 +223,11 @@ mod tests {
         );
         assert!(matches!(result, VmResult::Finished));
         assert_eq!(
-            vm.roots.globals.get(index as u32).unwrap().as_i64(),
+            vm.roots().globals.get(index as u32).unwrap().as_i64(),
             Some(42)
         );
         assert_eq!(
-            vm.roots.globals.get(4095),
+            vm.roots().globals.get(4095),
             Err(GlobalError::Uninitialized(4095))
         );
     }
@@ -244,8 +254,7 @@ mod tests {
         }])
         .unwrap();
         let signature = vm
-            .state
-            .type_pool
+            .type_pool_write()
             .intern_structural(type_pool::TypeKind::Function {
                 params: vec![],
                 ret: Intrinsic::I64.type_index(),
@@ -302,6 +311,6 @@ mod tests {
         let task = vm.spawn_root(FuncId(0));
         assert!(matches!(vm.run(), VmResult::Finished));
         assert_eq!(vm.task_result_i64(task).unwrap(), 42);
-        assert_eq!(vm.roots.globals.get(0).unwrap().as_i64(), Some(42));
+        assert_eq!(vm.roots().globals.get(0).unwrap().as_i64(), Some(42));
     }
 }

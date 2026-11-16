@@ -1,12 +1,10 @@
 //! Environment, time/calendar, child process, PRNG, GC, and backtrace builtins (`616..=637`).
 
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use interpreter::resources::{IO_OK, io_error_code};
-use interpreter::{BuiltinCtx, NativeValue, VmError};
+use interpreter::{BuiltinCtx, NativeValue, ProcessSpec, VmError};
 use runtime::Number;
 
 // ---------------------------------------------------------------------------
@@ -181,9 +179,7 @@ pub fn time_sleep_ms(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
             "sleep duration must not be negative",
         ));
     }
-    std::thread::sleep(Duration::from_millis(ms as u64));
-    ctx.return_unit();
-    Ok(())
+    ctx.sleep_async_ms(ms as u64)
 }
 
 #[derive(Clone)]
@@ -735,208 +731,129 @@ fn format_utc_offset(gmtoff_secs: i64) -> String {
 /// `631` `__proc_exec(prog: String, args: List, stdin_data: ?String) -> (i64, i64, String, String)`
 pub fn proc_exec(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(3)?;
-    let prog = ctx.arg_string(0)?;
-    let args_root = ctx.arg_rooted(1)?;
-    let stdin_data = ctx.arg_optional_string(2)?;
+    ctx.spawn_process_async(|ctx| {
+        let prog = ctx.arg_string(0)?;
+        let args_root = ctx.arg_rooted(1)?;
+        let stdin_data = ctx.arg_optional_string(2)?;
 
-    let args_val = ctx.reload_root(&args_root)?;
-    let args_len = ctx.list_len(args_val)?;
-    let mut args = Vec::with_capacity(args_len);
-    for idx in 0..args_len {
-        let elem_root = ctx.list_get_rooted(&args_root, idx)?;
-        let elem = ctx.reload_root(&elem_root)?;
-        let Some(s) = extract_string_arg(elem) else {
-            return Err(VmError::TypeError);
-        };
-        args.push(s);
-    }
+        let args_val = ctx.reload_root(&args_root)?;
+        let args_len = ctx.list_len(args_val)?;
+        let mut args = Vec::with_capacity(args_len);
+        for idx in 0..args_len {
+            let elem_root = ctx.list_get_rooted(&args_root, idx)?;
+            let elem = ctx.reload_root(&elem_root)?;
+            let Some(s) = extract_string_arg(elem) else {
+                return Err(VmError::TypeError);
+            };
+            args.push(s);
+        }
 
-    let (code, exit_code, stdout, stderr) = run_child_command(&prog, &args, stdin_data, None)?;
-    ctx.check_string_size(stdout.len())?;
-    ctx.check_string_size(stderr.len())?;
-    ctx.return_native(NativeValue::Tuple(vec![
-        NativeValue::I64(code),
-        NativeValue::I64(exit_code),
-        NativeValue::Str(stdout),
-        NativeValue::Str(stderr),
-    ]))
+        Ok(Some(ProcessSpec {
+            prog,
+            args,
+            stdin_data: stdin_data.map(String::into_bytes),
+            cwd: None,
+        }))
+    })
 }
 
 /// `646` `__proc_exec_cwd(prog: String, args: List, stdin_data: ?String, cwd: ?String) -> (i64, i64, String, String)`
 pub fn proc_exec_cwd(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(4)?;
-    let prog = ctx.arg_string(0)?;
-    let args_root = ctx.arg_rooted(1)?;
-    let stdin_data = ctx.arg_optional_string(2)?;
-    let cwd = ctx.arg_optional_string(3)?;
+    ctx.spawn_process_async(|ctx| {
+        let prog = ctx.arg_string(0)?;
+        let args_root = ctx.arg_rooted(1)?;
+        let stdin_data = ctx.arg_optional_string(2)?;
+        let cwd = ctx.arg_optional_string(3)?;
 
-    let args_val = ctx.reload_root(&args_root)?;
-    let args_len = ctx.list_len(args_val)?;
-    let mut args = Vec::with_capacity(args_len);
-    for idx in 0..args_len {
-        let elem_root = ctx.list_get_rooted(&args_root, idx)?;
-        let elem = ctx.reload_root(&elem_root)?;
-        let Some(s) = extract_string_arg(elem) else {
-            return Err(VmError::TypeError);
-        };
-        args.push(s);
-    }
+        let args_val = ctx.reload_root(&args_root)?;
+        let args_len = ctx.list_len(args_val)?;
+        let mut args = Vec::with_capacity(args_len);
+        for idx in 0..args_len {
+            let elem_root = ctx.list_get_rooted(&args_root, idx)?;
+            let elem = ctx.reload_root(&elem_root)?;
+            let Some(s) = extract_string_arg(elem) else {
+                return Err(VmError::TypeError);
+            };
+            args.push(s);
+        }
 
-    let (code, exit_code, stdout, stderr) =
-        run_child_command(&prog, &args, stdin_data, cwd.as_deref())?;
-    ctx.check_string_size(stdout.len())?;
-    ctx.check_string_size(stderr.len())?;
-    ctx.return_native(NativeValue::Tuple(vec![
-        NativeValue::I64(code),
-        NativeValue::I64(exit_code),
-        NativeValue::Str(stdout),
-        NativeValue::Str(stderr),
-    ]))
+        Ok(Some(ProcessSpec {
+            prog,
+            args,
+            stdin_data: stdin_data.map(String::into_bytes),
+            cwd: cwd.filter(|s| !s.is_empty()),
+        }))
+    })
 }
 
 /// `632` `__proc_shell(cmd: String, stdin_data: ?String) -> (i64, i64, String, String)`
 pub fn proc_shell(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(2)?;
-    let cmd = ctx.arg_string(0)?;
-    let stdin_data = ctx.arg_optional_string(1)?;
+    ctx.spawn_process_async(|ctx| {
+        let cmd = ctx.arg_string(0)?;
+        let stdin_data = ctx.arg_optional_string(1)?;
 
-    if cmd.is_empty() {
-        return ctx.return_native(NativeValue::Tuple(vec![
-            NativeValue::I64(IO_OK),
-            NativeValue::I64(1),
-            NativeValue::Str(String::new()),
-            NativeValue::Str(String::new()),
-        ]));
-    }
+        if cmd.is_empty() {
+            ctx.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(IO_OK),
+                NativeValue::I64(1),
+                NativeValue::Str(String::new()),
+                NativeValue::Str(String::new()),
+            ]))?;
+            return Ok(None);
+        }
 
-    #[cfg(windows)]
-    let (shell_prog, shell_args) = ("cmd", vec!["/C".to_string(), cmd]);
-    #[cfg(not(windows))]
-    let (shell_prog, shell_args) = ("sh", vec!["-c".to_string(), cmd]);
+        #[cfg(windows)]
+        let (shell_prog, shell_args) = ("cmd".to_string(), vec!["/C".to_string(), cmd]);
+        #[cfg(not(windows))]
+        let (shell_prog, shell_args) = ("sh".to_string(), vec!["-c".to_string(), cmd]);
 
-    let (code, exit_code, stdout, stderr) =
-        run_child_command(shell_prog, &shell_args, stdin_data, None)?;
-    ctx.check_string_size(stdout.len())?;
-    ctx.check_string_size(stderr.len())?;
-    ctx.return_native(NativeValue::Tuple(vec![
-        NativeValue::I64(code),
-        NativeValue::I64(exit_code),
-        NativeValue::Str(stdout),
-        NativeValue::Str(stderr),
-    ]))
+        Ok(Some(ProcessSpec {
+            prog: shell_prog,
+            args: shell_args,
+            stdin_data: stdin_data.map(String::into_bytes),
+            cwd: None,
+        }))
+    })
 }
 
 /// `647` `__proc_shell_cwd(cmd: String, stdin_data: ?String, cwd: ?String) -> (i64, i64, String, String)`
 pub fn proc_shell_cwd(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(3)?;
-    let cmd = ctx.arg_string(0)?;
-    let stdin_data = ctx.arg_optional_string(1)?;
-    let cwd = ctx.arg_optional_string(2)?;
+    ctx.spawn_process_async(|ctx| {
+        let cmd = ctx.arg_string(0)?;
+        let stdin_data = ctx.arg_optional_string(1)?;
+        let cwd = ctx.arg_optional_string(2)?;
 
-    if cmd.is_empty() {
-        return ctx.return_native(NativeValue::Tuple(vec![
-            NativeValue::I64(IO_OK),
-            NativeValue::I64(1),
-            NativeValue::Str(String::new()),
-            NativeValue::Str(String::new()),
-        ]));
-    }
+        if cmd.is_empty() {
+            ctx.return_native(NativeValue::Tuple(vec![
+                NativeValue::I64(IO_OK),
+                NativeValue::I64(1),
+                NativeValue::Str(String::new()),
+                NativeValue::Str(String::new()),
+            ]))?;
+            return Ok(None);
+        }
 
-    #[cfg(windows)]
-    let (shell_prog, shell_args) = ("cmd", vec!["/C".to_string(), cmd]);
-    #[cfg(not(windows))]
-    let (shell_prog, shell_args) = ("sh", vec!["-c".to_string(), cmd]);
+        #[cfg(windows)]
+        let (shell_prog, shell_args) = ("cmd".to_string(), vec!["/C".to_string(), cmd]);
+        #[cfg(not(windows))]
+        let (shell_prog, shell_args) = ("sh".to_string(), vec!["-c".to_string(), cmd]);
 
-    let (code, exit_code, stdout, stderr) =
-        run_child_command(shell_prog, &shell_args, stdin_data, cwd.as_deref())?;
-    ctx.check_string_size(stdout.len())?;
-    ctx.check_string_size(stderr.len())?;
-    ctx.return_native(NativeValue::Tuple(vec![
-        NativeValue::I64(code),
-        NativeValue::I64(exit_code),
-        NativeValue::Str(stdout),
-        NativeValue::Str(stderr),
-    ]))
+        Ok(Some(ProcessSpec {
+            prog: shell_prog,
+            args: shell_args,
+            stdin_data: stdin_data.map(String::into_bytes),
+            cwd: cwd.filter(|s| !s.is_empty()),
+        }))
+    })
 }
 
 /// `633` `__proc_pid() -> i64`
 pub fn proc_pid(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ctx.require_arity(0)?;
     ctx.return_i64(i64::from(std::process::id()))
-}
-
-fn run_child_command(
-    prog: &str,
-    args: &[String],
-    stdin_data: Option<String>,
-    cwd: Option<&str>,
-) -> Result<(i64, i64, String, String), VmError> {
-    let mut command = Command::new(prog);
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(dir) = cwd
-        && !dir.is_empty()
-    {
-        command.current_dir(dir);
-    }
-    if stdin_data.is_some() {
-        command.stdin(Stdio::piped());
-    } else {
-        command.stdin(Stdio::null());
-    }
-
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(err) => {
-            return Ok((io_error_code(&err), -1, String::new(), err.to_string()));
-        }
-    };
-
-    let writer_handle = if let Some(input_text) = stdin_data
-        && let Some(mut child_stdin) = child.stdin.take()
-    {
-        Some(std::thread::spawn(move || {
-            let _ = child_stdin.write_all(input_text.as_bytes());
-        }))
-    } else {
-        None
-    };
-
-    let output = match child.wait_with_output() {
-        Ok(out) => out,
-        Err(err) => {
-            if let Some(h) = writer_handle {
-                let _ = h.join();
-            }
-            return Ok((io_error_code(&err), -1, String::new(), err.to_string()));
-        }
-    };
-    if let Some(h) = writer_handle {
-        let _ = h.join();
-    }
-
-    let exit_code = match output.status.code() {
-        Some(code) => i64::from(code),
-        None => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                output
-                    .status
-                    .signal()
-                    .map_or(-1, |sig| 128 + i64::from(sig))
-            }
-            #[cfg(not(unix))]
-            {
-                -1
-            }
-        }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    Ok((IO_OK, exit_code, stdout, stderr))
 }
 
 fn extract_string_arg(val: runtime::TaggedValue) -> Option<String> {

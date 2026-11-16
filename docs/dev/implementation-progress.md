@@ -2474,3 +2474,24 @@ builtin。
 - **未纳入本次范围的空占位设计目录**：
   - 仓库内 0 字节空文件 `docs/ffi/{intro,c,wasm}.md` 与 `docs/disaster-recovery-and-vm-exception-handling/intro.md` 尚无规范正文，保持未实现状态，未添加任何伪造占位行为。
 
+## 发布级多核并发运行时、`libuv` I/O Reactor 与同步/网络标准库（Wave C1–C6，2026-11-16）
+
+按 [concurrency-vision-and-roadmap.md](concurrency-vision-and-roadmap.md) 完成全部 6 个阶段（Wave C1 ~ Wave C6）与 8 项发布门禁（Release Gates）：
+
+- **Wave C1 — 生命周期闭环、代际 `TaskArena`、Promise 自动回收与取消 `defer` 栈展开**：
+  - `engine/runtime/src/task.rs`、`engine/scheduler/src/lib.rs`：将 `TaskId` 升级为 `[32-bit generation | 32-bit slot_index]` 分片代际槽表（`TaskArena`），消除 $O(N)$ 线性任务扫描与 ABA 误唤醒。
+  - `engine/interpreter/src/futures.rs`：实现 `PromiseTable` 双引用计数（活跃作用域引用 + MMTk `WeakObject` 句柄引用）自动回收与父任务 `pending_children` 即时压缩，500,000 短异步任务压测后 `occupied_task_count == 1`、`promise_count == 0`、`active_stack_count == 0`。
+  - `engine/interpreter/src/{lib,futures}.rs`、`engine/codegen/src/lib.rs`：取消进入受保护的 `UnwindingCancel` 模式，先级联取消并等待子任务收敛，再按严格 LIFO 顺序执行当前任务全部已登记 `defer` 块与 handler 弹出清理；`Opcode::Safepoint` 收敛至循环回边与函数入口。
+- **Wave C2 & Wave C3 — 多 Mutator MMTk Immix 协作、共享堆并发安全与多核 Work-Stealing 调度器**：
+  - `engine/gc/src/{lib,mutators,safepoint}.rs`、`engine/interpreter/src/lib.rs`：拆分 `Arc<SharedVm>` 与线程独占 `WorkerState`，为每个 Worker 线程绑定独立 MMTk `Mutator<NessaVM>`，实现多 Mutator STW 屏障与根扫描。
+  - `engine/interpreter/src/{globals,collections,maps,fields,effects}.rs`：`GlobalTable` 原子槽与 64 路缓存行填充容器读写条带锁保障多线程并发修改 `List`、`Map`、`struct` 字段与 `global` 变量零数据竞争 UB；`spawn_async_effect` 以 $O(1)$ 快照继承祖先不可变 Handler 链，跨任务动态捕获祖先 `catch k` 确定性报告 `VmError::CrossTaskContinuationCapture`；`library/std/coroutine.ns` 按代际 `TaskId` 隔离每任务活跃协程栈，消除多核协程交叉污染。
+  - `engine/scheduler/src/lib.rs`：实现每 Worker Chase-Lev 本地双端队列、全局 Injector 队列、随机跨核窃取与空闲线程 `Parker` 休眠唤醒；4 核 CPU 密集型异步任务实测加速比达 `3.5x ~ 4.0x`。
+- **Wave C4 — `libuv` 专职 I/O Reactor、非阻塞系统调用与全局死锁检测**：
+  - `engine/scheduler/src/reactor.rs`：启动专职 `libuv` 事件循环线程（`uv_async_t` 门铃投递），驱动非阻塞定时器（`uv_timer_t`）、异步子进程与标准流管道（`uv_process_t` + `uv_pipe_t`，取消时自动 `SIGKILL` 进程组并等待 `on_proc_exit` 回收杜绝僵尸进程）及异步文件系统操作（`uv_fs_t`）。
+  - 实现全局死锁检测：当所有就绪任务耗尽、存在挂起等待的任务且无活跃 Reactor 句柄或外部唤醒源时，立即报告包含等待链信息的 `VmError::DeadlockDetected`。
+- **Wave C5 & Wave C6 — `std.sync`、`std.net`、强类型 `std.task` 与全量门禁验收**：
+  - 新增 `BUILTIN_ABI_VERSION = 11`（内建 ID `803..=864`）、`engine/interpreter/src/sync_primitives.rs`（64 分片任务级等待队列 + 移动式 GC 根追踪 + 死锁等待图接入）与 `engine/scheduler/src/reactor_net.rs`（`uv_tcp_t`、`uv_udp_t`、`uv_getaddrinfo_t`）。
+  - 新增标准库 [`library/std/sync.ns`](../../library/std/sync.ns)（`Channel`、`Mutex`、`RwLock`、`Semaphore`、`Once`、`Lazy`、`Barrier`、`AtomicInt`、`AtomicBool`）、[`library/std/net.ns`](../../library/std/net.ns)（`SocketAddr`、`TcpListener`、`TcpStream`、`UdpDatagram`、`UdpSocket`、`resolve_host`），升级 [`library/std/task.ns`](../../library/std/task.ns)（`TimeoutError`、`with_timeout`、`sleep`、`sleep_ms`、`current_id`、`tree_snapshot`）。
+  - 新增 `engine/resolution/src/task_combinators.rs` 与 `engine/nir/src/tuples.rs` 模式绑定转换，为 `await_all`、`await_any`、`await_first` 与 `with_timeout` 提供编译期静态元素/错误集精化及非 `Future` 元素静态拒绝诊断。
+  - 同步更新 `docs/concurrency-and-async-algebraic-effect/`、`docs/standard-library/` 与 `docs/dev/` 文档，新增 `wave_c1` ~ `wave_c6` 专项集成验收测试套件。
+

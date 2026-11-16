@@ -1972,13 +1972,6 @@ fn emit_specialized_loop(
                 asm.jmp(resume_lbl);
 
                 asm.bind(budget_zero_lbl);
-                asm.movzx_rm8(GpReg::Rax, GpReg::R12, JitRuntimeCtx::OFF_HAS_OTHER_READY);
-                asm.test_rr(GpReg::Rax, GpReg::Rax);
-                let yield_lbl = asm.new_label();
-                asm.jcc(Cond::Ne, yield_lbl);
-                asm.mov_mi32(GpReg::R12, JitRuntimeCtx::OFF_SLICE_SAFEPOINTS, 64);
-                asm.jmp(resume_lbl);
-                asm.bind(yield_lbl);
                 asm.mov_mi32(GpReg::R12, JitRuntimeCtx::OFF_SLICE_SAFEPOINTS, 1);
                 asm.jmp(slow_lbl);
 
@@ -2503,13 +2496,6 @@ fn emit_fast_loop_jump(
                 asm.jmp(resume_lbl);
 
                 asm.bind(budget_zero_lbl);
-                asm.movzx_rm8(GpReg::Rax, GpReg::R12, JitRuntimeCtx::OFF_HAS_OTHER_READY);
-                asm.test_rr(GpReg::Rax, GpReg::Rax);
-                let yield_lbl = asm.new_label();
-                asm.jcc(Cond::Ne, yield_lbl);
-                asm.mov_mi32(GpReg::R12, JitRuntimeCtx::OFF_SLICE_SAFEPOINTS, 64);
-                asm.jmp(resume_lbl);
-                asm.bind(yield_lbl);
                 asm.mov_mi32(GpReg::R12, JitRuntimeCtx::OFF_SLICE_SAFEPOINTS, 1);
                 asm.jmp(slow_lbl);
 

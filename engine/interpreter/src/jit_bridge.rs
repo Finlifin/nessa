@@ -64,32 +64,62 @@ static JIT_HELPERS: JitHelpers = JitHelpers {
 };
 
 impl Vm {
-    /// Configure the per-VM tiered JIT mode and code-cache cap.
+    /// Configure the per-VM tiered JIT mode and code-cache cap across all workers.
     pub fn set_jit_config(&mut self, config: JitConfig) {
         let _operation = self.operation();
-        self.state.jit.set_config(config);
+        *self.shared.jit_config.write() = config;
+        self.shared
+            .jit_compiled_functions
+            .store(0, Ordering::Release);
+        self.shared.jit_code_bytes.store(0, Ordering::Release);
+        self.shared.jit_deopt_count.store(0, Ordering::Release);
+        let epoch = self.shared.jit_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.worker.jit.set_config(config);
+        self.worker.jit_synced_epoch = epoch;
+        self.worker.jit_reported_fns = 0;
+        self.worker.jit_reported_bytes = 0;
+        self.worker.jit_reported_deopts = 0;
     }
 
     /// Return the active [`JitConfig`] for this VM.
     pub fn jit_config(&self) -> JitConfig {
-        self.state.jit.config()
+        *self.shared.jit_config.read()
     }
 
     /// Set the active [`JitMode`] while preserving other [`JitConfig`] parameters.
     pub fn set_jit_mode(&mut self, mode: JitMode) {
-        let mut cfg = self.state.jit.config();
+        let mut cfg = self.jit_config();
         cfg.mode = mode;
         self.set_jit_config(cfg);
     }
 
     /// Whether JIT compilation and execution are enabled on this VM and host target.
     pub fn jit_enabled(&self) -> bool {
-        self.state.jit.is_enabled()
+        self.jit_config().mode != JitMode::Off && jit::arch::is_target_supported()
     }
 
-    /// Return current JIT telemetry counters (`compiled_functions`, `code_bytes`, `deopt_count`).
+    /// Return current JIT telemetry counters aggregated across all workers.
     pub fn jit_stats(&self) -> JitStats {
-        self.state.jit.stats()
+        JitStats {
+            compiled_functions: self.shared.jit_compiled_functions.load(Ordering::Acquire),
+            code_bytes: self.shared.jit_code_bytes.load(Ordering::Acquire),
+            deopt_count: self.shared.jit_deopt_count.load(Ordering::Acquire),
+        }
+    }
+
+    /// Invalidate all worker code caches when VM type-pool or method-scope metadata mutates.
+    pub(crate) fn invalidate_jit(&mut self) {
+        self.shared
+            .jit_compiled_functions
+            .store(0, Ordering::Release);
+        self.shared.jit_code_bytes.store(0, Ordering::Release);
+        self.shared.jit_deopt_count.store(0, Ordering::Release);
+        let epoch = self.shared.jit_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.worker.jit.invalidate_all();
+        self.worker.jit_synced_epoch = epoch;
+        self.worker.jit_reported_fns = 0;
+        self.worker.jit_reported_bytes = 0;
+        self.worker.jit_reported_deopts = 0;
     }
 
     #[inline]
@@ -97,51 +127,96 @@ impl Vm {
         JitEngine::new(JitConfig::default())
     }
 
+    #[inline]
+    pub(crate) fn sync_worker_jit(&mut self) {
+        let epoch = self.shared.jit_epoch.load(Ordering::Acquire);
+        if self.worker.jit_synced_epoch != epoch {
+            let cfg = *self.shared.jit_config.read();
+            self.worker.jit.set_config(cfg);
+            self.worker.jit.invalidate_all();
+            self.worker.jit_synced_epoch = epoch;
+            self.worker.jit_reported_fns = 0;
+            self.worker.jit_reported_bytes = 0;
+            self.worker.jit_reported_deopts = 0;
+        }
+    }
+
+    #[inline]
+    fn publish_worker_jit_stats(&mut self) {
+        let local = self.worker.jit.stats();
+        if local.compiled_functions > self.worker.jit_reported_fns {
+            self.shared.jit_compiled_functions.fetch_add(
+                local.compiled_functions - self.worker.jit_reported_fns,
+                Ordering::Release,
+            );
+            self.worker.jit_reported_fns = local.compiled_functions;
+        }
+        if local.code_bytes > self.worker.jit_reported_bytes {
+            self.shared.jit_code_bytes.fetch_add(
+                local.code_bytes - self.worker.jit_reported_bytes,
+                Ordering::Release,
+            );
+            self.worker.jit_reported_bytes = local.code_bytes;
+        }
+        if local.deopt_count > self.worker.jit_reported_deopts {
+            self.shared.jit_deopt_count.fetch_add(
+                local.deopt_count - self.worker.jit_reported_deopts,
+                Ordering::Release,
+            );
+            self.worker.jit_reported_deopts = local.deopt_count;
+        }
+    }
+
     /// Record function-entry or interpreter backward-jump hotness and trigger compilation if hot.
     #[inline]
     pub(crate) fn maybe_compile_on_hotness(&mut self, func_id: FuncId, delta: u64) {
-        if self.state.jit.record_hotness(func_id, delta) {
+        self.sync_worker_jit();
+        if self.worker.jit.record_hotness(func_id, delta) {
             self.compile_jit_function(func_id, false);
         }
     }
 
     /// Compile `func_id` into native code (Tier-1 or Tier-2), degrading gracefully on failure.
     pub(crate) fn compile_jit_function(&mut self, func_id: FuncId, request_tier2: bool) {
-        if !self.state.jit.is_enabled() {
+        self.sync_worker_jit();
+        if !self.worker.jit.is_enabled() {
             return;
         }
-        if self.state.bytecode.try_get_function(func_id).is_none() {
+        if self.shared.bytecode.try_get_function(func_id).is_none() {
             return;
         }
 
         let constants = self.classify_constants_for_jit();
-        let (hotness_ptr, global_deopt_ptr, func_deopt_ptr) = self.state.jit.counter_ptrs(func_id);
+        let (hotness_ptr, global_deopt_ptr, func_deopt_ptr) = self.worker.jit.counter_ptrs(func_id);
 
-        // Borrow immutable compilation inputs from `self.state` while mutating `self.state.jit`.
-        let state = &mut *self.state;
-        let instructions = &state.bytecode.get_function(func_id).instructions;
-        let type_pool = &state.type_pool;
-        let scopes = &state.method_call_scopes;
-        let scopes_required = !type_pool.scopes().is_empty();
-        let has_scope =
-            |pc: usize| -> bool { !scopes_required || scopes.contains_key(&(func_id, pc)) };
+        {
+            let shared = &*self.shared;
+            let instructions = &shared.bytecode.get_function(func_id).instructions;
+            let tp_guard = shared.type_pool.read(self.worker.worker_id);
+            let scopes = &shared.method_call_scopes;
+            let scopes_required = !tp_guard.scopes().is_empty();
+            let has_scope =
+                |pc: usize| -> bool { !scopes_required || scopes.contains_key(&(func_id, pc)) };
 
-        let input = CompilationInput {
-            func_id,
-            instructions,
-            constants: &constants,
-            type_pool,
-            has_scope: &has_scope,
-            helpers: &JIT_HELPERS,
-            hotness_ptr,
-            global_deopt_ptr,
-            func_deopt_ptr,
-        };
-        state.jit.compile_function(&input, request_tier2);
+            let input = CompilationInput {
+                func_id,
+                instructions,
+                constants: &constants,
+                type_pool: &tp_guard,
+                has_scope: &has_scope,
+                helpers: &JIT_HELPERS,
+                hotness_ptr,
+                global_deopt_ptr,
+                func_deopt_ptr,
+            };
+            self.worker.jit.compile_function(&input, request_tier2);
+        }
+        self.publish_worker_jit_stats();
     }
 
     fn classify_constants_for_jit(&self) -> Vec<CompileConstant> {
-        let values = self.roots.constants.values();
+        let consts_guard = self.constants_read();
+        let values = consts_guard.values();
         let mut out = Vec::with_capacity(values.len());
         for &val in values {
             if val.as_enum().is_some() {
@@ -198,8 +273,9 @@ impl Vm {
         func_id: FuncId,
         pc: u32,
     ) -> Option<JitStepOutcome> {
+        self.sync_worker_jit();
         let (entry_fn, entry_offset, allow_tier_up, allow_tier2_loops) =
-            self.state.jit.lookup_entry(func_id, pc)?;
+            self.worker.jit.lookup_entry(func_id, pc)?;
 
         let mut session = BridgeSession {
             vm: std::ptr::from_mut(self),
@@ -216,7 +292,7 @@ impl Vm {
             consts_len: 0,
             gc_requested_ptr: GC_FLAGS.gc_requested.as_ptr().cast::<u8>(),
             preempt_requested_ptr: GC_FLAGS.preempt_requested.as_ptr().cast::<u8>(),
-            slice_safepoints: self.state.slice_safepoints,
+            slice_safepoints: self.worker.slice_safepoints,
             has_other_ready: 0,
             allow_tier_up: u8::from(allow_tier_up),
             allow_tier2_loops: u8::from(allow_tier2_loops),
@@ -229,7 +305,7 @@ impl Vm {
 
         let mut exit = JitExit::default();
         // SAFETY: `entry_fn` points to a sealed `PROT_READ | PROT_EXEC` buffer owned by
-        // `self.state.jit`, `rt_ctx` and `session` outlive the synchronous call on this stack,
+        // `self.worker.jit`, `rt_ctx` and `session` outlive the synchronous call on this stack,
         // and all helper callbacks re-borrow `session.vm` exclusively for the callback duration
         // while keeping all managed heap references rooted in `StackContext`.
         unsafe {
@@ -241,7 +317,8 @@ impl Vm {
             );
         }
 
-        self.state.slice_safepoints = rt_ctx.slice_safepoints;
+        self.worker.slice_safepoints = rt_ctx.slice_safepoints;
+        self.publish_worker_jit_stats();
 
         let outcome = match exit.kind {
             x if x == JitExitKind::Finished as u32 => JitStepOutcome::Finished,
@@ -265,12 +342,14 @@ impl Vm {
 }
 
 fn refresh_runtime_ctx(rt_ctx: &mut JitRuntimeCtx, vm: &mut Vm, task_id: TaskId) {
-    let has_other_ready = u8::from(vm.roots.scheduler.has_other_ready_tasks());
-    let consts = vm.roots.constants.values();
-    rt_ctx.consts_ptr = consts.as_ptr().cast::<u64>();
-    rt_ctx.consts_len = consts.len();
-    rt_ctx.has_other_ready = has_other_ready;
-    if let Some(task) = vm.roots.scheduler.get_task_mut(task_id) {
+    let (consts_ptr, consts_len) = {
+        let consts_guard = vm.constants_read();
+        let consts = consts_guard.values();
+        (consts.as_ptr().cast::<u64>(), consts.len())
+    };
+    rt_ctx.consts_ptr = consts_ptr;
+    rt_ctx.consts_len = consts_len;
+    if let Some(task) = vm.task_mut(task_id) {
         rt_ctx.regs_ptr = task.registers.regs.as_mut_ptr().cast::<u64>();
         rt_ctx.slots_len = task.local_slots.len();
         rt_ctx.slots_ptr = if rt_ctx.slots_len == 0 {
@@ -314,7 +393,9 @@ fn finish_dispatch(
         DispatchResult::Continue => 0,
         DispatchResult::Yield => JitExitKind::Yield as u32,
         DispatchResult::SuspendRetry => JitExitKind::SuspendRetry as u32,
-        DispatchResult::Cancelled => JitExitKind::Cancelled as u32,
+        DispatchResult::StartCancelUnwind | DispatchResult::ResumeCancelUnwind => {
+            JitExitKind::Cancelled as u32
+        }
         DispatchResult::Error(err) => {
             session.pending_error = Some(err);
             JitExitKind::Trap as u32
@@ -346,7 +427,7 @@ def_jit_helper!(
             ));
             return JitExitKind::Trap as u32;
         }
-        let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) else {
+        let Some(task) = vm.task_mut(session.task_id) else {
             session.pending_error = Some(VmError::InvalidTask);
             return JitExitKind::Trap as u32;
         };
@@ -366,32 +447,36 @@ def_jit_helper!(
     fn helper_safepoint(vm_opaque: *mut c_void, resume_pc: u32) -> u32 {
         // SAFETY: invoked synchronously from compiled JIT code with all live state flushed to `StackContext`.
         let (rt_ctx, session, vm) = unsafe { unpack_ctx(vm_opaque) };
-        vm.state.slice_safepoints = rt_ctx.slice_safepoints;
-        if let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) {
+        vm.worker.slice_safepoints = rt_ctx.slice_safepoints;
+        if let Some(task) = vm.task_mut(session.task_id) {
             task.pc = resume_pc;
         }
-        vm.state.heap.safe_point();
+        vm.worker.heap.safe_point();
         refresh_runtime_ctx(rt_ctx, vm, session.task_id);
 
-        let Some(task) = vm.roots.scheduler.get_task(session.task_id) else {
+        let async_cancelled = vm.scheduler().is_cancelled(session.task_id);
+        let Some(task) = vm.task_mut(session.task_id) else {
             session.pending_error = Some(VmError::InvalidTask);
             return JitExitKind::Trap as u32;
         };
+        if async_cancelled {
+            task.cancelled = true;
+        }
         if task.cancelled {
             return JitExitKind::Cancelled as u32;
         }
         if GC_FLAGS.preempt_requested.load(Ordering::Relaxed) {
             return JitExitKind::Yield as u32;
         }
-        vm.state.slice_safepoints = vm.state.slice_safepoints.saturating_sub(1);
-        if vm.state.slice_safepoints == 0 {
-            vm.state.slice_safepoints = 64;
-            rt_ctx.slice_safepoints = 64;
-            if vm.roots.scheduler.has_other_ready_tasks() {
+        vm.worker.slice_safepoints = vm.worker.slice_safepoints.saturating_sub(1);
+        if vm.worker.slice_safepoints == 0 {
+            vm.worker.slice_safepoints = 4096;
+            rt_ctx.slice_safepoints = 4096;
+            if vm.scheduler().has_other_ready_tasks() {
                 return JitExitKind::Yield as u32;
             }
         }
-        rt_ctx.slice_safepoints = vm.state.slice_safepoints;
+        rt_ctx.slice_safepoints = vm.worker.slice_safepoints;
         0
     }
 );
@@ -445,7 +530,7 @@ def_jit_helper!(
             session.pending_error = Some(err);
             return JitExitKind::Trap as u32;
         }
-        let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) else {
+        let Some(task) = vm.task_mut(session.task_id) else {
             session.pending_error = Some(VmError::InvalidTask);
             return JitExitKind::Trap as u32;
         };
@@ -468,7 +553,7 @@ def_jit_helper!(
             session.pending_error = Some(VmError::InvalidInstruction(instr_word));
             return JitExitKind::Trap as u32;
         };
-        if let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) {
+        if let Some(task) = vm.task_mut(session.task_id) {
             task.pc = pc + 1;
         }
         let res = vm.dispatch(session.task_id, instr);
@@ -489,16 +574,14 @@ def_jit_helper!(
             session.pending_error = Some(VmError::InvalidInstruction(instr_word));
             return JitExitKind::Trap as u32;
         };
-        if let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) {
+        if let Some(task) = vm.task_mut(session.task_id) {
             task.pc = pc + 1;
         }
         let res = vm.dispatch(session.task_id, instr);
         if matches!(res, DispatchResult::Continue) && !ic_ptr.is_null() {
             let (_, recv_reg, field_idx) = a_fields(&instr);
             if let Some(recv_val) = vm
-                .roots
-                .scheduler
-                .get_task(session.task_id)
+                .task_ref(session.task_id)
                 .map(|t| t.registers.get(recv_reg))
             {
                 // SAFETY: `ic_ptr` points into the pinned `Box<[MonomorphicIc]>` owned by `CompiledFunctionArtifact`.
@@ -523,16 +606,14 @@ def_jit_helper!(
             session.pending_error = Some(VmError::InvalidInstruction(instr_word));
             return JitExitKind::Trap as u32;
         };
-        if let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) {
+        if let Some(task) = vm.task_mut(session.task_id) {
             task.pc = pc + 1;
         }
         let res = vm.dispatch(session.task_id, instr);
         if matches!(res, DispatchResult::Continue) && !ic_ptr.is_null() {
             let (_, recv_reg, field_idx) = a_fields(&instr);
             if let Some(recv_val) = vm
-                .roots
-                .scheduler
-                .get_task(session.task_id)
+                .task_ref(session.task_id)
                 .map(|t| t.registers.get(recv_reg))
             {
                 // SAFETY: `ic_ptr` points into the pinned `Box<[MonomorphicIc]>` owned by `CompiledFunctionArtifact`.
@@ -560,7 +641,7 @@ def_jit_helper!(
                 return JitExitKind::Trap as u32;
             }
         };
-        let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) else {
+        let Some(task) = vm.task_mut(session.task_id) else {
             session.pending_error = Some(VmError::InvalidTask);
             return JitExitKind::Trap as u32;
         };
@@ -600,7 +681,7 @@ def_jit_helper!(
                 | Opcode::Return
                 | Opcode::ReturnUnit
         ));
-        if let Some(task) = vm.roots.scheduler.get_task_mut(session.task_id) {
+        if let Some(task) = vm.task_mut(session.task_id) {
             task.pc = pc + 1;
         }
         let res = vm.dispatch(session.task_id, instr);
@@ -620,15 +701,16 @@ fn inspect_ordinary_field(
         return None;
     }
     let raw_ty = header.type_index.as_u32();
-    let canon_ty = vm.state.type_pool.canonical_type(header.type_index)?;
-    if canon_ty != header.type_index || vm.state.type_pool.is_reserved_collection_role(canon_ty) {
+    let tp = vm.type_pool_read();
+    let canon_ty = tp.canonical_type(header.type_index)?;
+    if canon_ty != header.type_index || tp.is_reserved_collection_role(canon_ty) {
         return None;
     }
     let words = header.payload_words();
     if words >= (1 << 19) || (field_idx as usize) >= words {
         return None;
     }
-    let field_ty = match &vm.state.type_pool.get(canon_ty).kind {
+    let field_ty = match &tp.get(canon_ty).kind {
         TypeKind::Struct { fields, .. } if fields.len() == words => {
             fields.get(field_idx as usize)?.ty
         }
@@ -638,8 +720,8 @@ fn inspect_ordinary_field(
         TypeKind::Newtype { inner, .. } if words == 1 && field_idx == 0 => *inner,
         _ => return None,
     };
-    let canon_field_ty = vm.state.type_pool.canonical_type(field_ty)?;
-    if vm.state.type_pool.contains_associated_type(canon_field_ty) {
+    let canon_field_ty = tp.canonical_type(field_ty)?;
+    if tp.contains_associated_type(canon_field_ty) {
         return None;
     }
     let expected_gc_meta_masked = (words as u32) << 3;
@@ -662,23 +744,23 @@ fn try_populate_load_ic(vm: &Vm, recv_val: TaggedValue, field_idx: u32, ic: &mut
     }
     // Only enable inline non-UNIT field load when `assert_value_type` is an identity check
     // on already-validated stored values (excluding `ErrorQualified`, `Trait`, `Tuple`, `Newtype`).
-    let can_fast_load = match &vm.state.type_pool.get(canon_field_ty).kind {
-        TypeKind::Intrinsic(
-            Intrinsic::I64
-            | Intrinsic::U64
-            | Intrinsic::I128
-            | Intrinsic::U128
-            | Intrinsic::F64
-            | Intrinsic::Bool
-            | Intrinsic::Char
-            | Intrinsic::Str,
-        ) => true,
-        TypeKind::Struct { .. } => !vm
-            .state
-            .type_pool
-            .is_reserved_collection_role(canon_field_ty),
-        TypeKind::Enum { .. } => true,
-        _ => false,
+    let can_fast_load = {
+        let tp = vm.type_pool_read();
+        match &tp.get(canon_field_ty).kind {
+            TypeKind::Intrinsic(
+                Intrinsic::I64
+                | Intrinsic::U64
+                | Intrinsic::I128
+                | Intrinsic::U128
+                | Intrinsic::F64
+                | Intrinsic::Bool
+                | Intrinsic::Char
+                | Intrinsic::Str,
+            ) => true,
+            TypeKind::Struct { .. } => !tp.is_reserved_collection_role(canon_field_ty),
+            TypeKind::Enum { .. } => true,
+            _ => false,
+        }
     };
     if can_fast_load {
         ic.receiver_type = raw_ty;
@@ -701,7 +783,7 @@ fn try_populate_store_ic(vm: &Vm, recv_val: TaggedValue, field_idx: u32, ic: &mu
         ic.fast_kind = FieldStoreFastKind::SlowOnly as u32;
         return;
     }
-    let fast_kind = match vm.state.type_pool.as_intrinsic(canon_field_ty) {
+    let fast_kind = match vm.type_pool_read().as_intrinsic(canon_field_ty) {
         Some(Intrinsic::I64) => FieldStoreFastKind::SmallI64,
         Some(Intrinsic::Bool) => FieldStoreFastKind::Bool,
         Some(Intrinsic::F64) => FieldStoreFastKind::CanonicalF64,

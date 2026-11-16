@@ -1,6 +1,7 @@
 //! Immutable proof selection survives ordinary frames and delimited stacks.
 //! Registry entries contain metadata only; receiver data stays in GC root slots.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nsbc::{CaptureAbi, FuncId, ParameterAbi};
@@ -12,7 +13,7 @@ use crate::{DispatchResult, Vm, VmError};
 static NEXT_PROOF: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
-pub(super) struct FrozenTraitProof {
+pub(crate) struct FrozenTraitProof {
     pub root_table: usize,
     pub concrete: TypeIndex,
     pub view: TypeIndex,
@@ -21,12 +22,9 @@ pub(super) struct FrozenTraitProof {
 
 impl Vm {
     fn checked_trait_view(&self, view: TypeIndex) -> Result<TypeIndex, VmError> {
-        let view = self
-            .state
-            .type_pool
-            .canonical_type(view)
-            .ok_or(VmError::InvalidType(view))?;
-        if !matches!(self.state.type_pool.get(view).kind, TypeKind::Trait { .. }) {
+        let tp = self.type_pool_read();
+        let view = tp.canonical_type(view).ok_or(VmError::InvalidType(view))?;
+        if !matches!(tp.get(view).kind, TypeKind::Trait { .. }) {
             return Err(VmError::InvalidType(view));
         }
         Ok(view)
@@ -35,25 +33,26 @@ impl Vm {
     /// Internal concrete adapters may carry associated views only when the
     /// selected root implementation has every concrete binding already fixed.
     fn check_associated_proof_bindings(&self, table_index: usize) -> Result<(), VmError> {
-        let table = self
-            .state
-            .type_pool
+        let tp = self.type_pool_read();
+        let table = tp
             .vtables_snapshot()
             .get(table_index)
             .ok_or(VmError::InvalidTraitProof)?;
-        self.state
-            .type_pool
-            .check_associated_implementation_bindings(
-                table.implementor,
-                table.trait_type,
-                table.visible_scope,
-            )
-            .map_err(|_| VmError::UnsupportedFunctionAbi)
+        tp.check_associated_implementation_bindings(
+            table.implementor,
+            table.trait_type,
+            table.visible_scope,
+        )
+        .map_err(|_| VmError::UnsupportedFunctionAbi)
     }
 
-    fn save_proof(&mut self, proof: FrozenTraitProof) -> Result<TaggedValue, VmError> {
+    fn save_proof(&self, proof: FrozenTraitProof) -> Result<TaggedValue, VmError> {
         let key = (proof.root_table, proof.view);
-        if let Some(&value) = self.state.trait_proof_cache.get(&key) {
+        if let Some(&value) = self.trait_registry_read().cache.get(&key) {
+            return Ok(value);
+        }
+        let mut reg = self.trait_registry_write();
+        if let Some(&value) = reg.cache.get(&key) {
             return Ok(value);
         }
         let id = NEXT_PROOF
@@ -62,16 +61,17 @@ impl Vm {
             })
             .map_err(|_| VmError::TraitProofLimit)?;
         let value = TaggedValue::from_trait_proof(id).ok_or(VmError::TraitProofLimit)?;
-        self.state.trait_proofs.insert(id, proof);
-        self.state.trait_proof_cache.insert(key, value);
+        reg.proofs.insert(id, Arc::new(proof));
+        reg.cache.insert(key, value);
         Ok(value)
     }
 
-    fn proof(&self, value: TaggedValue) -> Result<&FrozenTraitProof, VmError> {
+    fn proof(&self, value: TaggedValue) -> Result<Arc<FrozenTraitProof>, VmError> {
         let id = value.as_trait_proof().ok_or(VmError::InvalidTraitProof)?;
-        self.state
-            .trait_proofs
+        self.trait_registry_read()
+            .proofs
             .get(&id)
+            .cloned()
             .ok_or(VmError::InvalidTraitProof)
     }
 
@@ -83,28 +83,26 @@ impl Vm {
         let view = self.checked_trait_view(view)?;
         let concrete = self.reflected_type(data)?;
         let scope = self
-            .state
+            .worker
             .type_query_scope
             .ok_or(VmError::MissingTraitContext)?;
-        let table = self
-            .state
-            .type_pool
-            .find_vtable_scoped(concrete, view, scope)
-            .map_err(VmError::TraitLookup)?
-            .ok_or(VmError::TypeError)?;
-        let index = self
-            .state
-            .type_pool
-            .vtables_snapshot()
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate, table))
-            .ok_or(VmError::InvalidTraitProof)?;
+        let (index, descriptors) = {
+            let tp = self.type_pool_read();
+            let table = tp
+                .find_vtable_scoped(concrete, view, scope)
+                .map_err(VmError::TraitLookup)?
+                .ok_or(VmError::TypeError)?;
+            let index = tp
+                .vtables_snapshot()
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, table))
+                .ok_or(VmError::InvalidTraitProof)?;
+            let descriptors = tp
+                .checked_vtable_descriptors(index)
+                .map_err(VmError::TraitProofMetadata)?;
+            (index, descriptors)
+        };
         self.check_associated_proof_bindings(index)?;
-        let descriptors = self
-            .state
-            .type_pool
-            .checked_vtable_descriptors(index)
-            .map_err(VmError::TraitProofMetadata)?;
         for descriptor in &descriptors {
             if descriptor.signature.is_none() {
                 return Err(VmError::UnsupportedFunctionAbi);
@@ -117,8 +115,7 @@ impl Vm {
                 access: descriptor.access,
             };
             if !self
-                .state
-                .type_pool
+                .type_pool_read()
                 .method_accessible(&method, scope)
                 .map_err(VmError::MethodAccess)?
             {
@@ -135,8 +132,7 @@ impl Vm {
             if key.signature.is_none() {
                 return Err(VmError::UnsupportedFunctionAbi);
             }
-            self.state
-                .type_pool
+            self.type_pool_read()
                 .check_trait_method_signature_in_impl(
                     &key,
                     concrete,
@@ -160,7 +156,7 @@ impl Vm {
         view: TypeIndex,
     ) -> Result<TaggedValue, VmError> {
         let view = self.checked_trait_view(view)?;
-        let original = self.proof(value)?.clone();
+        let original = self.proof(value)?;
         if original.view == view {
             return Ok(value);
         }
@@ -178,42 +174,47 @@ impl Vm {
                 ancestor = true;
                 break;
             }
-            if let TypeKind::Trait { parents, .. } = &self.state.type_pool.get(current).kind {
-                for &parent in parents {
-                    let parent = self.checked_trait_view(parent)?;
-                    pending.push((parent, depth + 1));
+            let parents = {
+                let tp = self.type_pool_read();
+                match &tp.get(current).kind {
+                    TypeKind::Trait { parents, .. } => parents.clone(),
+                    _ => Vec::new(),
                 }
+            };
+            for parent in parents {
+                let parent = self.checked_trait_view(parent)?;
+                pending.push((parent, depth + 1));
             }
         }
         if !ancestor {
             return Err(VmError::InvalidTraitProof);
         }
-        let schema = self
-            .state
-            .type_pool
-            .trait_schema(view)
-            .ok_or(VmError::UnsupportedFunctionAbi)?;
-        let mut descriptors = Vec::with_capacity(schema.slots.len());
-        for key in &schema.slots {
-            let descriptor = original
-                .descriptors
-                .iter()
-                .find(|descriptor| descriptor.name == key.name)
-                .ok_or(VmError::InvalidTraitProof)?;
-            let root_key = TraitMethodKey {
-                trait_owner: descriptor.trait_owner,
-                name: descriptor.name,
-                signature: descriptor.signature.clone(),
-            };
-            self.state
-                .type_pool
-                .check_trait_method_redeclaration(&root_key, key)
-                .map_err(|_| VmError::InvalidTraitProof)?;
-            let mut projected = descriptor.clone();
-            projected.trait_owner = key.trait_owner;
-            projected.signature = key.signature.clone();
-            descriptors.push(projected);
-        }
+        let descriptors = {
+            let tp = self.type_pool_read();
+            let schema = tp
+                .trait_schema(view)
+                .ok_or(VmError::UnsupportedFunctionAbi)?;
+            let mut descriptors = Vec::with_capacity(schema.slots.len());
+            for key in &schema.slots {
+                let descriptor = original
+                    .descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.name == key.name)
+                    .ok_or(VmError::InvalidTraitProof)?;
+                let root_key = TraitMethodKey {
+                    trait_owner: descriptor.trait_owner,
+                    name: descriptor.name,
+                    signature: descriptor.signature.clone(),
+                };
+                tp.check_trait_method_redeclaration(&root_key, key)
+                    .map_err(|_| VmError::InvalidTraitProof)?;
+                let mut projected = descriptor.clone();
+                projected.trait_owner = key.trait_owner;
+                projected.signature = key.signature.clone();
+                descriptors.push(projected);
+            }
+            descriptors
+        };
         self.save_proof(FrozenTraitProof {
             root_table: original.root_table,
             concrete: original.concrete,
@@ -269,22 +270,23 @@ impl Vm {
                 got: u8::try_from(values.len()).unwrap_or(u8::MAX),
             });
         }
+        if abi.parameters.iter().all(|p| *p == ParameterAbi::Value) {
+            return Ok(());
+        }
         // Synthesized handler entries can carry an ABI without a source
         // function signature. Only a real descriptor supplies ordinary
         // parameter contracts; trait proof checks remain mandatory.
-        let params = if code.function_type == TypeIndex::INVALID {
+        let params: Option<Vec<TypeIndex>> = if code.function_type == TypeIndex::INVALID {
             None
         } else {
-            let declaration = self
-                .state
-                .type_pool
+            let tp = self.type_pool_read();
+            let declaration = tp
                 .canonical_type(code.function_type)
                 .ok_or(VmError::TypeError)?;
-            let TypeKind::Function { params, .. } = &self.state.type_pool.get(declaration).kind
-            else {
+            let TypeKind::Function { params, .. } = &tp.get(declaration).kind else {
                 return Err(VmError::TypeError);
             };
-            Some(params)
+            Some(params.clone())
         };
         let mut offset = 0;
         for (index, parameter) in abi.parameters.iter().enumerate() {
@@ -296,10 +298,9 @@ impl Vm {
                 }
                 ParameterAbi::TraitSelf { view } => {
                     self.assert_trait_pair(values[offset], values[offset + 1], *view)?;
-                    let params = params.ok_or(VmError::TypeError)?;
+                    let params = params.as_ref().ok_or(VmError::TypeError)?;
                     let concrete = self
-                        .state
-                        .type_pool
+                        .type_pool_read()
                         .canonical_type(params[index])
                         .ok_or(VmError::TypeError)?;
                     if self.proof(values[offset])?.concrete != concrete {
@@ -331,42 +332,71 @@ impl Vm {
     ) -> Result<(), VmError> {
         self.check_physical_arguments(id, values)?;
         let code = self.checked_function(id)?;
-        let abi = &code.abi;
         if code.function_type == TypeIndex::INVALID {
             return Ok(());
         }
-        let declaration = self
-            .state
-            .type_pool
-            .canonical_type(code.function_type)
-            .ok_or(VmError::TypeError)?;
-        let TypeKind::Function { params, .. } = &self.state.type_pool.get(declaration).kind else {
-            return Err(VmError::TypeError);
-        };
-        let mut contracts = Vec::new();
-        let mut offset = 0;
-        for (index, parameter) in abi.parameters.iter().enumerate() {
-            match parameter {
-                ParameterAbi::Value => {
-                    contracts.push((offset, *params.get(index).ok_or(VmError::TypeError)?));
-                    offset += 1;
-                }
-                ParameterAbi::Trait { .. } | ParameterAbi::TraitSelf { .. } => offset += 2,
+        let cached = self.sync_meta_cache().indirect_contracts.get(&id).cloned();
+        let contracts: std::sync::Arc<[(usize, TypeIndex)]> = match cached {
+            Some(arc) => arc,
+            None => {
+                let built = {
+                    let abi = &code.abi;
+                    let tp = self.type_pool_read();
+                    let declaration = tp
+                        .canonical_type(code.function_type)
+                        .ok_or(VmError::TypeError)?;
+                    let TypeKind::Function { params, .. } = &tp.get(declaration).kind else {
+                        return Err(VmError::TypeError);
+                    };
+                    let mut contracts = Vec::with_capacity(abi.parameters.len());
+                    let mut offset = 0;
+                    for (index, parameter) in abi.parameters.iter().enumerate() {
+                        match parameter {
+                            ParameterAbi::Value => {
+                                let pty = *params.get(index).ok_or(VmError::TypeError)?;
+                                let canon = tp.canonical_type(pty).unwrap_or(pty);
+                                contracts.push((offset, canon));
+                                offset += 1;
+                            }
+                            ParameterAbi::Trait { .. } | ParameterAbi::TraitSelf { .. } => {
+                                offset += 2
+                            }
+                        }
+                    }
+                    std::sync::Arc::<[(usize, TypeIndex)]>::from(contracts)
+                };
+                self.sync_meta_cache()
+                    .indirect_contracts
+                    .insert(id, std::sync::Arc::clone(&built));
+                built
             }
+        };
+        if contracts.iter().all(|&(offset, expected)| {
+            Self::value_is_exact_intrinsic_fast(values[offset], expected)
+        }) {
+            for _ in contracts.iter() {
+                after_conversion(self)?;
+            }
+            return Ok(());
         }
-        let base = self.roots.temporary_values.borrow().len();
-        let prepared = self.with_temporary_roots(values, |vm| {
-            for (offset, expected) in contracts {
+        let base = self.worker_roots().temporary_values.borrow().len();
+        let val_len = values.len();
+        let mut out_buf = [TaggedValue::UNIT; runtime::GP_REGISTER_COUNT];
+        self.with_temporary_roots(values, |vm| {
+            for &(offset, expected) in contracts.iter() {
                 // Read from registered slots: a preceding allocation may have
                 // relocated either an original argument or a converted value.
-                let source = vm.roots.temporary_values.borrow()[base + offset];
+                let source = vm.worker_roots().temporary_values.borrow()[base + offset];
                 let converted = vm.assert_value_type(source, expected)?;
-                vm.roots.temporary_values.borrow_mut()[base + offset] = converted;
+                vm.worker_roots().temporary_values.borrow_mut()[base + offset] = converted;
                 after_conversion(vm)?;
             }
-            Ok(vm.roots.temporary_values.borrow()[base..base + values.len()].to_vec())
+            out_buf[..val_len].copy_from_slice(
+                &vm.worker_roots().temporary_values.borrow()[base..base + val_len],
+            );
+            Ok(())
         })?;
-        values.copy_from_slice(&prepared);
+        values.copy_from_slice(&out_buf[..val_len]);
         Ok(())
         // The caller publishes these values into the callee's registers before
         // any further Nessa allocation; stack/frame installation is host memory.
@@ -378,6 +408,15 @@ impl Vm {
         values: &[TaggedValue],
     ) -> Result<Vec<TaggedValue>, VmError> {
         self.check_user_argument_abi(id, values.len())?;
+        if self
+            .checked_function(id)?
+            .abi
+            .parameters
+            .iter()
+            .all(|p| *p == ParameterAbi::Value)
+        {
+            return Ok(values.to_vec());
+        }
         let abi = self.checked_function(id)?.abi.clone();
         let mut physical = Vec::new();
         for (parameter, &data) in abi.parameters.iter().zip(values) {
@@ -410,7 +449,7 @@ impl Vm {
         slot: usize,
         physical: &[TaggedValue],
     ) -> Result<(FuncId, Vec<TaggedValue>), VmError> {
-        let proof = self.proof(proof_value)?.clone();
+        let proof = self.proof(proof_value)?;
         let descriptor = proof
             .descriptors
             .get(slot)
@@ -429,19 +468,20 @@ impl Vm {
         if signature.parameter_kinds.first() != Some(&type_pool::TraitParameterKind::Receiver) {
             return Err(VmError::UnsupportedFunctionAbi);
         }
-        let interface = self
-            .state
-            .type_pool
-            .instantiate_trait_method_signature_in_impl(
-                &key,
-                proof.concrete,
-                descriptor.implementation_trait,
-                descriptor.implementation_scope,
-            )
-            .map_err(|_| VmError::TypeError)?;
-        let TypeKind::Function { params, .. } = self.state.type_pool.get(interface).kind.clone()
-        else {
-            return Err(VmError::TypeError);
+        let params = {
+            let mut tp = self.type_pool_write();
+            let interface = tp
+                .instantiate_trait_method_signature_in_impl(
+                    &key,
+                    proof.concrete,
+                    descriptor.implementation_trait,
+                    descriptor.implementation_scope,
+                )
+                .map_err(|_| VmError::TypeError)?;
+            let TypeKind::Function { params, .. } = tp.get(interface).kind.clone() else {
+                return Err(VmError::TypeError);
+            };
+            params
         };
         let function = FuncId(descriptor.func_id);
         let target = self.checked_function(function)?;
@@ -449,8 +489,7 @@ impl Vm {
         if abi.capture_count() != 0 || abi.parameters.len() != params.len() {
             return Err(VmError::UnsupportedFunctionAbi);
         }
-        self.state
-            .type_pool
+        self.type_pool_read()
             .check_trait_method_signature_in_impl(
                 &key,
                 proof.concrete,
@@ -470,20 +509,18 @@ impl Vm {
         };
         let mut offset = 1;
         for (index, &parameter) in params.iter().enumerate().skip(1) {
-            let parameter = self
-                .state
-                .type_pool
-                .canonical_type(parameter)
-                .ok_or(VmError::InvalidType(parameter))?;
+            let (parameter, is_trait_param) = {
+                let tp = self.type_pool_read();
+                let canonical = tp
+                    .canonical_type(parameter)
+                    .ok_or(VmError::InvalidType(parameter))?;
+                let is_trait = matches!(tp.get(canonical).kind, TypeKind::Trait { .. });
+                (canonical, is_trait)
+            };
             let direct_self = signature
                 .self_paths
                 .contains(&vec![type_pool::TraitTypeStep::Parameter(index as u32)]);
-            if direct_self
-                || matches!(
-                    self.state.type_pool.get(parameter).kind,
-                    TypeKind::Trait { .. }
-                )
-            {
+            if direct_self || is_trait_param {
                 let parameter_view = if direct_self { proof.view } else { parameter };
                 let incoming = *physical.get(offset).ok_or(VmError::TypeError)?;
                 let data = *physical.get(offset + 1).ok_or(VmError::TypeError)?;
@@ -503,8 +540,11 @@ impl Vm {
                         _ => return Err(VmError::UnsupportedFunctionAbi),
                     }
                 } else {
-                    if !matches!(abi.parameters[index], ParameterAbi::Trait { view } if self.state.type_pool.canonical_type(view) == Some(parameter))
-                    {
+                    if !matches!(
+                        abi.parameters[index],
+                        ParameterAbi::Trait { view }
+                            if self.type_pool_read().canonical_type(view) == Some(parameter)
+                    ) {
                         return Err(VmError::UnsupportedFunctionAbi);
                     }
                     arguments.push(projected);
@@ -541,7 +581,7 @@ mod tests {
     fn indirect_parameter_conversions_remain_rooted_between_allocations() {
         let mut vm = crate::tests::make_vm();
         let target = type_pool::Intrinsic::I128.type_index();
-        let signature = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let signature = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![target, target],
             ret: target,
         });
@@ -558,15 +598,15 @@ mod tests {
                 parameters: vec![ParameterAbi::Value; 2],
             },
         });
-        let base = vm.roots.temporary_values.borrow().len();
+        let base = vm.worker_roots().temporary_values.borrow().len();
         let before = vm.completed_collections();
         let mut converted = 0;
         let mut arguments = [TaggedValue::from_i64(40), TaggedValue::from_i64(2)];
         vm.prepare_indirect_arguments_with(FuncId(0), &mut arguments, |vm| {
             converted += 1;
-            assert_eq!(vm.roots.temporary_values.borrow().len(), base + 2);
+            assert_eq!(vm.worker_roots().temporary_values.borrow().len(), base + 2);
             assert!(vm.collect_garbage()?);
-            let values = vm.roots.temporary_values.borrow();
+            let values = vm.worker_roots().temporary_values.borrow();
             assert!(values[base].as_heap_ptr().is_some());
             // SAFETY: values are registered roots even across the completed collection.
             assert_eq!(
@@ -598,13 +638,13 @@ mod tests {
             unsafe { runtime::Number::from_tagged(arguments[1]) },
             Some(runtime::Number::I128(2))
         );
-        assert_eq!(vm.roots.temporary_values.borrow().len(), base);
+        assert_eq!(vm.worker_roots().temporary_values.borrow().len(), base);
         let mut invalid = [TaggedValue::from_i64(40), TaggedValue::TRUE];
         assert!(matches!(
             vm.prepare_indirect_arguments(FuncId(0), &mut invalid),
             Err(VmError::TypeError)
         ));
-        assert_eq!(vm.roots.temporary_values.borrow().len(), base);
+        assert_eq!(vm.worker_roots().temporary_values.borrow().len(), base);
     }
 
     fn fixture() -> (crate::tests::TestVm, TypeIndex, TypeIndex) {
@@ -723,14 +763,14 @@ mod tests {
                 },
             });
         }
-        vm.state.type_query_scope = Some(1);
+        vm.worker.type_query_scope = Some(1);
         (vm, view, other)
     }
 
     #[test]
     fn associated_proofs_freeze_exact_bindings_but_reject_bare_parameter_abis() {
         let (mut vm, view, _) = fixture();
-        let mut snapshot = vm.state.type_pool.snapshot();
+        let mut snapshot = vm.type_pool_read().snapshot();
         let name = str_interner::intern("Item");
         let TypeKind::Trait { assoc_types, .. } = &mut snapshot.types[view.as_u32() as usize].kind
         else {
@@ -763,7 +803,7 @@ mod tests {
                 value: type_pool::Intrinsic::I64.type_index(),
             });
         vm.install_type_pool(type_pool::TypePool::restore(snapshot).unwrap());
-        vm.state.type_query_scope = Some(1);
+        vm.worker.type_query_scope = Some(1);
         let data = TaggedValue::from_i64(42);
         let proof = vm.acquire_trait_proof(data, view).unwrap();
         vm.assert_trait_pair(proof, data, view).unwrap();
@@ -771,7 +811,7 @@ mod tests {
         assert_eq!(function, FuncId(1));
         assert_eq!(arguments, [data]);
         assert_eq!(vm.project_trait_proof(proof, view).unwrap(), proof);
-        let signature = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let signature = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![view],
             ret: type_pool::Intrinsic::I64.type_index(),
         });
@@ -798,16 +838,16 @@ mod tests {
     fn associated_item_equal_to_self_still_uses_one_value_argument() {
         let (mut vm, view, _) = fixture();
         let concrete = type_pool::Intrinsic::I64.type_index();
-        let declaration = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let declaration = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![view, concrete],
             ret: concrete,
         });
-        let function_type = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let function_type = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![concrete, concrete],
             ret: concrete,
         });
         let name = str_interner::intern("Item");
-        let mut snapshot = vm.state.type_pool.snapshot();
+        let mut snapshot = vm.type_pool_read().snapshot();
         let TypeKind::Trait { assoc_types, .. } = &mut snapshot.types[view.as_u32() as usize].kind
         else {
             panic!("fixture trait");
@@ -868,7 +908,7 @@ mod tests {
             is_closure: false,
             function_type,
         });
-        vm.state.type_query_scope = Some(1);
+        vm.worker.type_query_scope = Some(1);
         let receiver = TaggedValue::from_i64(40);
         let item = TaggedValue::from_i64(2);
         let proof = vm.acquire_trait_proof(receiver, view).unwrap();
@@ -906,7 +946,7 @@ mod tests {
     fn declaration_only_associated_views_and_their_children_are_not_bare_proofs() {
         for inherited in [false, true] {
             let (mut vm, view, parent) = fixture();
-            let mut snapshot = vm.state.type_pool.snapshot();
+            let mut snapshot = vm.type_pool_read().snapshot();
             let owner = if inherited { parent } else { view };
             let TypeKind::Trait { assoc_types, .. } =
                 &mut snapshot.types[owner.as_u32() as usize].kind
@@ -926,7 +966,7 @@ mod tests {
                 parents.push(parent);
             }
             vm.install_type_pool(type_pool::TypePool::restore(snapshot).unwrap());
-            vm.state.type_query_scope = Some(1);
+            vm.worker.type_query_scope = Some(1);
             assert!(matches!(
                 vm.acquire_trait_proof(TaggedValue::from_i64(42), view),
                 Err(VmError::UnsupportedFunctionAbi)
@@ -935,7 +975,7 @@ mod tests {
                 vm.project_trait_proof(TaggedValue::NULL, view),
                 Err(VmError::InvalidTraitProof)
             ));
-            assert!(vm.state.trait_proofs.is_empty());
+            assert!(vm.shared.trait_registry.read(0).proofs.is_empty());
         }
     }
 
@@ -948,7 +988,7 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(first.acquire_trait_proof(data, view).unwrap(), proof);
         }
-        assert_eq!(first.state.trait_proofs.len(), 1);
+        assert_eq!(first.shared.trait_registry.read(0).proofs.len(), 1);
         assert!(matches!(
             first.assert_trait_pair(proof, TaggedValue::TRUE, view),
             Err(VmError::InvalidTraitProof)
@@ -964,7 +1004,7 @@ mod tests {
             second.assert_trait_pair(proof, data, second_view),
             Err(VmError::InvalidTraitProof)
         ));
-        let pool = first.state.type_pool.snapshot();
+        let pool = first.type_pool_read().snapshot();
         first.install_type_pool(type_pool::TypePool::restore(pool).unwrap());
         assert!(matches!(
             first.assert_trait_pair(proof, data, view),
@@ -975,7 +1015,7 @@ mod tests {
     #[test]
     fn concrete_self_entries_keep_frozen_proof_and_validate_concrete_signature() {
         let (mut vm, view, _) = fixture();
-        let signature = vm.state.bytecode.get_function(FuncId(1)).function_type;
+        let signature = vm.shared.bytecode.get_function(FuncId(1)).function_type;
         vm.add_function(FunctionCode {
             display_owner: None,
             abi: FunctionAbi {
@@ -989,7 +1029,7 @@ mod tests {
             is_closure: false,
             function_type: signature,
         });
-        let mut metadata = vm.state.type_pool.snapshot();
+        let mut metadata = vm.type_pool_read().snapshot();
         for methods in &mut metadata.methods {
             for method in methods {
                 if method.func_id == 1 {
@@ -1006,20 +1046,20 @@ mod tests {
         }
         metadata.vtables[0].entries[0] = 2;
         vm.install_type_pool(type_pool::TypePool::restore(metadata).unwrap());
-        vm.state.type_query_scope = Some(1);
+        vm.worker.type_query_scope = Some(1);
         let data = TaggedValue::from_i64(42);
         let proof = vm.acquire_trait_proof(data, view).unwrap();
-        vm.state.type_query_scope = None;
+        vm.worker.type_query_scope = None;
         let (function, arguments) = vm.prepare_trait_call(proof, 0, &[data]).unwrap();
         assert_eq!(function, FuncId(2));
         assert_eq!(arguments, vec![proof, data]);
-        assert_eq!(vm.state.trait_proofs.len(), 1);
+        assert_eq!(vm.shared.trait_registry.read(0).proofs.len(), 1);
         assert!(vm.check_physical_arguments(function, &arguments).is_ok());
         assert!(matches!(
             vm.check_physical_arguments(function, &[proof, TaggedValue::TRUE]),
             Err(VmError::InvalidTraitProof)
         ));
-        let wrong_signature = vm.state.type_pool.intern_structural(TypeKind::Function {
+        let wrong_signature = vm.type_pool_write().intern_structural(TypeKind::Function {
             params: vec![type_pool::Intrinsic::Bool.type_index()],
             ret: type_pool::Intrinsic::Bool.type_index(),
         });
@@ -1070,14 +1110,7 @@ mod tests {
             vm.invoke_closure_physical(task, FuncId(2), None, &[proof, TaggedValue::TRUE]),
             DispatchResult::Error(VmError::InvalidTraitProof)
         ));
-        assert!(
-            vm.roots
-                .scheduler
-                .get_task(task)
-                .unwrap()
-                .call_stack
-                .is_empty()
-        );
+        assert!(vm.task_ref(task).unwrap().call_stack.is_empty());
         assert!(matches!(
             vm.invoke_closure_physical(
                 task,
@@ -1092,20 +1125,21 @@ mod tests {
             DispatchResult::Continue
         ));
     }
+
     #[test]
     fn registry_caches_frozen_tables_and_parent_views_without_mixing_origins() {
         let (mut vm, view, parent) = fixture();
-        if let TypeKind::Trait { parents, .. } = &mut vm.state.type_pool.get_mut(view).kind {
+        if let TypeKind::Trait { parents, .. } = &mut vm.type_pool_write().get_mut(view).kind {
             parents.push(parent);
         }
         let concrete = type_pool::Intrinsic::I64.type_index();
-        vm.state.type_pool.add_trait_impl(TraitImplRecord {
+        vm.type_pool_write().add_trait_impl(TraitImplRecord {
             implementor: concrete,
             trait_type: parent,
             visible_scope: None,
             methods: vec![],
         });
-        vm.state.type_pool.add_vtable(VTable {
+        vm.type_pool_write().add_vtable(VTable {
             implementor: concrete,
             trait_type: parent,
             visible_scope: None,
@@ -1118,14 +1152,13 @@ mod tests {
             assert_eq!(vm.acquire_trait_proof(data, view).unwrap(), proof);
             assert_eq!(vm.project_trait_proof(proof, parent).unwrap(), projected);
         }
-        assert_eq!(vm.state.trait_proofs.len(), 2);
+        assert_eq!(vm.shared.trait_registry.read(0).proofs.len(), 2);
         let independent = vm.acquire_trait_proof(data, parent).unwrap();
         assert_ne!(projected, independent);
-        assert_eq!(vm.state.trait_proofs.len(), 3);
+        assert_eq!(vm.shared.trait_registry.read(0).proofs.len(), 3);
         assert!(vm.assert_trait_pair(projected, data, parent).is_ok());
         assert!(vm.assert_trait_pair(independent, data, parent).is_ok());
-        vm.state
-            .type_pool
+        vm.type_pool_write()
             .install_scopes(vec![
                 ScopeContext {
                     parent: None,
@@ -1144,25 +1177,25 @@ mod tests {
                 },
             ])
             .unwrap();
-        let mut method = vm.state.type_pool.trait_impls_snapshot()[0].methods[0].clone();
+        let mut method = vm.type_pool_read().trait_impls_snapshot()[0].methods[0].clone();
         method.visible_scope = Some(2);
-        vm.state.type_pool.add_method(concrete, method.clone());
-        vm.state.type_pool.add_trait_impl(TraitImplRecord {
+        vm.type_pool_write().add_method(concrete, method.clone());
+        vm.type_pool_write().add_trait_impl(TraitImplRecord {
             implementor: concrete,
             trait_type: view,
             visible_scope: Some(2),
             methods: vec![method],
         });
-        vm.state.type_pool.add_vtable(VTable {
+        vm.type_pool_write().add_vtable(VTable {
             implementor: concrete,
             trait_type: view,
             visible_scope: Some(2),
             entries: vec![1],
         });
-        vm.state.type_query_scope = Some(2);
+        vm.worker.type_query_scope = Some(2);
         let sibling = vm.acquire_trait_proof(data, view).unwrap();
         assert_ne!(sibling, proof);
-        assert_eq!(vm.state.trait_proofs.len(), 4);
+        assert_eq!(vm.shared.trait_registry.read(0).proofs.len(), 4);
         assert_eq!(
             vm.proof(sibling).unwrap().descriptors[0].implementation_scope,
             Some(2)
@@ -1172,6 +1205,7 @@ mod tests {
             Some(1)
         );
     }
+
     #[test]
     fn captured_proofs_validate_their_data_before_creation_and_invocation() {
         let (mut vm, view, _) = fixture();
@@ -1192,7 +1226,7 @@ mod tests {
         let proof = vm
             .acquire_trait_proof(TaggedValue::from_i64(42), view)
             .unwrap();
-        let state = vm.roots.scheduler.get_task_mut(task).unwrap();
+        let state = vm.task_mut(task).unwrap();
         state.registers.set(Reg(0), TaggedValue::TRUE);
         state.registers.set(Reg(1), proof);
         assert!(matches!(
@@ -1202,8 +1236,7 @@ mod tests {
         // SAFETY: TestVm owns the operation. The initialized closure is rooted
         // immediately, before any further allocation or collection can occur.
         let pointer = unsafe {
-            vm.state
-                .heap
+            vm.heap_mut()
                 .alloc_object(
                     type_pool::Intrinsic::Closure.type_index(),
                     runtime::ClosureEnv::payload_words(2),
@@ -1214,9 +1247,7 @@ mod tests {
             runtime::ClosureEnv::write(pointer.as_ptr(), FuncId(2), &[TaggedValue::TRUE, proof]);
             TaggedValue::from_heap_ptr(pointer.as_ptr())
         };
-        vm.roots
-            .scheduler
-            .get_task_mut(task)
+        vm.task_mut(task)
             .unwrap()
             .registers
             .set(Reg(20), environment);
@@ -1224,13 +1255,6 @@ mod tests {
             vm.invoke_closure_physical(task, FuncId(2), Some(environment), &[]),
             DispatchResult::Error(VmError::InvalidTraitProof)
         ));
-        assert!(
-            vm.roots
-                .scheduler
-                .get_task(task)
-                .unwrap()
-                .call_stack
-                .is_empty()
-        );
+        assert!(vm.task_ref(task).unwrap().call_stack.is_empty());
     }
 }

@@ -27,14 +27,13 @@ pub(crate) fn unwrap_handler_pattern(ast: &Ast, pattern: NodeIndex) -> (NodeInde
 
 /// Collect [`EffectInfo`] entries from all effect symbols found by Phase 3a.
 pub(crate) fn resolve_effects(r: &mut Resolver, ast: &Ast) {
-    // Gather (name, type_index, def_node, is_async) from all Effect symbols.
+    // Gather (name, type_index, def_node, is_async) from all Effect symbols
+    // in deterministic symbol-definition order rather than HashMap binding order.
     let effect_defs: Vec<_> = r
-        .scopes
+        .symbols
         .iter()
-        .flat_map(|scope| scope.bindings.values())
-        .filter_map(|&sym_id| {
-            let sym = &r.symbols[sym_id.0 as usize];
-            if sym.kind == SymbolKind::Effect {
+        .filter_map(|sym| {
+            if sym.kind == SymbolKind::Effect && !sym.def_node.is_null() {
                 // Determine async-ness from the definition node kind.
                 let is_async = ast.node(sym.def_node).kind == NodeKind::AsyncEffectDef;
                 Some((sym.name, sym.type_index, sym.def_node, is_async))

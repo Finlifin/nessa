@@ -442,7 +442,7 @@ fn unfinalized_error_metadata_non_v4_containers_and_zero_checksums_reject() {
         },
         type_pool: pool,
         entry: Some(FuncId(0)),
-        builtin_abi_version: 11,
+        builtin_abi_version: 12,
         builtins: vec![BuiltinImport {
             id: 1,
             name: "println".into(),

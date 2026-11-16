@@ -65,6 +65,7 @@ mod ranges;
 pub(crate) mod resolver;
 mod self_provenance;
 mod structs;
+mod task_combinators;
 mod trait_loops;
 pub use trait_loops::{ForLoopPlan, IteratorCall, StaticForLoop};
 mod trait_schemas;
