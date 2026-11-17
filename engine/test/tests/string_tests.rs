@@ -69,17 +69,17 @@ fn invalid_arguments_are_runtime_errors_with_their_domain() {
             r#"fn main() { "a".rsplit_once(""); 0 }"#,
             "split separator must not be empty",
         ),
-        // Size checks happen before the host builds the result.
+        // Size checks happen before the host builds the result (> 1 GiB MAX_STRING_BYTES).
         (
             r#"fn main() { "ab".repeat(9223372036854775807).len() }"#,
             "ObjectTooLarge",
         ),
         (
-            r#"fn main() { "x".repeat(600000).len() }"#,
+            r#"fn main() { "x".repeat(1073741825).len() }"#,
             "ObjectTooLarge",
         ),
         (
-            r#"fn main() { "x".repeat(300000).replace("x", "xx").len() }"#,
+            r#"fn main() { "x".repeat(600000).replace("x", "y".repeat(2000)).len() }"#,
             "ObjectTooLarge",
         ),
     ] {

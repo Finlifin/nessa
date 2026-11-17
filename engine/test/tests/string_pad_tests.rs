@@ -28,7 +28,7 @@ fn bad_width_fill_and_oversized_results_fail() {
             "pad fill must not be empty",
         ),
         (
-            r#"fn main() { "x".pad_end(600000, "y"); 0 }"#,
+            r#"fn main() { "x".pad_end(1073741825, "y"); 0 }"#,
             "ObjectTooLarge",
         ),
     ] {

@@ -14,7 +14,8 @@ use std::sync::{Condvar, Mutex};
 use type_pool::TypeIndex;
 
 use crate::{
-    GC_FLAGS, GcConfig, NessaSlot, ObjectHeader, PayloadRole, mutators, roots,
+    EXTERNAL_RC_SHELL_WORDS, ExternalRcHandle, GC_FLAGS, GcConfig, LARGE_TAGGED_PREFIX_BYTES,
+    MAX_LARGE_TAGGED_WORDS, NessaSlot, ObjectHeader, PayloadRole, external_rc, mutators, roots,
     visit_payload_reference_slots,
 };
 
@@ -160,7 +161,10 @@ fn gc_worker_loop(col: &'static WinCollector) {
 
         // 3. Prepare conditional / weak roots under STW.
         // SAFETY: All mutators are stopped for the entire collection epoch.
-        unsafe { roots::prepare_conditional_roots() };
+        unsafe {
+            roots::prepare_conditional_roots();
+            external_rc::prepare_stw();
+        };
 
         // 4. Mark from VM root slots.
         mark_stack.clear();
@@ -178,6 +182,7 @@ fn gc_worker_loop(col: &'static WinCollector) {
         loop {
             // SAFETY: Called under STW after transitive mark closure drained.
             let exposed_new = unsafe {
+                external_rc::trace_stw();
                 roots::trace_conditional_roots(&mut |slot| {
                     if let Some(payload_addr) = slot.load_payload_addr() {
                         mark_object(payload_addr, &mut mark_stack);
@@ -193,6 +198,8 @@ fn gc_worker_loop(col: &'static WinCollector) {
         // inspects `MARK_BIT` before unmarked allocations are freed in step 6.
         unsafe {
             roots::sweep_conditional_roots();
+            external_rc::sweep_stw();
+            external_rc::forward_stw();
             roots::forward_conditional_roots(&mut |_slot| {});
         }
 
@@ -202,8 +209,9 @@ fn gc_worker_loop(col: &'static WinCollector) {
         for read_idx in 0..tracked_objects.len() {
             let payload_addr = tracked_objects[read_idx];
             let payload_ptr = payload_addr as *mut u8;
-            // SAFETY: Every entry in `tracked_objects` was allocated by `alloc_raw_object` with
-            // an initialized 16-byte `ObjectHeader` at `payload_ptr.sub(ObjectHeader::SIZE)`.
+            // SAFETY: Every entry in `tracked_objects` was allocated by `Heap` with an initialized
+            // `ObjectHeader` at `payload_ptr.sub(ObjectHeader::SIZE)` and allocation start at
+            // `payload_ptr.sub(header.header_offset())`.
             unsafe {
                 let header = ObjectHeader::from_payload_ptr_mut(payload_ptr);
                 let obj_size = header.object_size();
@@ -213,7 +221,7 @@ fn gc_worker_loop(col: &'static WinCollector) {
                     write_idx += 1;
                     surviving_bytes = surviving_bytes.saturating_add(obj_size);
                 } else {
-                    let block_ptr = payload_ptr.sub(ObjectHeader::SIZE);
+                    let block_ptr = payload_ptr.sub(header.header_offset());
                     let layout = Layout::from_size_align_unchecked(obj_size, 8);
                     dealloc(block_ptr, layout);
                 }
@@ -368,6 +376,89 @@ impl Heap {
         unsafe { self.alloc_raw_object(header, payload_bytes) }
     }
 
+    /// Allocate a scanned `TaggedValue`-slot object of `payload_words` words,
+    /// using [`PayloadRole::Ordinary`] up to `u16::MAX` words and [`PayloadRole::LargeTagged`]
+    /// (8-byte `u64` prefix + 16-byte `ObjectHeader`) up to [`MAX_LARGE_TAGGED_WORDS`].
+    ///
+    /// # Safety
+    /// Same mutator-operation, initialization, and root-publication obligations as
+    /// [`Heap::alloc_object`].
+    pub unsafe fn alloc_tagged_words(
+        &mut self,
+        type_index: TypeIndex,
+        payload_words: usize,
+    ) -> Option<NonNull<u8>> {
+        if let Ok(small_words) = u16::try_from(payload_words) {
+            // SAFETY: Caller supplies mutator operation and root obligations.
+            return unsafe { self.alloc_object(type_index, small_words) };
+        }
+        if payload_words > MAX_LARGE_TAGGED_WORDS {
+            return None;
+        }
+        let payload_bytes = payload_words.checked_mul(8)?;
+        let header_offset = LARGE_TAGGED_PREFIX_BYTES + ObjectHeader::SIZE;
+        let total_size = header_offset.checked_add(payload_bytes)?;
+        let layout = Layout::from_size_align(total_size, 8).ok()?;
+        // SAFETY: `total_size >= 24 > 0` and alignment is 8.
+        let block_ptr = unsafe { alloc_zeroed(layout) };
+        if block_ptr.is_null() {
+            return None;
+        }
+        let header = ObjectHeader::new_large_tagged(type_index);
+        // SAFETY: `block_ptr` points to `total_size` zeroed, 8-byte aligned bytes:
+        // `[0..8]` = `u64` word count, `[8..24]` = `ObjectHeader`, `[24..]` = zeroed slots.
+        let payload_ptr = unsafe {
+            block_ptr.cast::<u64>().write(payload_words as u64);
+            block_ptr
+                .add(LARGE_TAGGED_PREFIX_BYTES)
+                .cast::<ObjectHeader>()
+                .write(header);
+            block_ptr.add(header_offset)
+        };
+        let m = &mut *self.mutator;
+        m.local_objects.push(payload_ptr as usize);
+        m.local_bytes = m.local_bytes.saturating_add(total_size);
+        if m.local_bytes >= LOCAL_FLUSH_BYTES {
+            flush_mutator_batch(m);
+        }
+
+        let prev = *self.alloc_count.get_mut();
+        *self.alloc_count.get_mut() = prev.wrapping_add(1);
+        NonNull::new(payload_ptr)
+    }
+
+    /// Allocate a 3-word [`PayloadRole::ExternalRc`] thin shell bound to `handle`
+    /// over `offset..(offset + len)`.
+    ///
+    /// # Safety
+    /// Caller must hold an active mutator operation and publish the returned pointer
+    /// into a registered root before another allocation or safepoint.
+    pub unsafe fn alloc_external_rc(
+        &mut self,
+        type_index: TypeIndex,
+        handle: ExternalRcHandle,
+        offset: usize,
+        len: usize,
+    ) -> Option<NonNull<u8>> {
+        if offset.checked_add(len)? > handle.capacity() {
+            return None;
+        }
+        // SAFETY: Caller holds an active mutator operation; `handle` is not yet registered,
+        // so any collection scheduled during allocation cannot sweep it prematurely.
+        let ptr = unsafe {
+            self.alloc_with_role(type_index, EXTERNAL_RC_SHELL_WORDS, PayloadRole::ExternalRc)?
+        };
+        let words = ptr.as_ptr().cast::<u64>();
+        // SAFETY: `ptr` owns 3 aligned `u64` words under exclusive mutator ownership;
+        // `register_shell` writes word 0 (`raw_handle`) and registers the `WeakObject`.
+        unsafe {
+            words.add(1).write(offset as u64);
+            words.add(2).write(len as u64);
+            external_rc::register_shell(ptr.as_ptr(), handle);
+        }
+        Some(ptr)
+    }
+
     unsafe fn alloc_raw_object(
         &mut self,
         header: ObjectHeader,
@@ -404,6 +495,13 @@ impl Heap {
     pub fn safe_point(&self) {
         if self.should_yield() {
             mutators::poll(self.tls);
+        }
+        if mutators::can_initiate_gc(self.tls) && external_rc::take_gc_needed() {
+            // SAFETY: `can_initiate_gc` verifies a top-level active `begin_execution` session
+            // with all live references published to roots at this safepoint.
+            unsafe {
+                let _ = self.collect_garbage();
+            }
         }
     }
 
@@ -448,7 +546,10 @@ impl Drop for Heap {
 }
 
 pub fn gc_init(config: &GcConfig) -> Heap {
-    let _ = collector(config.heap_size);
+    let col = collector(config.heap_size);
+    if col.live_bytes_approx.load(Ordering::Relaxed) == 0 {
+        external_rc::init_pressure_threshold(config.heap_size);
+    }
     let tls_identity = Box::new(0u8);
     let addr = (&*tls_identity as *const u8) as usize;
     let tls = VMMutatorThread(VMThread(OpaquePointer::from_address(addr)));

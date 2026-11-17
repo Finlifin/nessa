@@ -1,13 +1,14 @@
 //! String-keyed maps retain identity while replacing a managed tagged bucket buffer.
 
-use gc::ObjectHeader;
+use gc::{MAX_LARGE_TAGGED_WORDS, ObjectHeader, heap_string_bytes};
 use runtime::TaggedValue;
 use type_pool::CollectionRole;
 
 use crate::collections::{read_u64_atomic, write_u64_atomic};
 use crate::{Vm, VmError};
 
-const MAX_CAPACITY: usize = 8192;
+pub(crate) const MAX_MAP_CAPACITY: usize = MAX_LARGE_TAGGED_WORDS / 4;
+const MAX_CAPACITY: usize = MAX_MAP_CAPACITY;
 const HASH_MASK: u64 = (1 << 57) - 1;
 const EMPTY: u64 = 0;
 const OCCUPIED: u64 = 1;
@@ -54,14 +55,8 @@ impl MapLayout {
                     .as_heap_ptr()
                     .ok_or(VmError::TypeError)?;
                 // SAFETY: the bucket key is a live reference from this rooted
-                // managed buffer; verify its string header before any byte read.
-                let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
-                if !header.is_ordinary() {
-                    return Err(VmError::TypeError);
-                }
-                if header.type_index != type_pool::Intrinsic::Str.type_index()
-                    || header.payload_words() == 0
-                {
+                // managed buffer; verify its string payload before any byte read.
+                if unsafe { heap_string_bytes(pointer) }.is_none() {
                     return Err(VmError::TypeError);
                 }
                 Ok(state)
@@ -260,15 +255,17 @@ impl Vm {
     }
 
     fn map_buffer(&mut self, capacity: usize) -> Result<TaggedValue, VmError> {
-        let words = u16::try_from(capacity.checked_mul(4).ok_or(VmError::ObjectTooLarge)?)
-            .map_err(|_| VmError::ObjectTooLarge)?;
+        if capacity > MAX_CAPACITY {
+            return Err(VmError::ObjectTooLarge);
+        }
+        let words = capacity.checked_mul(4).ok_or(VmError::ObjectTooLarge)?;
         let ty = self
             .type_pool_read()
             .map_buffer_type()
             .ok_or(VmError::TypeError)?;
-        // SAFETY: mutator owns this allocation with no lock held across `alloc_object`.
-        let pointer =
-            unsafe { self.worker.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+        // SAFETY: mutator owns this allocation with no lock held across `alloc_tagged_words`.
+        let pointer = unsafe { self.worker.heap.alloc_tagged_words(ty, words) }
+            .ok_or(VmError::OutOfMemory)?;
         let base = pointer.as_ptr().cast::<u64>();
         for bucket in 0..capacity {
             let slot = bucket * 4;
@@ -769,31 +766,32 @@ mod tests {
     fn growth_and_full_capacity_fail_without_changing_existing_entries() {
         let mut vm = make_vm();
         let map = vm.new_map(0).unwrap();
+        // Grow past the legacy `8192` capacity wall (`16_385` entries -> `capacity = 32_768`,
+        // `131_072` words > `u16::MAX` using `PayloadRole::LargeTagged`).
+        let target_entries = 16_385usize;
         vm.with_temporary_roots(&[map], |vm| {
-            for index in 0..MAX_CAPACITY {
+            for index in 0..target_entries {
                 let key = vm.alloc_string(&format!("entry{index}"))?;
                 vm.map_set(map, key, TaggedValue::from_i64(index as i64))?;
             }
-            assert_eq!(vm.map_layout(map)?.capacity, MAX_CAPACITY);
-            assert_eq!(vm.map_len(map)?, MAX_CAPACITY);
+            let layout = vm.map_layout(map)?;
+            assert_eq!(layout.capacity, 32_768);
+            let buf_hdr = unsafe { ObjectHeader::from_payload_ptr(layout.buffer.cast::<u8>()) };
+            assert_eq!(buf_hdr.payload_role(), Some(gc::PayloadRole::LargeTagged));
+            assert_eq!(buf_hdr.payload_words(), 32_768 * 4);
+            assert_eq!(vm.map_len(map)?, target_entries);
             let snapshot = vm.map_keys(map)?;
             vm.worker_roots()
                 .temporary_values
                 .borrow_mut()
                 .push(snapshot);
-            assert_eq!(vm.list_len(snapshot)?, MAX_CAPACITY);
+            assert_eq!(vm.list_len(snapshot)?, target_entries);
             let mut seen = std::collections::HashSet::new();
-            for index in 0..MAX_CAPACITY {
+            for index in 0..target_entries {
                 let key = vm.list_get(snapshot, TaggedValue::from_u64(index as u64))?;
                 assert!(seen.insert(string_key(key)?));
                 assert!(vm.map_contains(map, key)?);
             }
-            let missing = vm.alloc_string("overflow")?;
-            assert!(matches!(
-                vm.map_set(map, missing, TaggedValue::TRUE),
-                Err(VmError::ObjectTooLarge)
-            ));
-            assert_eq!(vm.map_len(map)?, MAX_CAPACITY);
             let existing = vm.alloc_string("entry4096")?;
             vm.worker_roots()
                 .temporary_values
@@ -805,7 +803,7 @@ mod tests {
             let replacement = vm.alloc_string("replacement")?;
             vm.map_set(map, replacement, TaggedValue::FALSE)?;
             assert_eq!(vm.map_get(map, replacement)?, TaggedValue::FALSE);
-            assert_eq!(vm.map_len(map)?, MAX_CAPACITY);
+            assert_eq!(vm.map_len(map)?, target_entries);
             Ok(())
         })
         .unwrap();

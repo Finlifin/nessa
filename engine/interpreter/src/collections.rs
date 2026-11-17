@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gc::ObjectHeader;
+use gc::{MAX_LARGE_TAGGED_WORDS, ObjectHeader};
 use nsbc::Reg;
 use runtime::{Number, TaggedValue, TaskId};
 use str_interner::StrId;
@@ -12,7 +12,8 @@ use type_pool::CollectionRole;
 
 use crate::{DispatchResult, Vm, VmError};
 
-const MAX_CAPACITY: usize = u16::MAX as usize;
+pub(crate) const MAX_LIST_CAPACITY: usize = MAX_LARGE_TAGGED_WORDS;
+const MAX_CAPACITY: usize = MAX_LIST_CAPACITY;
 
 #[inline]
 pub(super) fn read_u64_atomic(base: *const u64, index: usize) -> u64 {
@@ -283,14 +284,16 @@ impl Vm {
     }
 
     fn list_buffer(&mut self, capacity: usize) -> Result<TaggedValue, VmError> {
-        let words = u16::try_from(capacity).map_err(|_| VmError::ObjectTooLarge)?;
+        if capacity > MAX_CAPACITY {
+            return Err(VmError::ObjectTooLarge);
+        }
         let ty = self
             .type_pool_read()
             .list_buffer_type()
             .ok_or(VmError::TypeError)?;
         // SAFETY: execution owns the mutator and holds no lock across allocation.
-        let pointer =
-            unsafe { self.worker.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+        let pointer = unsafe { self.worker.heap.alloc_tagged_words(ty, capacity) }
+            .ok_or(VmError::OutOfMemory)?;
         let base = pointer.as_ptr().cast::<u64>();
         for index in 0..capacity {
             write_u64_atomic(base, index, TaggedValue::UNIT.raw());
@@ -1312,19 +1315,22 @@ mod tests {
     #[test]
     fn integer_indices_and_capacity_limits_are_checked_without_mutation() {
         let mut vm = make_vm();
-        let list = vm.new_list(MAX_CAPACITY).unwrap();
+        // Allocate beyond the legacy `u16::MAX` limit (`70_000 > 65_535`) to verify
+        // `PayloadRole::LargeTagged` backing buffers alongside index & overflow guards.
+        let large_len = (u16::MAX as usize) + 4_465;
+        let list = vm.new_list(large_len).unwrap();
         vm.with_temporary_roots(&[list], |vm| {
-            assert!(matches!(
-                vm.list_push(list, TaggedValue::TRUE),
-                Err(VmError::ObjectTooLarge)
-            ));
-            assert_eq!(vm.list_len(list)?, MAX_CAPACITY);
+            let layout = vm.list_layout(list)?;
+            let buf_hdr = unsafe { ObjectHeader::from_payload_ptr(layout.buffer.cast::<u8>()) };
+            assert_eq!(buf_hdr.payload_role(), Some(gc::PayloadRole::LargeTagged));
+            assert_eq!(buf_hdr.payload_words(), large_len);
+            assert_eq!(vm.list_len(list)?, large_len);
             assert!(matches!(
                 vm.list_get(list, TaggedValue::from_i64(-1)),
                 Err(VmError::InvalidIndex)
             ));
             assert!(matches!(
-                vm.list_get(list, TaggedValue::from_u64(MAX_CAPACITY as u64)),
+                vm.list_get(list, TaggedValue::from_u64(large_len as u64)),
                 Err(VmError::InvalidIndex)
             ));
             let float = vm.number_value(Number::F64(0.0))?;
@@ -1335,6 +1341,19 @@ mod tests {
                 Err(VmError::InvalidIndex)
             ));
             assert!(vm.list_get(list, TaggedValue::from_u64(0))?.is_unit());
+            assert!(
+                vm.list_get(list, TaggedValue::from_u64((large_len - 1) as u64))?
+                    .is_unit()
+            );
+            assert!(matches!(
+                vm.list_resize(
+                    list,
+                    TaggedValue::from_u64((MAX_CAPACITY + 1) as u64),
+                    TaggedValue::TRUE
+                ),
+                Err(VmError::ObjectTooLarge)
+            ));
+            assert_eq!(vm.list_len(list)?, large_len);
             Ok(())
         })
         .unwrap();

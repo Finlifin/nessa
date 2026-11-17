@@ -1,4 +1,7 @@
-use gc::{GC_FLAGS, GcConfig, Heap, NessaSlot, ObjectHeader};
+use gc::{
+    ExternalRcHandle, GC_FLAGS, GcConfig, Heap, INLINE_BYTES_THRESHOLD, MAX_EXTERNAL_RC_BYTES,
+    MAX_LARGE_TAGGED_WORDS, NessaSlot, ObjectHeader, external_rc_clone_view, heap_string_bytes,
+};
 use nsbc::{AddrMode, FuncId, Instruction, InstructionData, Opcode, ParameterAbi, Reg};
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use runtime::{
@@ -1344,29 +1347,57 @@ impl Vm {
         })
     }
 
-    /// Allocate a heap string and return its TaggedValue.
-    /// The string bytes are laid out as: [len:u64][...UTF-8 bytes...].
-    /// Payload words of a String object: an eight-byte length prefix plus UTF-8 bytes.
-    fn string_payload_words(byte_len: usize) -> Result<u16, VmError> {
-        let payload_bytes = 8usize
-            .checked_add(byte_len)
-            .ok_or(VmError::ObjectTooLarge)?;
-        u16::try_from(payload_bytes.div_ceil(8)).map_err(|_| VmError::ObjectTooLarge)
+    /// Maximum UTF-8 byte length of a managed `String` (`1 GiB`).
+    pub const MAX_STRING_BYTES: usize = MAX_EXTERNAL_RC_BYTES;
+
+    #[inline]
+    pub(crate) fn check_string_bytes(byte_len: usize) -> Result<(), VmError> {
+        if byte_len > Self::MAX_STRING_BYTES {
+            Err(VmError::ObjectTooLarge)
+        } else {
+            Ok(())
+        }
     }
 
+    #[inline]
+    fn inline_string_payload_words(byte_len: usize) -> u16 {
+        debug_assert!(byte_len <= INLINE_BYTES_THRESHOLD);
+        (8usize + byte_len).div_ceil(8) as u16
+    }
+
+    /// Allocate a heap string and return its `TaggedValue`.
+    ///
+    /// Strings up to [`INLINE_BYTES_THRESHOLD`] (`8,168 B`) stay inline in Immix
+    /// (`[len: u64][UTF-8 bytes...]`, `PayloadRole::Ordinary`); larger strings up to
+    /// [`Self::MAX_STRING_BYTES`] (`1 GiB`) use a 3-word Immix thin shell backed by an
+    /// off-heap reference-counted [`ExternalRcHandle`] (`PayloadRole::ExternalRc`).
     pub(crate) fn alloc_string(&mut self, s: &str) -> Result<TaggedValue, VmError> {
         let bytes = s.as_bytes();
-        let payload_words = Self::string_payload_words(bytes.len())?;
+        Self::check_string_bytes(bytes.len())?;
         let str_type = Intrinsic::Str.type_index();
-        // SAFETY: callers hold an operation, and publish the initialized value
-        // before ending it. No lock is held across allocation.
-        match unsafe { self.worker.heap.alloc_object(str_type, payload_words) } {
-            Some(ptr) => unsafe {
-                *(ptr.as_ptr() as *mut u64) = bytes.len() as u64;
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().add(8), bytes.len());
-                Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
-            },
-            None => Err(VmError::OutOfMemory),
+        if bytes.len() <= INLINE_BYTES_THRESHOLD {
+            let payload_words = Self::inline_string_payload_words(bytes.len());
+            // SAFETY: callers hold an operation, and publish the initialized value
+            // before ending it. No lock is held across allocation.
+            match unsafe { self.worker.heap.alloc_object(str_type, payload_words) } {
+                Some(ptr) => unsafe {
+                    *(ptr.as_ptr() as *mut u64) = bytes.len() as u64;
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr().add(8), bytes.len());
+                    Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+                },
+                None => Err(VmError::OutOfMemory),
+            }
+        } else {
+            let handle = ExternalRcHandle::from_slice(bytes).ok_or(VmError::OutOfMemory)?;
+            // SAFETY: active mutator operation; `handle` is fully initialized.
+            match unsafe {
+                self.worker
+                    .heap
+                    .alloc_external_rc(str_type, handle, 0, bytes.len())
+            } {
+                Some(ptr) => Ok(unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) }),
+                None => Err(VmError::OutOfMemory),
+            }
         }
     }
 
@@ -1388,29 +1419,61 @@ impl Vm {
         if len_b == 0 {
             return Ok(left);
         }
-        let payload_words = Self::string_payload_words(total)?;
-        let root = self.worker_roots().temporary_values.borrow().len();
-        self.with_temporary_roots(&[left, right], |vm| {
-            let str_type = Intrinsic::Str.type_index();
-            // SAFETY: active mutator operation; `left` and `right` are rooted in
-            // `temporary_values[root..root+2]` across `alloc_object` and reloaded below.
-            let ptr = unsafe { vm.worker.heap.alloc_object(str_type, payload_words) }
-                .ok_or(VmError::OutOfMemory)?;
-            let (la, rb) = {
-                let roots = vm.worker_roots().temporary_values.borrow();
-                (roots[root], roots[root + 1])
-            };
-            let pa = la.as_heap_ptr().ok_or(VmError::TypeError)?;
-            let pb = rb.as_heap_ptr().ok_or(VmError::TypeError)?;
-            // SAFETY: `ptr` has `8 + total` bytes allocated; `pa` and `pb` are live
-            // non-overlapping `Str` objects whose lengths `len_a` and `len_b` were verified.
+        Self::check_string_bytes(total)?;
+        let str_type = Intrinsic::Str.type_index();
+        if total <= INLINE_BYTES_THRESHOLD {
+            let payload_words = Self::inline_string_payload_words(total);
+            let root = self.worker_roots().temporary_values.borrow().len();
+            self.with_temporary_roots(&[left, right], |vm| {
+                // SAFETY: active mutator operation; `left` and `right` are rooted in
+                // `temporary_values[root..root+2]` across `alloc_object` and reloaded below.
+                let ptr = unsafe { vm.worker.heap.alloc_object(str_type, payload_words) }
+                    .ok_or(VmError::OutOfMemory)?;
+                let (la, rb) = {
+                    let roots = vm.worker_roots().temporary_values.borrow();
+                    (roots[root], roots[root + 1])
+                };
+                let pa = la.as_heap_ptr().ok_or(VmError::TypeError)?;
+                let pb = rb.as_heap_ptr().ok_or(VmError::TypeError)?;
+                // SAFETY: `la` and `rb` are rooted live `Str` objects; `ptr` owns `8 + total` bytes.
+                unsafe {
+                    let bytes_a = heap_string_bytes(pa).ok_or(VmError::TypeError)?;
+                    let bytes_b = heap_string_bytes(pb).ok_or(VmError::TypeError)?;
+                    *(ptr.as_ptr() as *mut u64) = total as u64;
+                    std::ptr::copy_nonoverlapping(bytes_a.as_ptr(), ptr.as_ptr().add(8), len_a);
+                    std::ptr::copy_nonoverlapping(
+                        bytes_b.as_ptr(),
+                        ptr.as_ptr().add(8 + len_a),
+                        len_b,
+                    );
+                    Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+                }
+            })
+        } else {
+            // Copy both slices into the off-heap RC buffer before allocating the Immix shell
+            // so `handle` is completely initialized before any GC safepoint inside `alloc_external_rc`.
+            // SAFETY: all `total` bytes are overwritten below before publication.
+            let handle =
+                unsafe { ExternalRcHandle::new_uninit(total) }.ok_or(VmError::OutOfMemory)?;
+            let pa = left.as_heap_ptr().ok_or(VmError::TypeError)?;
+            let pb = right.as_heap_ptr().ok_or(VmError::TypeError)?;
+            // SAFETY: no managed allocation occurred since `left`/`right` validation; `handle` is disjoint.
             unsafe {
-                *(ptr.as_ptr() as *mut u64) = total as u64;
-                std::ptr::copy_nonoverlapping(pa.add(8), ptr.as_ptr().add(8), len_a);
-                std::ptr::copy_nonoverlapping(pb.add(8), ptr.as_ptr().add(8 + len_a), len_b);
-                Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+                let bytes_a = heap_string_bytes(pa).ok_or(VmError::TypeError)?;
+                let bytes_b = heap_string_bytes(pb).ok_or(VmError::TypeError)?;
+                let dst = handle.data_mut_ptr();
+                std::ptr::copy_nonoverlapping(bytes_a.as_ptr(), dst, len_a);
+                std::ptr::copy_nonoverlapping(bytes_b.as_ptr(), dst.add(len_a), len_b);
             }
-        })
+            // SAFETY: active mutator operation; `handle` is fully initialized.
+            let ptr = unsafe {
+                self.worker
+                    .heap
+                    .alloc_external_rc(str_type, handle, 0, total)
+            }
+            .ok_or(VmError::OutOfMemory)?;
+            Ok(unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) })
+        }
     }
 
     pub(crate) fn alloc_string_subrange(
@@ -1426,28 +1489,59 @@ impl Vm {
         if start_byte == 0 && end_byte == src_len {
             return Ok(src);
         }
-        let payload_words = Self::string_payload_words(slice_len)?;
-        let root = self.worker_roots().temporary_values.borrow().len();
-        self.with_temporary_roots(&[src], |vm| {
-            let str_type = Intrinsic::Str.type_index();
-            // SAFETY: active mutator operation; `src` is rooted across `alloc_object`.
-            let ptr = unsafe { vm.worker.heap.alloc_object(str_type, payload_words) }
-                .ok_or(VmError::OutOfMemory)?;
-            let reloaded = vm.worker_roots().temporary_values.borrow()[root];
-            let ps = reloaded.as_heap_ptr().ok_or(VmError::TypeError)?;
-            // SAFETY: `[start_byte..end_byte]` was verified on UTF-8 character boundaries of `src`.
-            unsafe {
-                *(ptr.as_ptr() as *mut u64) = slice_len as u64;
-                if slice_len > 0 {
-                    std::ptr::copy_nonoverlapping(
-                        ps.add(8 + start_byte),
-                        ptr.as_ptr().add(8),
-                        slice_len,
-                    );
+        Self::check_string_bytes(slice_len)?;
+        let str_type = Intrinsic::Str.type_index();
+        if slice_len <= INLINE_BYTES_THRESHOLD {
+            let payload_words = Self::inline_string_payload_words(slice_len);
+            let root = self.worker_roots().temporary_values.borrow().len();
+            self.with_temporary_roots(&[src], |vm| {
+                // SAFETY: active mutator operation; `src` is rooted across `alloc_object`.
+                let ptr = unsafe { vm.worker.heap.alloc_object(str_type, payload_words) }
+                    .ok_or(VmError::OutOfMemory)?;
+                let reloaded = vm.worker_roots().temporary_values.borrow()[root];
+                let ps = reloaded.as_heap_ptr().ok_or(VmError::TypeError)?;
+                // SAFETY: `[start_byte..end_byte]` was verified on UTF-8 character boundaries of `src`.
+                unsafe {
+                    let src_bytes = heap_string_bytes(ps).ok_or(VmError::TypeError)?;
+                    *(ptr.as_ptr() as *mut u64) = slice_len as u64;
+                    if slice_len > 0 {
+                        std::ptr::copy_nonoverlapping(
+                            src_bytes.as_ptr().add(start_byte),
+                            ptr.as_ptr().add(8),
+                            slice_len,
+                        );
+                    }
+                    Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
                 }
-                Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+            })
+        } else {
+            let ps = src.as_heap_ptr().ok_or(VmError::TypeError)?;
+            // If `src` is already an `ExternalRc` string and the slice retains at least 1/4 of
+            // the backing capacity, share the `ExternalRcHandle` in O(1) with zero copying!
+            // Otherwise allocate a right-sized `ExternalRcHandle` to avoid pinning huge buffers.
+            // SAFETY: `ps` is a live `Str` payload within an active mutator operation.
+            let handle_and_offset = unsafe {
+                if let Some((handle, base_offset, _)) = external_rc_clone_view(ps)
+                    && slice_len >= handle.capacity() / 4
+                {
+                    Some((handle, base_offset + start_byte))
+                } else {
+                    let src_bytes = heap_string_bytes(ps).ok_or(VmError::TypeError)?;
+                    let copied = ExternalRcHandle::from_slice(&src_bytes[start_byte..end_byte])
+                        .ok_or(VmError::OutOfMemory)?;
+                    Some((copied, 0usize))
+                }
+            };
+            let (handle, new_offset) = handle_and_offset.expect("checked Some");
+            // SAFETY: active mutator operation; `handle` covers `new_offset..(new_offset + slice_len)`.
+            let ptr = unsafe {
+                self.worker
+                    .heap
+                    .alloc_external_rc(str_type, handle, new_offset, slice_len)
             }
-        })
+            .ok_or(VmError::OutOfMemory)?;
+            Ok(unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) })
+        }
     }
 
     /// Spawn a root task that starts executing the given function.
@@ -2301,16 +2395,16 @@ impl Vm {
                         type_pool::TypeKind::Newtype { .. } => 1,
                         _ => return DispatchResult::Error(VmError::TypeError),
                     };
-                    let Ok(words) = u16::try_from(words) else {
-                        return DispatchResult::Error(VmError::TypeError);
-                    };
+                    if words > MAX_LARGE_TAGGED_WORDS {
+                        return DispatchResult::Error(VmError::ObjectTooLarge);
+                    }
                     (type_idx, words)
                 };
                 // SAFETY: slice owns an execution operation, no lock is held across allocation,
                 // and all payload slots are initialized before publishing to `dst`.
-                match unsafe { self.worker.heap.alloc_object(type_idx, words) } {
+                match unsafe { self.worker.heap.alloc_tagged_words(type_idx, words) } {
                     Some(ptr) => {
-                        for index in 0..words as usize {
+                        for index in 0..words {
                             unsafe {
                                 ptr.as_ptr()
                                     .cast::<u64>()

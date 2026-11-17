@@ -128,7 +128,7 @@ impl Vm {
         // SAFETY: callers hold a mutator operation and keep this live value rooted.
         let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
         match header.payload_role() {
-            Some(PayloadRole::Ordinary) => {
+            Some(PayloadRole::Ordinary | PayloadRole::LargeTagged) => {
                 if header.type_index.as_u32() < Intrinsic::COUNT as u32 {
                     return Ok(None);
                 }
@@ -136,6 +136,12 @@ impl Vm {
                 if self.cached_has_error_shape(ty)? {
                     return Err(VmError::TypeError);
                 }
+                return Ok(None);
+            }
+            Some(PayloadRole::ExternalRc)
+                if header.type_index == Intrinsic::Str.type_index()
+                    && crate::builtin_ctx::with_heap_string_str(value, |_| ()).is_some() =>
+            {
                 return Ok(None);
             }
             Some(PayloadRole::ErrorEnvelope) if header.payload_words() == 3 => {}

@@ -826,20 +826,7 @@ fn quote_literal_value(val: TaggedValue) -> Result<Result<String, (i64, String)>
 fn extract_heap_str_for_quote(val: TaggedValue) -> Option<String> {
     let ptr = val.as_heap_ptr()?;
     // SAFETY: `val` is a rooted live VM value inside an active `BuiltinCtx` operation.
-    let header = unsafe { gc::ObjectHeader::from_payload_ptr(ptr) };
-    if !header.is_ordinary()
-        || header.type_index != type_pool::Intrinsic::Str.type_index()
-        || header.payload_words() == 0
-    {
-        return None;
-    }
-    // SAFETY: validated ordinary `Str` header with at least one word for byte length.
-    let len = unsafe { *(ptr as *const u64) } as usize;
-    if len > header.payload_words() * 8 - 8 {
-        return None;
-    }
-    // SAFETY: `len` fits within the live string payload.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
+    let bytes = unsafe { gc::heap_string_bytes(ptr) }?;
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 

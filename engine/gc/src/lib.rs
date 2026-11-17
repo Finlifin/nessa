@@ -35,6 +35,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod external_rc;
+pub use external_rc::{
+    EXTERNAL_RC_SHELL_WORDS, ExternalRcHandle, INLINE_BYTES_THRESHOLD, MAX_EXTERNAL_RC_BYTES,
+    external_live_bytes, external_rc_backing_parts, external_rc_bytes, external_rc_clone_view,
+    external_shell_count, heap_string_bytes,
+};
 mod mutators;
 pub use mutators::{MutatorAccessError, MutatorSession};
 mod roots;
@@ -56,6 +62,12 @@ pub const MAX_BYTE_BUFFER_WORDS: usize = 0x1FF_FFFF;
 /// Maximum byte capacity of a single [`PayloadRole::ByteBuffer`] allocation (~256 MiB).
 pub const MAX_BYTE_BUFFER_BYTES: usize = MAX_BYTE_BUFFER_WORDS * 8;
 
+/// Prefix size (`u64` word count) placed immediately before `ObjectHeader` for [`PayloadRole::LargeTagged`].
+pub const LARGE_TAGGED_PREFIX_BYTES: usize = std::mem::size_of::<u64>();
+
+/// Maximum 8-byte `TaggedValue` words in a single [`PayloadRole::LargeTagged`] object (`67,108,864` words = 512 MiB).
+pub const MAX_LARGE_TAGGED_WORDS: usize = 1 << 26;
+
 /// VM-selected payload interpretation. Only checked allocators may publish
 /// non-default roles; a role is never supplied by source or archive data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,20 +76,30 @@ pub enum PayloadRole {
     Ordinary = 0,
     ErrorEnvelope = 1,
     ByteBuffer = 2,
+    /// Multi-segment/large scanned `TaggedValue` payload with an 8-byte `u64` word-count
+    /// prefix immediately preceding `ObjectHeader`, preserving the 6-bit lock `stripe_index`.
+    LargeTagged = 3,
+    /// 3-word Immix thin shell (`[raw_ptr, offset, byte_len]`) backed by an off-heap
+    /// reference-counted [`ExternalRcHandle`].
+    ExternalRc = 4,
 }
 
-/// Header stored at the beginning of every GC-managed heap object (16 bytes).
+/// Header stored immediately before every GC-managed heap object's payload (16 bytes).
 ///
 /// ```text
-///   [TypeIndex: u32][gc_meta: u32][hash_or_fwd: u64]
+///   Ordinary / ErrorEnvelope / ByteBuffer / ExternalRc:
+///     [TypeIndex: u32][gc_meta: u32][hash_or_fwd: u64][payload words...]
+///
+///   LargeTagged:
+///     [payload_words: u64][TypeIndex: u32][gc_meta: u32][hash_or_fwd: u64][payload words...]
 /// ```
 ///
 /// `gc_meta` bit layout:
 ///   - bits 0-2:   reserved for MMTk (mark bit, forwarding bits)
-///   - bits 3-18:  payload word count low 16 bits (up to 65535 words for ordinary objects)
-///   - bits 19-21: VM payload role (0 ordinary, 1 Error envelope, 2 No-Scan ByteBuffer)
-///   - bits 22-27: immutable concurrency stripe index (0..63) for ordinary/Error objects
-///   - bits 22-30: high 9 bits of payload word count for ByteBuffer (bits 28-30 reserved otherwise)
+///   - bits 3-18:  payload word count low 16 bits (unused/0 for `LargeTagged`)
+///   - bits 19-21: VM payload role (`0..=4`)
+///   - bits 22-27: immutable concurrency stripe index (`0..64`) for `Ordinary`/`ErrorEnvelope`/`LargeTagged`/`ExternalRc`
+///   - bits 22-30: high 9 bits of payload word count for `ByteBuffer` (bits 28-30 reserved otherwise)
 ///   - bit  31:    pinned flag
 ///
 /// `hash_or_fwd`:  identity hash (normal) / forwarding pointer (during GC).
@@ -135,6 +157,16 @@ impl ObjectHeader {
         })
     }
 
+    pub fn new_large_tagged(type_index: TypeIndex) -> Self {
+        let id = next_object_id();
+        let stripe = ((id ^ (id >> 13) ^ (id >> 27)) as u32) & 0x3F;
+        Self {
+            type_index,
+            gc_meta: ((PayloadRole::LargeTagged as u32) << 19) | (stripe << 22),
+            hash_or_fwd: id,
+        }
+    }
+
     /// Immutable concurrency lock-stripe index (`0..64`), preserved across moving GC.
     #[inline]
     pub fn stripe_index(&self) -> usize {
@@ -146,26 +178,48 @@ impl ObjectHeader {
             0 => Some(PayloadRole::Ordinary),
             1 => Some(PayloadRole::ErrorEnvelope),
             2 => Some(PayloadRole::ByteBuffer),
+            3 => Some(PayloadRole::LargeTagged),
+            4 => Some(PayloadRole::ExternalRc),
             _ => None,
         }
     }
 
+    /// Returns `true` for standard `TaggedValue`-slot payloads (`Ordinary` and `LargeTagged`).
     pub fn is_ordinary(&self) -> bool {
-        self.payload_role() == Some(PayloadRole::Ordinary)
+        matches!(
+            self.payload_role(),
+            Some(PayloadRole::Ordinary | PayloadRole::LargeTagged)
+        )
+    }
+
+    /// Byte distance from the start of the MMTk allocation to the payload start.
+    #[inline]
+    pub fn header_offset(&self) -> usize {
+        if self.payload_role() == Some(PayloadRole::LargeTagged) {
+            Self::SIZE + LARGE_TAGGED_PREFIX_BYTES
+        } else {
+            Self::SIZE
+        }
     }
 
     pub fn payload_words(&self) -> usize {
-        let low = ((self.gc_meta >> 3) & 0xFFFF) as usize;
-        if self.payload_role() == Some(PayloadRole::ByteBuffer) {
-            let high = ((self.gc_meta >> 22) & 0x1FF) as usize;
-            low | (high << 16)
-        } else {
-            low
+        match self.payload_role() {
+            Some(PayloadRole::ByteBuffer) => {
+                let low = ((self.gc_meta >> 3) & 0xFFFF) as usize;
+                let high = ((self.gc_meta >> 22) & 0x1FF) as usize;
+                low | (high << 16)
+            }
+            Some(PayloadRole::LargeTagged) => {
+                // SAFETY: Every `LargeTagged` header is allocated with an initialized
+                // 8-byte `u64` word-count prefix immediately preceding `ObjectHeader`.
+                unsafe { *((self as *const Self as *const u64).sub(1)) as usize }
+            }
+            _ => ((self.gc_meta >> 3) & 0xFFFF) as usize,
         }
     }
 
     pub fn object_size(&self) -> usize {
-        Self::SIZE + self.payload_words() * 8
+        self.header_offset() + self.payload_words() * 8
     }
 
     /// # Safety
@@ -190,20 +244,23 @@ pub(crate) fn visit_payload_reference_slots(
     header: &ObjectHeader,
     mut visit: impl FnMut(usize),
 ) {
-    if header.payload_role() == Some(PayloadRole::ErrorEnvelope) {
-        assert_eq!(
-            header.payload_words(),
-            3,
-            "invalid Error envelope allocation"
-        );
-        visit(payload_addr + 16);
-        return;
+    match header.payload_role() {
+        Some(PayloadRole::ErrorEnvelope) => {
+            assert_eq!(
+                header.payload_words(),
+                3,
+                "invalid Error envelope allocation"
+            );
+            visit(payload_addr + 16);
+            return;
+        }
+        Some(PayloadRole::ByteBuffer | PayloadRole::ExternalRc) => {
+            // Raw byte buffers and off-heap RC shells never contain managed reference slots.
+            return;
+        }
+        Some(PayloadRole::Ordinary | PayloadRole::LargeTagged) => {}
+        None => panic!("invalid VM payload role"),
     }
-    if header.payload_role() == Some(PayloadRole::ByteBuffer) {
-        // Raw byte buffers never contain managed TaggedValue reference slots.
-        return;
-    }
-    assert!(header.is_ordinary(), "invalid VM payload role");
     let first_reference_word = if header.type_index.as_u32() <= Intrinsic::F64 as u32
         || header.type_index == Intrinsic::Str.type_index()
         || header.type_index == Intrinsic::Continuation.type_index()
@@ -412,8 +469,11 @@ mod unix_mmtk {
             semantics: CopySemantics,
             copy_context: &mut GCWorkerCopyContext<NessaVM>,
         ) -> ObjectReference {
+            // SAFETY: `from` is a live object reference whose `ObjectHeader` sits at `from - 16`.
+            let header: &ObjectHeader =
+                unsafe { &*(Self::ref_to_header(from).to_ptr::<ObjectHeader>()) };
             let obj_start = Self::ref_to_object_start(from);
-            let header: &ObjectHeader = unsafe { &*(obj_start.to_ptr::<ObjectHeader>()) };
+            let hdr_offset = header.header_offset();
             let total_size = header.object_size();
 
             let dst = copy_context.alloc_copy(from, total_size, 8, 0, semantics);
@@ -425,7 +485,7 @@ mod unix_mmtk {
                 );
             }
             let new_objref =
-                unsafe { ObjectReference::from_raw_address_unchecked(dst + ObjectHeader::SIZE) };
+                unsafe { ObjectReference::from_raw_address_unchecked(dst + hdr_offset) };
             copy_context.post_copy(new_objref, total_size, semantics);
             new_objref
         }
@@ -440,13 +500,17 @@ mod unix_mmtk {
             dst + size
         }
 
-        fn get_reference_when_copied_to(_from: ObjectReference, to: Address) -> ObjectReference {
-            unsafe { ObjectReference::from_raw_address_unchecked(to + ObjectHeader::SIZE) }
+        fn get_reference_when_copied_to(from: ObjectReference, to: Address) -> ObjectReference {
+            // SAFETY: `from` is a live object reference whose `ObjectHeader` sits at `from - 16`.
+            let header: &ObjectHeader =
+                unsafe { &*(Self::ref_to_header(from).to_ptr::<ObjectHeader>()) };
+            unsafe { ObjectReference::from_raw_address_unchecked(to + header.header_offset()) }
         }
 
         fn get_current_size(object: ObjectReference) -> usize {
-            let obj_start = Self::ref_to_object_start(object);
-            let header: &ObjectHeader = unsafe { &*(obj_start.to_ptr::<ObjectHeader>()) };
+            // SAFETY: `object` is a live reference with `ObjectHeader` at `object - 16`.
+            let header: &ObjectHeader =
+                unsafe { &*(Self::ref_to_header(object).to_ptr::<ObjectHeader>()) };
             header.object_size()
         }
 
@@ -467,7 +531,14 @@ mod unix_mmtk {
         }
 
         fn ref_to_object_start(object: ObjectReference) -> Address {
-            object.to_raw_address() - ObjectHeader::SIZE
+            let hdr_addr = object.to_raw_address() - ObjectHeader::SIZE;
+            // SAFETY: `hdr_addr` points to the aligned `ObjectHeader` immediately before `object`.
+            let hdr: &ObjectHeader = unsafe { &*(hdr_addr.to_ptr::<ObjectHeader>()) };
+            if hdr.payload_role() == Some(PayloadRole::LargeTagged) {
+                hdr_addr - LARGE_TAGGED_PREFIX_BYTES
+            } else {
+                hdr_addr
+            }
         }
 
         fn ref_to_header(object: ObjectReference) -> Address {
@@ -476,11 +547,12 @@ mod unix_mmtk {
 
         fn dump_object(object: ObjectReference) {
             let hdr: &ObjectHeader =
-                unsafe { &*(Self::ref_to_object_start(object).to_ptr::<ObjectHeader>()) };
+                unsafe { &*(Self::ref_to_header(object).to_ptr::<ObjectHeader>()) };
             eprintln!(
-                "NessaObj@{}: type={} words={} hash={}",
+                "NessaObj@{}: type={} role={:?} words={} hash={}",
                 object.to_raw_address(),
                 hdr.type_index.as_u32(),
+                hdr.payload_role(),
                 hdr.payload_words(),
                 hdr.hash_or_fwd,
             );
@@ -495,10 +567,10 @@ mod unix_mmtk {
             object: ObjectReference,
             slot_visitor: &mut SV,
         ) {
-            let obj_start = NessaObjectModel::ref_to_object_start(object);
+            let hdr_addr = NessaObjectModel::ref_to_header(object);
             // SAFETY: the collector supplies a live object with its initialized
             // aligned ObjectHeader immediately before the payload.
-            let header: &ObjectHeader = unsafe { &*(obj_start.to_ptr::<ObjectHeader>()) };
+            let header: &ObjectHeader = unsafe { &*(hdr_addr.to_ptr::<ObjectHeader>()) };
             let payload_start = object.to_raw_address().as_usize();
             visit_payload_reference_slots(payload_start, header, |slot_addr| {
                 // SAFETY: `slot_addr` lies within the live object payload.
@@ -557,6 +629,7 @@ mod unix_mmtk {
             let changed = tracer_context.with_tracer(worker, |tracer| {
                 // SAFETY: weak processing follows the completed closure under STW.
                 unsafe {
+                    external_rc::trace_stw();
                     roots::trace_conditional_roots(&mut |slot| {
                         if let Some(object) = slot.load() {
                             slot.store(tracer.trace_object(object));
@@ -565,8 +638,11 @@ mod unix_mmtk {
                 }
             });
             if !changed {
-                // SAFETY: fixed point reached under STW.
-                unsafe { roots::sweep_conditional_roots() };
+                // SAFETY: fixed point reached under STW; unreachable owners cannot revive.
+                unsafe {
+                    roots::sweep_conditional_roots();
+                    external_rc::sweep_stw();
+                };
             }
             changed
         }
@@ -578,6 +654,7 @@ mod unix_mmtk {
             tracer_context.with_tracer(worker, |tracer| {
                 // SAFETY: two-phase collectors forward only retained roots under STW.
                 unsafe {
+                    external_rc::forward_stw();
                     roots::forward_conditional_roots(&mut |slot| {
                         if let Some(object) = slot.load() {
                             slot.store(tracer.trace_object(object));
@@ -597,7 +674,10 @@ mod unix_mmtk {
         {
             let stopped = mutators::stop_all();
             // SAFETY: the barrier stopped operations before any root work starts.
-            unsafe { roots::prepare_conditional_roots() };
+            unsafe {
+                roots::prepare_conditional_roots();
+                external_rc::prepare_stw();
+            };
             for pointer in stopped {
                 // SAFETY: collection owns mutator access during the STW barrier.
                 mutator_visitor(unsafe { &mut *pointer });
@@ -817,6 +897,92 @@ mod unix_mmtk {
             NonNull::new(payload_addr.to_mut_ptr::<u8>())
         }
 
+        /// Allocate a scanned `TaggedValue`-slot object of `payload_words` words,
+        /// using [`PayloadRole::Ordinary`] up to `u16::MAX` words and switching
+        /// transparently to [`PayloadRole::LargeTagged`] (8-byte `u64` prefix + 16-byte
+        /// `ObjectHeader` in MMTk LOS, preserving the 6-bit concurrency `stripe_index`)
+        /// up to [`MAX_LARGE_TAGGED_WORDS`].
+        ///
+        /// # Safety
+        /// Same mutator-operation, initialization, and root-publication obligations as
+        /// [`Heap::alloc_object`].
+        pub unsafe fn alloc_tagged_words(
+            &mut self,
+            type_index: TypeIndex,
+            payload_words: usize,
+        ) -> Option<NonNull<u8>> {
+            if let Ok(small_words) = u16::try_from(payload_words) {
+                // SAFETY: Caller supplies mutator operation and root obligations.
+                return unsafe { self.alloc_object(type_index, small_words) };
+            }
+            if payload_words > MAX_LARGE_TAGGED_WORDS {
+                return None;
+            }
+            let payload_bytes = payload_words.checked_mul(8)?;
+            let header_offset = LARGE_TAGGED_PREFIX_BYTES + ObjectHeader::SIZE;
+            let total_size = header_offset.checked_add(payload_bytes)?;
+            let semantics = AllocationSemantics::Los;
+
+            let mutator = &mut *self.mutator;
+            let addr = mmtk::memory_manager::alloc(mutator, total_size, 8, 0, semantics);
+            if addr.is_zero() {
+                return None;
+            }
+
+            let header = ObjectHeader::new_large_tagged(type_index);
+            let hdr_addr = addr + LARGE_TAGGED_PREFIX_BYTES;
+            let payload_addr = addr + header_offset;
+            // SAFETY: `addr` owns `total_size` 8-byte-aligned writable bytes:
+            // `[0..8]` = `u64` word count, `[8..24]` = `ObjectHeader`, `[24..]` = zeroed slots.
+            unsafe {
+                std::ptr::write(addr.to_mut_ptr::<u64>(), payload_words as u64);
+                std::ptr::write(hdr_addr.to_mut_ptr::<ObjectHeader>(), header);
+                std::ptr::write_bytes(payload_addr.to_mut_ptr::<u8>(), 0, payload_bytes);
+            }
+            // SAFETY: `payload_addr` is non-zero and 8-byte aligned.
+            let objref = unsafe { ObjectReference::from_raw_address_unchecked(payload_addr) };
+            mmtk::memory_manager::post_alloc(mutator, objref, total_size, semantics);
+            let prev = *self.alloc_count.get_mut();
+            *self.alloc_count.get_mut() = prev.wrapping_add(1);
+
+            NonNull::new(payload_addr.to_mut_ptr::<u8>())
+        }
+
+        /// Allocate a 3-word [`PayloadRole::ExternalRc`] thin shell in Immix bound to
+        /// `handle` over `offset..(offset + len)`.
+        ///
+        /// If allocation triggers a GC before the shell exists, `handle` remains safely
+        /// owned on the caller's Rust stack; if allocation fails, `handle` drops cleanly.
+        ///
+        /// # Safety
+        /// Caller must hold an active mutator operation and publish the returned pointer
+        /// into a registered root before another allocation or safepoint.
+        pub unsafe fn alloc_external_rc(
+            &mut self,
+            type_index: TypeIndex,
+            handle: ExternalRcHandle,
+            offset: usize,
+            len: usize,
+        ) -> Option<NonNull<u8>> {
+            if offset.checked_add(len)? > handle.capacity() {
+                return None;
+            }
+            // SAFETY: Caller holds an active mutator operation; `handle` is not yet in
+            // `EXTERNAL_RC_REGISTRY`, so any GC inside `alloc_with_role` cannot sweep it.
+            let ptr = unsafe {
+                self.alloc_with_role(type_index, EXTERNAL_RC_SHELL_WORDS, PayloadRole::ExternalRc)?
+            };
+            let words = ptr.as_ptr().cast::<u64>();
+            // SAFETY: `ptr` owns 3 aligned `u64` words under exclusive mutator ownership;
+            // `register_shell` writes word 0 (`raw_handle`) and registers the `WeakObject`.
+            unsafe {
+                words.add(1).write(offset as u64);
+                words.add(2).write(len as u64);
+                external_rc::register_shell(ptr.as_ptr(), handle);
+            }
+            Some(ptr)
+        }
+
         pub fn should_yield(&self) -> bool {
             GC_FLAGS.gc_requested.load(Ordering::Relaxed)
         }
@@ -824,6 +990,12 @@ mod unix_mmtk {
         pub fn safe_point(&self) {
             if self.should_yield() {
                 mutators::poll(self.tls);
+            }
+            if mutators::can_initiate_gc(self.tls)
+                && external_rc::take_gc_needed()
+                && !mmtk_ref().handle_user_collection_request(self.tls, true, false)
+            {
+                GC_FLAGS.gc_requested.store(false, Ordering::Release);
             }
         }
 
@@ -861,6 +1033,7 @@ mod unix_mmtk {
             let _ = builder.set_option("threads", &gc_threads.to_string());
             let _ =
                 builder.set_option("gc_trigger", &format!("FixedHeapSize:{}", config.heap_size));
+            external_rc::init_pressure_threshold(config.heap_size);
 
             let mmtk_box = mmtk::memory_manager::mmtk_init::<NessaVM>(&builder);
             Box::leak(mmtk_box)

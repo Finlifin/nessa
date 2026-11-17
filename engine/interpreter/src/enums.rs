@@ -1,6 +1,6 @@
 //! Checked nominal enum descriptors and tagged variant payloads.
 
-use gc::ObjectHeader;
+use gc::{MAX_LARGE_TAGGED_WORDS, ObjectHeader};
 use runtime::TaggedValue;
 use str_interner::StrId;
 use type_pool::{FieldInfo, TypeIndex, TypeKind};
@@ -35,7 +35,7 @@ impl Vm {
             .max()
             .unwrap_or(0)
             .checked_add(1)
-            .filter(|&words| words <= u16::MAX as usize)
+            .filter(|&words| words <= MAX_LARGE_TAGGED_WORDS)
             .ok_or(VmError::ObjectTooLarge)?;
         Ok(EnumLayout {
             ty,
@@ -130,7 +130,7 @@ impl Vm {
             let payload = unsafe {
                 vm.worker
                     .heap
-                    .alloc_object(descriptor.ty, descriptor.words as u16)
+                    .alloc_tagged_words(descriptor.ty, descriptor.words)
             }
             .ok_or(VmError::OutOfMemory)?;
             let roots = vm.worker_roots().temporary_values.borrow();

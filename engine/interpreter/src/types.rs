@@ -235,6 +235,15 @@ impl Vm {
             // SAFETY: the caller holds the operation and the source register
             // roots this live object. No collection occurs during inspection.
             let header = unsafe { ObjectHeader::from_payload_ptr(pointer) };
+            if header.type_index == Intrinsic::Str.type_index()
+                && header.payload_role() == Some(gc::PayloadRole::ExternalRc)
+            {
+                return if crate::builtin_ctx::with_heap_string_str(value, |_| ()).is_some() {
+                    Ok(Some(Intrinsic::Str.type_index()))
+                } else {
+                    Err(VmError::TypeError)
+                };
+            }
             if !header.is_ordinary() {
                 return Err(VmError::TypeError);
             }
@@ -509,8 +518,7 @@ impl Vm {
             // SAFETY: caller holds a mutator operation and `value` is a live VM value.
             let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
             if target == Intrinsic::Str.type_index() {
-                return header.is_ordinary()
-                    && header.type_index == Intrinsic::Str.type_index()
+                return header.type_index == Intrinsic::Str.type_index()
                     && crate::builtin_ctx::with_heap_string_str(value, |_| ()).is_some();
             }
             if target == Intrinsic::F64.type_index() {
