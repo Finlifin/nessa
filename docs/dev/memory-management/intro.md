@@ -1,6 +1,8 @@
 # 内存管理 (Memory Management)
 
-Nessa 采用 MMTK (Memory Management Toolkit) 框架集成 LXR GC，结合 Work Packet 并行化设计和 mmap'd Task Stack Pool 管理。
+Nessa 在 Unix（Linux / macOS）上采用 MMTk 0.32 `Immix` 移动式回收器 + 大对象空间（LOS），在 Windows（Windows 10 1709+）上采用原生精确 Stop-The-World Mark-Sweep + LOS 回收器（`win_gc.rs`），并结合分段式 `Task Stack Pool` 管理任务与定界延续栈段。
+
+> **说明**：早期设计文档曾规划接入实验性的 `LXR` 并发回收器与每 Task 独立分配器；**当前实际运行实现**为**每 OS Worker 线程绑定独立 Mutator**（Unix 下为 `mmtk::Mutator<NessaVM>` bump-pointer 分配器，同一 Worker 上顺序切换的多个 Task 共享该线程的 Mutator 缓冲区，无需跨线程加锁；LXR 与并发标记仍属远期演进方向）。
 
 ## 设计概览
 
@@ -8,23 +10,23 @@ Nessa 采用 MMTK (Memory Management Toolkit) 框架集成 LXR GC，结合 Work 
 ┌────────────────── Memory Subsystem ──────────────────────────────┐
 │                                                                   │
 │  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ MMTK Framework                                               │ │
+│  │ Managed Heap Backend                                         │ │
 │  │                                                              │ │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │ │
-│  │  │  Allocators  │  │  LXR GC      │  │   Work Packets   │ │ │
-│  │  │  (per-task   │  │  (collector)  │  │   (并行 GC 任务   │ │ │
-│  │  │  bump alloc) │  │              │  │    调度框架)      │ │ │
+│  │  │  Allocators  │  │  Collector   │  │   STW & Packets   │ │ │
+│  │  │ (per-worker  │  │ (Unix Immix  │  │ (多 Worker 安全点  │ │ │
+│  │  │  bump/freels)│  │ / Win MarkSwp│  │   协同与根集扫描)  │ │ │
 │  │  └──────────────┘  └──────────────┘  └───────────────────┘ │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │                                                                   │
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │ Task Stack Pool (Segmented List)                             │ │
-│  │   mmap'd 8MB slots, guard pages, demand-paged               │ │
+│  │   mmap / VirtualAlloc 8MB slots, guard pages, demand-paged   │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │                                                                   │
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │ Extern Object Table                                          │ │
-│  │   FFI 分配的 C 对象注册与析构                                 │ │
+│  │   FFI 分配的外部对象注册与析构（规划扩展）                     │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │                                                                   │
 └──────────────────────────────────────────────────────────────────┘
@@ -34,28 +36,26 @@ Nessa 采用 MMTK (Memory Management Toolkit) 框架集成 LXR GC，结合 Work 
 
 ### 快速路径 (Hot Path)
 
-每个 Task 持有一个 per-task bump allocator：
+在 Unix MMTk `Immix` 后端下，每个 OS Worker 线程独占持有一个 `Mutator<NessaVM>` bump allocator（Task 只在安全点切换，不在分配中途跨线程迁移）：
 
 ```
-1. task 向 MMTK 请求一个 allocation buffer (如 32KB)
-2. 后续分配只需 bump pointer += object_size
-3. buffer 用尽时向 MMTK 请求新 buffer
-4. 无锁、无竞争——每个 task 独立分配
+1. Worker 线程向 MMTk 请求本地分配块 (Immix line / block)
+2. 该 Worker 上运行的任意 task 分配小对象时仅推进当前线程的 bump pointer
+3. 本地块耗尽时向 MMTk 全局池申请新块；空间不足时触发协同 STW 回收
+4. 分配快路径为线程本地操作（不跨线程争用锁，但并非每个 Task 单独持有 TLAB）
 ```
 
 ### 大对象分配
 
-超过阈值的大对象（如 > 8KB）直接走 MMTK 的 large object space，避免碎片化。
+超过阈值的大对象（> 8KB）直接进入大对象空间（Large Object Space, LOS），避免普通块碎片化。
 
 详见 [large-object-management.md](large-object-management.md)。
 
-## GC 策略：LXR
+## GC 策略：Immix（Unix）与精确 Mark-Sweep（Windows）
 
-LXR (Lattice-based Cross-reference) GC 的核心特性：
-
-- **分代收集**: 新生代 (nursery) 使用 copying collector，老生代使用标记-整理
-- **并发标记**: 标记阶段可与 mutator 并发执行（减少 STW 时间）
-- **Work Packet 并行化**: GC 工作被拆分为细粒度的 work packet，由 worker 线程并行处理
+- **Unix (`Immix` + `LOS`)**：按块/行（block/line）管理内存，支持常规标记复用空闲行及碎片整理（defrag 移动式压缩，自动更新所有已注册 `TaggedValue` 根槽位），并由 MMTk Work Packet 多线程并行执行回收。
+- **Windows (`win_gc` Mark-Sweep + `LOS`)**：面向 Windows 10 1709+ 提供零外部 C++ 运行时依赖的精确根集标记-清扫回收器，支持多 Worker STW 屏障与按类大小空闲链表复用。
+- **远期演进方向（未启用）**：并发标记或 `LXR` 低延迟回收器留待未来按需评估。
 
 ### GC 触发条件
 

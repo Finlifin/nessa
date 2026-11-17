@@ -70,10 +70,11 @@ fn main() {
 
 当 task 因父作用域提前 `return`、错误 `!` 传播、`await_any` / `await_first` 竞速淘汰或 `task.with_timeout` 到期而被标记取消时，它会在下一个 **safe-point** 或挂起原语（`libuv` I/O、`std.sync` 等待队列、`.await`）处立即感知取消信号，并进入受保护的 **`UnwindingCancel` 展开阶段**：
 
-1. **停止正常控制流**并唤醒/撤销当前正在等待的定时器、子进程、TCP/UDP 套接字或 `Channel`/`Mutex`/`Semaphore` 队列条目
+1. **停止正常控制流**并唤醒/撤销当前正在等待的定时器、子进程、TCP/UDP 套接字或 `Channel`/`Mutex`/`Semaphore`/`Barrier` 队列条目（任何已抵达但尚未被调用方接管的临时套接字自动关闭或重回监听队列，已缓冲流数据零丢失）
 2. **级联取消并等待所有子 task 收敛**：确保子任务的资源清理先于父任务完成（严格内层先于外层析构顺序）
-3. **自顶向下按 LIFO 逆序执行当前任务所有活跃栈帧中的 `defer` 块与 handler 弹出清理**（期间屏蔽重复取消中断，确保 `defer { file.close() }`、`defer { sock.close() }`、`Mutex.with_lock` 解锁等 RAII 逻辑 100% 完整执行）
-4. **归还栈段至 `StackPool`**，状态收敛为 `Cancelled`
+3. **自顶向下按 LIFO 逆序执行当前任务所有活跃栈帧中的 `defer` 块与 handler 弹出清理**：在 `UnwindingCancel` 期间，调度器通过 `unwinding_cancel` 状态屏蔽外层作用域重复下发的取消中断，允许 `defer` 块内部安全地执行**可挂起的异步清理操作**（例如争用 `Mutex.with_lock`、向审计 `Channel` 发送日志、`task.sleep_ms` 退避、关闭套接字，乃至派生并 `.await` 清理用的子 `async effect` 任务）
+4. **归还栈段至 `StackPool` 并触发终止钩子**：状态收敛为 `Cancelled`；若任务因未捕获异常退出而仍持有底层锁，终止钩子亦自动释放以防同伴死锁
+5. **竞速组合子同步等待败者清理**：`await_any`、`await_first` 与 `task.with_timeout` 在选出胜者并取消其余兄弟分支后，会**等待所有被取消败者的 `defer` 块执行完毕**才向调用方返回，保证组合子返回后的下一行代码即可立即重用败者释放的端口、文件或互斥锁
 
 ```
 [被取消的 Task]

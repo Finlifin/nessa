@@ -345,6 +345,7 @@ impl Drop for PrimaryAuxShutdown {
         for handle in handles {
             let _ = handle.join();
         }
+        shared.roots.scheduler.shutdown_reactor();
     }
 }
 
@@ -450,6 +451,7 @@ pub(crate) struct SharedVm {
     pub(crate) next_future_id: AtomicU64,
     pub(crate) next_handler_scope_id: AtomicU64,
     pub(crate) await_all_ops: Arc<futures::AwaitAllTable>,
+    pub(crate) await_any_ops: Arc<futures::AwaitAnyTable>,
     pub(crate) container_stripes: Box<[CachePaddedRwLock; CONTAINER_STRIPE_COUNT]>,
     pub(crate) worker_slices: Box<[CachePaddedAtomicU64]>,
     pub(crate) epoch_sync: Arc<AuxEpochSync>,
@@ -582,17 +584,29 @@ impl Vm {
             std::array::from_fn(|_| CachePaddedRwLock::default());
         let scheduler = Scheduler::with_workers(stack_pool, configured_workers);
         let await_all_ops = Arc::new(futures::AwaitAllTable::new());
+        let await_any_ops = Arc::new(futures::AwaitAnyTable::new());
         let sync = Arc::new(sync_primitives::SyncRegistry::new());
         {
             let await_all_for_hook = Arc::clone(&await_all_ops);
+            let await_any_for_hook = Arc::clone(&await_any_ops);
             let sync_for_hook = Arc::clone(&sync);
             let weak_sched = scheduler.downgrade();
             scheduler.set_cancel_hook(Arc::new(move |tid| {
                 if let Some(st) = await_all_for_hook.remove(tid) {
                     st.early_exit.store(true, Ordering::Release);
                 }
+                let _ = await_any_for_hook.remove(tid);
                 if let Some(sched) = weak_sched.upgrade() {
                     sync_for_hook.cancel_task(&sched, tid);
+                }
+            }));
+        }
+        {
+            let sync_for_exit = Arc::clone(&sync);
+            let weak_sched = scheduler.downgrade();
+            scheduler.set_exit_hook(Arc::new(move |tid| {
+                if let Some(sched) = weak_sched.upgrade() {
+                    sync_for_exit.on_task_terminated(&sched, tid);
                 }
             }));
         }
@@ -650,6 +664,7 @@ impl Vm {
             next_future_id: AtomicU64::new(1),
             next_handler_scope_id: AtomicU64::new(1),
             await_all_ops,
+            await_any_ops,
             container_stripes: Box::new(stripes),
             worker_slices: worker_slices.into_boxed_slice(),
             epoch_sync: Arc::new(AuxEpochSync::new()),
@@ -1752,6 +1767,7 @@ impl Vm {
             }
             if is_cancelled && !unwinding_cancel {
                 self.shared.roots.scheduler.cancel_task_waiters(task_id);
+                self.shared.roots.scheduler.mark_unwinding_cancel(task_id);
                 if let Some(task) = self.task_mut(task_id) {
                     task.unwinding_cancel = true;
                 }
@@ -1879,6 +1895,7 @@ impl Vm {
                 }
                 DispatchResult::StartCancelUnwind => {
                     self.shared.roots.scheduler.cancel_task_waiters(task_id);
+                    self.shared.roots.scheduler.mark_unwinding_cancel(task_id);
                     if let Some(task) = self.task_mut(task_id) {
                         task.unwinding_cancel = true;
                     }

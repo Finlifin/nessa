@@ -24,7 +24,7 @@ use crate::SchedulerInner;
 use crate::reactor::{
     BoxedWorkFn, Doorbell, IO_ALREADY_EXISTS, IO_BROKEN_PIPE, IO_INVALID_INPUT, IO_NOT_FOUND,
     IO_OK, IO_OTHER, IO_PERMISSION_DENIED, IO_UNEXPECTED_EOF, ProcessOutcome, ProcessSpec,
-    ReactorCmd, TaskOpEntry, TaskOpResult, TaskOpState, complete_entry,
+    ReactorCmd, TaskOpEntry, TaskOpResult, TaskOpState, complete_entry, try_complete_entry,
 };
 use crate::reactor_net::{
     MAX_BUFFERED_TCP_READ_BYTES, NetCmd, NetHandleKind, NetHandleMeta, NetOutcome, NetRegistry,
@@ -297,7 +297,7 @@ impl WinWaker {
 
     #[inline]
     pub(crate) fn wake(&self) {
-        if !self.notified.swap(true, Ordering::AcqRel) {
+        if !self.notified.swap(true, Ordering::SeqCst) {
             let _ = self.tx.send(&[1u8]);
         }
     }
@@ -383,8 +383,11 @@ impl WinHelperPool {
             q.jobs.clear();
             cvar.notify_all();
         }
+        let current_id = std::thread::current().id();
         for jh in self.workers.drain(..) {
-            let _ = jh.join();
+            if jh.thread().id() != current_id {
+                let _ = jh.join();
+            }
         }
     }
 }
@@ -652,54 +655,65 @@ type IoErrTuple = (i64, String);
 
 impl WinReactorState {
     fn drain_doorbell_and_internal(&mut self) {
-        self.waker.notified.store(false, Ordering::Release);
-        let mut wake_buf = [0u8; 64];
-        while self.waker_rx.recv(&mut wake_buf).is_ok() {}
+        loop {
+            let mut wake_buf = [0u8; 64];
+            while self.waker_rx.recv(&mut wake_buf).is_ok() {}
+            // Clear `notified` AFTER draining `waker_rx` and BEFORE draining `internal`/`doorbell`
+            // so a concurrent `wake()` packet consumed by `waker_rx.recv()` never leaves `notified`
+            // stuck at `true` with an empty socket buffer.
+            self.waker.notified.store(false, Ordering::SeqCst);
 
-        let mut internal_batch = VecDeque::new();
-        std::mem::swap(&mut internal_batch, &mut *self.waker.internal.lock());
-        while let Some(ev) = internal_batch.pop_front() {
-            match ev {
-                InternalEvent::TcpConnected {
-                    op_id,
-                    entry,
-                    result,
-                } => self.finish_tcp_connect(op_id, entry, result),
-                InternalEvent::ProcessFinished { op_id } => {
-                    self.processes.remove(&op_id);
+            let mut internal_batch = VecDeque::new();
+            std::mem::swap(&mut internal_batch, &mut *self.waker.internal.lock());
+            let had_internal = !internal_batch.is_empty();
+            while let Some(ev) = internal_batch.pop_front() {
+                match ev {
+                    InternalEvent::TcpConnected {
+                        op_id,
+                        entry,
+                        result,
+                    } => self.finish_tcp_connect(op_id, entry, result),
+                    InternalEvent::ProcessFinished { op_id } => {
+                        self.processes.remove(&op_id);
+                    }
                 }
             }
-        }
 
-        let mut cmd_batch = VecDeque::new();
-        std::mem::swap(&mut cmd_batch, &mut self.doorbell.lock().queue);
-        while let Some(cmd) = cmd_batch.pop_front() {
-            match cmd {
-                ReactorCmd::StartTimer {
-                    op_id,
-                    duration_ms,
-                    entry,
-                } => self.handle_start_timer(op_id, duration_ms, entry),
-                ReactorCmd::SpawnProcess { op_id, spec, entry } => {
-                    self.handle_spawn_process(op_id, spec, entry)
-                }
-                ReactorCmd::QueueWork {
-                    op_id: _op_id,
-                    work,
-                    entry,
-                } => {
-                    self.pool.submit(HelperJob::Work {
+            let mut cmd_batch = VecDeque::new();
+            std::mem::swap(&mut cmd_batch, &mut self.doorbell.lock().queue);
+            let had_cmds = !cmd_batch.is_empty();
+            while let Some(cmd) = cmd_batch.pop_front() {
+                match cmd {
+                    ReactorCmd::StartTimer {
+                        op_id,
+                        duration_ms,
+                        entry,
+                    } => self.handle_start_timer(op_id, duration_ms, entry),
+                    ReactorCmd::SpawnProcess { op_id, spec, entry } => {
+                        self.handle_spawn_process(op_id, spec, entry)
+                    }
+                    ReactorCmd::QueueWork {
+                        op_id: _op_id,
                         work,
                         entry,
-                        sched: Weak::clone(&self.sched),
-                    });
+                    } => {
+                        self.pool.submit(HelperJob::Work {
+                            work,
+                            entry,
+                            sched: Weak::clone(&self.sched),
+                        });
+                    }
+                    ReactorCmd::Net(net_cmd) => self.handle_net_cmd(net_cmd),
+                    ReactorCmd::CancelOp { op_id } => self.handle_cancel_op(op_id),
+                    ReactorCmd::Shutdown => {
+                        self.begin_shutdown();
+                        return;
+                    }
                 }
-                ReactorCmd::Net(net_cmd) => self.handle_net_cmd(net_cmd),
-                ReactorCmd::CancelOp { op_id } => self.handle_cancel_op(op_id),
-                ReactorCmd::Shutdown => {
-                    self.begin_shutdown();
-                    return;
-                }
+            }
+
+            if !had_internal && !had_cmds {
+                break;
             }
         }
     }
@@ -1095,7 +1109,7 @@ impl WinReactorState {
                 accept_waiters: VecDeque::new(),
             },
         );
-        complete_entry(
+        if try_complete_entry(
             &entry,
             TaskOpResult::Net(NetOutcome::HandleAddr {
                 code: IO_OK,
@@ -1105,7 +1119,11 @@ impl WinReactorState {
                 port: local_port,
             }),
             &self.sched,
-        );
+        )
+        .is_err()
+        {
+            self.close_listener_by_id(id);
+        }
     }
 
     fn register_connected_stream(&mut self, sock: TcpStream) -> Result<StreamConnMeta, IoErrTuple> {
@@ -1158,12 +1176,20 @@ impl WinReactorState {
             );
             return;
         }
+        if matches!(*entry.state.lock(), TaskOpState::Cancelled) {
+            return;
+        }
         if let Some((stream_id, peer_ip, peer_port)) = self
             .listeners
             .get_mut(&listener_id)
             .and_then(|l| l.backlog.pop_front())
         {
-            complete_entry(
+            if let Err(TaskOpResult::Net(NetOutcome::HandleAddr {
+                handle_id,
+                host,
+                port,
+                ..
+            })) = try_complete_entry(
                 &entry,
                 TaskOpResult::Net(NetOutcome::HandleAddr {
                     code: IO_OK,
@@ -1173,7 +1199,10 @@ impl WinReactorState {
                     port: peer_port,
                 }),
                 &self.sched,
-            );
+            ) && let Some(lst) = self.listeners.get_mut(&listener_id)
+            {
+                lst.backlog.push_front((handle_id, host, port));
+            }
             return;
         }
         let accept_res = self
@@ -1185,7 +1214,12 @@ impl WinReactorState {
         match accept_res {
             Ok((sock, _)) => match self.register_connected_stream(sock) {
                 Ok((stream_id, _, (peer_ip, peer_port))) => {
-                    complete_entry(
+                    if let Err(TaskOpResult::Net(NetOutcome::HandleAddr {
+                        handle_id,
+                        host,
+                        port,
+                        ..
+                    })) = try_complete_entry(
                         &entry,
                         TaskOpResult::Net(NetOutcome::HandleAddr {
                             code: IO_OK,
@@ -1195,7 +1229,13 @@ impl WinReactorState {
                             port: peer_port,
                         }),
                         &self.sched,
-                    );
+                    ) {
+                        if let Some(lst) = self.listeners.get_mut(&listener_id) {
+                            lst.backlog.push_front((handle_id, host, port));
+                        } else {
+                            self.close_stream_by_id(handle_id);
+                        }
+                    }
                 }
                 Err((code, msg)) => {
                     complete_entry(
@@ -1289,7 +1329,7 @@ impl WinReactorState {
         match result {
             Ok(sock) => match self.register_connected_stream(sock) {
                 Ok((stream_id, (local_ip, local_port), _)) => {
-                    complete_entry(
+                    if try_complete_entry(
                         &entry,
                         TaskOpResult::Net(NetOutcome::HandleAddr {
                             code: IO_OK,
@@ -1299,7 +1339,11 @@ impl WinReactorState {
                             port: local_port,
                         }),
                         &self.sched,
-                    );
+                    )
+                    .is_err()
+                    {
+                        self.close_stream_by_id(stream_id);
+                    }
                 }
                 Err((code, msg)) => {
                     complete_entry(
@@ -1574,7 +1618,7 @@ impl WinReactorState {
                 send_queue: VecDeque::new(),
             },
         );
-        complete_entry(
+        if try_complete_entry(
             &entry,
             TaskOpResult::Net(NetOutcome::HandleAddr {
                 code: IO_OK,
@@ -1584,7 +1628,11 @@ impl WinReactorState {
                 port: local_port,
             }),
             &self.sched,
-        );
+        )
+        .is_err()
+        {
+            self.close_udp_by_id(id);
+        }
     }
 
     fn cmd_udp_send(
@@ -1800,8 +1848,17 @@ impl WinReactorState {
             }
         }
 
+        let effective_timeout = if self.waker.notified.load(Ordering::SeqCst)
+            || !self.waker.internal.lock().is_empty()
+            || !self.doorbell.lock().queue.is_empty()
+        {
+            0
+        } else {
+            timeout_ms
+        };
+
         // SAFETY: `fds` is a valid non-empty array of live Winsock `SOCKET` descriptors.
-        let rc = unsafe { win_ffi::WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms) };
+        let rc = unsafe { win_ffi::WSAPoll(fds.as_mut_ptr(), fds.len() as u32, effective_timeout) };
         if rc <= 0 {
             return;
         }
@@ -1849,6 +1906,16 @@ impl WinReactorState {
 
     fn pump_listener_accepts(&mut self, listener_id: i64) {
         loop {
+            if let Some(lst) = self.listeners.get_mut(&listener_id) {
+                while let Some(&(op_id, ref entry)) = lst.accept_waiters.front() {
+                    if matches!(*entry.state.lock(), TaskOpState::Cancelled) {
+                        lst.accept_waiters.pop_front();
+                        self.cancel_targets.remove(&op_id);
+                    } else {
+                        break;
+                    }
+                }
+            }
             let has_waiter = self
                 .listeners
                 .get(&listener_id)
@@ -1863,30 +1930,47 @@ impl WinReactorState {
                 .listener
                 .accept();
             match accept_res {
-                Ok((sock, _)) => {
-                    let waiter = self
-                        .listeners
-                        .get_mut(&listener_id)
-                        .and_then(|l| l.accept_waiters.pop_front());
-                    let Some((op_id, entry)) = waiter else {
-                        break;
-                    };
-                    self.cancel_targets.remove(&op_id);
-                    match self.register_connected_stream(sock) {
-                        Ok((stream_id, _, (peer_ip, peer_port))) => {
-                            complete_entry(
+                Ok((sock, _)) => match self.register_connected_stream(sock) {
+                    Ok((stream_id, _, (peer_ip, peer_port))) => {
+                        let mut delivered = false;
+                        while let Some((op_id, entry)) = self
+                            .listeners
+                            .get_mut(&listener_id)
+                            .and_then(|l| l.accept_waiters.pop_front())
+                        {
+                            self.cancel_targets.remove(&op_id);
+                            if try_complete_entry(
                                 &entry,
                                 TaskOpResult::Net(NetOutcome::HandleAddr {
                                     code: IO_OK,
                                     msg: String::new(),
                                     handle_id: stream_id,
-                                    host: peer_ip,
+                                    host: peer_ip.clone(),
                                     port: peer_port,
                                 }),
                                 &self.sched,
-                            );
+                            )
+                            .is_ok()
+                            {
+                                delivered = true;
+                                break;
+                            }
                         }
-                        Err((code, msg)) => {
+                        if !delivered {
+                            if let Some(lst) = self.listeners.get_mut(&listener_id) {
+                                lst.backlog.push_back((stream_id, peer_ip, peer_port));
+                            } else {
+                                self.close_stream_by_id(stream_id);
+                            }
+                        }
+                    }
+                    Err((code, msg)) => {
+                        let waiter = self
+                            .listeners
+                            .get_mut(&listener_id)
+                            .and_then(|l| l.accept_waiters.pop_front());
+                        if let Some((op_id, entry)) = waiter {
+                            self.cancel_targets.remove(&op_id);
                             complete_entry(
                                 &entry,
                                 TaskOpResult::Net(NetOutcome::HandleAddr {
@@ -1900,7 +1984,7 @@ impl WinReactorState {
                             );
                         }
                     }
-                }
+                },
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
                     let waiter = self
@@ -1977,11 +2061,26 @@ fn try_satisfy_tcp_read(
     cancel_targets: &mut FastHashMap<u64, NetCancelKind>,
     sched: &Weak<SchedulerInner>,
 ) -> bool {
-    let Some(pr) = stream.pending_read.as_ref() else {
+    let Some(pr_ref) = stream.pending_read.as_ref() else {
         return false;
     };
-    let outcome = match pr.mode {
-        TcpReadMode::Bytes(max_bytes) => {
+    let entry = Arc::clone(&pr_ref.entry);
+    let op_id = pr_ref.op_id;
+    let mode_is_bytes = match pr_ref.mode {
+        TcpReadMode::Bytes(n) => Some(n),
+        TcpReadMode::Line => None,
+    };
+
+    let mut st = entry.state.lock();
+    if matches!(*st, TaskOpState::Cancelled) {
+        drop(st);
+        stream.pending_read = None;
+        cancel_targets.remove(&op_id);
+        return false;
+    }
+
+    let outcome = match mode_is_bytes {
+        Some(max_bytes) => {
             if max_bytes == 0 {
                 Some(NetOutcome::Bytes {
                     code: IO_OK,
@@ -2012,7 +2111,7 @@ fn try_satisfy_tcp_read(
                 None
             }
         }
-        TcpReadMode::Line => {
+        None => {
             if let Some(nl_pos) = stream.read_buf.iter().position(|&b| b == b'\n') {
                 let mut raw: Vec<u8> = stream.read_buf.drain(..=nl_pos).collect();
                 if raw.last() == Some(&b'\n') {
@@ -2061,9 +2160,16 @@ fn try_satisfy_tcp_read(
     };
 
     if let Some(out) = outcome {
-        let pr = stream.pending_read.take().expect("verified Some");
-        cancel_targets.remove(&pr.op_id);
-        complete_entry(&pr.entry, TaskOpResult::Net(out), sched);
+        *st = TaskOpState::Ready(TaskOpResult::Net(out));
+        drop(st);
+        stream.pending_read = None;
+        cancel_targets.remove(&op_id);
+        if entry.io_accounted.swap(false, Ordering::AcqRel)
+            && let Some(s) = sched.upgrade()
+        {
+            let _ = s.wake_from_reactor(entry.task_id);
+            s.dec_active_io();
+        }
         true
     } else {
         false
@@ -2171,24 +2277,48 @@ fn pump_udp_readable(
     cancel_targets: &mut FastHashMap<u64, NetCancelKind>,
     sched: &Weak<SchedulerInner>,
 ) {
-    while !u.recv_waiters.is_empty() {
-        if let Some(mut pkt) = u.recv_queue.pop_front() {
-            let (op_id, max_bytes, waiter) = u.recv_waiters.pop_front().expect("verified Some");
-            cancel_targets.remove(&op_id);
-            if pkt.data.len() > max_bytes {
-                pkt.data.truncate(max_bytes);
+    loop {
+        while let Some(&(op_id, _, ref waiter)) = u.recv_waiters.front() {
+            if matches!(*waiter.state.lock(), TaskOpState::Cancelled) {
+                u.recv_waiters.pop_front();
+                cancel_targets.remove(&op_id);
+            } else {
+                break;
             }
-            complete_entry(
-                &waiter,
-                TaskOpResult::Net(NetOutcome::Datagram {
-                    code: IO_OK,
-                    msg: String::new(),
-                    data: pkt.data,
-                    host: pkt.host,
-                    port: pkt.port,
-                }),
-                sched,
-            );
+        }
+        if u.recv_waiters.is_empty() {
+            break;
+        }
+        if let Some(pkt) = u.recv_queue.pop_front() {
+            let mut delivered = false;
+            while let Some((op_id, max_bytes, waiter)) = u.recv_waiters.pop_front() {
+                cancel_targets.remove(&op_id);
+                let data = if pkt.data.len() > max_bytes {
+                    pkt.data[..max_bytes].to_vec()
+                } else {
+                    pkt.data.clone()
+                };
+                if try_complete_entry(
+                    &waiter,
+                    TaskOpResult::Net(NetOutcome::Datagram {
+                        code: IO_OK,
+                        msg: String::new(),
+                        data,
+                        host: pkt.host.clone(),
+                        port: pkt.port,
+                    }),
+                    sched,
+                )
+                .is_ok()
+                {
+                    delivered = true;
+                    break;
+                }
+            }
+            if !delivered {
+                u.recv_queue.push_front(pkt);
+                break;
+            }
             continue;
         }
         if let Some((code, msg)) = u.recv_err.take() {
@@ -2212,22 +2342,39 @@ fn pump_udp_readable(
             Ok((n, peer)) => {
                 buf.truncate(n);
                 let (peer_ip, peer_port) = format_sock_addr(peer);
-                let (op_id, max_bytes, waiter) = u.recv_waiters.pop_front().expect("verified Some");
-                cancel_targets.remove(&op_id);
-                if buf.len() > max_bytes {
-                    buf.truncate(max_bytes);
+                let mut delivered = false;
+                while let Some((op_id, max_bytes, waiter)) = u.recv_waiters.pop_front() {
+                    cancel_targets.remove(&op_id);
+                    let data = if buf.len() > max_bytes {
+                        buf[..max_bytes].to_vec()
+                    } else {
+                        buf.clone()
+                    };
+                    if try_complete_entry(
+                        &waiter,
+                        TaskOpResult::Net(NetOutcome::Datagram {
+                            code: IO_OK,
+                            msg: String::new(),
+                            data,
+                            host: peer_ip.clone(),
+                            port: peer_port,
+                        }),
+                        sched,
+                    )
+                    .is_ok()
+                    {
+                        delivered = true;
+                        break;
+                    }
                 }
-                complete_entry(
-                    &waiter,
-                    TaskOpResult::Net(NetOutcome::Datagram {
-                        code: IO_OK,
-                        msg: String::new(),
+                if !delivered {
+                    u.recv_queue.push_back(UdpPacket {
                         data: buf,
                         host: peer_ip,
                         port: peer_port,
-                    }),
-                    sched,
-                );
+                    });
+                    break;
+                }
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,

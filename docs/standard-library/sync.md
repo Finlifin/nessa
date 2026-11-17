@@ -1,11 +1,11 @@
 # `std.sync` — 任务级非阻塞同步原语与无锁原子类型
 
-`std.sync` 提供面向多核结构化并发的任务间通信与同步设施。所有可能等待的原语（`Channel`、`Mutex`、`RwLock`、`Semaphore`、`Once`、`Barrier`）均为**任务级挂起（Task-Suspending）**：
+`std.sync` 提供面向多核结构化并发的任务间通信与同步设施。
 
-- 未就绪时仅将当前 `TaskId` 挂入分片等待队列并立即释放 OS Worker 线程去执行其它就绪任务；
-- 所有存储在同步原语内部的托管堆对象均纳入 MMTk 移动式 Immix GC 根追踪；
-- 挂起等待纳入运行时全局死锁检测图（无外部唤醒源的环形锁/空通道等待确定性报告 `VmError::DeadlockDetected`）；
-- 当等待中的任务被结构化取消时，自动从等待队列摘除并进入 `defer` 栈展开，绝不留下幽灵等待者或死锁。
+- **任务级非阻塞挂起（分片锁等待队列）**：`Channel`、`Mutex`、`RwLock`、`Semaphore`、`Once` 与 `Barrier` 内部采用 64 路分片互斥锁保护等待队列；未就绪时仅将当前 `TaskId` 挂入队列并立即释放 OS Worker 线程去执行其它就绪任务，绝不自旋阻塞 Worker 线程。
+- **无锁原子单元**：`AtomicInt` 与 `AtomicBool` 的加载、存储、加减与 CAS 均为 `SeqCst` 无锁原子指令（仅在每 1024 个原子单元扩容新块时获取一次块分配锁）。
+- **精确 GC 与全局死锁检测**：所有存储在同步原语内部的托管堆对象均纳入精确 GC 根追踪（支持移动式回收槽位更新）；挂起等待纳入全局死锁检测图（无外部唤醒源的环形锁/空通道等待确定性报告 `VmError::DeadlockDetected`）。
+- **取消安全与异常退出兜底**：等待中的任务被结构化取消（且未处于 `defer` 展开期）时自动从等待队列摘除，并将已交接的锁/信号量令牌级联传递给下一名合法等待者；若持锁任务因未捕获运行时错误异常终止，调度器任务退出钩子会自动释放其持有的 `Mutex` / `RwLock` 并回滚运行中的 `Once`，防止永久死锁。
 
 ## `Channel` 与 `ChannelError`
 
@@ -35,8 +35,8 @@ impl Channel {
 }
 ```
 
-- `send(val)`：缓冲区已满（或零缓冲尚无接收方）时挂起当前任务；若通道已关闭，返回 `error ChannelError.Closed`。
-- `recv()`：队列非空时直接取出元素并唤醒一个挂起的发送方；队列为空且未关闭时挂起当前任务；通道关闭且已排空后返回 `error ChannelError.Closed`。
+- `send(val)`：缓冲区已满（或零缓冲尚无活跃接收方）时挂起当前任务；若挂起期间发送方被取消，保证元素**绝不会**残留在通道中；若通道已关闭，返回 `error ChannelError.Closed`。
+- `recv()`：有缓冲队列非空或零缓冲通道存在就绪发送方时直接完成交接；否则挂起当前任务（零缓冲通道 `len()` 恒为 `0`，接收方取消绝不缓冲或丢弃发送方消息）；通道关闭且已排空后返回 `error ChannelError.Closed`。
 - `close()`：幂等关闭通道，唤醒所有正在等待的发送方（返回 `Closed`）与接收方（排空剩余元素后返回 `Closed`）。
 
 ## `Mutex`（任务级互斥锁）
@@ -121,7 +121,9 @@ impl Lazy {
 
 ### `Barrier`
 
-可重用多阶段多任务同步栅栏。当第 `parties` 个任务到达 `wait()` 时，一次性放行本轮全部任务并开启下一代（最后一个到达的 leader 任务返回 `true`，其余任务返回 `false`）：
+可重用多阶段多任务同步栅栏。当第 `parties` 个任务到达 `wait()` 时，一次性放行本轮全部任务并开启下一代（最后一个到达的 leader 任务返回 `true`，其余任务返回 `false`）。
+
+若某个已到达 `wait()` 的参与者任务在本轮凑齐 `parties` 之前被结构化取消，栅栏立即进入**破损（Broken）**状态并唤醒所有已到达的等待任务，报告破损栅栏错误而非让其余 $N-1$ 个任务永久挂死：
 
 ```nessa
 impl Barrier {
@@ -166,7 +168,7 @@ fn main() {
     let ch = Channel.buffered(4)
     let total = Mutex.new(0)
 
-    {
+    if true {
         handles async produce(id: i64) => {
             ch.send(id * 10)! {}
         }

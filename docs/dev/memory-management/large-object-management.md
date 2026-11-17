@@ -2,7 +2,7 @@
 
 ## 大对象阈值
 
-对象大小超过 **8 KB** 时视为大对象，不使用 per-task bump allocator，而是直接从 MMTK 的 Large Object Space (LOS) 分配。
+对象大小超过 **8 KB** 时视为大对象，不走线程本地小对象快速分配器（per-worker bump allocator），而是直接从 Large Object Space (LOS) 分配。
 
 ## 分配策略
 

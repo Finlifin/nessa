@@ -1,10 +1,14 @@
-# `std.net` — 基于 `libuv` 的非阻塞网络库
+# `std.net` — 跨平台非阻塞网络库
 
-`std.net` 在运行时专职 `libuv` I/O Reactor 之上提供非阻塞 TCP、UDP 与异步 DNS 解析接口：
+`std.net` 在运行时专职 I/O Reactor（Unix 基于 `libuv`，Windows 10 1709+ 基于 Winsock2 `WSAPoll`）之上提供非阻塞 TCP、UDP 与异步 DNS 解析接口：
 
 - 所有连接、监听接收、流式读写、数据报收发与主机名解析仅挂起当前 `Task`，不会阻塞计算 Worker 线程；
 - 错误统一返回 `std.io.IoError` 受检错误集（`!IoError`）；
-- 当正在等待 `accept`、`connect`、`read*`、`write*` 或 `recv_from` 的任务被结构化取消（例如 `task.with_timeout` 超时或父作用域提前退出）时，Reactor 自动取消对应等待请求；配合 `defer { stream.close() }` / `defer { listener.close() }` 可确定性释放底层文件描述符。
+- **取消零泄漏与零丢包保证**：
+  - 当 `TcpListener.bind`、`TcpStream.connect` 或 `UdpSocket.bind` 在等待期间或刚完成瞬间遭遇任务取消时，底层新建套接字由 Reactor 自动关闭回收，绝不泄漏系统端口或文件描述符；
+  - 当 `TcpListener.accept` 或 `UdpSocket.recv_from` 被取消时，未交付给调用方的新连接/数据报自动重回监听队列，供后续接收者继续读取；
+  - 当 `TcpStream.read_bytes` / `read_line` 被取消时，Reactor 在校验未取消状态后才消费内部读缓冲区，绝不吞掉已到达的对端字节流；
+  - 配合 `defer { stream.close() }` / `defer { listener.close() }` 可在正常退出、错误返回与取消展开时确定性释放已获取句柄。
 
 ## 地址与主机名解析
 

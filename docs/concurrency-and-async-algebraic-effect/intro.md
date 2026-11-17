@@ -30,7 +30,7 @@ async effect 声明
 - **Task**：并发执行的调度单位，由多核 Work-Stealing 调度器在 $M:N$ Worker 线程池上并行执行
 - **Task 树**：task 的父子关系形成的树结构，是结构化并发、级联取消与 `defer` 确定性清理的基础
 - **Safe-point**：编译器在循环回边与函数入口插入的低开销调度与移动式 GC 协作检查点
-- **I/O Reactor**：基于 `libuv` 事件循环的非阻塞定时器、子进程、文件系统与网络事件驱动器
+- **I/O Reactor**：跨平台非阻塞定时器、子进程、文件系统工作池与网络事件驱动器（Unix 基于 `libuv`，Windows 10 1709+ 基于 Winsock2 `WSAPoll` 与 Win32 Job Object）
 
 ## 本章内容
 

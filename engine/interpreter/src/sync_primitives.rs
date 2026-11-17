@@ -40,7 +40,10 @@ impl AtomicChunk {
     }
 }
 
-/// Lock-free append-only chunked arena of `AtomicI64` cells for `AtomicInt` and `AtomicBool`.
+/// Append-only chunked arena of `AtomicI64` cells for `AtomicInt` and `AtomicBool`.
+///
+/// Cell loads, stores, swaps, fetch-adds, and CAS operations are lock-free `SeqCst` atomics
+/// over published chunk pointers; allocating a new 1024-cell chunk serializes under `alloc_lock`.
 struct AtomicArena {
     chunks: Box<[AtomicPtr<AtomicChunk>; ATOMIC_MAX_CHUNKS]>,
     alloc_lock: Mutex<()>,
@@ -144,6 +147,8 @@ struct ChannelEntry {
     offers: VecDeque<(TaskId, TaggedValue)>,
     /// Unbuffered senders whose offer was accepted by a receiver.
     accepted_senders: FastHashSet<TaskId>,
+    /// Direct values handed to a waiting receiver by `try_send` on an unbuffered channel.
+    accepted_receivers: FastHashMap<TaskId, TaggedValue>,
     /// Buffered (`capacity > 0`) senders waiting for buffer space.
     send_waiters: VecDeque<TaskId>,
     recv_waiters: VecDeque<TaskId>,
@@ -189,6 +194,7 @@ struct OnceEntry {
 struct BarrierEntry {
     parties: usize,
     generation: u64,
+    broken: bool,
     arrived: Vec<TaskId>,
     completed_waiters: FastHashMap<TaskId, (u64, bool)>,
 }
@@ -207,6 +213,7 @@ struct SyncShard {
 pub enum SyncPoll<T> {
     Ready(T),
     SuspendRetry,
+    Cancelled,
 }
 
 type WaitIndexMap = FastHashMap<TaskId, Vec<WaitTarget>>;
@@ -217,6 +224,10 @@ pub(crate) struct SyncRegistry {
     shards: Box<[Mutex<SyncShard>; SYNC_SHARDS]>,
     wait_index: Box<[Mutex<WaitIndexMap>; SYNC_SHARDS]>,
     active_waiters: AtomicUsize,
+    owned_index: Box<[Mutex<WaitIndexMap>; SYNC_SHARDS]>,
+    active_owners: AtomicUsize,
+    committed_index: Box<[Mutex<WaitIndexMap>; SYNC_SHARDS]>,
+    active_committed: AtomicUsize,
     atomics: AtomicArena,
 }
 
@@ -226,11 +237,19 @@ impl SyncRegistry {
             std::array::from_fn(|_| Mutex::new(SyncShard::default()));
         let wait_index: [Mutex<WaitIndexMap>; SYNC_SHARDS] =
             std::array::from_fn(|_| Mutex::new(FastHashMap::default()));
+        let owned_index: [Mutex<WaitIndexMap>; SYNC_SHARDS] =
+            std::array::from_fn(|_| Mutex::new(FastHashMap::default()));
+        let committed_index: [Mutex<WaitIndexMap>; SYNC_SHARDS] =
+            std::array::from_fn(|_| Mutex::new(FastHashMap::default()));
         Self {
             next_id: AtomicI64::new(1),
             shards: Box::new(shards),
             wait_index: Box::new(wait_index),
             active_waiters: AtomicUsize::new(0),
+            owned_index: Box::new(owned_index),
+            active_owners: AtomicUsize::new(0),
+            committed_index: Box::new(committed_index),
+            active_committed: AtomicUsize::new(0),
             atomics: AtomicArena::new(),
         }
     }
@@ -248,6 +267,16 @@ impl SyncRegistry {
     #[inline]
     fn wait_shard(&self, tid: TaskId) -> &Mutex<FastHashMap<TaskId, Vec<WaitTarget>>> {
         &self.wait_index[(tid.slot() as usize) & (SYNC_SHARDS - 1)]
+    }
+
+    #[inline]
+    fn owned_shard(&self, tid: TaskId) -> &Mutex<FastHashMap<TaskId, Vec<WaitTarget>>> {
+        &self.owned_index[(tid.slot() as usize) & (SYNC_SHARDS - 1)]
+    }
+
+    #[inline]
+    fn committed_shard(&self, tid: TaskId) -> &Mutex<FastHashMap<TaskId, Vec<WaitTarget>>> {
+        &self.committed_index[(tid.slot() as usize) & (SYNC_SHARDS - 1)]
     }
 
     fn record_wait(&self, tid: TaskId, target: WaitTarget) {
@@ -275,6 +304,56 @@ impl SyncRegistry {
         }
     }
 
+    fn record_owned(&self, tid: TaskId, target: WaitTarget) {
+        let mut map = self.owned_shard(tid).lock();
+        let list = map.entry(tid).or_default();
+        if !list.contains(&target) {
+            list.push(target);
+            self.active_owners.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn clear_owned(&self, tid: TaskId, target: WaitTarget) {
+        if self.active_owners.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut map = self.owned_shard(tid).lock();
+        if let Some(list) = map.get_mut(&tid)
+            && let Some(pos) = list.iter().position(|&x| x == target)
+        {
+            list.swap_remove(pos);
+            self.active_owners.fetch_sub(1, Ordering::Release);
+            if list.is_empty() {
+                map.remove(&tid);
+            }
+        }
+    }
+
+    fn record_committed(&self, tid: TaskId, target: WaitTarget) {
+        let mut map = self.committed_shard(tid).lock();
+        let list = map.entry(tid).or_default();
+        if !list.contains(&target) {
+            list.push(target);
+            self.active_committed.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn clear_committed(&self, tid: TaskId, target: WaitTarget) {
+        if self.active_committed.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut map = self.committed_shard(tid).lock();
+        if let Some(list) = map.get_mut(&tid)
+            && let Some(pos) = list.iter().position(|&x| x == target)
+        {
+            list.swap_remove(pos);
+            self.active_committed.fetch_sub(1, Ordering::Release);
+            if list.is_empty() {
+                map.remove(&tid);
+            }
+        }
+    }
+
     /// Trace all GC-managed `TaggedValue`s stored inside `Channel`, `Mutex`, `RwLock`, and `Once`
     /// under MMTk stop-the-world when all mutator threads are parked.
     pub(crate) fn visit_roots_stopped(&self, mut visit: impl FnMut(&mut TaggedValue)) {
@@ -285,6 +364,9 @@ impl SyncRegistry {
                     visit(slot);
                 }
                 for (_, slot) in &mut ch.offers {
+                    visit(slot);
+                }
+                for slot in ch.accepted_receivers.values_mut() {
                     visit(slot);
                 }
             }
@@ -318,7 +400,7 @@ impl SyncRegistry {
         self.active_waiters
             .fetch_sub(targets.len(), Ordering::Release);
 
-        let mut to_wake: Vec<TaskId> = Vec::new();
+        let mut to_wake: Vec<(TaskId, Option<WaitTarget>)> = Vec::new();
         for target in targets {
             match target {
                 WaitTarget::Channel(id) => {
@@ -327,7 +409,6 @@ impl SyncRegistry {
                         ch.send_waiters.retain(|&w| w != tid);
                         ch.recv_waiters.retain(|&w| w != tid);
                         ch.offers.retain(|&(s, _)| s != tid);
-                        ch.accepted_senders.remove(&tid);
                         if ch.woken_sender == Some(tid) {
                             ch.woken_sender = None;
                             if !ch.closed
@@ -335,7 +416,7 @@ impl SyncRegistry {
                                 && let Some(next_s) = pop_live_waiter(sched, &mut ch.send_waiters)
                             {
                                 ch.woken_sender = Some(next_s);
-                                to_wake.push(next_s);
+                                to_wake.push((next_s, Some(target)));
                             }
                         }
                         if ch.woken_receiver == Some(tid) {
@@ -344,7 +425,7 @@ impl SyncRegistry {
                                 && let Some(next_r) = pop_live_waiter(sched, &mut ch.recv_waiters)
                             {
                                 ch.woken_receiver = Some(next_r);
-                                to_wake.push(next_r);
+                                to_wake.push((next_r, Some(target)));
                             }
                         }
                     }
@@ -359,7 +440,7 @@ impl SyncRegistry {
                                 && let Some(next_w) = pop_live_waiter(sched, &mut mu.waiters)
                             {
                                 mu.woken = Some(next_w);
-                                to_wake.push(next_w);
+                                to_wake.push((next_w, Some(target)));
                             }
                         }
                     }
@@ -382,7 +463,11 @@ impl SyncRegistry {
                             && rw.woken_readers.is_empty()
                             && rw.woken_writer.is_none()
                         {
-                            schedule_next_rwlock_turn(sched, rw, &mut to_wake);
+                            let mut rw_wakes = Vec::new();
+                            schedule_next_rwlock_turn(sched, rw, &mut rw_wakes);
+                            for w in rw_wakes {
+                                to_wake.push((w, Some(target)));
+                            }
                         }
                     }
                 }
@@ -395,7 +480,7 @@ impl SyncRegistry {
                             && let Some(next_w) = pop_live_waiter(sched, &mut sem.waiters)
                         {
                             sem.woken.insert(next_w);
-                            to_wake.push(next_w);
+                            to_wake.push((next_w, Some(target)));
                         }
                     }
                 }
@@ -409,7 +494,7 @@ impl SyncRegistry {
                                 && let Some(next_w) = pop_live_waiter(sched, &mut once.waiters)
                             {
                                 once.woken_runner = Some(next_w);
-                                to_wake.push(next_w);
+                                to_wake.push((next_w, Some(target)));
                             }
                         }
                     }
@@ -417,14 +502,133 @@ impl SyncRegistry {
                 WaitTarget::Barrier(id) => {
                     let mut shard = self.shard(id).lock();
                     if let Some(bar) = shard.barriers.get_mut(&id) {
+                        let prev_len = bar.arrived.len();
                         bar.arrived.retain(|&w| w != tid);
-                        bar.completed_waiters.remove(&tid);
+                        if bar.arrived.len() < prev_len {
+                            bar.broken = true;
+                            for w in bar.arrived.drain(..) {
+                                to_wake.push((w, None));
+                            }
+                        }
                     }
                 }
             }
         }
 
-        for w in to_wake {
+        for (w, maybe_target) in to_wake {
+            if let Some(t) = maybe_target {
+                self.record_wait(w, t);
+            }
+            let _ = sched.wake(w);
+        }
+    }
+
+    /// Release any locks / active `Once` initialization still held by `tid` when `tid`
+    /// terminates abnormally without unlocking, and purge any unread committed wakeups.
+    pub(crate) fn on_task_terminated(&self, sched: &Scheduler, tid: TaskId) {
+        if self.active_committed.load(Ordering::Acquire) > 0 {
+            let committed = self
+                .committed_shard(tid)
+                .lock()
+                .remove(&tid)
+                .unwrap_or_default();
+            if !committed.is_empty() {
+                self.active_committed
+                    .fetch_sub(committed.len(), Ordering::Release);
+                for target in committed {
+                    let mut shard = match target {
+                        WaitTarget::Channel(id) | WaitTarget::Barrier(id) => self.shard(id).lock(),
+                        _ => continue,
+                    };
+                    match target {
+                        WaitTarget::Channel(id) => {
+                            if let Some(ch) = shard.channels.get_mut(&id) {
+                                ch.accepted_senders.remove(&tid);
+                                ch.accepted_receivers.remove(&tid);
+                            }
+                        }
+                        WaitTarget::Barrier(id) => {
+                            if let Some(bar) = shard.barriers.get_mut(&id) {
+                                bar.completed_waiters.remove(&tid);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if self.active_owners.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let owned = self
+            .owned_shard(tid)
+            .lock()
+            .remove(&tid)
+            .unwrap_or_default();
+        if owned.is_empty() {
+            return;
+        }
+        self.active_owners.fetch_sub(owned.len(), Ordering::Release);
+
+        let mut to_wake: Vec<(TaskId, WaitTarget)> = Vec::new();
+        for target in owned {
+            match target {
+                WaitTarget::Mutex(id) => {
+                    let mut shard = self.shard(id).lock();
+                    if let Some(mu) = shard.mutexes.get_mut(&id)
+                        && mu.locked_by == Some(tid)
+                    {
+                        mu.locked_by = None;
+                        if let Some(nw) = pop_live_waiter(sched, &mut mu.waiters) {
+                            mu.woken = Some(nw);
+                            to_wake.push((nw, target));
+                        }
+                    }
+                }
+                WaitTarget::RwLock(id) => {
+                    let mut shard = self.shard(id).lock();
+                    if let Some(rw) = shard.rwlocks.get_mut(&id) {
+                        let mut released = false;
+                        if rw.writer == Some(tid) {
+                            rw.writer = None;
+                            released = true;
+                        }
+                        if rw.readers.remove(&tid).is_some() {
+                            released = true;
+                        }
+                        if released
+                            && rw.writer.is_none()
+                            && rw.readers.is_empty()
+                            && rw.woken_readers.is_empty()
+                            && rw.woken_writer.is_none()
+                        {
+                            let mut rw_wakes = Vec::new();
+                            schedule_next_rwlock_turn(sched, rw, &mut rw_wakes);
+                            for w in rw_wakes {
+                                to_wake.push((w, target));
+                            }
+                        }
+                    }
+                }
+                WaitTarget::Once(id) => {
+                    let mut shard = self.shard(id).lock();
+                    if let Some(once) = shard.onces.get_mut(&id)
+                        && matches!(once.state, OnceState::Running(owner) if owner == tid)
+                    {
+                        once.state = OnceState::Uninit;
+                        if let Some(nw) = pop_live_waiter(sched, &mut once.waiters) {
+                            once.woken_runner = Some(nw);
+                            to_wake.push((nw, target));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (w, target) in to_wake {
+            self.record_wait(w, target);
             let _ = sched.wake(w);
         }
     }
@@ -445,6 +649,7 @@ impl SyncRegistry {
             buf: VecDeque::with_capacity(cap.min(64)),
             offers: VecDeque::new(),
             accepted_senders: FastHashSet::default(),
+            accepted_receivers: FastHashMap::default(),
             send_waiters: VecDeque::new(),
             recv_waiters: VecDeque::new(),
             woken_sender: None,
@@ -461,9 +666,11 @@ impl SyncRegistry {
         id: i64,
         task_id: TaskId,
         val: TaggedValue,
+        can_abort_on_cancel: bool,
     ) -> Result<SyncPoll<i64>, VmError> {
         let target = WaitTarget::Channel(id);
-        let mut wake_rx = None;
+        let mut to_wake: Vec<TaskId> = Vec::new();
+        let mut clear_committed_self = false;
         let outcome = {
             let mut shard = self.shard(id).lock();
             let ch = shard
@@ -472,7 +679,22 @@ impl SyncRegistry {
                 .ok_or(VmError::InvalidArgument("invalid Channel handle"))?;
 
             if ch.accepted_senders.remove(&task_id) {
+                clear_committed_self = true;
                 SyncPoll::Ready(0)
+            } else if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                ch.offers.retain(|&(s, _)| s != task_id);
+                ch.send_waiters.retain(|&w| w != task_id);
+                if ch.woken_sender == Some(task_id) {
+                    ch.woken_sender = None;
+                    if !ch.closed
+                        && ch.buf.len() < ch.capacity
+                        && let Some(next_s) = pop_live_waiter(sched, &mut ch.send_waiters)
+                    {
+                        ch.woken_sender = Some(next_s);
+                        to_wake.push(next_s);
+                    }
+                }
+                SyncPoll::Cancelled
             } else if ch.closed {
                 ch.offers.retain(|&(s, _)| s != task_id);
                 ch.send_waiters.retain(|&w| w != task_id);
@@ -490,7 +712,7 @@ impl SyncRegistry {
                         && let Some(rx) = pop_live_waiter(sched, &mut ch.recv_waiters)
                     {
                         ch.woken_receiver = Some(rx);
-                        wake_rx = Some(rx);
+                        to_wake.push(rx);
                     }
                     SyncPoll::Ready(0)
                 } else {
@@ -498,48 +720,50 @@ impl SyncRegistry {
                     SyncPoll::SuspendRetry
                 }
             } else {
-                // Unbuffered rendezvous channel (`capacity == 0`)
-                if ch.offers.iter().any(|&(s, _)| s == task_id) {
-                    if ch.woken_receiver.is_none()
-                        && let Some(rx) = pop_live_waiter(sched, &mut ch.recv_waiters)
-                    {
-                        ch.woken_receiver = Some(rx);
-                        wake_rx = Some(rx);
-                    }
-                    SyncPoll::SuspendRetry
-                } else if let Some(rx) = pop_live_waiter(sched, &mut ch.recv_waiters) {
-                    ch.buf.push_back(val);
-                    ch.woken_receiver = Some(rx);
-                    wake_rx = Some(rx);
-                    SyncPoll::Ready(0)
+                // Unbuffered rendezvous channel (`capacity == 0`): never buffer in `ch.buf`
+                // so a cancelled receiver cannot strand or lose an unreceived message.
+                if let Some(slot) = ch.offers.iter_mut().find(|(s, _)| *s == task_id) {
+                    slot.1 = val;
                 } else {
                     ch.offers.push_back((task_id, val));
-                    SyncPoll::SuspendRetry
                 }
+                if ch.woken_receiver.is_none()
+                    && let Some(rx) = pop_live_waiter(sched, &mut ch.recv_waiters)
+                {
+                    ch.woken_receiver = Some(rx);
+                    to_wake.push(rx);
+                }
+                SyncPoll::SuspendRetry
             }
         };
 
+        if clear_committed_self {
+            self.clear_committed(task_id, target);
+        }
         match outcome {
-            SyncPoll::Ready(_) => self.clear_wait(task_id, target),
+            SyncPoll::Ready(_) | SyncPoll::Cancelled => self.clear_wait(task_id, target),
             SyncPoll::SuspendRetry => self.record_wait(task_id, target),
         }
-        if let Some(rx) = wake_rx {
-            self.record_wait(rx, target);
-            let _ = sched.wake(rx);
+        for w in to_wake {
+            self.record_wait(w, target);
+            let _ = sched.wake(w);
         }
         Ok(outcome)
     }
 
     /// Check if an unbuffered `send` offer was already accepted before aborting on cancel.
     pub(crate) fn chan_take_accepted_on_cancel(&self, id: i64, task_id: TaskId) -> bool {
-        let mut shard = self.shard(id).lock();
-        let Some(ch) = shard.channels.get_mut(&id) else {
-            return false;
+        let target = WaitTarget::Channel(id);
+        let accepted = {
+            let mut shard = self.shard(id).lock();
+            let Some(ch) = shard.channels.get_mut(&id) else {
+                return false;
+            };
+            ch.accepted_senders.remove(&task_id)
         };
-        let accepted = ch.accepted_senders.remove(&task_id);
         if accepted {
-            drop(shard);
-            self.clear_wait(task_id, WaitTarget::Channel(id));
+            self.clear_committed(task_id, target);
+            self.clear_wait(task_id, target);
         }
         accepted
     }
@@ -553,6 +777,7 @@ impl SyncRegistry {
     ) -> Result<i64, VmError> {
         let target = WaitTarget::Channel(id);
         let mut wake_rx = None;
+        let mut direct_rx = false;
         let code = {
             let mut shard = self.shard(id).lock();
             let ch = shard
@@ -575,15 +800,19 @@ impl SyncRegistry {
                     2
                 }
             } else if let Some(rx) = pop_live_waiter(sched, &mut ch.recv_waiters) {
-                ch.buf.push_back(val);
+                ch.accepted_receivers.insert(rx, val);
                 ch.woken_receiver = Some(rx);
                 wake_rx = Some(rx);
+                direct_rx = true;
                 0
             } else {
                 2
             }
         };
         if let Some(rx) = wake_rx {
+            if direct_rx {
+                self.record_committed(rx, target);
+            }
             self.record_wait(rx, target);
             let _ = sched.wake(rx);
         }
@@ -596,9 +825,12 @@ impl SyncRegistry {
         sched: &Scheduler,
         id: i64,
         task_id: TaskId,
+        can_abort_on_cancel: bool,
     ) -> Result<SyncPoll<(i64, TaggedValue)>, VmError> {
         let target = WaitTarget::Channel(id);
         let mut to_wake: Vec<TaskId> = Vec::new();
+        let mut accepted_tx = None;
+        let mut clear_committed_self = false;
         let outcome = {
             let mut shard = self.shard(id).lock();
             let ch = shard
@@ -608,7 +840,20 @@ impl SyncRegistry {
             if ch.woken_receiver == Some(task_id) {
                 ch.woken_receiver = None;
             }
-            if let Some(val) = ch.buf.pop_front() {
+            if let Some(val) = ch.accepted_receivers.remove(&task_id) {
+                clear_committed_self = true;
+                SyncPoll::Ready((0, val))
+            } else if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                ch.recv_waiters.retain(|&w| w != task_id);
+                if (!ch.buf.is_empty() || !ch.offers.is_empty() || ch.closed)
+                    && ch.woken_receiver.is_none()
+                    && let Some(next_r) = pop_live_waiter(sched, &mut ch.recv_waiters)
+                {
+                    ch.woken_receiver = Some(next_r);
+                    to_wake.push(next_r);
+                }
+                SyncPoll::Cancelled
+            } else if let Some(val) = ch.buf.pop_front() {
                 if ch.capacity > 0
                     && !ch.closed
                     && ch.woken_sender.is_none()
@@ -627,6 +872,7 @@ impl SyncRegistry {
                 SyncPoll::Ready((0, val))
             } else if let Some((sender_tid, val)) = pop_live_offer(sched, &mut ch.offers) {
                 ch.accepted_senders.insert(sender_tid);
+                accepted_tx = Some(sender_tid);
                 to_wake.push(sender_tid);
                 if !ch.offers.is_empty()
                     && ch.woken_receiver.is_none()
@@ -644,8 +890,14 @@ impl SyncRegistry {
             }
         };
 
+        if clear_committed_self {
+            self.clear_committed(task_id, target);
+        }
+        if let Some(tx) = accepted_tx {
+            self.record_committed(tx, target);
+        }
         match outcome {
-            SyncPoll::Ready(_) => self.clear_wait(task_id, target),
+            SyncPoll::Ready(_) | SyncPoll::Cancelled => self.clear_wait(task_id, target),
             SyncPoll::SuspendRetry => self.record_wait(task_id, target),
         }
         for w in to_wake {
@@ -663,6 +915,7 @@ impl SyncRegistry {
     ) -> Result<(i64, TaggedValue), VmError> {
         let target = WaitTarget::Channel(id);
         let mut to_wake: Vec<TaskId> = Vec::new();
+        let mut accepted_tx = None;
         let res = {
             let mut shard = self.shard(id).lock();
             let ch = shard
@@ -681,6 +934,7 @@ impl SyncRegistry {
                 (0, val)
             } else if let Some((sender_tid, val)) = pop_live_offer(sched, &mut ch.offers) {
                 ch.accepted_senders.insert(sender_tid);
+                accepted_tx = Some(sender_tid);
                 to_wake.push(sender_tid);
                 (0, val)
             } else if ch.closed {
@@ -689,6 +943,9 @@ impl SyncRegistry {
                 (2, TaggedValue::UNIT)
             }
         };
+        if let Some(tx) = accepted_tx {
+            self.record_committed(tx, target);
+        }
         for w in to_wake {
             self.record_wait(w, target);
             let _ = sched.wake(w);
@@ -736,7 +993,7 @@ impl SyncRegistry {
             .channels
             .get(&id)
             .ok_or(VmError::InvalidArgument("invalid Channel handle"))?;
-        Ok((ch.buf.len() + ch.offers.len()) as i64)
+        Ok(ch.buf.len() as i64)
     }
 
     // =========================================================================
@@ -757,10 +1014,13 @@ impl SyncRegistry {
 
     pub(crate) fn mutex_lock(
         &self,
+        sched: &Scheduler,
         id: i64,
         task_id: TaskId,
+        can_abort_on_cancel: bool,
     ) -> Result<SyncPoll<TaggedValue>, VmError> {
         let target = WaitTarget::Mutex(id);
+        let mut next_w = None;
         let outcome = {
             let mut shard = self.shard(id).lock();
             let mu = shard
@@ -772,10 +1032,18 @@ impl SyncRegistry {
                     "re-entrant Mutex lock on the same task would deadlock",
                 ));
             }
-            if mu.woken == Some(task_id) {
+            let was_woken = mu.woken == Some(task_id);
+            if was_woken {
                 mu.woken = None;
             }
-            if mu.locked_by.is_none() {
+            if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                mu.waiters.retain(|&w| w != task_id);
+                if was_woken && mu.locked_by.is_none() {
+                    next_w = pop_live_waiter(sched, &mut mu.waiters);
+                    mu.woken = next_w;
+                }
+                SyncPoll::Cancelled
+            } else if mu.locked_by.is_none() {
                 mu.locked_by = Some(task_id);
                 SyncPoll::Ready(mu.value)
             } else {
@@ -784,27 +1052,42 @@ impl SyncRegistry {
             }
         };
         match outcome {
-            SyncPoll::Ready(_) => self.clear_wait(task_id, target),
+            SyncPoll::Ready(_) => {
+                self.clear_wait(task_id, target);
+                self.record_owned(task_id, target);
+            }
+            SyncPoll::Cancelled => self.clear_wait(task_id, target),
             SyncPoll::SuspendRetry => self.record_wait(task_id, target),
+        }
+        if let Some(w) = next_w {
+            self.record_wait(w, target);
+            let _ = sched.wake(w);
         }
         Ok(outcome)
     }
 
     pub(crate) fn mutex_try_lock(&self, id: i64, task_id: TaskId) -> Result<bool, VmError> {
-        let mut shard = self.shard(id).lock();
-        let mu = shard
-            .mutexes
-            .get_mut(&id)
-            .ok_or(VmError::InvalidArgument("invalid Mutex handle"))?;
-        if mu.locked_by.is_none() {
-            mu.locked_by = Some(task_id);
-            if mu.woken == Some(task_id) {
-                mu.woken = None;
+        let target = WaitTarget::Mutex(id);
+        let acquired = {
+            let mut shard = self.shard(id).lock();
+            let mu = shard
+                .mutexes
+                .get_mut(&id)
+                .ok_or(VmError::InvalidArgument("invalid Mutex handle"))?;
+            if mu.locked_by.is_none() {
+                mu.locked_by = Some(task_id);
+                if mu.woken == Some(task_id) {
+                    mu.woken = None;
+                }
+                true
+            } else {
+                false
             }
-            Ok(true)
-        } else {
-            Ok(false)
+        };
+        if acquired {
+            self.record_owned(task_id, target);
         }
+        Ok(acquired)
     }
 
     pub(crate) fn mutex_unlock(
@@ -830,6 +1113,7 @@ impl SyncRegistry {
             mu.woken = nw;
             nw
         };
+        self.clear_owned(task_id, target);
         if let Some(w) = next_w {
             self.record_wait(w, target);
             let _ = sched.wake(w);
@@ -901,10 +1185,13 @@ impl SyncRegistry {
 
     pub(crate) fn rwlock_read_lock(
         &self,
+        sched: &Scheduler,
         id: i64,
         task_id: TaskId,
+        can_abort_on_cancel: bool,
     ) -> Result<SyncPoll<TaggedValue>, VmError> {
         let target = WaitTarget::RwLock(id);
+        let mut to_wake = Vec::new();
         let outcome = {
             let mut shard = self.shard(id).lock();
             let rw = shard
@@ -917,41 +1204,69 @@ impl SyncRegistry {
                 ));
             }
             let woken_for_batch = rw.woken_readers.remove(&task_id);
-            let can_read = rw.writer.is_none()
-                && (woken_for_batch
-                    || rw.readers.contains_key(&task_id)
-                    || (rw.write_waiters.is_empty() && rw.woken_writer.is_none()));
-            if can_read {
-                *rw.readers.entry(task_id).or_insert(0) += 1;
-                SyncPoll::Ready(rw.value)
+            if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                rw.read_waiters.retain(|&w| w != task_id);
+                if woken_for_batch
+                    && rw.writer.is_none()
+                    && rw.readers.is_empty()
+                    && rw.woken_readers.is_empty()
+                    && rw.woken_writer.is_none()
+                {
+                    schedule_next_rwlock_turn(sched, rw, &mut to_wake);
+                }
+                SyncPoll::Cancelled
             } else {
-                push_unique(&mut rw.read_waiters, task_id);
-                SyncPoll::SuspendRetry
+                let can_read = rw.writer.is_none()
+                    && (woken_for_batch
+                        || rw.readers.contains_key(&task_id)
+                        || (rw.write_waiters.is_empty() && rw.woken_writer.is_none()));
+                if can_read {
+                    *rw.readers.entry(task_id).or_insert(0) += 1;
+                    SyncPoll::Ready(rw.value)
+                } else {
+                    push_unique(&mut rw.read_waiters, task_id);
+                    SyncPoll::SuspendRetry
+                }
             }
         };
         match outcome {
-            SyncPoll::Ready(_) => self.clear_wait(task_id, target),
+            SyncPoll::Ready(_) => {
+                self.clear_wait(task_id, target);
+                self.record_owned(task_id, target);
+            }
+            SyncPoll::Cancelled => self.clear_wait(task_id, target),
             SyncPoll::SuspendRetry => self.record_wait(task_id, target),
+        }
+        for w in to_wake {
+            self.record_wait(w, target);
+            let _ = sched.wake(w);
         }
         Ok(outcome)
     }
 
     pub(crate) fn rwlock_try_read_lock(&self, id: i64, task_id: TaskId) -> Result<bool, VmError> {
-        let mut shard = self.shard(id).lock();
-        let rw = shard
-            .rwlocks
-            .get_mut(&id)
-            .ok_or(VmError::InvalidArgument("invalid RwLock handle"))?;
-        if rw.writer.is_none()
-            && (rw.readers.contains_key(&task_id)
-                || (rw.write_waiters.is_empty() && rw.woken_writer.is_none()))
-        {
-            rw.woken_readers.remove(&task_id);
-            *rw.readers.entry(task_id).or_insert(0) += 1;
-            Ok(true)
-        } else {
-            Ok(false)
+        let target = WaitTarget::RwLock(id);
+        let acquired = {
+            let mut shard = self.shard(id).lock();
+            let rw = shard
+                .rwlocks
+                .get_mut(&id)
+                .ok_or(VmError::InvalidArgument("invalid RwLock handle"))?;
+            if rw.writer.is_none()
+                && (rw.readers.contains_key(&task_id)
+                    || (rw.write_waiters.is_empty() && rw.woken_writer.is_none()))
+            {
+                rw.woken_readers.remove(&task_id);
+                *rw.readers.entry(task_id).or_insert(0) += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if acquired {
+            self.record_owned(task_id, target);
         }
+        Ok(acquired)
     }
 
     pub(crate) fn rwlock_read_unlock(
@@ -962,6 +1277,7 @@ impl SyncRegistry {
     ) -> Result<(), VmError> {
         let target = WaitTarget::RwLock(id);
         let mut to_wake = Vec::new();
+        let mut fully_unlocked = false;
         {
             let mut shard = self.shard(id).lock();
             let rw = shard
@@ -977,6 +1293,7 @@ impl SyncRegistry {
                 *cnt -= 1;
             } else {
                 rw.readers.remove(&task_id);
+                fully_unlocked = rw.writer != Some(task_id);
                 rw.woken_readers.retain(|&r| is_live_un_cancelled(sched, r));
                 if let Some(w) = rw.woken_writer
                     && !is_live_un_cancelled(sched, w)
@@ -1000,6 +1317,9 @@ impl SyncRegistry {
                 }
             }
         }
+        if fully_unlocked {
+            self.clear_owned(task_id, target);
+        }
         for w in to_wake {
             self.record_wait(w, target);
             let _ = sched.wake(w);
@@ -1009,10 +1329,13 @@ impl SyncRegistry {
 
     pub(crate) fn rwlock_write_lock(
         &self,
+        sched: &Scheduler,
         id: i64,
         task_id: TaskId,
+        can_abort_on_cancel: bool,
     ) -> Result<SyncPoll<TaggedValue>, VmError> {
         let target = WaitTarget::RwLock(id);
+        let mut to_wake = Vec::new();
         let outcome = {
             let mut shard = self.shard(id).lock();
             let rw = shard
@@ -1024,10 +1347,21 @@ impl SyncRegistry {
                     "re-entrant or upgraded RwLock write_lock on same task would deadlock",
                 ));
             }
-            if rw.woken_writer == Some(task_id) {
+            let was_woken = rw.woken_writer == Some(task_id);
+            if was_woken {
                 rw.woken_writer = None;
             }
-            if rw.writer.is_none() && rw.readers.is_empty() && rw.woken_readers.is_empty() {
+            if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                rw.write_waiters.retain(|&w| w != task_id);
+                if was_woken
+                    && rw.writer.is_none()
+                    && rw.readers.is_empty()
+                    && rw.woken_readers.is_empty()
+                {
+                    schedule_next_rwlock_turn(sched, rw, &mut to_wake);
+                }
+                SyncPoll::Cancelled
+            } else if rw.writer.is_none() && rw.readers.is_empty() && rw.woken_readers.is_empty() {
                 rw.writer = Some(task_id);
                 SyncPoll::Ready(rw.value)
             } else {
@@ -1036,27 +1370,42 @@ impl SyncRegistry {
             }
         };
         match outcome {
-            SyncPoll::Ready(_) => self.clear_wait(task_id, target),
+            SyncPoll::Ready(_) => {
+                self.clear_wait(task_id, target);
+                self.record_owned(task_id, target);
+            }
+            SyncPoll::Cancelled => self.clear_wait(task_id, target),
             SyncPoll::SuspendRetry => self.record_wait(task_id, target),
+        }
+        for w in to_wake {
+            self.record_wait(w, target);
+            let _ = sched.wake(w);
         }
         Ok(outcome)
     }
 
     pub(crate) fn rwlock_try_write_lock(&self, id: i64, task_id: TaskId) -> Result<bool, VmError> {
-        let mut shard = self.shard(id).lock();
-        let rw = shard
-            .rwlocks
-            .get_mut(&id)
-            .ok_or(VmError::InvalidArgument("invalid RwLock handle"))?;
-        if rw.writer.is_none() && rw.readers.is_empty() && rw.woken_readers.is_empty() {
-            rw.writer = Some(task_id);
-            if rw.woken_writer == Some(task_id) {
-                rw.woken_writer = None;
+        let target = WaitTarget::RwLock(id);
+        let acquired = {
+            let mut shard = self.shard(id).lock();
+            let rw = shard
+                .rwlocks
+                .get_mut(&id)
+                .ok_or(VmError::InvalidArgument("invalid RwLock handle"))?;
+            if rw.writer.is_none() && rw.readers.is_empty() && rw.woken_readers.is_empty() {
+                rw.writer = Some(task_id);
+                if rw.woken_writer == Some(task_id) {
+                    rw.woken_writer = None;
+                }
+                true
+            } else {
+                false
             }
-            Ok(true)
-        } else {
-            Ok(false)
+        };
+        if acquired {
+            self.record_owned(task_id, target);
         }
+        Ok(acquired)
     }
 
     pub(crate) fn rwlock_write_unlock(
@@ -1081,6 +1430,7 @@ impl SyncRegistry {
             rw.writer = None;
             schedule_next_rwlock_turn(sched, rw, &mut to_wake);
         }
+        self.clear_owned(task_id, target);
         for w in to_wake {
             self.record_wait(w, target);
             let _ = sched.wake(w);
@@ -1141,16 +1491,33 @@ impl SyncRegistry {
         Ok(id)
     }
 
-    pub(crate) fn sem_acquire(&self, id: i64, task_id: TaskId) -> Result<SyncPoll<()>, VmError> {
+    pub(crate) fn sem_acquire(
+        &self,
+        sched: &Scheduler,
+        id: i64,
+        task_id: TaskId,
+        can_abort_on_cancel: bool,
+    ) -> Result<SyncPoll<()>, VmError> {
         let target = WaitTarget::Semaphore(id);
+        let mut next_w = None;
         let outcome = {
             let mut shard = self.shard(id).lock();
             let sem = shard
                 .semaphores
                 .get_mut(&id)
                 .ok_or(VmError::InvalidArgument("invalid Semaphore handle"))?;
-            sem.woken.remove(&task_id);
-            if sem.permits > 0 {
+            let was_woken = sem.woken.remove(&task_id);
+            if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                sem.waiters.retain(|&w| w != task_id);
+                if was_woken
+                    && sem.permits > 0
+                    && let Some(nw) = pop_live_waiter(sched, &mut sem.waiters)
+                {
+                    sem.woken.insert(nw);
+                    next_w = Some(nw);
+                }
+                SyncPoll::Cancelled
+            } else if sem.permits > 0 {
                 sem.permits -= 1;
                 SyncPoll::Ready(())
             } else {
@@ -1159,8 +1526,12 @@ impl SyncRegistry {
             }
         };
         match outcome {
-            SyncPoll::Ready(()) => self.clear_wait(task_id, target),
+            SyncPoll::Ready(()) | SyncPoll::Cancelled => self.clear_wait(task_id, target),
             SyncPoll::SuspendRetry => self.record_wait(task_id, target),
+        }
+        if let Some(w) = next_w {
+            self.record_wait(w, target);
+            let _ = sched.wake(w);
         }
         Ok(outcome)
     }
@@ -1249,39 +1620,61 @@ impl SyncRegistry {
     /// `(0, val)` = already complete; `(1, UNIT)` = caller claimed initialization.
     pub(crate) fn once_begin(
         &self,
+        sched: &Scheduler,
         id: i64,
         task_id: TaskId,
+        can_abort_on_cancel: bool,
     ) -> Result<SyncPoll<(i64, TaggedValue)>, VmError> {
         let target = WaitTarget::Once(id);
+        let mut next_w = None;
+        let mut claimed_running = false;
         let outcome = {
             let mut shard = self.shard(id).lock();
             let once = shard
                 .onces
                 .get_mut(&id)
                 .ok_or(VmError::InvalidArgument("invalid Once handle"))?;
-            if once.woken_runner == Some(task_id) {
+            let was_woken = once.woken_runner == Some(task_id);
+            if was_woken {
                 once.woken_runner = None;
             }
-            match once.state {
-                OnceState::Complete(val) => SyncPoll::Ready((0, val)),
-                OnceState::Uninit => {
-                    once.state = OnceState::Running(task_id);
-                    SyncPoll::Ready((1, TaggedValue::UNIT))
+            if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                once.waiters.retain(|&w| w != task_id);
+                if was_woken && matches!(once.state, OnceState::Uninit) {
+                    next_w = pop_live_waiter(sched, &mut once.waiters);
+                    once.woken_runner = next_w;
                 }
-                OnceState::Running(owner) => {
-                    if owner == task_id {
-                        return Err(VmError::InvalidArgument(
-                            "recursive Once/Lazy initialization on the same task would deadlock",
-                        ));
+                SyncPoll::Cancelled
+            } else {
+                match once.state {
+                    OnceState::Complete(val) => SyncPoll::Ready((0, val)),
+                    OnceState::Uninit => {
+                        once.state = OnceState::Running(task_id);
+                        claimed_running = true;
+                        SyncPoll::Ready((1, TaggedValue::UNIT))
                     }
-                    push_unique(&mut once.waiters, task_id);
-                    SyncPoll::SuspendRetry
+                    OnceState::Running(owner) => {
+                        if owner == task_id {
+                            return Err(VmError::InvalidArgument(
+                                "recursive Once/Lazy initialization on the same task would deadlock",
+                            ));
+                        }
+                        push_unique(&mut once.waiters, task_id);
+                        SyncPoll::SuspendRetry
+                    }
                 }
             }
         };
+        if claimed_running {
+            self.record_owned(task_id, target);
+        }
         match outcome {
-            SyncPoll::Ready(_) => self.clear_wait(task_id, target),
+            SyncPoll::Ready(_) | SyncPoll::Cancelled => self.clear_wait(task_id, target),
             SyncPoll::SuspendRetry => self.record_wait(task_id, target),
+        }
+        if let Some(w) = next_w {
+            self.record_wait(w, target);
+            let _ = sched.wake(w);
         }
         Ok(outcome)
     }
@@ -1293,6 +1686,7 @@ impl SyncRegistry {
         task_id: TaskId,
         val: TaggedValue,
     ) -> Result<(), VmError> {
+        let target = WaitTarget::Once(id);
         let mut to_wake = Vec::new();
         {
             let mut shard = self.shard(id).lock();
@@ -1313,6 +1707,7 @@ impl SyncRegistry {
                 }
             }
         }
+        self.clear_owned(task_id, target);
         for w in to_wake {
             let _ = sched.wake(w);
         }
@@ -1329,6 +1724,7 @@ impl SyncRegistry {
     ) -> Result<(), VmError> {
         let target = WaitTarget::Once(id);
         let mut next_w = None;
+        let mut was_owner = false;
         {
             let mut shard = self.shard(id).lock();
             let once = shard
@@ -1336,10 +1732,14 @@ impl SyncRegistry {
                 .get_mut(&id)
                 .ok_or(VmError::InvalidArgument("invalid Once handle"))?;
             if matches!(once.state, OnceState::Running(owner) if owner == task_id) {
+                was_owner = true;
                 once.state = OnceState::Uninit;
                 next_w = pop_live_waiter(sched, &mut once.waiters);
                 once.woken_runner = next_w;
             }
+        }
+        if was_owner {
+            self.clear_owned(task_id, target);
         }
         if let Some(w) = next_w {
             self.record_wait(w, target);
@@ -1373,6 +1773,7 @@ impl SyncRegistry {
         let entry = BarrierEntry {
             parties: p,
             generation: 0,
+            broken: false,
             arrived: Vec::with_capacity(p.min(64)),
             completed_waiters: FastHashMap::default(),
         };
@@ -1386,9 +1787,12 @@ impl SyncRegistry {
         sched: &Scheduler,
         id: i64,
         task_id: TaskId,
+        can_abort_on_cancel: bool,
     ) -> Result<SyncPoll<bool>, VmError> {
         let target = WaitTarget::Barrier(id);
         let mut to_wake = Vec::new();
+        let mut clear_committed_self = false;
+        let mut mark_committed = Vec::new();
         let outcome = {
             let mut shard = self.shard(id).lock();
             let bar = shard
@@ -1396,33 +1800,55 @@ impl SyncRegistry {
                 .get_mut(&id)
                 .ok_or(VmError::InvalidArgument("invalid Barrier handle"))?;
             if let Some((_, is_leader)) = bar.completed_waiters.remove(&task_id) {
-                SyncPoll::Ready(is_leader)
+                clear_committed_self = true;
+                Ok(SyncPoll::Ready(is_leader))
+            } else if can_abort_on_cancel && sched.is_cancelled_not_unwinding(task_id) {
+                let prev_len = bar.arrived.len();
+                bar.arrived.retain(|&w| w != task_id);
+                if bar.arrived.len() < prev_len {
+                    bar.broken = true;
+                    to_wake.append(&mut bar.arrived);
+                }
+                Ok(SyncPoll::Cancelled)
+            } else if bar.broken {
+                Err(VmError::InvalidArgument(
+                    "Barrier broken by cancelled participant",
+                ))
             } else if bar.arrived.contains(&task_id) {
-                SyncPoll::SuspendRetry
+                Ok(SyncPoll::SuspendRetry)
             } else if bar.parties == 1 {
                 bar.generation = bar.generation.wrapping_add(1);
-                SyncPoll::Ready(true)
+                Ok(SyncPoll::Ready(true))
             } else if bar.arrived.len() + 1 == bar.parties {
                 let cur_gen = bar.generation;
                 bar.generation = bar.generation.wrapping_add(1);
                 for w in bar.arrived.drain(..) {
                     bar.completed_waiters.insert(w, (cur_gen, false));
+                    mark_committed.push(w);
                     to_wake.push(w);
                 }
-                SyncPoll::Ready(true)
+                Ok(SyncPoll::Ready(true))
             } else {
                 bar.arrived.push(task_id);
-                SyncPoll::SuspendRetry
+                Ok(SyncPoll::SuspendRetry)
             }
         };
-        match outcome {
-            SyncPoll::Ready(_) => self.clear_wait(task_id, target),
-            SyncPoll::SuspendRetry => self.record_wait(task_id, target),
+        if clear_committed_self {
+            self.clear_committed(task_id, target);
+        }
+        for w in mark_committed {
+            self.record_committed(w, target);
+        }
+        match &outcome {
+            Ok(SyncPoll::Ready(_)) | Ok(SyncPoll::Cancelled) | Err(_) => {
+                self.clear_wait(task_id, target);
+            }
+            Ok(SyncPoll::SuspendRetry) => self.record_wait(task_id, target),
         }
         for w in to_wake {
             let _ = sched.wake(w);
         }
-        Ok(outcome)
+        outcome
     }
 
     /// Check if `task_id` already completed its barrier cycle before aborting on cancellation.
@@ -1431,11 +1857,15 @@ impl SyncRegistry {
         id: i64,
         task_id: TaskId,
     ) -> Option<bool> {
-        let mut shard = self.shard(id).lock();
-        let bar = shard.barriers.get_mut(&id)?;
-        let (_, is_leader) = bar.completed_waiters.remove(&task_id)?;
-        drop(shard);
-        self.clear_wait(task_id, WaitTarget::Barrier(id));
+        let target = WaitTarget::Barrier(id);
+        let is_leader = {
+            let mut shard = self.shard(id).lock();
+            let bar = shard.barriers.get_mut(&id)?;
+            let (_, is_leader) = bar.completed_waiters.remove(&task_id)?;
+            is_leader
+        };
+        self.clear_committed(task_id, target);
+        self.clear_wait(task_id, target);
         Some(is_leader)
     }
 
@@ -1495,7 +1925,7 @@ fn push_unique(queue: &mut VecDeque<TaskId>, tid: TaskId) {
 }
 
 fn is_live_un_cancelled(sched: &Scheduler, tid: TaskId) -> bool {
-    !sched.is_cancelled(tid)
+    !sched.is_cancelled_not_unwinding(tid)
         && matches!(
             sched.task_status(tid),
             Some(
@@ -1567,23 +1997,23 @@ mod tests {
 
         // `w1` acquires write lock; `r0`, `r1`, and `w0` suspend behind it.
         assert!(matches!(
-            sync.rwlock_write_lock(rw, w1).unwrap(),
+            sync.rwlock_write_lock(&sched, rw, w1, true).unwrap(),
             SyncPoll::Ready(_)
         ));
         assert!(matches!(
-            sync.rwlock_read_lock(rw, r0).unwrap(),
+            sync.rwlock_read_lock(&sched, rw, r0, true).unwrap(),
             SyncPoll::SuspendRetry
         ));
         sched.set_running(r0);
         sched.suspend(r0);
         assert!(matches!(
-            sync.rwlock_read_lock(rw, r1).unwrap(),
+            sync.rwlock_read_lock(&sched, rw, r1, true).unwrap(),
             SyncPoll::SuspendRetry
         ));
         sched.set_running(r1);
         sched.suspend(r1);
         assert!(matches!(
-            sync.rwlock_write_lock(rw, w0).unwrap(),
+            sync.rwlock_write_lock(&sched, rw, w0, true).unwrap(),
             SyncPoll::SuspendRetry
         ));
         sched.set_running(w0);
@@ -1597,7 +2027,7 @@ mod tests {
 
         // `r0` runs and unlocks BEFORE `r1` has even polled `rwlock_read_lock`!
         assert!(matches!(
-            sync.rwlock_read_lock(rw, r0).unwrap(),
+            sync.rwlock_read_lock(&sched, rw, r0, true).unwrap(),
             SyncPoll::Ready(_)
         ));
         sync.rwlock_read_unlock(&sched, rw, r0).unwrap();
@@ -1606,14 +2036,14 @@ mod tests {
 
         // Now `r1` acquires and unlocks -> must hand off to `w0` cleanly!
         assert!(matches!(
-            sync.rwlock_read_lock(rw, r1).unwrap(),
+            sync.rwlock_read_lock(&sched, rw, r1, true).unwrap(),
             SyncPoll::Ready(_)
         ));
         sync.rwlock_read_unlock(&sched, rw, r1).unwrap();
         assert_eq!(sched.task_status(w0), Some(TaskStatus::Ready));
 
         assert!(matches!(
-            sync.rwlock_write_lock(rw, w0).unwrap(),
+            sync.rwlock_write_lock(&sched, rw, w0, true).unwrap(),
             SyncPoll::Ready(_)
         ));
         sync.rwlock_write_unlock(&sched, rw, w0).unwrap();

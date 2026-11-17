@@ -231,8 +231,8 @@ mod unix_net {
     };
     use crate::SchedulerInner;
     use crate::reactor::{
-        TaskOpEntry, TaskOpResult, alloc_uv_aligned, complete_entry, free_uv_aligned,
-        uv_error_message, uv_error_to_io_code,
+        TaskOpEntry, TaskOpResult, TaskOpState, alloc_uv_aligned, complete_entry, free_uv_aligned,
+        try_complete_entry, uv_error_message, uv_error_to_io_code,
     };
 
     const IO_OK: i64 = 0;
@@ -792,7 +792,7 @@ mod unix_net {
                     }),
                 );
                 self.listeners.insert(id, ctx_ptr);
-                complete_entry(
+                if try_complete_entry(
                     &entry,
                     TaskOpResult::Net(NetOutcome::HandleAddr {
                         code: IO_OK,
@@ -802,7 +802,11 @@ mod unix_net {
                         port: local_port,
                     }),
                     &self.sched,
-                );
+                )
+                .is_err()
+                {
+                    self.close_listener_by_id(id);
+                }
             }
         }
 
@@ -837,8 +841,16 @@ mod unix_net {
                 );
                 return;
             }
+            if matches!(*entry.state.lock(), TaskOpState::Cancelled) {
+                return;
+            }
             if let Some((stream_id, peer_ip, peer_port)) = listener.backlog.pop_front() {
-                complete_entry(
+                if let Err(TaskOpResult::Net(NetOutcome::HandleAddr {
+                    handle_id,
+                    host,
+                    port,
+                    ..
+                })) = try_complete_entry(
                     &entry,
                     TaskOpResult::Net(NetOutcome::HandleAddr {
                         code: IO_OK,
@@ -848,7 +860,9 @@ mod unix_net {
                         port: peer_port,
                     }),
                     &self.sched,
-                );
+                ) {
+                    listener.backlog.push_front((handle_id, host, port));
+                }
                 return;
             }
             listener.accept_waiters.push_back((op_id, entry));
@@ -1429,7 +1443,7 @@ mod unix_net {
                     }),
                 );
                 self.udps.insert(id, uctx_ptr);
-                complete_entry(
+                if try_complete_entry(
                     &entry,
                     TaskOpResult::Net(NetOutcome::HandleAddr {
                         code: IO_OK,
@@ -1439,7 +1453,11 @@ mod unix_net {
                         port: local_port,
                     }),
                     &self.sched,
-                );
+                )
+                .is_err()
+                {
+                    self.close_udp_by_id(id);
+                }
             }
         }
 
@@ -1576,21 +1594,35 @@ mod unix_net {
                 );
                 return;
             }
-            if let Some(mut pkt) = sock.recv_queue.pop_front() {
-                if pkt.data.len() > max_bytes {
-                    pkt.data.truncate(max_bytes);
-                }
-                complete_entry(
+            if matches!(*entry.state.lock(), TaskOpState::Cancelled) {
+                return;
+            }
+            if let Some(pkt) = sock.recv_queue.pop_front() {
+                let full_data = pkt.data;
+                let delivered = if full_data.len() > max_bytes {
+                    full_data[..max_bytes].to_vec()
+                } else {
+                    full_data.clone()
+                };
+                if try_complete_entry(
                     &entry,
                     TaskOpResult::Net(NetOutcome::Datagram {
                         code: IO_OK,
                         msg: String::new(),
-                        data: pkt.data,
-                        host: pkt.host,
+                        data: delivered,
+                        host: pkt.host.clone(),
                         port: pkt.port,
                     }),
                     &self.sched,
-                );
+                )
+                .is_err()
+                {
+                    sock.recv_queue.push_front(UdpPacket {
+                        data: full_data,
+                        host: pkt.host,
+                        port: pkt.port,
+                    });
+                }
                 return;
             }
             if let Some((code, msg)) = sock.recv_err.take() {
@@ -1784,11 +1816,32 @@ mod unix_net {
     /// Attempt to complete `stream.pending_read` from `stream.read_buf` / `eof` / `read_err`.
     /// Returns `true` if `pending_read` was satisfied and consumed.
     fn try_satisfy_tcp_read(stream: &mut TcpStreamCtx, sched: &Weak<SchedulerInner>) -> bool {
-        let Some(pr) = stream.pending_read.as_ref() else {
+        let Some(pr_ref) = stream.pending_read.as_ref() else {
             return false;
         };
-        let outcome = match pr.mode {
-            TcpReadMode::Bytes(max_bytes) => {
+        let entry = Arc::clone(&pr_ref.entry);
+        let op_id = pr_ref.op_id;
+        let mode_is_bytes = match pr_ref.mode {
+            TcpReadMode::Bytes(n) => Some(n),
+            TcpReadMode::Line => None,
+        };
+
+        // Lock `entry.state` BEFORE draining `stream.read_buf` / `stream.read_err` so a
+        // cancelled `read*` operation can never discard buffered stream data.
+        let mut st = entry.state.lock();
+        if matches!(*st, TaskOpState::Cancelled) {
+            drop(st);
+            stream.pending_read = None;
+            // SAFETY: `stream.net` outlives all handles on the reactor thread.
+            unsafe {
+                (*stream.net).cancel_targets.remove(&op_id);
+            }
+            stop_stream_reading(stream);
+            return false;
+        }
+
+        let outcome = match mode_is_bytes {
+            Some(max_bytes) => {
                 if max_bytes == 0 {
                     Some(NetOutcome::Bytes {
                         code: IO_OK,
@@ -1819,7 +1872,7 @@ mod unix_net {
                     None
                 }
             }
-            TcpReadMode::Line => {
+            None => {
                 if let Some(nl_pos) = stream.read_buf.iter().position(|&b| b == b'\n') {
                     let mut raw: Vec<u8> = stream.read_buf.drain(..=nl_pos).collect();
                     if raw.last() == Some(&b'\n') {
@@ -1868,12 +1921,21 @@ mod unix_net {
         };
 
         if let Some(out) = outcome {
-            let pr = stream.pending_read.take().expect("verified Some");
+            *st = TaskOpState::Ready(TaskOpResult::Net(out));
+            drop(st);
+            stream.pending_read = None;
             // SAFETY: `stream.net` outlives all handles on the reactor thread.
             unsafe {
-                (*stream.net).cancel_targets.remove(&pr.op_id);
+                (*stream.net).cancel_targets.remove(&op_id);
             }
-            complete_entry(&pr.entry, TaskOpResult::Net(out), sched);
+            if entry
+                .io_accounted
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+                && let Some(s) = sched.upgrade()
+            {
+                let _ = s.wake_from_reactor(entry.task_id);
+                s.dec_active_io();
+            }
             if stream.read_buf.len() >= MAX_BUFFERED_TCP_READ_BYTES || stream.eof {
                 stop_stream_reading(stream);
             }
@@ -2002,20 +2064,27 @@ mod unix_net {
 
             match net.register_connected_stream(client) {
                 Ok((stream_id, _, (peer_ip, peer_port))) => {
-                    if let Some((op_id, waiter)) = listener.accept_waiters.pop_front() {
+                    let mut delivered = false;
+                    while let Some((op_id, waiter)) = listener.accept_waiters.pop_front() {
                         net.cancel_targets.remove(&op_id);
-                        complete_entry(
+                        if try_complete_entry(
                             &waiter,
                             TaskOpResult::Net(NetOutcome::HandleAddr {
                                 code: IO_OK,
                                 msg: String::new(),
                                 handle_id: stream_id,
-                                host: peer_ip,
+                                host: peer_ip.clone(),
                                 port: peer_port,
                             }),
                             &net.sched,
-                        );
-                    } else {
+                        )
+                        .is_ok()
+                        {
+                            delivered = true;
+                            break;
+                        }
+                    }
+                    if !delivered {
                         listener.backlog.push_back((stream_id, peer_ip, peer_port));
                     }
                 }
@@ -2293,7 +2362,7 @@ mod unix_net {
             ctx.tcp_handle = ptr::null_mut();
             match net.register_connected_stream(handle) {
                 Ok((stream_id, (local_ip, local_port), _)) => {
-                    complete_entry(
+                    if try_complete_entry(
                         &ctx.entry,
                         TaskOpResult::Net(NetOutcome::HandleAddr {
                             code: IO_OK,
@@ -2303,7 +2372,11 @@ mod unix_net {
                             port: local_port,
                         }),
                         &net.sched,
-                    );
+                    )
+                    .is_err()
+                    {
+                        net.close_stream_by_id(stream_id);
+                    }
                 }
                 Err((code, msg)) => {
                     libuv_sys2::uv_close(
@@ -2488,22 +2561,32 @@ mod unix_net {
                 return;
             }
             let (peer_ip, peer_port) = extract_sockaddr(addr).unwrap_or_else(|| (String::new(), 0));
-            if let Some((op_id, max_bytes, waiter)) = sock.recv_waiters.pop_front() {
+            let mut delivered = false;
+            while let Some((op_id, max_bytes, waiter)) = sock.recv_waiters.pop_front() {
                 net.cancel_targets.remove(&op_id);
-                if payload.len() > max_bytes {
-                    payload.truncate(max_bytes);
-                }
-                complete_entry(
+                let data = if payload.len() > max_bytes {
+                    payload[..max_bytes].to_vec()
+                } else {
+                    payload.clone()
+                };
+                if try_complete_entry(
                     &waiter,
                     TaskOpResult::Net(NetOutcome::Datagram {
                         code: IO_OK,
                         msg: String::new(),
-                        data: payload,
-                        host: peer_ip,
+                        data,
+                        host: peer_ip.clone(),
                         port: peer_port,
                     }),
                     &net.sched,
-                );
+                )
+                .is_ok()
+                {
+                    delivered = true;
+                    break;
+                }
+            }
+            if delivered {
                 if sock.recv_waiters.is_empty() {
                     stop_udp_receiving(sock);
                 }

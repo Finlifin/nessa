@@ -193,6 +193,64 @@ impl AwaitAllTable {
     }
 }
 
+#[repr(align(64))]
+struct AwaitAnyShard(Mutex<FastHashMap<TaskId, (usize, u64)>>);
+
+impl Default for AwaitAnyShard {
+    fn default() -> Self {
+        Self(Mutex::new(FastHashMap::default()))
+    }
+}
+
+/// Per-task sticky winner table `(winner_idx, winner_fid)` while `await_any` / `await_first`
+/// waits for cancelled sibling tasks' `defer` blocks to converge.
+pub(crate) struct AwaitAnyTable {
+    shards: Box<[AwaitAnyShard; PROMISE_SHARD_COUNT]>,
+    active_count: AtomicUsize,
+}
+
+impl AwaitAnyTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            shards: Box::new(std::array::from_fn(|_| AwaitAnyShard::default())),
+            active_count: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn shard(&self, tid: TaskId) -> &Mutex<FastHashMap<TaskId, (usize, u64)>> {
+        &self.shards[(tid.slot() as usize) & (PROMISE_SHARD_COUNT - 1)].0
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, tid: TaskId) -> Option<(usize, u64)> {
+        if self.active_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.shard(tid).lock().get(&tid).copied()
+    }
+
+    #[inline]
+    pub(crate) fn insert(&self, tid: TaskId, winner: (usize, u64)) {
+        self.active_count.fetch_add(1, Ordering::AcqRel);
+        if self.shard(tid).lock().insert(tid, winner).is_some() {
+            self.active_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remove(&self, tid: TaskId) -> Option<(usize, u64)> {
+        if self.active_count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let removed = self.shard(tid).lock().remove(&tid);
+        if removed.is_some() {
+            self.active_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        removed
+    }
+}
+
 pub(crate) struct PromiseEntry {
     pub parent_task: TaskId,
     pub handler_scope_id: u64,

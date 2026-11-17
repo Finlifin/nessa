@@ -147,7 +147,7 @@ impl Default for EventLoop {
 }
 
 // ---------------------------------------------------------------------------
-// TaskArena — Lock-free chunked O(1) generational slot table
+// TaskArena — Chunked O(1) generational slot table
 // ---------------------------------------------------------------------------
 
 const CHUNK_BITS: u32 = 10;
@@ -161,6 +161,7 @@ struct SlotMeta {
     status: Option<TaskStatus>,
     wake_token: bool,
     external_waiter: bool,
+    unwinding_cancel: bool,
     parent: Option<TaskId>,
     children: FastHashSet<TaskId>,
     promise_set: FastHashSet<u64>,
@@ -214,8 +215,11 @@ impl ArenaChunk {
 
 /// Concurrent generational `O(1)` task table with append-only fixed chunks.
 ///
-/// Growing the arena allocates new chunks without relocating any existing `ArenaSlot`
-/// or `TaskState`, keeping both fast worker access and STW GC root slots stable.
+/// Chunk pointer lookups, `generation`, and `cancelled` checks use lock-free atomics;
+/// per-slot lifecycle transitions (`SlotMeta`), 16-way sharded free lists, and chunk
+/// growth use fine-grained `parking_lot::Mutex`es while running workers lease `TaskState`
+/// exclusively without per-instruction locking. Growing the arena allocates new chunks
+/// without relocating any existing `ArenaSlot` or `TaskState`, keeping STW GC root slots stable.
 pub struct TaskArena {
     chunks: Box<[AtomicPtr<ArenaChunk>; MAX_CHUNKS]>,
     chunk_alloc_lock: Mutex<()>,
@@ -342,6 +346,7 @@ impl TaskArena {
         meta.status = Some(TaskStatus::Ready);
         meta.wake_token = false;
         meta.external_waiter = false;
+        meta.unwinding_cancel = false;
         meta.parent = None;
         meta.children.clear();
         meta.promise_set.clear();
@@ -584,6 +589,7 @@ pub(crate) struct SchedulerInner {
     event_loop: Mutex<EventLoop>,
     reactor: reactor::ReactorController,
     cancel_hook: std::sync::OnceLock<Arc<dyn Fn(TaskId) + Send + Sync>>,
+    exit_hook: std::sync::OnceLock<Arc<dyn Fn(TaskId) + Send + Sync>>,
     stack_pool: Arc<StackPool>,
 }
 
@@ -720,6 +726,13 @@ impl SchedulerInner {
             cb(id);
         }
     }
+
+    pub(crate) fn terminate_task_resources(&self, id: TaskId) {
+        self.cancel_waiters(id);
+        if let Some(cb) = self.exit_hook.get() {
+            cb(id);
+        }
+    }
 }
 
 impl Scheduler {
@@ -760,6 +773,7 @@ impl Scheduler {
                 event_loop: Mutex::new(EventLoop::new()),
                 reactor: reactor::ReactorController::new(),
                 cancel_hook: std::sync::OnceLock::new(),
+                exit_hook: std::sync::OnceLock::new(),
                 stack_pool,
             }),
         }
@@ -782,10 +796,33 @@ impl Scheduler {
         }
     }
 
-    /// Register a callback invoked whenever a task is cancelled, finished, or reaped
-    /// so external wait queues (e.g. `std.sync` primitives) immediately purge the task.
+    /// Register a callback invoked whenever a task enters cancellation so external
+    /// wait queues (e.g. `std.sync` primitives, `await_all`/`await_any`) purge pending waits.
     pub fn set_cancel_hook(&self, hook: Arc<dyn Fn(TaskId) + Send + Sync>) {
         let _ = self.inner.cancel_hook.set(hook);
+    }
+
+    /// Register a callback invoked when a task terminates (`finish`, `reap_task`, or `cancel_subtree`)
+    /// so any still-owned synchronization locks/states are released without deadlocking peers.
+    pub fn set_exit_hook(&self, hook: Arc<dyn Fn(TaskId) + Send + Sync>) {
+        let _ = self.inner.exit_hook.set(hook);
+    }
+
+    /// Record in `SlotMeta` that `id` has entered protected `defer` cancellation unwinding,
+    /// shielding in-flight cleanup operations and cleanup child tasks from redundant cancels.
+    pub fn mark_unwinding_cancel(&self, id: TaskId) {
+        if let Some(slot) = self.inner.arena.slot(id.slot()) {
+            let mut meta = slot.meta.lock();
+            if slot.generation.load(Ordering::Acquire) == id.generation() && meta.occupied {
+                meta.unwinding_cancel = true;
+            }
+        }
+    }
+
+    /// Deterministically stop and join the background I/O reactor thread (if started)
+    /// from the owning VM teardown path before `Arc<SchedulerInner>` is dropped.
+    pub fn shutdown_reactor(&self) {
+        self.inner.reactor.shutdown();
     }
 
     /// Cancel any pending `IoReactor` operation or registered sync wait-queue entry for `id`.
@@ -1019,6 +1056,7 @@ impl Scheduler {
                     pmeta.promise_set.insert(fid);
                 }
                 if pslot.cancelled.load(Ordering::Acquire)
+                    && !pmeta.unwinding_cancel
                     && let Some(cslot) = inner.arena.slot(id.slot())
                 {
                     cslot.cancelled.store(true, Ordering::Release);
@@ -1431,7 +1469,7 @@ impl Scheduler {
     ///
     /// Must only be called by the worker owning `id` (or when `id` is not running on another worker).
     pub fn finish_only(&self, id: TaskId) {
-        self.inner.cancel_waiters(id);
+        self.inner.terminate_task_resources(id);
         let inner = &self.inner;
         let Some(slot) = inner.arena.slot(id.slot()) else {
             return;
@@ -1469,7 +1507,7 @@ impl Scheduler {
     /// Reap a finished task from `TaskArena`, detaching it from its parent's `SlotMeta.children`
     /// without touching the parent's `TaskState`, and recycling its slot with `generation + 1`.
     pub fn reap_task(&self, id: TaskId) -> bool {
-        self.inner.cancel_waiters(id);
+        self.inner.terminate_task_resources(id);
         let inner = &self.inner;
         let Some(slot) = inner.arena.slot(id.slot()) else {
             return false;
@@ -1484,6 +1522,7 @@ impl Scheduler {
             meta.occupied = false;
             meta.status = None;
             meta.wake_token = false;
+            meta.unwinding_cancel = false;
             meta.children.clear();
             meta.promise_set.clear();
             // SAFETY: `id` is being reaped by its owning worker; `meta` is locked and
@@ -1543,25 +1582,34 @@ impl Scheduler {
                 if slot.generation.load(Ordering::Acquire) != id.generation() || !meta.occupied {
                     continue;
                 }
+                if meta.unwinding_cancel {
+                    // Task is already inside protected `defer` cancellation unwinding:
+                    // never abort its cleanup I/O/locks or cleanup children spawned inside `defer`.
+                    continue;
+                }
                 visited.push(id);
                 let children: Vec<TaskId> = meta.children.iter().copied().collect();
                 let mut enqueue = false;
+                let mut cancel_first_time = false;
                 let not_finished = meta.status != Some(TaskStatus::Finished);
                 if not_finished {
                     let was_cancelled = slot.cancelled.swap(true, Ordering::AcqRel);
-                    match meta.status {
-                        Some(TaskStatus::Suspended | TaskStatus::Waiting) => {
-                            meta.wake_token = false;
-                            let _ = self.apply_status_delta(&mut meta, TaskStatus::Ready);
-                            enqueue = true;
+                    if !was_cancelled {
+                        cancel_first_time = true;
+                        match meta.status {
+                            Some(TaskStatus::Suspended | TaskStatus::Waiting) => {
+                                meta.wake_token = false;
+                                let _ = self.apply_status_delta(&mut meta, TaskStatus::Ready);
+                                enqueue = true;
+                            }
+                            Some(TaskStatus::Running) => {
+                                meta.wake_token = true;
+                            }
+                            _ => {}
                         }
-                        Some(TaskStatus::Running) if !was_cancelled => {
-                            meta.wake_token = true;
-                        }
-                        _ => {}
                     }
                 }
-                (children, enqueue, not_finished)
+                (children, enqueue, cancel_first_time)
             };
             for child_id in children.into_iter().rev() {
                 stack.push(child_id);
@@ -1609,7 +1657,7 @@ impl Scheduler {
             for child_id in children.into_iter().rev() {
                 stack.push(child_id);
             }
-            inner.cancel_waiters(id);
+            inner.terminate_task_resources(id);
             if finish_now {
                 self.finish_only(id);
             }
@@ -1617,7 +1665,7 @@ impl Scheduler {
         visited
     }
 
-    // -- Fast Lock-Free & SlotMeta Queries -----------------------------------
+    // -- Atomic Cancel Flag & SlotMeta Queries -------------------------------
 
     /// Single-instruction atomic cancellation check used at `Safepoint`s.
     #[inline]
@@ -1627,6 +1675,27 @@ impl Scheduler {
         };
         slot.generation.load(Ordering::Acquire) == id.generation()
             && slot.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Return `true` only when `id` has a pending cancellation request AND has not yet
+    /// entered protected `defer` unwinding (`SlotMeta::unwinding_cancel == false`).
+    ///
+    /// Synchronization wait queues use this so tasks executing `defer` cleanup blocks can
+    /// still acquire contended locks/channels/semaphores without being skipped on wakeup.
+    #[inline]
+    pub fn is_cancelled_not_unwinding(&self, id: TaskId) -> bool {
+        let Some(slot) = self.inner.arena.slot(id.slot()) else {
+            return false;
+        };
+        if slot.generation.load(Ordering::Acquire) != id.generation()
+            || !slot.cancelled.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let meta = slot.meta.lock();
+        slot.generation.load(Ordering::Acquire) == id.generation()
+            && meta.occupied
+            && !meta.unwinding_cancel
     }
 
     pub fn task_status(&self, id: TaskId) -> Option<TaskStatus> {

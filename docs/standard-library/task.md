@@ -1,6 +1,6 @@
 # `std.task` — 结构化并发组合子、超时控制与任务内省
 
-`std.task` 提供面向 `async effect` 与 `Future(T)` 的任务调度协作、批量等待/竞速组合子、基于 `libuv` 定时器的结构化超时包装器以及任务树调试内省 API。
+`std.task` 提供面向 `async effect` 与 `Future(T)` 的任务调度协作、批量等待/竞速组合子、基于跨平台 I/O Reactor 非阻塞定时器的结构化超时包装器以及任务树调试内省 API。
 
 > 在 Nessa 中，新任务的创建始终通过 `async effect` handler 完成，`std.task` 不提供脱离效应作用域的非结构化裸 `spawn`。
 
@@ -67,7 +67,7 @@ pub fn await_any(futures: List) -> Any
 -- 同时作为 List 方法提供：futures.await_any() -> Any
 ```
 
-竞速等待非空 `Future` 列表，返回第一个完成的 `Future` 的结果，并**自动级联取消其余未完成的兄弟子任务**（等待其 `defer` 清理收敛后再返回）：
+竞速等待非空 `Future` 列表，返回第一个完成的 `Future` 的结果，**立即取消其余未完成的兄弟子任务，并等待所有被取消败者的 `defer` 清理块完全收敛后再返回**（败者在被取消后若产生未捕获失败，亦自动标记为已观察，不会在退出外层 `handles` 作用域时误伤父任务）：
 
 - **静态类型精化**：当输入列表元素静态已知为 `Future(T)` 时，表达式返回类型自动精化为 `T`。
 

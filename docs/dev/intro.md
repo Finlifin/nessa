@@ -8,7 +8,7 @@
 |------|------|
 | [architecture.md](architecture.md) | 系统总体架构、编译管线、运行时架构、Crate 组织 |
 | [runtime-representation/](runtime-representation/) | Tagged Pointer、堆对象布局、值的运行时表示 |
-| [memory-management/](memory-management/) | MMTK + LXR GC、Task Stack Pool、外部对象管理 |
+| [memory-management/](memory-management/) | MMTk Immix / Windows 精确 GC、Task Stack Pool、大对象与外部对象管理 |
 | [nessa-bytecode/](nessa-bytecode/) | 64-bit 指令集设计、NSBC Archive 格式、Safe Point |
 | [normalied-intermediate-representation/](normalied-intermediate-representation/) | NIR 设计：脱糖、基本块、闭包转换 |
 | [static-and-dynamic-decision-procedures.md/](static-and-dynamic-decision-procedures.md/) | 名称解析、类型推断、Effect 静态/动态分派决策 |

@@ -34,4 +34,5 @@ bash scripts/cargo-win.sh test -p nessa-test \
     --test wave_c4_reactor_and_deadlock_tests \
     --test wave_c5_sync_net_and_task_tests \
     --test wave_c6_release_gates_tests \
+    --test async_soundness_and_cancel_tests \
     -- --test-threads=2

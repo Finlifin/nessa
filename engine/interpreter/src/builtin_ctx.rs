@@ -1429,14 +1429,19 @@ impl<'vm> BuiltinCtx<'vm> {
         self.vm.shared.files.seek(id, whence, offset)
     }
 
+    /// True if `self.task_id` is not yet in protected `defer` cancellation unwinding.
+    #[inline]
+    pub fn can_abort_for_cancel(&self) -> bool {
+        !self
+            .vm
+            .task_ref(self.task_id)
+            .is_some_and(|t| t.unwinding_cancel)
+    }
+
     /// True if `self.task_id` has been cancelled and is not yet unwinding `defer` blocks.
     #[inline]
     pub fn should_abort_for_cancel(&self) -> bool {
-        let already_unwinding = self
-            .vm
-            .task_ref(self.task_id)
-            .is_some_and(|t| t.unwinding_cancel);
-        !already_unwinding && self.vm.scheduler().is_cancelled(self.task_id)
+        self.can_abort_for_cancel() && self.vm.scheduler().is_cancelled(self.task_id)
     }
 
     /// Non-blocking `libuv` timer sleep (`uv_timer_t` on `nessa-io-reactor`).
@@ -1448,7 +1453,12 @@ impl<'vm> BuiltinCtx<'vm> {
             }
             TaskOpPoll::Ready(_) => unreachable!("unexpected TaskOpResult variant for sleep"),
             TaskOpPoll::Pending => {
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    self.vm.scheduler().cancel_task_waiters(self.task_id);
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 Ok(())
             }
             TaskOpPoll::Vacant => {
@@ -1464,7 +1474,12 @@ impl<'vm> BuiltinCtx<'vm> {
                     return Ok(());
                 }
                 self.vm.scheduler().submit_sleep(self.task_id, duration_ms);
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    self.vm.scheduler().cancel_task_waiters(self.task_id);
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 Ok(())
             }
         }
@@ -1491,7 +1506,12 @@ impl<'vm> BuiltinCtx<'vm> {
             }
             TaskOpPoll::Ready(_) => unreachable!("unexpected TaskOpResult variant for process"),
             TaskOpPoll::Pending => {
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    self.vm.scheduler().cancel_task_waiters(self.task_id);
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 Ok(())
             }
             TaskOpPoll::Vacant => {
@@ -1503,7 +1523,12 @@ impl<'vm> BuiltinCtx<'vm> {
                     return Ok(());
                 };
                 self.vm.scheduler().submit_process(self.task_id, spec);
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    self.vm.scheduler().cancel_task_waiters(self.task_id);
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 Ok(())
             }
         }
@@ -1531,7 +1556,12 @@ impl<'vm> BuiltinCtx<'vm> {
                 unreachable!("unexpected TaskOpResult variant for blocking IO")
             }
             TaskOpPoll::Pending => {
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    self.vm.scheduler().cancel_task_waiters(self.task_id);
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 Ok(())
             }
             TaskOpPoll::Vacant => {
@@ -1550,7 +1580,12 @@ impl<'vm> BuiltinCtx<'vm> {
                     .submit_work(self.task_id, move || -> Result<NativeValue, VmError> {
                         work_fn(&io_ctx)
                     });
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    self.vm.scheduler().cancel_task_waiters(self.task_id);
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 Ok(())
             }
         }
@@ -1641,7 +1676,7 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn task_await_all(&mut self, list_handle: &BuiltinRoot) -> Result<(), VmError> {
-        if self.vm.scheduler().is_cancelled(self.task_id) {
+        if self.should_abort_for_cancel() {
             if let Some(st) = self.vm.shared.await_all_ops.remove(self.task_id) {
                 st.early_exit
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -1701,9 +1736,18 @@ impl<'vm> BuiltinCtx<'vm> {
             if let (Some(fid), Some(err)) = (failed_fid, failed_err) {
                 drop(promises);
                 self.vm.mark_promise_failure_observed(fid);
+                for &other_fid in &fids {
+                    if other_fid != fid {
+                        self.vm.cancel_future(other_fid);
+                    }
+                }
                 return Err(err);
             }
             if cancelled {
+                drop(promises);
+                for &other_fid in &fids {
+                    self.vm.cancel_future(other_fid);
+                }
                 return Err(VmError::TaskCancelled);
             }
             if !pending_unique.is_empty() {
@@ -1719,7 +1763,15 @@ impl<'vm> BuiltinCtx<'vm> {
                 }
                 drop(promises);
                 self.vm.shared.await_all_ops.insert(self.task_id, state);
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    if let Some(st) = self.vm.shared.await_all_ops.remove(self.task_id) {
+                        st.early_exit
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 return Ok(());
             }
             let mut vals = Vec::with_capacity(len);
@@ -1763,6 +1815,12 @@ impl<'vm> BuiltinCtx<'vm> {
         &mut self,
         list_handle: &BuiltinRoot,
     ) -> Result<Option<(usize, TaggedValue)>, VmError> {
+        if self.should_abort_for_cancel() {
+            let _ = self.vm.shared.await_any_ops.remove(self.task_id);
+            self.outcome = BuiltinOutcome::StartCancelUnwind;
+            return Ok(None);
+        }
+
         let list_val = self.load_rooted(list_handle)?;
         let elems = self.vm.snapshot_list_elements(list_val)?;
         let len = elems.len();
@@ -1776,31 +1834,110 @@ impl<'vm> BuiltinCtx<'vm> {
             fids.push(self.vm.decode_future_id(elem)?);
         }
 
-        let (winner, any_pending) = {
+        let sticky = self
+            .vm
+            .shared
+            .await_any_ops
+            .get(self.task_id)
+            .filter(|&(w_idx, w_fid)| fids.get(w_idx) == Some(&w_fid));
+
+        enum AnyStep {
+            Converged {
+                winner_idx: usize,
+                winner_fid: u64,
+                outcome: Result<TaggedValue, VmError>,
+                winner_failed_to_mark: bool,
+                loser_failures_to_mark: Vec<u64>,
+            },
+            WaitLosers {
+                winner_idx: usize,
+                winner_fid: u64,
+                losers_to_cancel: Vec<u64>,
+                loser_failures_to_mark: Vec<u64>,
+            },
+            WaitWinner {
+                any_pending: bool,
+            },
+        }
+
+        let step = {
             let mut promises = self.vm.roots().promises.lock_fids(&fids);
-            let mut winner: Option<(usize, Result<TaggedValue, VmError>)> = None;
-            let mut failed_fid_to_mark = None;
-            for (idx, &fid) in fids.iter().enumerate() {
-                let entry = promises.get(fid).ok_or(VmError::TypeError)?;
-                match &entry.state {
-                    crate::futures::PromiseState::Completed(val) => {
-                        winner = Some((idx, Ok(*val)));
-                        break;
+            let chosen = sticky.or_else(|| {
+                for (idx, &fid) in fids.iter().enumerate() {
+                    if let Some(entry) = promises.get(fid)
+                        && matches!(
+                            entry.state,
+                            crate::futures::PromiseState::Completed(_)
+                                | crate::futures::PromiseState::Failed(_)
+                        )
+                    {
+                        return Some((idx, fid));
                     }
-                    crate::futures::PromiseState::Failed(err) => {
-                        failed_fid_to_mark = Some(fid);
-                        winner = Some((idx, Err(err.clone())));
-                        break;
-                    }
-                    _ => {}
                 }
-            }
-            if let Some(fid) = failed_fid_to_mark {
-                drop(promises);
-                self.vm.mark_promise_failure_observed(fid);
-                (winner, false)
-            } else if winner.is_some() {
-                (winner, false)
+                None
+            });
+
+            if let Some((winner_idx, winner_fid)) = chosen {
+                let mut losers_to_cancel = Vec::new();
+                let mut loser_failures_to_mark = Vec::new();
+                let mut any_loser_pending = false;
+
+                for (idx, &other_fid) in fids.iter().enumerate() {
+                    if idx == winner_idx || other_fid == winner_fid {
+                        if let Some(w_entry) = promises.get_mut(other_fid) {
+                            w_entry.waiters.retain(|&w| w != self.task_id);
+                        }
+                        continue;
+                    }
+                    let Some(other_entry) = promises.get_mut(other_fid) else {
+                        return Err(VmError::TypeError);
+                    };
+                    match &other_entry.state {
+                        crate::futures::PromiseState::Pending => {
+                            any_loser_pending = true;
+                            if !other_entry.waiters.contains(&self.task_id) {
+                                other_entry.waiters.push(self.task_id);
+                            }
+                            if !losers_to_cancel.contains(&other_fid) {
+                                losers_to_cancel.push(other_fid);
+                            }
+                        }
+                        crate::futures::PromiseState::Failed(_) => {
+                            other_entry.waiters.retain(|&w| w != self.task_id);
+                            if !other_entry.observed_failure
+                                && !loser_failures_to_mark.contains(&other_fid)
+                            {
+                                loser_failures_to_mark.push(other_fid);
+                            }
+                        }
+                        _ => {
+                            other_entry.waiters.retain(|&w| w != self.task_id);
+                        }
+                    }
+                }
+
+                if any_loser_pending {
+                    AnyStep::WaitLosers {
+                        winner_idx,
+                        winner_fid,
+                        losers_to_cancel,
+                        loser_failures_to_mark,
+                    }
+                } else {
+                    let w_entry = promises.get(winner_fid).ok_or(VmError::TypeError)?;
+                    let (outcome, winner_failed_to_mark) = match &w_entry.state {
+                        crate::futures::PromiseState::Completed(val) => (Ok(*val), false),
+                        crate::futures::PromiseState::Failed(err) => (Err(err.clone()), true),
+                        _ => (Err(VmError::TaskCancelled), false),
+                    };
+                    AnyStep::Converged {
+                        winner_idx,
+                        winner_fid,
+                        outcome,
+                        winner_failed_to_mark,
+                        loser_failures_to_mark,
+                    }
+                }
             } else {
                 let mut any_pending = false;
                 for &fid in &fids {
@@ -1813,25 +1950,54 @@ impl<'vm> BuiltinCtx<'vm> {
                         }
                     }
                 }
-                (None, any_pending)
+                AnyStep::WaitWinner { any_pending }
             }
         };
 
-        if let Some((winner_idx, outcome)) = winner {
-            let winner_fid = fids[winner_idx];
-            for (idx, &other_fid) in fids.iter().enumerate() {
-                if idx != winner_idx && other_fid != winner_fid {
-                    self.vm.cancel_future(other_fid);
+        match step {
+            AnyStep::WaitLosers {
+                winner_idx,
+                winner_fid,
+                losers_to_cancel,
+                loser_failures_to_mark,
+            } => {
+                self.vm
+                    .shared
+                    .await_any_ops
+                    .insert(self.task_id, (winner_idx, winner_fid));
+                for fid in loser_failures_to_mark {
+                    self.vm.mark_promise_failure_observed(fid);
+                }
+                for fid in losers_to_cancel {
+                    self.vm.cancel_future(fid);
+                }
+                self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(None)
+            }
+            AnyStep::Converged {
+                winner_idx,
+                winner_fid,
+                outcome,
+                winner_failed_to_mark,
+                loser_failures_to_mark,
+            } => {
+                let _ = self.vm.shared.await_any_ops.remove(self.task_id);
+                if winner_failed_to_mark {
+                    self.vm.mark_promise_failure_observed(winner_fid);
+                }
+                for fid in loser_failures_to_mark {
+                    self.vm.mark_promise_failure_observed(fid);
+                }
+                outcome.map(|val| Some((winner_idx, val)))
+            }
+            AnyStep::WaitWinner { any_pending } => {
+                if any_pending {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                    Ok(None)
+                } else {
+                    Err(VmError::TaskCancelled)
                 }
             }
-            return outcome.map(|val| Some((winner_idx, val)));
-        }
-
-        if any_pending {
-            self.outcome = BuiltinOutcome::SuspendRetry;
-            Ok(None)
-        } else {
-            Err(VmError::TaskCancelled)
         }
     }
 
@@ -1949,7 +2115,8 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_chan_send(&mut self, id: i64, val_root: &BuiltinRoot) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
+        let can_abort = self.can_abort_for_cancel();
+        if can_abort && self.vm.scheduler().is_cancelled(self.task_id) {
             if self
                 .vm
                 .roots()
@@ -1969,11 +2136,15 @@ impl<'vm> BuiltinCtx<'vm> {
             .vm
             .roots()
             .sync
-            .chan_send(&sched, id, self.task_id, val)?
+            .chan_send(&sched, id, self.task_id, val, can_abort)?
         {
             crate::sync_primitives::SyncPoll::Ready(code) => self.return_i64(code),
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -1987,19 +2158,29 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_chan_recv(&mut self, id: i64) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
+        let can_abort = self.can_abort_for_cancel();
+        if can_abort && self.vm.scheduler().is_cancelled(self.task_id) {
             let sched = self.vm.scheduler().clone();
             self.vm.roots().sync.cancel_task(&sched, self.task_id);
             self.outcome = BuiltinOutcome::StartCancelUnwind;
             return Ok(());
         }
         let sched = self.vm.scheduler().clone();
-        match self.vm.roots().sync.chan_recv(&sched, id, self.task_id)? {
+        match self
+            .vm
+            .roots()
+            .sync
+            .chan_recv(&sched, id, self.task_id, can_abort)?
+        {
             crate::sync_primitives::SyncPoll::Ready((code, val)) => {
                 self.return_i64_any_tuple(code, val)
             }
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -2036,19 +2217,29 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_mutex_lock(&mut self, id: i64) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
-            let sched = self.vm.scheduler().clone();
+        let can_abort = self.can_abort_for_cancel();
+        let sched = self.vm.scheduler().clone();
+        if can_abort && sched.is_cancelled(self.task_id) {
             self.vm.roots().sync.cancel_task(&sched, self.task_id);
             self.outcome = BuiltinOutcome::StartCancelUnwind;
             return Ok(());
         }
-        match self.vm.roots().sync.mutex_lock(id, self.task_id)? {
+        match self
+            .vm
+            .roots()
+            .sync
+            .mutex_lock(&sched, id, self.task_id, can_abort)?
+        {
             crate::sync_primitives::SyncPoll::Ready(val) => {
                 self.write_return(val);
                 Ok(())
             }
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -2096,19 +2287,29 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_rwlock_read_lock(&mut self, id: i64) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
-            let sched = self.vm.scheduler().clone();
+        let can_abort = self.can_abort_for_cancel();
+        let sched = self.vm.scheduler().clone();
+        if can_abort && sched.is_cancelled(self.task_id) {
             self.vm.roots().sync.cancel_task(&sched, self.task_id);
             self.outcome = BuiltinOutcome::StartCancelUnwind;
             return Ok(());
         }
-        match self.vm.roots().sync.rwlock_read_lock(id, self.task_id)? {
+        match self
+            .vm
+            .roots()
+            .sync
+            .rwlock_read_lock(&sched, id, self.task_id, can_abort)?
+        {
             crate::sync_primitives::SyncPoll::Ready(val) => {
                 self.write_return(val);
                 Ok(())
             }
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -2135,19 +2336,29 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_rwlock_write_lock(&mut self, id: i64) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
-            let sched = self.vm.scheduler().clone();
+        let can_abort = self.can_abort_for_cancel();
+        let sched = self.vm.scheduler().clone();
+        if can_abort && sched.is_cancelled(self.task_id) {
             self.vm.roots().sync.cancel_task(&sched, self.task_id);
             self.outcome = BuiltinOutcome::StartCancelUnwind;
             return Ok(());
         }
-        match self.vm.roots().sync.rwlock_write_lock(id, self.task_id)? {
+        match self
+            .vm
+            .roots()
+            .sync
+            .rwlock_write_lock(&sched, id, self.task_id, can_abort)?
+        {
             crate::sync_primitives::SyncPoll::Ready(val) => {
                 self.write_return(val);
                 Ok(())
             }
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -2192,19 +2403,29 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_sem_acquire(&mut self, id: i64) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
-            let sched = self.vm.scheduler().clone();
+        let can_abort = self.can_abort_for_cancel();
+        let sched = self.vm.scheduler().clone();
+        if can_abort && sched.is_cancelled(self.task_id) {
             self.vm.roots().sync.cancel_task(&sched, self.task_id);
             self.outcome = BuiltinOutcome::StartCancelUnwind;
             return Ok(());
         }
-        match self.vm.roots().sync.sem_acquire(id, self.task_id)? {
+        match self
+            .vm
+            .roots()
+            .sync
+            .sem_acquire(&sched, id, self.task_id, can_abort)?
+        {
             crate::sync_primitives::SyncPoll::Ready(()) => {
                 self.return_unit();
                 Ok(())
             }
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -2234,18 +2455,28 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_once_begin(&mut self, id: i64) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
-            let sched = self.vm.scheduler().clone();
+        let can_abort = self.can_abort_for_cancel();
+        let sched = self.vm.scheduler().clone();
+        if can_abort && sched.is_cancelled(self.task_id) {
             self.vm.roots().sync.cancel_task(&sched, self.task_id);
             self.outcome = BuiltinOutcome::StartCancelUnwind;
             return Ok(());
         }
-        match self.vm.roots().sync.once_begin(id, self.task_id)? {
+        match self
+            .vm
+            .roots()
+            .sync
+            .once_begin(&sched, id, self.task_id, can_abort)?
+        {
             crate::sync_primitives::SyncPoll::Ready((code, val)) => {
                 self.return_i64_any_tuple(code, val)
             }
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -2290,7 +2521,9 @@ impl<'vm> BuiltinCtx<'vm> {
     }
 
     pub fn sync_barrier_wait(&mut self, id: i64) -> Result<(), VmError> {
-        if self.should_abort_for_cancel() {
+        let can_abort = self.can_abort_for_cancel();
+        let sched = self.vm.scheduler().clone();
+        if can_abort && sched.is_cancelled(self.task_id) {
             if let Some(is_leader) = self
                 .vm
                 .roots()
@@ -2300,17 +2533,15 @@ impl<'vm> BuiltinCtx<'vm> {
                 self.return_bool(is_leader);
                 return Ok(());
             }
-            let sched = self.vm.scheduler().clone();
             self.vm.roots().sync.cancel_task(&sched, self.task_id);
             self.outcome = BuiltinOutcome::StartCancelUnwind;
             return Ok(());
         }
-        let sched = self.vm.scheduler().clone();
         match self
             .vm
             .roots()
             .sync
-            .barrier_wait(&sched, id, self.task_id)?
+            .barrier_wait(&sched, id, self.task_id, can_abort)?
         {
             crate::sync_primitives::SyncPoll::Ready(is_leader) => {
                 self.return_bool(is_leader);
@@ -2318,6 +2549,10 @@ impl<'vm> BuiltinCtx<'vm> {
             }
             crate::sync_primitives::SyncPoll::SuspendRetry => {
                 self.outcome = BuiltinOutcome::SuspendRetry;
+                Ok(())
+            }
+            crate::sync_primitives::SyncPoll::Cancelled => {
+                self.outcome = BuiltinOutcome::StartCancelUnwind;
                 Ok(())
             }
         }
@@ -2456,7 +2691,12 @@ impl<'vm> BuiltinCtx<'vm> {
             TaskOpPoll::Ready(TaskOpResult::Net(out)) => self.complete_net_outcome(out),
             TaskOpPoll::Ready(_) => unreachable!("unexpected TaskOpResult variant for net op"),
             TaskOpPoll::Pending => {
-                self.outcome = BuiltinOutcome::SuspendRetry;
+                if self.should_abort_for_cancel() {
+                    self.vm.scheduler().cancel_task_waiters(self.task_id);
+                    self.outcome = BuiltinOutcome::StartCancelUnwind;
+                } else {
+                    self.outcome = BuiltinOutcome::SuspendRetry;
+                }
                 Ok(())
             }
             TaskOpPoll::Vacant => {
@@ -2465,7 +2705,12 @@ impl<'vm> BuiltinCtx<'vm> {
                     return Ok(());
                 }
                 if submit(self)? {
-                    self.outcome = BuiltinOutcome::SuspendRetry;
+                    if self.should_abort_for_cancel() {
+                        self.vm.scheduler().cancel_task_waiters(self.task_id);
+                        self.outcome = BuiltinOutcome::StartCancelUnwind;
+                    } else {
+                        self.outcome = BuiltinOutcome::SuspendRetry;
+                    }
                 }
                 Ok(())
             }

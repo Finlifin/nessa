@@ -128,11 +128,11 @@ Created → Running → Completed
 
 ## 多核 Work-Stealing 调度与 I/O Reactor
 
-nessa 运行时采用 **$M:N$ 多核 Work-Stealing 调度器 + 每 Worker 独立 MMTk Mutator + `libuv` 异步 I/O Reactor** 架构：
+nessa 运行时采用 **$M:N$ 多核 Work-Stealing 调度器 + 每 Worker 独立堆分配器 + 跨平台异步 I/O Reactor** 架构：
 
-1. **Worker 线程池**：默认启动与逻辑 CPU 核数相等的 Worker 线程（可通过 `NESSA_WORKER_THREADS` 或 `SchedulerConfig` 配置为单线程确定性模式）。每个 Worker 持有本地双端队列（LIFO 亲和局部性 + 跨线程 FIFO 窃取）和独立的 MMTk bump-pointer 分配器。
-2. **收敛 Safe-Point**：编译器在**循环回边**（`while` / `for`）与**函数入口**插入 `Safepoint` 指令。在 safe-point 处，Worker 通过单次原子标志与时间片预算检查协作响应移动式 GC Stop-The-World 握手、任务取消与时间片轮转让出。
-3. **`libuv` I/O Reactor 与全局死锁检测**：定时器（`task.sleep` / `time.sleep_ms`）、子进程（`std.process`）、文件系统（`std.fs`）与网络套接字（`std.net`）统一通过后台 `libuv` Reactor 非阻塞驱动，绝不阻塞计算 Worker 线程。若所有就绪任务耗尽、存在挂起等待的任务且没有任何活跃 Reactor 句柄或外部唤醒源，运行时立即报告 `VmError::DeadlockDetected`（包含等待链信息），避免静默挂死或误退出。
+1. **Worker 线程池**：默认启动与逻辑 CPU 核数相等的 Worker 线程（可通过 `NESSA_WORKER_THREADS` 或 `SchedulerConfig` 配置为单线程确定性模式）。每个 Worker 持有 `crossbeam` 本地 FIFO 双端队列（配合跨线程 FIFO 窃取与全局 `Injector` 防饥饿轮询）以及线程私有的托管堆分配器上下文（Unix 为 MMTk `Immix` `Mutator`，Windows 为 `win_gc` 线程上下文）。
+2. **收敛 Safe-Point**：编译器在**循环回边**（`while` / `for`）与**函数入口**插入 `Safepoint` 指令。在 safe-point 处，Worker 通过单次原子标志与时间片预算检查协作响应 GC Stop-The-World 握手、任务取消与时间片轮转让出。
+3. **跨平台 I/O Reactor 与全局死锁检测**：定时器（`task.sleep` / `time.sleep_ms`）、子进程（`std.process`）、文件系统（`std.fs`）与网络套接字（`std.net`）统一通过后台 I/O Reactor（Unix 采用 `libuv`，Windows 采用 Winsock2 `WSAPoll` + Win32 Job Object 进程树管理）非阻塞驱动，绝不阻塞计算 Worker 线程。若所有就绪任务耗尽、存在挂起等待的任务且没有任何活跃 Reactor 句柄或外部唤醒源，运行时立即报告 `VmError::DeadlockDetected`（包含等待链信息），避免静默挂死或误退出。
 
 ### 为什么是 Safe-Point 而非硬件信号硬抢占
 

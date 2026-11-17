@@ -2,7 +2,11 @@
 
 本文档面向负责将 Nessa 并发运行时推进至**发布级（Release-Ready）状态**的工程代理，基于语言规范（[docs/concurrency-and-async-algebraic-effect/](../concurrency-and-async-algebraic-effect/intro.md)）、引擎总体架构（[docs/dev/architecture.md](architecture.md) §5.4–§5.5）以及当前仓库源码做逐项核对，明确区分**已实现能力**、**半成品/原型缺口**与**完整目标架构**，并给出可直接按 [AGENTS.md](../../AGENTS.md) 分阶段落地的实施计划。
 
-> **范围说明**：本报告仅针对 Nessa 语言编译器、运行时与标准库（`engine/*`、`library/std/*`、`docs/*`），暂不改动外部上层应用（如 Lava）。
+> **文档状态说明**：
+> - **第 0–3 节**记录 Wave C1 启动前的历史基线审计与目标架构规划（其中提到的单线程缺口均已在 Wave C1–C6 修复，保留供架构溯源对照）；
+> - **第 4 节**记录 Wave C1–C6 发布门禁验收结果；
+> - **第 5 节**记录后续**异步健全性与取消安全全面审计（Async Soundness Audit）**中修正的锁语义说明、取消展开保护、资源零泄漏与竞速收敛保证。
+> - **范围说明**：本报告针对 Nessa 语言编译器、运行时与标准库（`engine/*`、`library/std/*`、`docs/*`）。
 
 ---
 
@@ -250,6 +254,29 @@ Nessa 允许 `async effect` 闭包捕获外部对象或传递引用，因此必�
 8. **[x] 全仓工程门禁**：
    - `bash scripts/cargo.sh fmt --all -- --check`
    - `bash scripts/cargo.sh check --workspace --all-targets`
-   - `bash scripts/cargo.sh test --workspace`
+   - `NESSA_TEST_JOBS=10 NESSA_TEST_THREADS=3 bash scripts/test-parallel.sh`
    - `bash scripts/cargo.sh clippy --workspace --all-targets -- -D warnings`
    - `git diff --check` 零空白错误、零新增未解释 `unsafe`、零占位实现。
+
+---
+
+## 5. 异步健全性与取消安全全面审计补强（Post-Wave-C6 Soundness Audit）
+
+在 Wave C6 之后，针对多核异步取消边界、同步原语异常退出、I/O 套接字竞态与锁语义文档准确性进行了二次全面审计与加固（回归测试见 [`engine/test/tests/async_soundness_and_cancel_tests.rs`](../../engine/test/tests/async_soundness_and_cancel_tests.rs)）：
+
+1. **准确界定同步与无锁边界（消除“伪无锁”表述）**：
+   - `TaskArena`：块数组指针、代际号（`generation`）与取消标志（`cancelled`）采用无锁原子读取；但单槽生命周期状态机使用每槽 `Mutex<SlotMeta>`，空闲槽位池采用 16 路分片 `Mutex<Vec<u32>>`。
+   - Worker 队列：采用 `crossbeam_deque::Worker::new_fifo()`（本地 FIFO 双端队列 + 跨线程 FIFO 窃取 + 全局 `Injector`），不宣称 LIFO 本地弹出。
+   - `std.sync`：`AtomicInt` / `AtomicBool` 的读写与 CAS 为 `SeqCst` 无锁原子操作（底层每 1024 槽块扩容由互斥锁保护）；`Channel`、`Mutex`、`RwLock`、`Semaphore`、`Once`、`Barrier` 内部均采用 64 路分片 `parking_lot::Mutex` 保护任务等待队列（任务级挂起不阻塞 OS Worker，但并非 lock-free 数据结构）。
+2. **`UnwindingCancel` 受保护 `defer` 清理（支持挂起与清理子任务）**：
+   - `SlotMeta` 区分 `cancelled` 与 `unwinding_cancel`（`is_cancelled_not_unwinding`）：一旦任务进入 `defer` 取消展开阶段，外层作用域重复触发的 `request_cancel_subtree` 不会打断正在执行的 `defer` 清理（包括在 `defer` 中争用 `Mutex`/`Semaphore`、`Channel` 发送、`task.sleep_ms`、网络关闭握手，乃至派生清理用的子 `async effect` 任务）。
+   - 分离调度器 `cancel_hook`（取消通知，唤醒挂起等待）与 `exit_hook`（任务最终退出，兜底回收资源），防止任务刚进入 `defer` 就被提前清空同步所有权。
+3. **`std.sync` 取消原子性与异常退出防死锁**：
+   - **零缓冲与有界 `Channel` 取消不变式**：`Channel.unbuffered()` 严格走发送/接收直接交接（`len()` 恒为 `0`，接收方超时取消绝不残留幽灵缓冲或丢失消息）；有界 `Channel.send` 在满队列挂起期间被取消绝不写入元素。
+   - **异常退出自动释放锁**：`SyncRegistry::on_task_terminated` 接入调度器任务终止钩子；若任务未解锁便因未捕获错误或异常终止，自动释放其持有的 `Mutex` 独占锁、`RwLock` 读/写锁并回滚未完成的 `Once`，唤醒后续等待者。
+   - **作用域包装器零空窗**：`Mutex.{with_lock,update}`、`RwLock.{with_read,with_write}`、`Semaphore.with_permit` 与 `Once.call_once` 消除获取原语返回与 `defer` 注册之间的取消空窗。
+   - **`Barrier` 取消破损传播**：已到达 `Barrier.wait()` 的参与者若在凑齐 `parties` 前被取消，栅栏立即标记为 `broken` 并唤醒所有已到达同伴报错，杜绝 $N-1$ 个任务永久挂死。
+4. **组合子竞速收敛与 Reactor / `std.net` 零句柄泄漏**：
+   - `await_any`、`await_first` 与 `with_timeout` 通过 `AwaitAnyTable` 锁定首个胜者后立即取消全部败者（含 `with_timeout` 定时器），**并等待所有被取消败者的 `defer` 块执行完毕后再向调用方返回**，同时将竞速期间并发失败的败者标记为已观察。
+   - `TcpListener.bind`、`TcpStream.connect`、`TcpListener.accept` 与 `UdpSocket.bind` 在 Reactor 刚完成但调用方任务已取消时自动关闭或重入队（`accept` 未消费连接放回 `backlog`，`UdpSocket` 未消费数据报放回 `recv_queue`）；`try_satisfy_tcp_read` 先锁定 `entry.state` 校验未取消再消费 `read_buf`，保证取消 `read_line`/`read_bytes` 零字节丢失。
+   - 修复 `ReactorController::shutdown` 与 `WinHelperPool::shutdown` 在 Reactor 回调线程自身释放最后一个 `Arc<SchedulerInner>` 时自 `join` 触发 `EDEADLK` 的竞态，并在 `PrimaryAuxShutdown::drop` 中确定性停机回收 Reactor。

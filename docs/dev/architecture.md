@@ -53,8 +53,8 @@
 │  │  │              Runtime Subsystems                           │          │ │
 │  │  │                                                          │          │ │
 │  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐ │          │ │
-│  │  │  │Type Pool │  │  MMTK    │  │Scheduler │  │  libuv  │ │          │ │
-│  │  │  │& Metdata │  │  LXR GC  │  │  (W.S.)  │  │Event Lp │ │          │ │
+│  │  │  │Type Pool │  │ Managed  │  │Scheduler │  │   I/O   │ │          │ │
+│  │  │  │& Metdata │  │    GC    │  │  (W.S.)  │  │ Reactor │ │          │ │
 │  │  │  └──────────┘  └──────────┘  └──────────┘  └─────────┘ │          │ │
 │  │  │                                                          │          │ │
 │  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │          │ │
@@ -206,38 +206,33 @@ Source Text
 ### 5.1 值表示 (Value Representation)
 
 ```
-Tagged Pointer (64-bit)
+TaggedValue (64-bit)
 ┌────────────────────────────────────────────────────────────────┬───┐
 │                      Payload (61 bits)                         │Tag│
 │                                                                │3b │
 └────────────────────────────────────────────────────────────────┴───┘
 
-Tag 编码:
-  000  HeapObject    → payload 为堆对象指针（8 字节对齐，低 3 位自然为 0）
-  001  Immediate     → payload 为立即数，内部再编码区分具体类型（见下）
-  01x  Reserved      → 保留扩展
-  1xx  Reserved      → 保留扩展
+低位编码:
+  bit 0 == 1  Inline f64  → IEEE-754 f64 按位左旋 1 位并翻转符号位内联存储
+                            （零堆分配表示绝大多数有限双精度浮点数；与位标签冲突的
+                            极少数 NaN 位型回退为堆上 BoxedF64）
+  000         HeapObject  → 8 字节对齐托管堆对象指针（低 3 位自然为 000）
+  010         Immediate   → 61-bit 立即数载荷（高 4 位为子类型 imm_kind，低 57 位为数据）
 
-Immediate 子编码 (payload 61 bits 内部):
-  高 4 位为子类型 tag，剩余 57 bits 为数据：
+Immediate 子编码 (imm_kind, 4 bits):
+  i_small / u_small  → 57-bit 有符号/无符号整数 (i64 / u64 常见值域；超出范围转堆对象)
+  usize / isize      → 平台指针宽度无符号/有符号整数内联表示
+  narrow scalar      → 窄宽度精确类型标量内联编码 (u8, u16, u32, i8, i16, i32, f32)
+  bool               → bit 0 = true / false
+  symbol             → 内部符号值（enum variant tag 等）
+  null               → 表示 ?T 的空值（optional 的 None 状态）
+  unit               → Unit 值 ()
+  char               → Unicode 标量值（21 bits）
+  type               → 一等类型值 Type（保存 TypeIndex）
 
-  0000  i_small    → 57-bit 有符号整数（覆盖 i8~i64/isize 常见值域）
-                     溢出时自动提升为堆上 BigInt 对象
-  0001  u_small    → 57-bit 无符号整数（覆盖 u8~u64/usize 常见值域）
-                     溢出时自动提升为堆上 BigUint 对象
-  0010  f64_bits   → 57-bit 压缩浮点（truncated mantissa）
-                     精度不足时回退为堆上 f64 对象
-  0011  bool       → bit 0 = true/false
-  0100  symbol     → 内部符号值（enum variant tag、.ok/.err 等）
-  0101  null       → 表示 ?T 的空值（optional 的 None 状态）
-  0110  unit       → Unit 值 ()
-  0111  char       → Unicode 码点（21 bits 即够用）
-  1xxx  reserved   → 保留扩展
+  注：u128 / i128 / BigInt 及超大位宽整数分配在托管堆上。
 
-  注：u128/i128/big int 始终分配在堆上，不适用立即数编码。
-      f32 值在运算时提升为 f64 处理，存储时使用 f64_bits 或堆对象。
-
-  数值类型完整列表（与 std intrinsic 定义一致）：
+  数值与基础标量类型完整列表（与 std intrinsic 定义一致）：
     无符号整数: u8, u16, u32, u64, u128, usize
     有符号整数: i8, i16, i32, i64, i128, isize
     大整数:     BigInt（任意精度）
@@ -370,15 +365,15 @@ continuation 保留它自己的栈段链。栈池的 slot 分配单位是栈段�
 ┌──────────────────── Scheduler Architecture ──────────────────────┐
 │                                                                    │
 │  ┌────────────────────────────────────────────────────────────┐   │
-│  │ Dedicated I/O Reactor Thread (libuv uv_loop_t)              │   │
-│  │   - uv_async_t 门铃接收跨线程异步命令                         │   │
-│  │   - 非阻塞定时器 (uv_timer_t)、子进程 (uv_process_t/pipe)   │   │
-│  │   - 异步文件系统 (uv_fs_t) 与 TCP/UDP/DNS (std.net)         │   │
+│  │ Dedicated I/O Reactor Thread                                │   │
+│  │   - Unix: libuv uv_loop_t + uv_async_t 门铃                 │   │
+│  │   - Windows (Win10 1709+): Winsock2 WSAPoll + Job Object    │   │
+│  │   - 非阻塞定时器、子进程组管理、异步文件工作池与 TCP/UDP/DNS │   │
 │  └────────────┬───────────────────────────────────────────────┘   │
 │               │ wake up / inject ready TaskId                      │
 │               ▼                                                    │
 │  ┌────────────────────────────────────────────────────────────┐   │
-│  │ Worker Threads (N = CPU cores, 独立 MMTk Mutator)          │   │
+│  │ Worker Threads (N = CPU cores, 每 Worker 独立分配器上下文)  │   │
 │  │                                                             │   │
 │  │  Worker 0          Worker 1          Worker 2               │   │
 │  │  ┌───────────┐    ┌───────────┐    ┌───────────┐           │   │
@@ -390,9 +385,12 @@ continuation 保留它自己的栈段链。栈池的 slot 分配单位是栈段�
 │  │                         │                                   │   │
 │  └────────────────────────────────────────────────────────────┘   │
 │                                                                    │
-│  调度与生命周期策略:                                               │
-│    - TaskArena 采用 [32-bit gen | 32-bit slot] 代际槽表，O(1) 寻址 │
-│    - 每个 Worker 持有本地双端队列 + 全局 Injector 防饥饿轮询       │
+│  调度与同步策略:                                                   │
+│    - TaskArena 采用 [32-bit gen | 32-bit slot] 代际槽表：          │
+│      块指针/代际号/取消标志使用原子读取，槽元数据采用每槽 Mutex，  │
+│      空闲槽回收池按 16 路分片锁管理                                │
+│    - 每个 Worker 持有 crossbeam FIFO 本地双端队列 + 跨线程窃取     │
+│      + 全局 Injector 防饥饿轮询                                    │
 │    - Safe-point 仅在循环回边与函数入口发射，单次预算/标志检查      │
 │    - PromiseRegistry 双引用计数自动回收已完成任务与 Promise 条目   │
 │    - 全局死锁检测：无就绪任务且无活跃 I/O 唤醒源时报告死锁         │
@@ -407,39 +405,41 @@ continuation 保留它自己的栈段链。栈池的 slot 分配单位是栈段�
 │                                                                    │
 │    保证:                                                           │
 │    - 父 task 退出时级联取消未完成子树并等待子任务收敛              │
-│    - 取消进入 UnwindingCancel，按 LIFO 执行全部已登记 defer 块     │
-│    - handler 作用域边界自动 implicit await                         │
+│    - 取消进入受保护的 UnwindingCancel 阶段，按 LIFO 执行全部已     │
+│      登记 defer 块；期间屏蔽外层重复取消，允许 defer 正常等待锁、   │
+│      睡眠、执行网络清理或派生清理子任务                            │
+│    - await_any / await_first / with_timeout 在返回胜者前等待被     │
+│      取消败者的 defer 清理全部收敛                                 │
+│    - 任务终止钩子自动释放异常退出时仍持有的 Mutex / RwLock / Once  │
 │    - 子任务 O(1) 继承祖先不可变 Handler 链快照；跨任务捕获         │
 │      catch k 定界延续明确报 CrossTaskContinuationCapture           │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.5 GC (MMTK + LXR)
+### 5.5 内存回收与托管堆 (Managed GC)
 
 ```
 ┌───────────────────── Memory Management ──────────────────────────┐
 │                                                                    │
 │  ┌────────────────────────────────────────────────────────────┐   │
-│  │ MMTK (Memory Management Toolkit)                            │   │
+│  │ Unix (Linux / macOS): MMTk Immix + Large Object Space       │   │
+│  │   - 每个 OS Worker 线程绑定独立 Mutator<NessaVM>            │   │
+│  │     (per-worker bump-pointer 快速分配，非 per-task)         │   │
+│  │   - Stop-The-World 精确根扫描（支持对象移动与槽位回写）      │   │
 │  │                                                             │   │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐    │   │
-│  │  │  Allocator  │  │  Collector  │  │   Work Packets  │    │   │
-│  │  │  (per-task  │  │  (LXR GC)   │  │   (并行 GC 工作  │    │   │
-│  │  │  bump alloc)│  │             │  │    单元化分派)   │    │   │
-│  │  └─────────────┘  └─────────────┘  └─────────────────┘    │   │
+│  │ Windows (Win10 1709+): 原生精确 STW Mark-Sweep + LOS        │   │
+│  │   - 零外部 C++ 运行时依赖，完整支持多 Worker STW 握手        │   │
 │  │                                                             │   │
 │  │  GC Root 来源:                                              │   │
-│  │    1. 寄存器文件 (register file)                             │   │
-│  │    2. 调用栈 (stack maps 定位引用)                           │   │
-│  │    3. 全局变量表                                             │   │
-│  │    4. Effect handler 证据链                                  │   │
+│  │    1. 所有活跃/挂起 Task 的寄存器文件与调用栈段（含延续）    │   │
+│  │    2. Worker 临时根栈与原生调用固定根 (BuiltinRoot)          │   │
+│  │    3. 全局变量表、常量池、活跃 Promise 与 std.sync 容器载荷 │   │
+│  │    4. Effect handler 证据链与闭包捕获环境                    │   │
 │  │                                                             │   │
 │  │  Safe-point 机制:                                           │   │
-│  │    - 循环回边 (back-edge) 处插入 safe-point 检查              │   │
-│  │    - 每次函数调用/返回为隐式 safe-point                      │   │
-│  │    - safe-point 触发时：暂停 task、扫描 stack map、           │   │
-│  │      标记可达对象                                            │   │
+│  │    - 循环回边与函数入口处检查原子 STW 标志                  │   │
+│  │    - 处于 I/O 或同步原语挂起等待的 Worker 自动视为已停靠     │   │
 │  │                                                             │   │
 │  └────────────────────────────────────────────────────────────┘   │
 │                                                                    │

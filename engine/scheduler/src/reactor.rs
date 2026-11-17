@@ -302,6 +302,18 @@ impl ReactorController {
         }
     }
 
+    fn cleanup_cancelled_state(&self, prev: TaskOpState) {
+        if let TaskOpState::Ready(TaskOpResult::Net(NetOutcome::HandleAddr {
+            code: IO_OK,
+            handle_id,
+            ..
+        })) = prev
+            && handle_id > 0
+        {
+            let _ = self.tcp_close(handle_id) || self.udp_close(handle_id);
+        }
+    }
+
     fn register_entry(&self, sched: &SchedulerInner, task_id: TaskId) -> (u64, Arc<TaskOpEntry>) {
         let op_id = self.next_op_id.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(TaskOpEntry {
@@ -319,7 +331,8 @@ impl ReactorController {
             .insert(task_id, Arc::clone(&entry));
         if let Some(stale) = prev {
             self.active_ops_count.fetch_sub(1, Ordering::AcqRel);
-            *stale.state.lock() = TaskOpState::Cancelled;
+            let old_state = std::mem::replace(&mut *stale.state.lock(), TaskOpState::Cancelled);
+            self.cleanup_cancelled_state(old_state);
             if stale.io_accounted.swap(false, Ordering::AcqRel) {
                 sched.dec_active_io();
             }
@@ -387,7 +400,8 @@ impl ReactorController {
             return;
         };
         self.active_ops_count.fetch_sub(1, Ordering::AcqRel);
-        *entry.state.lock() = TaskOpState::Cancelled;
+        let prev_state = std::mem::replace(&mut *entry.state.lock(), TaskOpState::Cancelled);
+        self.cleanup_cancelled_state(prev_state);
         let pid = entry.spawned_pid.load(Ordering::Acquire);
         if pid > 0 {
             #[cfg(unix)]
@@ -422,7 +436,9 @@ impl ReactorController {
                     db.notify();
                 }
             }
-            if let Some(jh) = rt.join_handle.take() {
+            if let Some(jh) = rt.join_handle.take()
+                && jh.thread().id() != std::thread::current().id()
+            {
                 let _ = jh.join();
             }
         }
@@ -694,15 +710,17 @@ impl ReactorController {
     }
 }
 
-pub(crate) fn complete_entry(
+/// Attempt to publish `result` into `entry`, returning `Err(result)` if `entry` was already
+/// cancelled so callers can close newly created OS handles or requeue unconsumed packets.
+pub(crate) fn try_complete_entry(
     entry: &Arc<TaskOpEntry>,
     result: TaskOpResult,
     sched: &Weak<SchedulerInner>,
-) {
+) -> Result<(), TaskOpResult> {
     {
         let mut st = entry.state.lock();
         if matches!(*st, TaskOpState::Cancelled) {
-            return;
+            return Err(result);
         }
         *st = TaskOpState::Ready(result);
     }
@@ -712,6 +730,15 @@ pub(crate) fn complete_entry(
         let _ = s.wake_from_reactor(entry.task_id);
         s.dec_active_io();
     }
+    Ok(())
+}
+
+pub(crate) fn complete_entry(
+    entry: &Arc<TaskOpEntry>,
+    result: TaskOpResult,
+    sched: &Weak<SchedulerInner>,
+) {
+    let _ = try_complete_entry(entry, result, sched);
 }
 
 #[cfg(unix)]

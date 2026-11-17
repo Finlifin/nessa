@@ -14,9 +14,9 @@
 │                                                                  │
 │           ▼                                                      │
 │                                                                  │
-│ 2. MMTK GC 初始化                                                │
-│    - 创建 MMTK 实例                                              │
-│    - 配置 GC 策略 (LXR)                                          │
+│ 2. 托管堆 GC 初始化                                              │
+│    - Unix: 初始化 MMTk 实例（Immix + LOS）与每 Worker Mutator    │
+│    - Windows (Win10 1709+): 初始化原生精确 Mark-Sweep + LOS 堆    │
 │    - 设置堆初始大小和最大大小                                     │
 │    - 注册 object model (对象头布局、引用字段扫描函数)              │
 │                                                                  │
