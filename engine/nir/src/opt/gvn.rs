@@ -358,8 +358,16 @@ impl GvnWalker<'_> {
 
             if let NirExpr::Use(src) = expr.unscoped() {
                 let canon_src = self.canonicalize_value(*src);
-                let prev = self.local_replacements.insert(dst, canon_src);
-                undo_locals.push((dst, prev));
+                // Only alias `dst -> canon_src` when `canon_src` is immutable (constant or
+                // single-def local); otherwise mutating `canon_src` later would corrupt `dst`.
+                let src_immutable = match canon_src {
+                    NirValue::Local(src_loc) => self.single_def.contains(&src_loc),
+                    _ => true,
+                };
+                if src_immutable {
+                    let prev = self.local_replacements.insert(dst, canon_src);
+                    undo_locals.push((dst, prev));
+                }
                 continue;
             }
 
@@ -555,6 +563,59 @@ impl GvnWalker<'_> {
                     undo_exprs.push((ne_key, p2));
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_dominator_gvn;
+    use crate::{
+        BasicBlock, BinOp, BlockId, NirExpr, NirFunction, NirLocal, NirStmt, NirValue, Terminator,
+    };
+    use type_pool::{TypeIndex, TypePool};
+
+    #[test]
+    fn gvn_does_not_alias_copy_of_mutable_local() {
+        let pool = TypePool::new();
+        let mut func = NirFunction {
+            entry_scope: None,
+            func_id: crate::FuncId(0),
+            name: str_interner::intern("copy_mut"),
+            function_type: TypeIndex::INVALID,
+            display_owner: None,
+            params: Vec::new(),
+            return_type: TypeIndex::INVALID,
+            entry_block: BlockId(0),
+            local_count: 3,
+            is_closure: false,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    NirStmt::Assign(NirLocal(0), NirExpr::Use(NirValue::ConstInt(10))),
+                    NirStmt::Assign(NirLocal(1), NirExpr::Use(NirValue::Local(NirLocal(0)))),
+                    NirStmt::Assign(
+                        NirLocal(0),
+                        NirExpr::BinOp(BinOp::Add, NirValue::Local(NirLocal(0)), NirValue::ConstInt(1)),
+                    ),
+                    NirStmt::Assign(
+                        NirLocal(2),
+                        NirExpr::BinOp(BinOp::Sub, NirValue::Local(NirLocal(0)), NirValue::Local(NirLocal(1))),
+                    ),
+                ],
+                terminator: Terminator::Return(NirValue::Local(NirLocal(2))),
+            }],
+        };
+
+        run_dominator_gvn(&mut func, &pool);
+
+        let last_assign = &func.blocks[0].stmts[3];
+        match last_assign {
+            NirStmt::Assign(_, NirExpr::BinOp(BinOp::Sub, lhs, rhs)) => {
+                assert_eq!(*lhs, NirValue::Local(NirLocal(0)));
+                assert_eq!(*rhs, NirValue::Local(NirLocal(1)));
+            }
+            other => panic!("unexpected stmt after gvn: {other:?}"),
         }
     }
 }
