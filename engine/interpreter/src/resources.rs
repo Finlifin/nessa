@@ -32,10 +32,10 @@ pub const STD_STDOUT: i64 = 1;
 pub const STD_STDERR: i64 = 2;
 
 const READ_BUF_CAPACITY: usize = 8192;
-/// Maximum bytes read by unbounded `FILE_READ_BYTES` (`List` max capacity is `u16::MAX`).
-const MAX_LIST_BYTES: usize = u16::MAX as usize;
-/// Maximum bytes read by `FILE_READ_ALL` (`String` max payload is `u16::MAX * 8 - 8`).
-const MAX_STRING_BYTES: usize = (u16::MAX as usize) * 8 - 8;
+/// Maximum bytes read by unbounded `FILE_READ_BYTES` (`List` max capacity).
+const MAX_LIST_BYTES: usize = gc::MAX_LARGE_TAGGED_WORDS;
+/// Maximum bytes read by `FILE_READ_ALL` (`String` max UTF-8 byte capacity).
+const MAX_STRING_BYTES: usize = gc::MAX_EXTERNAL_RC_BYTES;
 
 /// Map a `std::io::Error` to Nessa's standardized integer `IoError` code.
 pub fn io_error_code(err: &io::Error) -> i64 {

@@ -126,8 +126,7 @@ Segment {
 
 当前 MMTk 0.32 默认使用 Immix；上述 LXR、并发收集、外部对象及 per-task
 分配器仍是目标，不能视作已实现。heap 配置通过 `gc_trigger=FixedHeapSize`
-生效，进程首次初始化决定 plan 和容量。对象头保留 u16 payload words，字符串
-超出当前容量时返回错误，不截断长度。Immix 使用 side mark metadata，与 LOS
+生效，进程首次初始化决定 plan 和容量。常规对象头保留 `u16` payload words；超出 `u16::MAX` 槽位的含引用容器/对象自动切换为 `PayloadRole::LargeTagged`（前置 8B `u64` 字数 + MMTk LOS，上限 `67,108,864` words），超过 `8,168 B` 的大 `String` 与 `Bytes` 缓冲自动切换为 `PayloadRole::ExternalRc`（Immix 3-word 薄壳 + 堆外原子引用计数缓冲 + STW `WeakObject` 清扫与外部内存压力记账，上限 `1 GiB`），超出上限时返回 `ObjectTooLarge`，不截断长度。Immix 使用 side mark metadata，与 LOS
 metadata 分开，worker 和 mutator 各有稳定的非空 TLS 身份。
 
 每个 mutator 通过 operation 记录运行深度与线程 owner；collector 用 epoch

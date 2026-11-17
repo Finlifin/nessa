@@ -12,15 +12,18 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gc::{MAX_BYTE_BUFFER_BYTES, ObjectHeader, PayloadRole};
+use gc::{
+    ExternalRcHandle, INLINE_BYTES_THRESHOLD, MAX_EXTERNAL_RC_BYTES, ObjectHeader, PayloadRole,
+    external_rc_backing_parts, heap_string_bytes,
+};
 use runtime::{Number, TaggedValue};
-use type_pool::{CollectionRole, Intrinsic};
+use type_pool::CollectionRole;
 
 use crate::collections::{read_u64_atomic, write_u64_atomic};
 use crate::{Vm, VmError};
 
-/// Maximum data byte capacity of a single `Bytes` buffer (8 bytes reserved for `share_count`).
-pub const MAX_BYTES_CAPACITY: usize = MAX_BYTE_BUFFER_BYTES - 8;
+/// Maximum data byte capacity of a single `Bytes` buffer (`1 GiB`).
+pub const MAX_BYTES_CAPACITY: usize = MAX_EXTERNAL_RC_BYTES;
 
 pub(crate) struct BytesLayout {
     pub(crate) wrapper: *mut u64,
@@ -33,8 +36,28 @@ pub(crate) struct BytesLayout {
 
 #[inline]
 unsafe fn atomic_share_count<'a>(buffer_payload: *mut u8) -> &'a AtomicU64 {
-    // SAFETY: `ByteBuffer` payload starts at an 8-byte aligned address with at least 8 bytes.
-    unsafe { &*buffer_payload.cast::<AtomicU64>() }
+    // SAFETY: Caller supplies a live `ByteBuffer` or `ExternalRc` `BytesBuffer` payload.
+    let hdr = unsafe { ObjectHeader::from_payload_ptr(buffer_payload) };
+    if hdr.payload_role() == Some(PayloadRole::ExternalRc) {
+        let (atom, _, _) = unsafe { external_rc_backing_parts(buffer_payload) }
+            .expect("validated ExternalRc BytesBuffer");
+        atom
+    } else {
+        unsafe { &*buffer_payload.cast::<AtomicU64>() }
+    }
+}
+
+#[inline]
+unsafe fn buffer_data_mut_ptr(buffer_payload: *mut u8) -> *mut u8 {
+    // SAFETY: Caller supplies a live `ByteBuffer` or `ExternalRc` `BytesBuffer` payload.
+    let hdr = unsafe { ObjectHeader::from_payload_ptr(buffer_payload) };
+    if hdr.payload_role() == Some(PayloadRole::ExternalRc) {
+        let (_, data_ptr, _) = unsafe { external_rc_backing_parts(buffer_payload) }
+            .expect("validated ExternalRc BytesBuffer");
+        data_ptr
+    } else {
+        unsafe { buffer_payload.add(8) }
+    }
 }
 
 #[inline]
@@ -129,20 +152,7 @@ pub(crate) fn heap_str_slice<'a>(value: TaggedValue) -> Option<&'a [u8]> {
     let ptr = value.as_heap_ptr()?;
     // SAFETY: callers supply a live rooted `TaggedValue` inside a mutator operation
     // with no intervening allocation while the returned slice is used.
-    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
-    if !header.is_ordinary()
-        || header.type_index != Intrinsic::Str.type_index()
-        || header.payload_words() == 0
-    {
-        return None;
-    }
-    // SAFETY: `payload_words() >= 1` guarantees the 8-byte length header is readable.
-    let len = unsafe { *(ptr as *const u64) } as usize;
-    if len > header.payload_words() * 8 - 8 {
-        return None;
-    }
-    // SAFETY: `8 + len` fits within `payload_words() * 8`.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
+    let bytes = unsafe { heap_string_bytes(ptr) }?;
     std::str::from_utf8(bytes).ok()?;
     Some(bytes)
 }
@@ -224,22 +234,35 @@ impl Vm {
         let buf_ptr = buffer.as_heap_ptr().ok_or(VmError::TypeError)?;
         // SAFETY: `buf_ptr` is stored in the rooted wrapper's scanned slot.
         let buf_header = unsafe { ObjectHeader::from_payload_ptr(buf_ptr) };
-        if buf_header.payload_role() != Some(PayloadRole::ByteBuffer)
-            || self
-                .type_pool_read()
-                .checked_collection_role(buf_header.type_index)
-                .map_err(|_| VmError::TypeError)?
-                != Some(CollectionRole::BytesBuffer)
+        if self
+            .type_pool_read()
+            .checked_collection_role(buf_header.type_index)
+            .map_err(|_| VmError::TypeError)?
+            != Some(CollectionRole::BytesBuffer)
         {
             return Err(VmError::TypeError);
         }
-        let min_bytes = 8usize.checked_add(capacity).ok_or(VmError::TypeError)?;
-        if buf_header.payload_words().saturating_mul(8) < min_bytes {
-            return Err(VmError::TypeError);
-        }
         let buffer_payload = buf_ptr.cast_mut();
-        // SAFETY: `min_bytes >= 8 + capacity` was verified against `buf_header`.
-        let data_ptr = unsafe { buffer_payload.add(8) };
+        let data_ptr = match buf_header.payload_role() {
+            Some(PayloadRole::ByteBuffer) => {
+                let min_bytes = 8usize.checked_add(capacity).ok_or(VmError::TypeError)?;
+                if buf_header.payload_words().saturating_mul(8) < min_bytes {
+                    return Err(VmError::TypeError);
+                }
+                // SAFETY: `min_bytes >= 8 + capacity` was verified against `buf_header`.
+                unsafe { buffer_payload.add(8) }
+            }
+            Some(PayloadRole::ExternalRc) => {
+                // SAFETY: `buf_ptr` is a live `ExternalRc` shell.
+                let (_, ext_data, ext_cap) =
+                    unsafe { external_rc_backing_parts(buf_ptr) }.ok_or(VmError::TypeError)?;
+                if ext_cap < capacity {
+                    return Err(VmError::TypeError);
+                }
+                ext_data
+            }
+            _ => return Err(VmError::TypeError),
+        };
         Ok(BytesLayout {
             wrapper,
             buffer_payload,
@@ -261,13 +284,25 @@ impl Vm {
             .type_pool_read()
             .bytes_buffer_type()
             .ok_or(VmError::TypeError)?;
-        // SAFETY: active execution operation owns mutator; initialized before return.
-        let ptr = unsafe { self.worker.heap.alloc_byte_buffer(buf_ty, 8 + capacity) }
+        if capacity <= INLINE_BYTES_THRESHOLD {
+            // SAFETY: active execution operation owns mutator; initialized before return.
+            let ptr = unsafe { self.worker.heap.alloc_byte_buffer(buf_ty, 8 + capacity) }
+                .ok_or(VmError::OutOfMemory)?;
+            // SAFETY: at least 8 bytes were allocated and 8-byte aligned; set `share_count = 1`.
+            unsafe {
+                atomic_share_count(ptr.as_ptr()).store(1, Ordering::Release);
+                Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+            }
+        } else {
+            let handle = ExternalRcHandle::new_zeroed(capacity).ok_or(VmError::OutOfMemory)?;
+            // SAFETY: active execution operation; `new_zeroed` initialized `share_count = 1` and zeroed bytes.
+            let ptr = unsafe {
+                self.worker
+                    .heap
+                    .alloc_external_rc(buf_ty, handle, 0, capacity)
+            }
             .ok_or(VmError::OutOfMemory)?;
-        // SAFETY: at least 8 bytes were allocated and 8-byte aligned; set `share_count = 1`.
-        unsafe {
-            atomic_share_count(ptr.as_ptr()).store(1, Ordering::Release);
-            Ok(TaggedValue::from_heap_ptr(ptr.as_ptr()))
+            Ok(unsafe { TaggedValue::from_heap_ptr(ptr.as_ptr()) })
         }
     }
 
@@ -314,7 +349,11 @@ impl Vm {
             // SAFETY: no allocation has occurred since `alloc_bytes_buffer(len)`, and
             // `data` is a host slice disjoint from the newly allocated GC object.
             unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.cast_mut().add(8), len);
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    buffer_data_mut_ptr(buf_ptr.cast_mut()),
+                    len,
+                );
             }
         }
         let base = self.worker_roots().temporary_values.borrow().len();
@@ -393,7 +432,7 @@ impl Vm {
                 if old.length > 0 {
                     std::ptr::copy_nonoverlapping(
                         old.data_ptr.add(old.offset),
-                        new_buf_ptr.add(8),
+                        buffer_data_mut_ptr(new_buf_ptr),
                         old.length,
                     );
                 }
@@ -553,7 +592,7 @@ impl Vm {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     src_layout.data_ptr.add(src_layout.offset),
-                    new_buf_ptr.add(8),
+                    buffer_data_mut_ptr(new_buf_ptr),
                     len,
                 );
             }
@@ -647,7 +686,11 @@ impl Vm {
             let buf_ptr = buf.as_heap_ptr().expect("str_len > 0").cast_mut();
             // SAFETY: no allocation between `heap_str_slice` and `copy_nonoverlapping`.
             unsafe {
-                std::ptr::copy_nonoverlapping(src_slice.as_ptr(), buf_ptr.add(8), str_len);
+                std::ptr::copy_nonoverlapping(
+                    src_slice.as_ptr(),
+                    buffer_data_mut_ptr(buf_ptr),
+                    str_len,
+                );
             }
             let inner_base = vm.worker_roots().temporary_values.borrow().len();
             vm.with_temporary_roots(&[buf], |vm| {
@@ -693,7 +736,7 @@ impl Vm {
 
     pub(crate) fn bytes_to_list(&mut self, bytes_val: TaggedValue) -> Result<TaggedValue, VmError> {
         let raw = self.bytes_layout(bytes_val)?.as_slice().to_vec();
-        if raw.len() > u16::MAX as usize {
+        if raw.len() > crate::collections::MAX_LIST_CAPACITY {
             return Err(VmError::ObjectTooLarge);
         }
         let list = self.new_list(raw.len())?;

@@ -859,20 +859,7 @@ pub fn proc_pid(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 fn extract_string_arg(val: runtime::TaggedValue) -> Option<String> {
     let ptr = val.as_heap_ptr()?;
     // SAFETY: `val` was loaded from a live `BuiltinRoot` within this native call.
-    let header = unsafe { gc::ObjectHeader::from_payload_ptr(ptr) };
-    if !header.is_ordinary()
-        || header.type_index != type_pool::Intrinsic::Str.type_index()
-        || header.payload_words() == 0
-    {
-        return None;
-    }
-    // SAFETY: checked `Str` payload header with valid 8-byte length prefix.
-    let len = unsafe { *(ptr as *const u64) } as usize;
-    if len > header.payload_words() * 8 - 8 {
-        return None;
-    }
-    // SAFETY: `len` fits inside the string payload allocation.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
+    let bytes = unsafe { gc::heap_string_bytes(ptr) }?;
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 

@@ -619,10 +619,14 @@ fn collection_preserves_idle_engine_and_captured_frame_roots() {
     drop(active);
     assert!(idle.collect_garbage().unwrap());
     assert_eq!(idle.constant_string(small).unwrap(), "idledata");
-    assert!(matches!(
-        idle.push_constant(&Constant::Str("a".repeat(524_281))),
-        Err(VmError::ObjectTooLarge)
-    ));
+    let over_legacy_str = idle
+        .push_constant(&Constant::Str("a".repeat(600_000)))
+        .unwrap();
+    assert!(idle.collect_garbage().unwrap());
+    assert_eq!(
+        idle.constant_string(over_legacy_str).unwrap().len(),
+        600_000
+    );
 }
 
 thread_local! {

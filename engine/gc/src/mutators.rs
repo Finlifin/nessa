@@ -336,6 +336,25 @@ pub(crate) fn poll(tls: VMMutatorThread) {
     COORDINATOR.park(identity(tls.0), false);
 }
 
+pub(crate) fn can_initiate_gc(tls: VMMutatorThread) -> bool {
+    let id = identity(tls.0);
+    let owner = std::thread::current().id();
+    let registry = COORDINATOR.registry.lock().unwrap();
+    if registry.phase != Phase::Normal {
+        return false;
+    }
+    let Some(entry) = registry.entries.get(&id) else {
+        return false;
+    };
+    if entry.owner != Some(owner) || entry.depth != 1 || entry.stopped {
+        return false;
+    }
+    !registry
+        .entries
+        .iter()
+        .any(|(&other_id, e)| other_id != id && e.owner == Some(owner) && e.depth != 0)
+}
+
 pub(crate) fn block(tls: VMMutatorThread) {
     COORDINATOR.park(identity(tls.0), true);
 }

@@ -1,6 +1,6 @@
 //! Structural tuple checks and conversions preserve the source object's identity.
 
-use gc::ObjectHeader;
+use gc::{MAX_LARGE_TAGGED_WORDS, ObjectHeader};
 use runtime::TaggedValue;
 use type_pool::{TypeId, TypeIndex, TypeKind};
 
@@ -16,7 +16,10 @@ impl Vm {
         if elements.len() != values.len() {
             return Err(VmError::TypeError);
         }
-        let words = u16::try_from(values.len()).map_err(|_| VmError::ObjectTooLarge)?;
+        let words = values.len();
+        if words > MAX_LARGE_TAGGED_WORDS {
+            return Err(VmError::ObjectTooLarge);
+        }
         let fast_ty = {
             let tp = self.type_pool_read();
             let existing = (0..tp.len())
@@ -53,7 +56,8 @@ impl Vm {
                         let info = tp.get(index);
                         if info.type_id == TypeId::ZERO && info.size == 0 {
                             let info_mut = tp.get_mut(index);
-                            info_mut.size = u32::from(words).saturating_mul(8);
+                            info_mut.size =
+                                u32::try_from(words.saturating_mul(8)).unwrap_or(u32::MAX);
                             info_mut.align = 8;
                         }
                         index
@@ -63,7 +67,7 @@ impl Vm {
                             elements: elements.to_vec(),
                         });
                         let info_mut = tp.get_mut(index);
-                        info_mut.size = u32::from(words).saturating_mul(8);
+                        info_mut.size = u32::try_from(words.saturating_mul(8)).unwrap_or(u32::MAX);
                         info_mut.align = 8;
                         if let Some(input) = tp.identity_input().cloned() {
                             tp.finalize_type_identities(input)
@@ -76,10 +80,10 @@ impl Vm {
         };
         let root = self.worker_roots().temporary_values.borrow().len();
         self.with_temporary_roots(values, |vm| {
-            // SAFETY: payload length fits u16; every element is rooted for the
-            // allocation and written before another safepoint, with no lock held.
-            let pointer =
-                unsafe { vm.worker.heap.alloc_object(ty, words) }.ok_or(VmError::OutOfMemory)?;
+            // SAFETY: payload length fits MAX_LARGE_TAGGED_WORDS; every element is rooted for
+            // the allocation and written before another safepoint, with no lock held.
+            let pointer = unsafe { vm.worker.heap.alloc_tagged_words(ty, words) }
+                .ok_or(VmError::OutOfMemory)?;
             let base = pointer.as_ptr().cast::<u64>();
             for index in 0..values.len() {
                 let value = vm.worker_roots().temporary_values.borrow()[root + index];
@@ -139,10 +143,13 @@ impl Vm {
                 let element = vm.cast_value(element, expected, depth)?;
                 vm.worker_roots().temporary_values.borrow_mut()[base + index] = element;
             }
-            let words = u16::try_from(elements.len()).map_err(|_| VmError::ObjectTooLarge)?;
+            let words = elements.len();
+            if words > MAX_LARGE_TAGGED_WORDS {
+                return Err(VmError::ObjectTooLarge);
+            }
             // SAFETY: every converted value is rooted. Reload those roots after
             // allocation and initialize fully before another safepoint.
-            let pointer = unsafe { vm.worker.heap.alloc_object(target, words) }
+            let pointer = unsafe { vm.worker.heap.alloc_tagged_words(target, words) }
                 .ok_or(VmError::OutOfMemory)?;
             let raw_base = pointer.as_ptr().cast::<u64>();
             for index in 0..elements.len() {

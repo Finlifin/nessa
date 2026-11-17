@@ -8,7 +8,6 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use gc::ObjectHeader;
 use nsbc::Reg;
 use runtime::{BuiltinFnId, Number, TaggedValue, TaskId};
 use scheduler::{NetOutcome, ProcessSpec, TaskOpPoll, TaskOpResult};
@@ -1241,7 +1240,7 @@ impl<'vm> BuiltinCtx<'vm> {
     /// host builds it: the Display limit applies, then the managed object limit.
     pub fn check_string_size(&self, bytes: usize) -> Result<(), VmError> {
         self.check_display_size(bytes)?;
-        Vm::string_payload_words(bytes).map(|_| ())
+        Vm::check_string_bytes(bytes)
     }
 
     /// Internal generated Tuple traversal hook; unauthorized frames are rejected.
@@ -2651,7 +2650,7 @@ impl Vm {
             )),
             NativeValue::Str(s) => {
                 self.check_display_bytes(task_id, s.len())?;
-                Self::string_payload_words(s.len())?;
+                Self::check_string_bytes(s.len())?;
                 let v = self.alloc_string(&s)?;
                 Ok((v, Intrinsic::Str.type_index()))
             }
@@ -2684,7 +2683,7 @@ impl Vm {
                 let v = match opt {
                     Some(s) => {
                         self.check_display_bytes(task_id, s.len())?;
-                        Self::string_payload_words(s.len())?;
+                        Self::check_string_bytes(s.len())?;
                         self.alloc_string(&s)?
                     }
                     None => TaggedValue::NULL,
@@ -2719,14 +2718,17 @@ impl Vm {
                 let cap = if entries.is_empty() {
                     0
                 } else {
-                    entries.len().saturating_mul(2).min(8192)
+                    entries
+                        .len()
+                        .saturating_mul(2)
+                        .min(crate::maps::MAX_MAP_CAPACITY)
                 };
                 let map = self.new_map(cap)?;
                 let base = self.worker_roots().temporary_values.borrow().len();
                 self.with_temporary_roots(&[map, TaggedValue::UNIT, TaggedValue::UNIT], |vm| {
                     for (key_str, val_spec) in entries {
                         vm.check_display_bytes(task_id, key_str.len())?;
-                        Self::string_payload_words(key_str.len())?;
+                        Self::check_string_bytes(key_str.len())?;
                         let k = vm.alloc_string(&key_str)?;
                         vm.worker_roots().temporary_values.borrow_mut()[base + 1] = k;
                         let (v, _) = vm.alloc_native(task_id, val_spec)?;
@@ -2887,20 +2889,7 @@ pub(crate) fn with_heap_string_str<R>(val: TaggedValue, f: impl FnOnce(&str) -> 
     let ptr = val.as_heap_ptr()?;
     // SAFETY: callers run within a mutator operation and supply live VM values;
     // `f` does not allocate managed objects, so `ptr` cannot move during `f`.
-    let header = unsafe { ObjectHeader::from_payload_ptr(ptr) };
-    if !header.is_ordinary()
-        || header.type_index != Intrinsic::Str.type_index()
-        || header.payload_words() == 0
-    {
-        return None;
-    }
-    // SAFETY: `Str` payloads are immutable after publication and word-aligned.
-    let len = unsafe { *(ptr as *const u64) } as usize;
-    if len > header.payload_words() * 8 - 8 {
-        return None;
-    }
-    // SAFETY: `len` was bounds-checked against `header.payload_words()`.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
+    let bytes = unsafe { gc::heap_string_bytes(ptr) }?;
     let s = if bytes.is_ascii() {
         // SAFETY: `bytes.is_ascii()` verifies every byte is `< 0x80`, which is valid UTF-8.
         unsafe { std::str::from_utf8_unchecked(bytes) }

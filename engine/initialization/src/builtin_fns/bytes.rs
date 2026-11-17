@@ -807,20 +807,7 @@ fn bytes_slice_to_string(slice: &[u8]) -> String {
 fn extract_string_elem(val: runtime::TaggedValue) -> Option<String> {
     let ptr = val.as_heap_ptr()?;
     // SAFETY: `val` was loaded from a live `BuiltinRoot` in an active `BuiltinCtx`.
-    let header = unsafe { gc::ObjectHeader::from_payload_ptr(ptr) };
-    if !header.is_ordinary()
-        || header.type_index != type_pool::Intrinsic::Str.type_index()
-        || header.payload_words() == 0
-    {
-        return None;
-    }
-    // SAFETY: checked ordinary `Str` header with a valid length prefix word.
-    let len = unsafe { *(ptr as *const u64) } as usize;
-    if len > header.payload_words() * 8 - 8 {
-        return None;
-    }
-    // SAFETY: `len` lies within the string's payload.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.add(8), len) };
+    let bytes = unsafe { gc::heap_string_bytes(ptr) }?;
     std::str::from_utf8(bytes).ok().map(str::to_owned)
 }
 
