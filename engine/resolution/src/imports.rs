@@ -622,7 +622,7 @@ mod tests {
     fn duplicate_definitions_and_named_std_modules_do_not_bypass_checks() {
         for source in [
             "fn repeated() {}\nfn repeated() {}",
-            "struct repeated {}\nstruct repeated {}",
+            "struct Repeated {}\nstruct Repeated {}",
             "fn repeated() {}\nmod repeated {}",
         ] {
             let (_, errors) = resolve(source, None);

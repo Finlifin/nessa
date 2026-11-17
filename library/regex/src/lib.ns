@@ -64,7 +64,7 @@ private fn _check_bytes_start(data: Bytes, start: usize) -> Unit {
     }
 }
 
-private struct _RegexGuard {
+private struct RegexGuard {
     raw_id: i64,
 }
 
@@ -129,7 +129,7 @@ pub struct Regex {
     pat: String,
     handle: i64,
     groups: usize,
-    guard: _RegexGuard,
+    guard: RegexGuard,
 }
 
 pub struct Captures {
@@ -449,7 +449,7 @@ impl Regex {
         let call_gc: fn(i64, Any, i64) -> Unit = .__ffi_call4'builtin
         let call_one: fn(i64, i64) -> i64 = .__ffi_call4'builtin
         let gcount = call_one(_sym_group_count, handle)
-        let guard = _RegexGuard { raw_id: handle }
+        let guard = RegexGuard { raw_id: handle }
         call_gc(_sym_free_on_gc, guard, handle)
         Regex {
             pat: pattern,

@@ -685,7 +685,7 @@ fn parse_struct_empty() {
 
 #[test]
 fn parse_enum_simple() {
-    let src = "enum Color {\n  Red,\n  Green,\n  Blue\n}";
+    let src = "enum Color {\n  red,\n  green,\n  blue\n}";
     let dump = parse_dump(src);
     assert!(dump.contains("EnumDef"), "Expected EnumDef, got: {dump}");
     assert!(
@@ -697,7 +697,7 @@ fn parse_enum_simple() {
 #[test]
 fn parse_enum_with_named_fields() {
     // Enum variant fields use struct-field syntax: `name: Type`.
-    let src = "enum Shape {\n  Circle(r: f64),\n  Rect(w: f64, h: f64)\n}";
+    let src = "enum Shape {\n  circle(r: f64),\n  rect(w: f64, h: f64)\n}";
     let dump = parse_dump(src);
     assert!(dump.contains("EnumDef"), "Expected EnumDef, got: {dump}");
 }
@@ -858,14 +858,14 @@ fn parse_enum_and_function() {
     // Simple enum (no variant data) with a function using match.
     let src = r###"
     enum Color {
-        Red,
-        Green,
-        Blue
+        red,
+        green,
+        blue
     }
     fn index(c: Color) -> i32 {
         c match {
-            Color.Red => 0
-            Color.Green => 1
+            Color.red => 0
+            Color.green => 1
             _ => 2
         }
     }"###;

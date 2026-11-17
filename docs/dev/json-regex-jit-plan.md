@@ -117,9 +117,9 @@
      - 字段值为 `null`：若字段类型为 `?U` 或 `Unit`，置为 `null`/`unit`；否则返回 `TypeMismatch`。
      - 当 `allow_unknown == false` 时，调用 `JSON_TAPE_OBJ_CHECK_UNKNOWN` 校验是否存在未声明键，命中返回 `UnknownField`。
    - **`enum`**：
-     - 无载荷变体 `E.A` $\leftrightarrow$ JSON 字符串 `"A"`。
-     - 单载荷变体 `E.B(x)` $\leftrightarrow$ 单键 JSON Object `{"B": <x>}`。
-     - 多载荷变体 `E.C(x, y)` $\leftrightarrow$ 单键 JSON Object 加定长数组 `{"C": [<x>, <y>]}`。
+     - 无载荷变体 `E.a` $\leftrightarrow$ JSON 字符串 `"a"`（Error 枚举同理映射其 `PascalCase` 变体名，如 `Err.Kind` $\leftrightarrow$ `"Kind"`）。
+     - 单载荷变体 `E.b(x)` $\leftrightarrow$ 单键 JSON Object `{"b": <x>}`。
+     - 多载荷变体 `E.c(x, y)` $\leftrightarrow$ 单键 JSON Object 加定长数组 `{"c": [<x>, <y>]}`。
    - **`newtype`**：透明表示，`Newtype(inner)` 直接编解码为 `<inner>` 的 JSON 表示。
    - **Tuple `typealias`**：定长 JSON Array `[e0, e1, ...]`，数组长度不等于元组元数时返回 `TypeMismatch`。
    - **数值精度与范围**：整数按目标位宽（如 `u8` 要求 `0..=255`，`i64` 要求 `-2^63..=2^63-1`）精确校验，禁止将带小数部分的 `1.5` 静默截断为 `1`；`i128`/`u128` 超出 JSON IEEE-754 双精度安全整数范围时仍按精确十进制字面量解析与写出。

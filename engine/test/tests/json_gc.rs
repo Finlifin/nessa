@@ -7,9 +7,9 @@ fn json_derive_and_dynamic_parse_survive_32mib_immix_collections() {
         use std.json
 
         enum EventKind {
-            Click,
-            View(ms: u32),
-            Span(start: i64, end: i64),
+            click,
+            view(ms: u32),
+            span(start: i64, end: i64),
         }
         derive Json, Eq, PartialEq for EventKind
 
@@ -27,7 +27,7 @@ fn json_derive_and_dynamic_parse_survive_32mib_immix_collections() {
             var i = 0
             var checksum = 0
             while i < 12000 {
-                let k = if i % 3 == 0 { EventKind.Click } else if i % 3 == 1 { EventKind.View((250).as(u32)) } else { EventKind.Span(i, i + 10) }
+                let k = if i % 3 == 0 { EventKind.click } else if i % 3 == 1 { EventKind.view((250).as(u32)) } else { EventKind.span(i, i + 10) }
                 let m: ?String = if i % 2 == 0 { null } else { "note" }
                 let rec = Record {
                     id: i,

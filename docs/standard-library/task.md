@@ -22,19 +22,19 @@ pub struct TimeoutError {
 
 ```nessa
 pub enum Either {
-    pub Left(value: Any),
-    pub Right(value: Any),
+    pub left(value: Any),
+    pub right(value: Any),
 
     pub fn is_left(self) -> bool
     pub fn is_right(self) -> bool
     pub fn unwrap_left(self) -> Any
     pub fn unwrap_right(self) -> Any
 }
-pub use Either.{Left, Right}
+pub use Either.{left, right}
 -- 实现 PartialEq, Display
 ```
 
-由 `task.await_first(first, second)` 返回，区分哪一路 `Future` 先完成。编译器会为 `await_first` 返回值记录两侧载荷静态类型，解构 `Left(a)` / `Right(b)` 或调用 `unwrap_left()` / `unwrap_right()` 时自动恢复精确静态类型。
+由 `task.await_first(first, second)` 返回，区分哪一路 `Future` 先完成。编译器会为 `await_first` 返回值记录两侧载荷静态类型，解构 `left(a)` / `right(b)` 或调用 `unwrap_left()` / `unwrap_right()` 时自动恢复精确静态类型。
 
 ## 调度、睡眠与内省函数
 
@@ -77,7 +77,7 @@ pub fn await_any(futures: List) -> Any
 pub fn await_first(first: Future, second: Future) -> Either
 ```
 
-二元竞速组合子：`first` 先完成时取消 `second` 并返回 `Either.Left(v1)`；`second` 先完成时取消 `first` 并返回 `Either.Right(v2)`。对 `Future(A)` 与 `Future(B)`，解构 `Left(x)` 得到 `A`，解构 `Right(y)` 得到 `B`。
+二元竞速组合子：`first` 先完成时取消 `second` 并返回 `Either.left(v1)`；`second` 先完成时取消 `first` 并返回 `Either.right(v2)`。对 `Future(A)` 与 `Future(B)`，解构 `left(x)` 得到 `A`，解构 `right(y)` 得到 `B`。
 
 ### `with_timeout`
 
@@ -95,7 +95,7 @@ pub fn with_timeout(ms: i64, thunk: fn() -> Any) -> Any
 
 ```nessa
 use std.task
-use std.task.{Left, Right, TimeoutError}
+use std.task.{left, right, TimeoutError}
 
 async effect compute(x: i64) -> i64
 

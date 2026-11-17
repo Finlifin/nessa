@@ -98,7 +98,7 @@ let future: Future(!NetErr Response) = http.get(url)#
 |---|---|
 | `xs.await_all()` / `task.await_all(xs)`（元素为 `Future(T)`） | 元素类型被追踪为 `T` 的 `List`（索引/模式解构直接得到 `T`） |
 | `xs.await_any()` / `task.await_any(xs)`（元素为 `Future(T)`） | `T` |
-| `task.await_first(fa, fb)`（`Future(A)` 与 `Future(B)`） | `Either`，解构 `Left(a)` / `Right(b)` 或调用 `unwrap_left()` / `unwrap_right()` 自动精化为 `A` / `B` |
+| `task.await_first(fa, fb)`（`Future(A)` 与 `Future(B)`） | `Either`，解构 `left(a)` / `right(b)` 或调用 `unwrap_left()` / `unwrap_right()` 自动精化为 `A` / `B` |
 | `task.with_timeout(ms, thunk)`（`thunk: fn() -> !E T`） | `![TimeoutError, ...E] T` |
 
 若向 `await_all`、`await_any` 或 `await_first` 传入静态已知的非 `Future` 元素，编译器会在类型检查阶段直接报错拒绝。

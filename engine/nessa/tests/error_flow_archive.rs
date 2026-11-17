@@ -124,15 +124,15 @@ fn rejects_before_entry(bytes: &[u8]) {
 #[test]
 fn source_deleted_branches_propagation_elimination_and_defaults_replay_exact_values() {
     for source in [
-        "enum E{bad};fn main(){let a:!E E=E.bad;let b:!E E=error E.bad;println((a match{E.bad! =>20,error E.bad=>0})+(b match{E.bad! =>0,error E.bad=>22}))}",
-        "enum E{bad};global trace:i64=0;fn get()->!E i64{error E.bad};fn work()->!E i64{let n=get()!;trace=99;n};fn main(){println(work() match{error E.bad=>if trace==0{42}else{0},_! =>0})}",
-        "enum E{a,b};global trace:i64=0;fn main(){let value:!E i64=error E.b;let kept=value!{E.a=>0};trace+=1;println(kept match{error E.b=>41+trace,error _=>0,_! =>0})}",
-        "enum E{bad};fn main(){let value:!E i64=40;println(value!{ok! =>ok+2,E.* =>0})}",
-        "enum E{value(text:String)};fn make()->fn()->i64{let value:!E i64=error E.value(\"abcd\"++\"efgh\");value match{error E.value(text)=>||text.len()+34,_! =>||0}};fn main(){println(make()())}",
-        "enum E{bad};enum F{bad};struct P{};struct Q{};trait Read{assoc Err:Type=E;assoc Item:Type=i64;fn get(self)->!Err Item;derive fn answer(self)->!Err Item{self.get()!}};impl Read for P{pub fn get(self)->!E i64{40}};impl Read for Q{assoc Err:Type=F;pub fn get(self)->!F i64{2}};fn main(){println((P{}.answer()!{E.* =>0})+(Q{}.answer()!{F.* =>0}))}",
-        "enum E{bad};fn again(v:Any)->!E i64{error v};fn main(){println(again(E.bad) match{error E.bad=>42,_! =>0})}",
-        "enum E{bad};fn lift(v:Any)->!E E{v};fn main(){println(lift(E.bad) match{E.bad! =>42,error E.bad=>0})}",
-        "enum E{bad};fn main(){let value:!E i64=error E.bad;let answer=value!{catch e=>{struct Local{n:i64};Local{n:40}.n},n! =>{struct Local{n:i64};Local{n:n}.n}};println(answer+2)}",
+        "enum E{Bad};fn main(){let a:!E E=E.Bad;let b:!E E=error E.Bad;println((a match{E.Bad! =>20,error E.Bad=>0})+(b match{E.Bad! =>0,error E.Bad=>22}))}",
+        "enum E{Bad};global trace:i64=0;fn get()->!E i64{error E.Bad};fn work()->!E i64{let n=get()!;trace=99;n};fn main(){println(work() match{error E.Bad=>if trace==0{42}else{0},_! =>0})}",
+        "enum E{A,B};global trace:i64=0;fn main(){let value:!E i64=error E.B;let kept=value!{E.A=>0};trace+=1;println(kept match{error E.B=>41+trace,error _=>0,_! =>0})}",
+        "enum E{Bad};fn main(){let value:!E i64=40;println(value!{ok! =>ok+2,E.* =>0})}",
+        "enum E{Value(text:String)};fn make()->fn()->i64{let value:!E i64=error E.Value(\"abcd\"++\"efgh\");value match{error E.Value(text)=>||text.len()+34,_! =>||0}};fn main(){println(make()())}",
+        "enum E{Bad};enum F{Bad};struct P{};struct Q{};trait Read{assoc Err:Type=E;assoc Item:Type=i64;fn get(self)->!Err Item;derive fn answer(self)->!Err Item{self.get()!}};impl Read for P{pub fn get(self)->!E i64{40}};impl Read for Q{assoc Err:Type=F;pub fn get(self)->!F i64{2}};fn main(){println((P{}.answer()!{E.* =>0})+(Q{}.answer()!{F.* =>0}))}",
+        "enum E{Bad};fn again(v:Any)->!E i64{error v};fn main(){println(again(E.Bad) match{error E.Bad=>42,_! =>0})}",
+        "enum E{Bad};fn lift(v:Any)->!E E{v};fn main(){println(lift(E.Bad) match{E.Bad! =>42,error E.Bad=>0})}",
+        "enum E{Bad};fn main(){let value:!E i64=error E.Bad;let answer=value!{catch e=>{struct Local{n:i64};Local{n:40}.n},n! =>{struct Local{n:i64};Local{n:n}.n}};println(answer+2)}",
     ] {
         roundtrip(source, "42\n");
     }
@@ -141,7 +141,7 @@ fn source_deleted_branches_propagation_elimination_and_defaults_replay_exact_val
 #[test]
 fn source_deleted_multishot_error_exit_and_success_frames_remain_independent() {
     roundtrip(
-        "enum E{bad};effect pick(catch k)->!E i64;global trace:i64=0;fn work()->!E i64{let n=pick()#!;trace=trace*10+n;n+20};fn main(){let saved=work()#{pick(k)=>k};let failed:!E i64=saved(error E.bad).as(!E i64);let a:!E i64=saved(0).as(!E i64);let b:!E i64=saved(2).as(!E i64);let bad=failed match{error E.bad=>true,_! =>false};if bad and trace==2{println((a!{E.* =>0})+(b!{E.* =>0}))}else{println(0)}}",
+        "enum E{Bad};effect pick(catch k)->!E i64;global trace:i64=0;fn work()->!E i64{let n=pick()#!;trace=trace*10+n;n+20};fn main(){let saved=work()#{pick(k)=>k};let failed:!E i64=saved(error E.Bad).as(!E i64);let a:!E i64=saved(0).as(!E i64);let b:!E i64=saved(2).as(!E i64);let bad=failed match{error E.Bad=>true,_! =>false};if bad and trace==2{println((a!{E.* =>0})+(b!{E.* =>0}))}else{println(0)}}",
         "42\n",
     );
 }
@@ -149,9 +149,9 @@ fn source_deleted_multishot_error_exit_and_success_frames_remain_independent() {
 #[test]
 fn erased_wrong_domains_and_ordinary_shapes_keep_runtime_typeerror_after_source_deletion() {
     for source in [
-        "enum E{bad};enum F{bad};fn again(v:Any)->!E i64{error v};fn main(){again(F.bad);println(42)}",
-        "enum E{bad};enum F{bad};fn main(){let value:Any=error F.bad;value.as(!E i64);println(42)}",
-        "enum E{bad};struct Fake{hi:i64,lo:i64,payload:i64};fn main(){let value:Any=Fake{hi:0,lo:0,payload:42};value.as(!E i64);println(42)}",
+        "enum E{Bad};enum F{Bad};fn again(v:Any)->!E i64{error v};fn main(){again(F.Bad);println(42)}",
+        "enum E{Bad};enum F{Bad};fn main(){let value:Any=error F.Bad;value.as(!E i64);println(42)}",
+        "enum E{Bad};struct Fake{hi:i64,lo:i64,payload:i64};fn main(){let value:Any=Fake{hi:0,lo:0,payload:42};value.as(!E i64);println(42)}",
     ] {
         let d = Directory::new();
         let p = d.0.join("wrong.ns");
@@ -173,17 +173,17 @@ fn erased_wrong_domains_and_ordinary_shapes_keep_runtime_typeerror_after_source_
 fn invalid_sets_subset_holes_and_escape_boundaries_emit_no_archive() {
     for source in [
         "fn main()->!Any i64{42}",
-        "enum E{bad};fn main(){let value:!E i64=42;if value matches n!{n}else{0}}",
-        "enum E{bad};fn main(){let value:!E i64=error E.bad;value match{error E.bad=>42}}",
-        "enum E{a,b};fn main(){let value:!E i64=42;value match{n! =>n,error E.a=>0}}",
-        "enum E{bad};fn main(){let value:!E (i64,i64)=(20,22);value match{((a,b) as whole)! if whole.0==a=>a+b,error _=>0}}",
-        "enum E{bad};fn dynamic(value:Any){error value};fn main(){dynamic(E.bad) match{_! =>0,error E.bad=>42}}",
+        "enum E{Bad};fn main(){let value:!E i64=42;if value matches n!{n}else{0}}",
+        "enum E{Bad};fn main(){let value:!E i64=error E.Bad;value match{error E.Bad=>42}}",
+        "enum E{A,B};fn main(){let value:!E i64=42;value match{n! =>n,error E.A=>0}}",
+        "enum E{Bad};fn main(){let value:!E (i64,i64)=(20,22);value match{((a,b) as whole)! if whole.0==a=>a+b,error _=>0}}",
+        "enum E{Bad};fn dynamic(value:Any){error value};fn main(){dynamic(E.Bad) match{_! =>0,error E.Bad=>42}}",
         "const A=B;const B=A;fn main()->!A i64{42}",
-        "enum E{bad};enum F{bad};fn narrow(v:!F Any)->!E Any{v};fn main(){42}",
-        "enum E{bad};fn read()->i64{let v:!E i64=error E.bad;v!};fn main(){42}",
-        "enum E{bad};fn get()->!E i64{error E.bad};fn call(.n:i64=get()!){n};fn main(){42}",
-        "enum E{bad};fn get()->!E i64{error E.bad};struct P{n:i64=get()!};fn main(){42}",
-        "enum E{bad};fn get()->!E i64{error E.bad};global n:i64=get()!;fn main(){42}",
+        "enum E{Bad};enum F{Bad};fn narrow(v:!F Any)->!E Any{v};fn main(){42}",
+        "enum E{Bad};fn read()->i64{let v:!E i64=error E.Bad;v!};fn main(){42}",
+        "enum E{Bad};fn get()->!E i64{error E.Bad};fn call(.n:i64=get()!){n};fn main(){42}",
+        "enum E{Bad};fn get()->!E i64{error E.Bad};struct P{n:i64=get()!};fn main(){42}",
+        "enum E{Bad};fn get()->!E i64{error E.Bad};global n:i64=get()!;fn main(){42}",
     ] {
         let d = Directory::new();
         let p = d.0.join("invalid.ns");
@@ -198,7 +198,7 @@ fn invalid_sets_subset_holes_and_escape_boundaries_emit_no_archive() {
 fn valid_checksum_bad_error_opcode_targets_modes_registers_and_reserved_fields_reject() {
     // Keep construction in a small separate function, so a validated tighter
     // register bound can test Reg(31) without changing executable instructions.
-    let source = "enum E{bad};fn make(){error E.bad};fn main(){let value:!E i64=make();value match{error E.bad=>println(42),_! =>println(0)}}";
+    let source = "enum E{Bad};fn make(){error E.Bad};fn main(){let value:!E i64=make();value match{error E.Bad=>println(42),_! =>println(0)}}";
     let mut artifact = compiled(source);
     let user_start = artifact
         .codegen_output
@@ -284,7 +284,7 @@ fn valid_checksum_bad_error_opcode_targets_modes_registers_and_reserved_fields_r
 #[test]
 fn authenticated_error_carrier_layout_and_tag_ids_reject_metadata_changes() {
     let artifact = compiled(
-        "enum E{bad};fn main(){let value:!E i64=error E.bad;value match{error E.bad=>println(42),_! =>println(0)}}",
+        "enum E{Bad};fn main(){let value:!E i64=error E.Bad;value match{error E.Bad=>println(42),_! =>println(0)}}",
     );
     let bytes = nsbc_io::write_artifact(&artifact).unwrap();
     let pool = &artifact.type_pool;
@@ -377,9 +377,9 @@ fn authenticated_error_carrier_layout_and_tag_ids_reject_metadata_changes() {
 #[test]
 fn nsbc3_cannot_smuggle_error_success_lifts_conversions_or_typed_function_capability() {
     for source in [
-        "enum E{bad};fn main(){let value:!E i64=42;println(value!{E.* =>0})}",
-        "enum E{bad};fn convert(value:Any)->!E i64{value.as(!E i64)};fn main(){println(42)}",
-        "enum E{bad};fn consume(value:!E i64)->i64{42};fn main(){println(42)}",
+        "enum E{Bad};fn main(){let value:!E i64=42;println(value!{E.* =>0})}",
+        "enum E{Bad};fn convert(value:Any)->!E i64{value.as(!E i64)};fn main(){println(42)}",
+        "enum E{Bad};fn consume(value:!E i64)->i64{42};fn main(){println(42)}",
     ] {
         let artifact = compiled(source);
         let mut bytes = nsbc_io::write_artifact(&artifact).unwrap();
@@ -399,7 +399,7 @@ fn unfinalized_error_metadata_non_v4_containers_and_zero_checksums_reject() {
         kind: TypeKind::Enum {
             name: str_interner::intern("LegacyError"),
             variants: vec![type_pool::VariantInfo {
-                name: str_interner::intern("bad"),
+                name: str_interner::intern("Bad"),
                 tag: 0,
                 fields: vec![],
             }],
@@ -451,7 +451,7 @@ fn unfinalized_error_metadata_non_v4_containers_and_zero_checksums_reject() {
     };
     assert!(nsbc_io::write_artifact(&unfinalized).is_err());
 
-    let valid = compiled("enum E{bad};fn main(){let value:!E i64=42;println(value!{E.* =>0})}");
+    let valid = compiled("enum E{Bad};fn main(){let value:!E i64=42;println(value!{E.* =>0})}");
     let bytes = nsbc_io::write_artifact(&valid).unwrap();
     for version in [0u32, 1, 2, 3, 5, u32::MAX] {
         let mut bad = bytes.clone();

@@ -481,7 +481,7 @@ mod syntax {
 
     #[test]
     fn test_enum_def() {
-        let dump = parse_dump("enum Color {\n  Red,\n  Green,\n  Blue\n}");
+        let dump = parse_dump("enum Color {\n  red,\n  green,\n  blue\n}");
         assert!(dump.contains("EnumDef"), "Expected EnumDef, got: {dump}");
     }
 
@@ -938,7 +938,7 @@ fn main():
     #[test]
     fn error_sets_nested_qualifiers_and_branch_patterns_have_distinct_ast() {
         let dump = parse_dump(
-            "enum E{bad,};fn f(v:![E] ++ [E] ![] i64){v match{ok! =>ok,error E.* as e=>1,#e=>0}}",
+            "enum E{Bad,};fn f(v:![E] ++ [E] ![] i64){v match{ok! =>ok,error E.* as e=>1,#e=>0}}",
         );
         assert_eq!(dump.matches("ErrorQualifiedType").count(), 2, "{dump}");
         assert!(dump.contains("Concat"), "{dump}");

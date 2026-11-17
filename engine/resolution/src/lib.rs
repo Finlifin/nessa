@@ -1089,11 +1089,11 @@ mod tests {
     fn step9_error_unwrap_bound_methods_spread_args_and_exhaustiveness_warnings() {
         // 1. `!E T` `.unwrap()` + bound method values on structs and enums
         let (_, diags, has_errors, _) = parse_and_resolve(
-            "enum Err { fail }\n\
+            "enum Err { Fail }\n\
              struct Counter { base: i64 }\n\
              impl Counter { fn add(self, delta: i64) -> i64 { self.base + delta } }\n\
              enum Mode { fast, slow, fn weight(self) -> i64 { self match { Mode.fast => 10, Mode.slow => 1 } } }\n\
-             fn compute(ok: bool) -> !Err i64 { if ok { 32 } else { error Err.fail } }\n\
+             fn compute(ok: bool) -> !Err i64 { if ok { 32 } else { error Err.Fail } }\n\
              fn main() -> i64 {\n\
                  let c = Counter { base: 10 }\n\
                  let f: fn(i64) -> i64 = c.add\n\

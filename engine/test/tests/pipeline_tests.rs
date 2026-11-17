@@ -243,7 +243,7 @@ fn bar() { foo() }";
 
 #[test]
 fn resolve_enum_def() {
-    let src = "enum Color {\n  .Red,\n  .Green,\n  .Blue\n}";
+    let src = "enum Color {\n  .red,\n  .green,\n  .blue\n}";
     let resolved = resolve_source(src);
     assert!(!resolved.scopes.is_empty());
 }

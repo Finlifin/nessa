@@ -123,9 +123,9 @@ fn execute_collections(source: &str, minimum: u64, builtin: interpreter::Builtin
 #[test]
 fn heap_error_payload_aliases_and_escaped_callbacks_remain_shallow_shared() {
     collected(
-        r#"struct Cell{n:i64,text:String};enum E{value(cell:Cell)};
-        fn make(cell:Cell)->fn()->i64{let value:!E i64=error E.value(cell);print(value);
-            value match{error E.value(c)=>||{print(value);print(value);c.n+c.text.len()},_! =>||0}}
+        r#"struct Cell{n:i64,text:String};enum E{Value(cell:Cell)};
+        fn make(cell:Cell)->fn()->i64{let value:!E i64=error E.Value(cell);print(value);
+            value match{error E.Value(c)=>||{print(value);print(value);c.n+c.text.len()},_! =>||0}}
         fn main(){let cell=Cell{n:32,text:"abcd"++"efgh"};let callback=make(cell);print("");cell.n=34;callback()}"#,
         4,
         false,
@@ -147,9 +147,9 @@ fn raw_full128_scalar_tag_words_are_not_gc_references() {
 #[test]
 fn failed_guard_capture_keeps_original_envelope_and_heap_payload_alive() {
     collected(
-        r#"enum E{value(text:String)};fn main(){var saved:fn()->i64=||0;
-        let value:!E i64=error E.value("abcd"++"efgh");
-        let selected=value!{E.value(text) if if true{saved=||{print(value);text.len()+34};print(value);false}else{true}=>0,E.* =>42,_! =>0};
+        r#"enum E{Value(text:String)};fn main(){var saved:fn()->i64=||0;
+        let value:!E i64=error E.Value("abcd"++"efgh");
+        let selected=value!{E.Value(text) if if true{saved=||{print(value);text.len()+34};print(value);false}else{true}=>0,E.* =>42,_! =>0};
         print(value);let answer=saved();print(value);if selected==42{answer}else{0}}"#,
         4,
         false,
@@ -160,12 +160,12 @@ fn failed_guard_capture_keeps_original_envelope_and_heap_payload_alive() {
 #[test]
 fn multishot_propagation_preserves_error_exit_and_independent_success_branches() {
     collected(
-        r#"enum E{bad};effect pick(catch k)->!E i64;global entries:i64=0;global trace:i64=0;
+        r#"enum E{Bad};effect pick(catch k)->!E i64;global entries:i64=0;global trace:i64=0;
         fn work()->!E i64{entries+=1;let text="abcd"++"efgh";print("");print("");let n=pick()#!;
             trace=trace*10+n;print("");print("");n+text.len()+12}
-        fn main(){let saved=work()#{pick(k)=>k};print("");let failed:!E i64=saved(error E.bad).as(!E i64);print(failed);
+        fn main(){let saved=work()#{pick(k)=>k};print("");let failed:!E i64=saved(error E.Bad).as(!E i64);print(failed);
             let a:!E i64=saved(0).as(!E i64);print(a);let b:!E i64=saved(2).as(!E i64);print(b);
-            let error_seen=failed match{error E.bad=>true,_! =>false};let first=a!{E.* =>0};let second=b!{E.* =>0};
+            let error_seen=failed match{error E.Bad=>true,_! =>false};let first=a!{E.* =>0};let second=b!{E.* =>0};
             if error_seen and first==20 and second==22 and entries==1 and trace==2{first+second}else{0}}"#,
         10,
         false,
@@ -176,9 +176,9 @@ fn multishot_propagation_preserves_error_exit_and_independent_success_branches()
 #[test]
 fn resumed_error_guard_reuses_rooted_snapshot_and_preserves_branch_trace() {
     collected(
-        r#"enum E{value(text:String)};effect pause(catch k)->bool;global entries:i64=0;global trace:i64=0;
-        fn work()->i64{let value:!E i64=error E.value("abcd"++"efgh");
-            value!{E.value(text) if if true{entries+=1;print(value);pause()#}else{false}=>{trace=trace*10+1;print(value);text.len()+12},
+        r#"enum E{Value(text:String)};effect pause(catch k)->bool;global entries:i64=0;global trace:i64=0;
+        fn work()->i64{let value:!E i64=error E.Value("abcd"++"efgh");
+            value!{E.Value(text) if if true{entries+=1;print(value);pause()#}else{false}=>{trace=trace*10+1;print(value);text.len()+12},
                 E.* =>{trace=trace*10+2;print(value);22},_! =>0}}
         fn main(){let saved=work()#{pause(k)=>k};print("");let a=saved(true).as(i64);print("");let b=saved(false).as(i64);print("");
             if a==20 and b==22 and entries==1 and trace==12{a+b}else{0}}"#,
@@ -267,8 +267,8 @@ fn checked_inspector_rejects_each_forged_tag_half_and_wrong_payload_before_colle
 #[test]
 fn nested_delimiters_preserve_envelope_roots_when_inner_continuation_branches_resume_outer() {
     collected(
-        r#"enum E{bad};effect choose(catch k)->!E i64;effect inner(catch k)->i64;global entries:i64=0;global handlers:i64=0;global trace:i64=0;
-        fn work()->!E i64{entries+=1;let persistent:!E i64=error E.bad;print(persistent);
+        r#"enum E{Bad};effect choose(catch k)->!E i64;effect inner(catch k)->i64;global entries:i64=0;global handlers:i64=0;global trace:i64=0;
+        fn work()->!E i64{entries+=1;let persistent:!E i64=error E.Bad;print(persistent);
             let value:!E i64=choose()#{choose(k)=>{handlers+=1;print(persistent);let bump=inner()#;print(persistent);k(bump)}};
             let n=value!;trace=trace*10+n;print(persistent);n+20}
         fn main(){let saved=work()#{inner(k)=>k};print("");let a:!E i64=saved(0).as(!E i64);print(a);let b:!E i64=saved(2).as(!E i64);print(b);

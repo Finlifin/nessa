@@ -7,9 +7,9 @@ private const _panic: fn(Any) -> NoReturn = .panic'builtin
 private const _to_string_raw: fn(Any) -> String = .to_string'builtin
 private const _task_current_id: fn() -> i64 = .__task_current_id'builtin
 
-private effect _co_yield(value: Any, catch k) -> Any
+private effect co_yield(value: Any, catch k) -> Any
 
-private enum _CoOutcome {
+private enum CoOutcome {
     yielded(value: Any, next_cont: Continuation),
     finished(value: Any),
 }
@@ -123,25 +123,25 @@ impl Coroutine {
             }
         }
 
-        let outcome: _CoOutcome = if self.cont == null {
+        let outcome: CoOutcome = if self.cont == null {
             let entry_fn = self.body.as(fn(Any) -> Any)
             self.body = null
-            (_CoOutcome.finished(entry_fn(arg)))# {
-                _co_yield(val, k) => _CoOutcome.yielded(val, k),
+            (CoOutcome.finished(entry_fn(arg)))# {
+                co_yield(val, k) => CoOutcome.yielded(val, k),
             }
         } else {
             let saved = self.cont.as(Continuation)
             self.cont = null
-            saved(arg).as(_CoOutcome)
+            saved(arg).as(CoOutcome)
         }
 
         outcome match {
-            _CoOutcome.yielded(val, next_k) => {
+            CoOutcome.yielded(val, next_k) => {
                 self.cont = next_k
                 self.status_field = CoroutineStatus.suspended
                 val
             },
-            _CoOutcome.finished(val) => {
+            CoOutcome.finished(val) => {
                 self.cont = null
                 self.status_field = CoroutineStatus.dead
                 val
@@ -226,7 +226,7 @@ pub fn yield_val(.value: Any = null) -> Any {
     if not is_yieldable() {
         _panic("attempt to yield from outside a coroutine")
     }
-    _co_yield(value)#
+    co_yield(value)#
 }
 
 pub fn wrap(body: fn(Any) -> Any) -> fn(Any) -> Any {

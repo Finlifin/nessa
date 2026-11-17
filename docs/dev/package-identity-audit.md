@@ -8,7 +8,7 @@
 ## 实际依据与缺口
 
 上轮双变参已独立验收，root/grader workspace1579/0/1。下一阶段实际 CLI
-`enum E{bad};fn main(){let value=error E.bad;println(type_of(value))}` 输出 Unit；
+`enum E{Bad};fn main(){let value=error E.Bad;println(type_of(value))}` 输出 Unit；
 Error 构造甚至省略操作数副作用，传播/消除也落到 NIR Unit。基线源/日志
 `/tmp/nessa-error-flow-baseline.{ns,log}`，独立更完整探针
 `/tmp/nessa-error-flow-repros/{results,corrected-and-archive-results}.json`。

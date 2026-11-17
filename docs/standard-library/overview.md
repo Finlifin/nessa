@@ -27,7 +27,7 @@ Nessa 标准库位于 `library/std/`，在编译时作为独立受信任包 `std
 | `std.coroutine` | 否 | 基于多提示符定界延续的非对称有状态协程与生成器：`Coroutine`（`create`、`try_resume`/`resume`、`step`、`yield_val`、`wrap`、`status`、`running`、`is_yieldable`、`close`）与 `Generator`（单任务局部栈段切换，完整覆盖 `coroutine.*`） |
 | `std.runtime` | 否 | 运行时内省、垃圾回收与 JIT 遥测：`VERSION`、`collect_garbage`、`gc_collections`、`backtrace`、`jit_enabled`、`jit_compiled_fns`、`jit_code_bytes`、`jit_deopt_count`（覆盖 `_VERSION`、`collectgarbage` 与 `debug.traceback`） |
 | `std.json` | `Json`, `JsonError` | 原生单趟扫描 RFC 8259 JSON 内核与类型化编解码：动态 `parse` / `stringify`、类型化 `encode` / `to_json_pretty` / `T.from_json`、支持 `derive Json for MyType`（`struct` 与单元/负载 `enum`，含独立 `.nsbc` 归档持久化、Unicode 代理对解码、128 层递归深度上限检查 `DepthLimitExceeded`、循环引用检测 `CircularReference` 与非有限浮点数拒绝） |
-| [`std.task`](task.md) | 否 | 异步效应与结构化并发组合子：`TimeoutError`、`Either`（`Left` / `Right`）、`yield_now`、`sleep_ms`、`sleep`、`current_id`、`tree_snapshot`、`is_ready`、支持编译期静态类型精化的 `await_all` / `await_any` / `await_first` / `with_timeout` |
+| [`std.task`](task.md) | 否 | 异步效应与结构化并发组合子：`TimeoutError`、`Either`（`left` / `right`）、`yield_now`、`sleep_ms`、`sleep`、`current_id`、`tree_snapshot`、`is_ready`、支持编译期静态类型精化的 `await_all` / `await_any` / `await_first` / `with_timeout` |
 | [`std.sync`](sync.md) | 否 | 任务级非阻塞同步与通信原语：`ChannelError`、有界/无缓冲 MPMC `Channel`、作用域安全 `Mutex` / `RwLock` / `Semaphore`、单次初始化 `Once` / `Lazy`、多任务栅栏 `Barrier` 及无锁原子 `AtomicInt` / `AtomicBool` |
 | [`std.net`](net.md) | 否 | 基于 `libuv` I/O Reactor 的非阻塞网络库：`SocketAddr`、`TcpListener`、`TcpStream`、`UdpDatagram`、`UdpSocket` 与异步 DNS 解析 `resolve_host` |
 

@@ -80,7 +80,7 @@ fn find_compiled_fn(output: &nsbc::CodegenOutput, name: &str) -> Option<(usize, 
 #[test]
 fn all_opt_levels_and_jit_modes_preserve_exact_semantics_effects_and_traps() {
     let complex_program = r#"
-        effect Ask() -> i64
+        effect ask() -> i64
 
         enum Tree {
             leaf(val: i64),
@@ -94,8 +94,8 @@ fn all_opt_levels_and_jit_modes_preserve_exact_semantics_effects_and_traps() {
             }
         }
 
-        fn with_effect() -> #Ask i64 {
-            let base = Ask()#
+        fn with_effect() -> #ask i64 {
+            let base = ask()#
             var acc = 0
             for i in 1..=5 {
                 acc += i
@@ -108,7 +108,7 @@ fn all_opt_levels_and_jit_modes_preserve_exact_semantics_effects_and_traps() {
                 Tree.leaf(10),
                 Tree.branch(Tree.leaf(7), Tree.leaf(10)),
             )
-            let from_eff = with_effect()# { Ask() => 0 }
+            let from_eff = with_effect()# { ask() => 0 }
             let narrow_u8 = (200.as(u8))
             if narrow_u8'type == u8 {
                 sum_tree(tree) + from_eff

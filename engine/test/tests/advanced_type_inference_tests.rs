@@ -239,15 +239,15 @@ fn local_unannotated_lambda_infers_parameter_types_from_block_call_sites() {
 fn effect_qualified_return_types_propagate_bidirectional_expected_payload_types() {
     assert_runs_to(
         r#"
-        effect Audit(code: i64) -> Unit
+        effect audit(code: i64) -> Unit
 
-        fn compute() -> #Audit i32 {
-            Audit(1)#
+        fn compute() -> #audit i32 {
+            audit(1)#
             42
         }
 
         fn main() {
-            let v: i32 = compute()# { Audit(c) => () }
+            let v: i32 = compute()# { audit(c) => () }
             v.as(i64)
         }
         "#,
@@ -266,8 +266,8 @@ fn target_typed_enum_variant_shorthand_works_in_expressions_errors_and_patterns(
         }
 
         enum MathErr {
-            negInput,
-            tooLarge(limit: i64),
+            NegInput,
+            TooLarge(limit: i64),
         }
 
         fn apply_op(base: i64, op: Op) -> i64 {
@@ -280,10 +280,10 @@ fn target_typed_enum_variant_shorthand_works_in_expressions_errors_and_patterns(
 
         fn checked(n: i64) -> !MathErr i64 {
             if n < 0 {
-                return error .negInput
+                return error .NegInput
             }
             if n > 100 {
-                return error .tooLarge(100)
+                return error .TooLarge(100)
             }
             n
         }
@@ -293,8 +293,8 @@ fn target_typed_enum_variant_shorthand_works_in_expressions_errors_and_patterns(
             let a = apply_op(10, first)
             let b = apply_op(a, .scale(2))
             let err_recover = checked(-5) ! {
-                .negInput => 0,
-                .tooLarge(lim) => lim,
+                .NegInput => 0,
+                .TooLarge(lim) => lim,
             }
             if first matches .add(_) {
                 b + err_recover

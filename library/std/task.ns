@@ -16,8 +16,8 @@ private const _task_await_indexed: fn(List) -> (i64, Any) = .__task_await_indexe
 private const _task_current_id: fn() -> i64 = .__task_current_id'builtin
 private const _task_tree_snapshot: fn() -> String = .__task_tree_snapshot'builtin
 
-private async effect _TimeoutWork() -> Any
-private async effect _TimeoutTimer(ms: i64) -> Unit
+private async effect timeout_work() -> Any
+private async effect timeout_timer(ms: i64) -> Unit
 
 pub struct TimeoutError {
     pub millis: i64,
@@ -33,28 +33,28 @@ impl Display for TimeoutError {
 }
 
 pub enum Either {
-    pub Left(value: Any),
-    pub Right(value: Any),
+    pub left(value: Any),
+    pub right(value: Any),
 
     pub fn is_left(self) -> bool {
-        self matches Either.Left(_)
+        self matches Either.left(_)
     }
 
     pub fn is_right(self) -> bool {
-        self matches Either.Right(_)
+        self matches Either.right(_)
     }
 
     pub fn unwrap_left(self) -> Any {
         self match {
-            Either.Left(v) => v,
-            Either.Right(_) => _panic("Either.unwrap_left called on Right"),
+            Either.left(v) => v,
+            Either.right(_) => _panic("Either.unwrap_left called on right"),
         }
     }
 
     pub fn unwrap_right(self) -> Any {
         self match {
-            Either.Right(v) => v,
-            Either.Left(_) => _panic("Either.unwrap_right called on Left"),
+            Either.right(v) => v,
+            Either.left(_) => _panic("Either.unwrap_right called on left"),
         }
     }
 }
@@ -62,13 +62,13 @@ pub enum Either {
 impl PartialEq for Either {
     pub fn eq(self, other: Self) -> bool {
         self match {
-            Either.Left(a) => other match {
-                Either.Left(b) => a == b,
-                Either.Right(_) => false,
+            Either.left(a) => other match {
+                Either.left(b) => a == b,
+                Either.right(_) => false,
             },
-            Either.Right(a) => other match {
-                Either.Right(b) => a == b,
-                Either.Left(_) => false,
+            Either.right(a) => other match {
+                Either.right(b) => a == b,
+                Either.left(_) => false,
             },
         }
     }
@@ -77,13 +77,13 @@ impl PartialEq for Either {
 impl Display for Either {
     pub fn to_string(self) -> String {
         self match {
-            Either.Left(v) => "Left(" ++ _to_string_raw(v) ++ ")",
-            Either.Right(v) => "Right(" ++ _to_string_raw(v) ++ ")",
+            Either.left(v) => "left(" ++ _to_string_raw(v) ++ ")",
+            Either.right(v) => "right(" ++ _to_string_raw(v) ++ ")",
         }
     }
 }
 
-pub use Either.{Left, Right}
+pub use Either.{left, right}
 
 pub fn yield_now() -> Unit {
     _task_yield()
@@ -123,9 +123,9 @@ pub fn await_first(first: Future, second: Future) -> Either {
     pair.push(second)
     let (idx, value) = _task_await_indexed(pair)
     if idx == 0 {
-        Either.Left(value)
+        Either.left(value)
     } else {
-        Either.Right(value)
+        Either.right(value)
     }
 }
 
@@ -138,11 +138,11 @@ pub fn with_timeout(ms: i64, thunk: fn() -> Any) -> Any {
         let e: Any = _make_timeout_err(ms)
         return e
     }
-    handles _TimeoutWork() => thunk()
-    handles _TimeoutTimer(d: i64) => _time_sleep_ms(d)
+    handles timeout_work() => thunk()
+    handles timeout_timer(d: i64) => _time_sleep_ms(d)
     let pair = List()
-    pair.push(_TimeoutWork())
-    pair.push(_TimeoutTimer(ms))
+    pair.push(timeout_work())
+    pair.push(timeout_timer(ms))
     let (idx, value) = _task_await_indexed(pair)
     if idx == 0 {
         value

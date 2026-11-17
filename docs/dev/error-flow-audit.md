@@ -3,7 +3,7 @@
 稳定源码 TypeId、TPOL11 和本阶段完整 Error 路径均已通过独立验收。
 本记录保留实施前基线与修复过程；最终结果见末节。整个 Nessa 仍未完成。
 
-实施前根工作区 CLI 的实际基线：`error E.bad` 返回并打印 Unit，成功值42的
+实施前根工作区 CLI 的实际基线：`error E.Bad` 返回并打印 Unit，成功值42的
 `get()!` 同样返回 Unit；`!E E` 成功载荷仍是未包装的 E。精确源码、输出与
 当前二进制哈希记录在 `/tmp/nessa-error-flow-current-baseline/results.json`。
 

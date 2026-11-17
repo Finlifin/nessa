@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn source_sets_lists_const_concat_flatten_empty_and_aliases() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};enum F{bad,};const ES=[E,F,E];typealias X=E;fn a()->!ES ++ [X] !F i64{42};fn b()->![] i64{42};fn c()->![F,E] i64{42}",
+            "enum E{Bad,};enum F{Bad,};const ES=[E,F,E];typealias X=E;fn a()->!ES ++ [X] !F i64{42};fn b()->![] i64{42};fn c()->![F,E] i64{42}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let a = result(&resolved, "a");
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn constructor_is_error_only_and_inference_joins_success() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};fn bad(){error E.bad};fn mixed(flag:bool){if flag {error E.bad}else{42}}",
+            "enum E{Bad,};fn bad(){error E.Bad};fn mixed(flag:bool){if flag {error E.Bad}else{42}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let bad = resolved
@@ -547,7 +547,7 @@ mod tests {
     }
     #[test]
     fn propagation_yields_success_and_contributes_callable_errors() {
-        let (resolved, errors) = resolve("enum E{bad,};fn get()->!E i64{42};fn next(){get()! + 1}");
+        let (resolved, errors) = resolve("enum E{Bad,};fn get()->!E i64{42};fn next(){get()! + 1}");
         assert!(errors.is_empty(), "{errors:?}");
         let shape = resolved
             .type_pool
@@ -562,9 +562,9 @@ mod tests {
     }
     #[test]
     fn elimination_partial_enum_and_guard_preserve_residual_and_success() {
-        for arm in ["E.a=>1", "E.* if false=>1", "E.a=>1,E.b if false=>2"] {
+        for arm in ["E.A=>1", "E.* if false=>1", "E.A=>1,E.B if false=>2"] {
             let (resolved, errors) = resolve(&format!(
-                "enum E{{a,b,}};fn get()->!E i64{{42}};fn next(){{get()!{{{arm}}}}}"
+                "enum E{{A,B,}};fn get()->!E i64{{42}};fn next(){{get()!{{{arm}}}}}"
             ));
             assert!(errors.is_empty(), "{arm}: {errors:?}");
             let plan = resolved.error_eliminations.values().next().unwrap();
@@ -581,9 +581,9 @@ mod tests {
     }
     #[test]
     fn whole_enum_and_family_remove_only_error_branch() {
-        for arm in ["E.a=>1,E.b=>2", "E.* as e=>1", "catch e=>1"] {
+        for arm in ["E.A=>1,E.B=>2", "E.* as e=>1", "catch e=>1"] {
             let (resolved, errors) = resolve(&format!(
-                "enum E{{a,b,}};fn get()->!E i64{{42}};fn next(){{get()!{{{arm}}}}}"
+                "enum E{{A,B,}};fn get()->!E i64{{42}};fn next(){{get()!{{{arm}}}}}"
             ));
             assert!(errors.is_empty(), "{arm}: {errors:?}");
             let plan = resolved.error_eliminations.values().next().unwrap();
@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn ordinary_ok_binder_and_error_binder_have_payload_types() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};fn get()->!E i64{42};fn next(){get()!{ok! =>ok+1,catch e=>error e}}",
+            "enum E{Bad,};fn get()->!E i64{42};fn next(){get()!{ok! =>ok+1,catch e=>error e}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let ok = resolved
@@ -638,7 +638,7 @@ mod tests {
     }
     #[test]
     fn open_finite_family_catch_does_not_exhaust_dynamic_domain() {
-        let (resolved, errors) = resolve("enum E{bad,};fn next(e:Any){(error e)!{E.* =>1}}");
+        let (resolved, errors) = resolve("enum E{Bad,};fn next(e:Any){(error e)!{E.* =>1}}");
         assert!(errors.is_empty(), "{errors:?}");
         let plan = resolved.error_eliminations.values().next().unwrap();
         assert!(matches!(
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn direct_match_wrappers_preserve_equal_success_error_payloads() {
         let (resolved, errors) =
-            resolve("enum E{bad,};fn next(v:!E E){v match{ok! =>ok;error E.bad=>E.bad}}");
+            resolve("enum E{Bad,};fn next(v:!E E){v match{ok! =>ok;error E.Bad=>E.Bad}}");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
             resolved
@@ -672,16 +672,16 @@ mod tests {
     #[test]
     fn rejects_invalid_sets_propagation_and_qualified_any_subset() {
         for source in [
-            "enum E{bad,};enum F{bad,};fn bad(v:!F Any)->!E Any{v}",
+            "enum E{Bad,};enum F{Bad,};fn bad(v:!F Any)->!E Any{v}",
             "fn bad()->!Any i64{42}",
             "fn bad()->![42] i64{42}",
-            "enum E{bad,};let ES=[E];fn bad()->!ES i64{42}",
-            "enum E{bad,};fn make(){E};fn bad()->!make() i64{42}",
+            "enum E{Bad,};let ES=[E];fn bad()->!ES i64{42}",
+            "enum E{Bad,};fn make(){E};fn bad()->!make() i64{42}",
             "fn bad(){42!}",
-            "enum E{bad,};fn get()->!E i64{42};get()!",
-            "enum E{bad,};fn get()->!E i64{42};fn bad(.x:i64=get()!){x}",
-            "enum E{bad,};fn get()->!E i64{42};fn bad()->i64{get()!}",
-            "enum E{bad,};fn get()->!E i64{42};fn bad(){get() match{#e=>1}}",
+            "enum E{Bad,};fn get()->!E i64{42};get()!",
+            "enum E{Bad,};fn get()->!E i64{42};fn bad(.x:i64=get()!){x}",
+            "enum E{Bad,};fn get()->!E i64{42};fn bad()->i64{get()!}",
+            "enum E{Bad,};fn get()->!E i64{42};fn bad(){get() match{#e=>1}}",
         ] {
             let (_, errors) = resolve(source);
             assert!(!errors.is_empty(), "unexpected acceptance: {source}");
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn generic_error_pattern_binding_is_any_and_dynamic_rethrow() {
         let (resolved, errors) =
-            resolve("enum E{bad,};fn next(v:!E i64){v match{ok! =>ok,error e=>error e}}");
+            resolve("enum E{Bad,};fn next(v:!E i64){v match{ok! =>ok,error e=>error e}}");
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             resolved
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn two_default_replays_keep_concrete_error_and_associated_facts_isolated() {
         let (resolved, errors) = resolve(
-            "enum Fail{bad,};struct P{};struct Q{};trait Read{assoc Item:Type=i64;fn next(self)->Item;derive fn wrap(self)->!Fail Item{self.next()};derive fn pass(self,v:!Fail Self)->!Fail Self{v!}};impl Read for P{fn next(self)->i64{42}};impl Read for Q{assoc Item:Type=String;fn next(self)->String{\"q\"}}",
+            "enum Fail{Bad,};struct P{};struct Q{};trait Read{assoc Item:Type=i64;fn next(self)->Item;derive fn wrap(self)->!Fail Item{self.next()};derive fn pass(self,v:!Fail Self)->!Fail Self{v!}};impl Read for P{fn next(self)->i64{42}};impl Read for Q{assoc Item:Type=String;fn next(self)->String{\"q\"}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let wrappers: Vec<_> = resolved
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn catch_and_case_local_nominals_have_distinct_persisted_identity_paths() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};fn get()->!E i64{42};fn next(){get()!{E.bad=>{struct Local{};42},catch e=>{struct Local{};42}}}",
+            "enum E{Bad,};fn get()->!E i64{42};fn next(){get()!{E.Bad=>{struct Local{};42},catch e=>{struct Local{};42}}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let local: Vec<_> = resolved
@@ -815,7 +815,7 @@ mod tests {
     }
     #[test]
     fn dynamic_context_checks_closed_set_but_construction_stays_error_only() {
-        let (resolved, errors) = resolve("enum E{bad,};fn next(e:Any)->!E i64{error e}");
+        let (resolved, errors) = resolve("enum E{Bad,};fn next(e:Any)->!E i64{error e}");
         assert!(errors.is_empty(), "{errors:?}");
         let plan = resolved.error_constructions.values().next().unwrap();
         let shape = resolved
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn propagation_in_capture_handler_targets_that_handler_callable() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};effect ask(catch k)->i64;fn get()->!E i64{42};fn next(){ask()#{ask(k)=>get()!}}",
+            "enum E{Bad,};effect ask(catch k)->i64;fn get()->!E i64{42};fn next(){ask()#{ask(k)=>get()!}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let plan = resolved.error_propagations.values().next().unwrap();
@@ -841,12 +841,12 @@ mod tests {
     #[test]
     fn direct_error_matches_require_both_branch_coverage() {
         for arms in [
-            "error E.bad=>1",
+            "error E.Bad=>1",
             "ok! =>ok",
-            "ok! if false=>ok,error E.bad=>1",
+            "ok! if false=>ok,error E.Bad=>1",
         ] {
             let (_, errors) = resolve(&format!(
-                "enum E{{bad,}};fn next(v:!E i64){{v match{{{arms}}}}}"
+                "enum E{{Bad,}};fn next(v:!E i64){{v match{{{arms}}}}}"
             ));
             assert!(
                 errors.iter().any(|error| error.contains("must exhaust")),
@@ -856,11 +856,11 @@ mod tests {
         for arms in [
             "_=>1",
             "v=>1",
-            "ok! =>ok,error E.bad=>1",
+            "ok! =>ok,error E.Bad=>1",
             "ok! =>ok,error e=>1",
         ] {
             let (_, errors) = resolve(&format!(
-                "enum E{{bad,}};fn next(v:!E i64){{v match{{{arms}}}}}"
+                "enum E{{Bad,}};fn next(v:!E i64){{v match{{{arms}}}}}"
             ));
             assert!(errors.is_empty(), "{arms}: {errors:?}");
         }
@@ -868,7 +868,7 @@ mod tests {
     #[test]
     fn dynamic_propagation_checks_restricted_callable_set_explicitly() {
         let (resolved, errors) =
-            resolve("enum E{bad,};fn make(e:Any){error e};fn next(e:Any)->!E i64{make(e)!}");
+            resolve("enum E{Bad,};fn make(e:Any){error e};fn next(e:Any)->!E i64{make(e)!}");
         assert!(errors.is_empty(), "{errors:?}");
         let plan = resolved.error_propagations.values().next().unwrap();
         assert_eq!(
@@ -879,14 +879,14 @@ mod tests {
     #[test]
     fn finite_nested_payload_constructor_matrix_proves_total_family_coverage() {
         let (resolved, errors) = resolve(
-            "enum Inner{a,b,};enum E{some(x:Inner),none,};fn next(v:!E i64){v!{E.some(Inner.a)=>1,E.some(Inner.b)=>2,E.none=>3}}",
+            "enum Inner{a,b,};enum E{Some(x:Inner),None,};fn next(v:!E i64){v!{E.Some(Inner.a)=>1,E.Some(Inner.b)=>2,E.None=>3}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let plan = resolved.error_eliminations.values().next().unwrap();
         assert_eq!(plan.residual, Intrinsic::NoReturn.type_index());
         assert_eq!(plan.result, Intrinsic::I64.type_index());
         let (resolved, errors) = resolve(
-            "enum Inner{a,b,};enum E{some(x:Inner),none,};fn next(v:!E i64){v!{E.some(Inner.a)=>1,E.none=>3}}",
+            "enum Inner{a,b,};enum E{Some(x:Inner),None,};fn next(v:!E i64){v!{E.Some(Inner.a)=>1,E.None=>3}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
@@ -901,7 +901,7 @@ mod tests {
     }
     #[test]
     fn mixed_composite_elimination_keeps_each_wrapper_entry_owned_once() {
-        let (resolved, errors) = resolve("enum E{bad,};fn next(v:!E i64){v!{E.bad or _! =>1}}");
+        let (resolved, errors) = resolve("enum E{Bad,};fn next(v:!E i64){v!{E.Bad or _! =>1}}");
         assert!(errors.is_empty(), "{errors:?}");
         let plan = resolved.error_eliminations.values().next().unwrap();
         assert!(plan.implicit_success_conversion.is_none());
@@ -916,7 +916,7 @@ mod tests {
     #[test]
     fn qualified_error_payload_can_be_matched_as_an_explicit_nested_wrapper() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};typealias Wrapped=!E i64;fn next(v:!Wrapped i64){v match{_! =>1,error (error e)=>1,error (_!)=>1}}",
+            "enum E{Bad,};typealias Wrapped=!E i64;fn next(v:!Wrapped i64){v match{_! =>1,error (error e)=>1,error (_!)=>1}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn qualified_result_wraps_arithmetic_once_after_raw_propagated_operands() {
         let (resolved, errors) =
-            resolve("enum E{bad,};fn get()->!E i64{40};fn next()->!E i64{get()!+2}");
+            resolve("enum E{Bad,};fn get()->!E i64{40};fn next()->!E i64{get()!+2}");
         assert!(errors.is_empty(), "{errors:?}");
         let (&propagation, _) = resolved.error_propagations.iter().next().unwrap();
         assert!(!resolved.error_conversions.contains_key(&propagation));
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn qualified_tuple_success_payload_widens_recursively() {
         let (resolved, errors) =
-            resolve("enum E{bad,};fn small()->!E (i8,i8){(1,2)};fn wide()->!E (i64,i64){small()}");
+            resolve("enum E{Bad,};fn small()->!E (i8,i8){(1,2)};fn wide()->!E (i64,i64){small()}");
         assert!(errors.is_empty(), "{errors:?}");
         let shape = resolved
             .type_pool
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn capturing_handler_checks_its_contextual_continuation_answer() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};effect choose(catch k)->!E i64;fn work()->!E i64{choose()#!};fn main(){let value:!E i64=work()#{choose(k)=>{let result:!E i64=error E.bad;result!;k(42)}};value match{error E.bad=>42,_! =>0}}",
+            "enum E{Bad,};effect choose(catch k)->!E i64;fn work()->!E i64{choose()#!};fn main(){let value:!E i64=work()#{choose(k)=>{let result:!E i64=error E.Bad;result!;k(42)}};value match{error E.Bad=>42,_! =>0}}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         let (&call, coercion) = resolved
@@ -1016,7 +1016,7 @@ mod tests {
     fn tuple_payload_conversion_rejects_narrowing_and_wrong_arity() {
         for target in ["(i8,i8)", "(i64,i64,i64)"] {
             let (_, errors) = resolve(&format!(
-                "enum E{{bad,}};fn a()->!E (i64,i64){{(1,2)}};fn b()->!E {target}{{a()}}"
+                "enum E{{Bad,}};fn a()->!E (i64,i64){{(1,2)}};fn b()->!E {target}{{a()}}"
             ));
             assert!(
                 errors.iter().any(|error| error.contains("type mismatch")),
@@ -1027,7 +1027,7 @@ mod tests {
     #[test]
     fn contextual_handler_still_checks_continuation_input() {
         let (_, errors) = resolve(
-            r#"enum E{bad,};effect choose(catch k)->!E i64;fn work()->!E i64{choose()#!};fn main(){let value:!E i64=work()#{choose(k)=>k("wrong")}}"#,
+            r#"enum E{Bad,};effect choose(catch k)->!E i64;fn work()->!E i64{choose()#!};fn main(){let value:!E i64=work()#{choose(k)=>k("wrong")}}"#,
         );
         assert!(
             errors
@@ -1053,7 +1053,7 @@ mod tests {
                 .is_subtype_scoped(source, target, 0)
                 .unwrap()
         );
-        let (resolved, errors) = resolve("enum E{bad,};fn a()->!E i8{1};fn b()->!E i64{a()}");
+        let (resolved, errors) = resolve("enum E{Bad,};fn a()->!E i8{1};fn b()->!E i64{a()}");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
             resolved
@@ -1076,8 +1076,8 @@ mod tests {
     #[test]
     fn reachable_error_branch_rejects_refutable_declaration_and_parameter() {
         for source in [
-            "enum E{bad,};fn main(){let value:!E i64=42;let n! = value;42}",
-            "enum E{bad,};fn take(n! : !E i64)->i64{n};fn main(){42}",
+            "enum E{Bad,};fn main(){let value:!E i64=42;let n! = value;42}",
+            "enum E{Bad,};fn take(n! : !E i64)->i64{n};fn main(){42}",
         ] {
             let (_, errors) = resolve(source);
             assert!(
@@ -1088,14 +1088,14 @@ mod tests {
             );
         }
         let (_, errors) = resolve(
-            "enum E{bad,};fn take(value:!E i64)->!E i64{value};fn main(){let value:!E i64=42;let whole=value;take(whole)}",
+            "enum E{Bad,};fn take(value:!E i64)->!E i64{value};fn main(){let value:!E i64=42;let whole=value;take(whole)}",
         );
         assert!(errors.is_empty(), "{errors:?}");
     }
     #[test]
     fn diverging_error_elimination_arm_preserves_inner_type_for_defer_methods() {
         let (resolved, errors) = resolve(
-            "enum E{bad,};struct Handle{id:i64,};impl Handle{fn open()->!E Handle{Handle{id:1}};fn flush(self)->!E Unit{()}};fn main()->i64{let h=Handle.open()!{_=>return -1};defer{let _=h.flush()!{_=>()}};h.id}",
+            "enum E{Bad,};struct Handle{id:i64,};impl Handle{fn open()->!E Handle{Handle{id:1}};fn flush(self)->!E Unit{()}};fn main()->i64{let h=Handle.open()!{_=>return -1};defer{let _=h.flush()!{_=>()}};h.id}",
         );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(resolved.error_eliminations.len(), 2);

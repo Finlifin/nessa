@@ -395,7 +395,7 @@ fn main() -> i64 {
 fn std_task_combinators_yield_is_ready_await_all_await_any_and_await_first() {
     let source = r#"
 use std.task
-use std.task.{Either, Left, Right}
+use std.task.{Either, left, right}
 
 enum TimeoutErr {
     Expired,
@@ -434,11 +434,11 @@ fn fetch_with_timeout(data_steps: i64, timeout_steps: i64, fail: bool) -> #[fetc
     let data_f = fetch_data(data_steps, fail)#
     let timeout_f = sleep_ticks(timeout_steps)#
     task.await_first(data_f, timeout_f) match {
-        Left(resp) => {
+        left(resp) => {
             let typed: !NetErr i64 = resp.as(!NetErr i64)
             typed!
         },
-        Right(_) => error TimeoutErr.Expired,
+        right(_) => error TimeoutErr.Expired,
     }
 }
 
@@ -509,9 +509,9 @@ fn main() -> i64 {
         TimeoutErr.Expired => 5,
     }
 
-    let e1 = Left(12)
-    let e2 = Right("hi")
-    let either_ok = if e1.is_left() and e2.is_right() and e1 == Either.Left(12) and "{e1}" == "Left(12)" {
+    let e1 = left(12)
+    let e2 = right("hi")
+    let either_ok = if e1.is_left() and e2.is_right() and e1 == Either.left(12) and "{e1}" == "left(12)" {
         e1.unwrap_left().as(i64)
     } else {
         -999

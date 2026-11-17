@@ -11,7 +11,7 @@
 - 属性名（struct 字段）
 - 函数名
 - 参数名
-- 代数效应名
+- 代数效应名（`effect` / `async effect`）
 - 包名
 - 非 Error 用途的 enum variant
 
@@ -19,7 +19,7 @@
 
 以下标识符使用大驼峰命名法：
 
-- 类型名（`struct`、`enum`、`trait`、`newtype`、`typealias`）
+- 类型名（`struct`、`enum`、`trait`、`newtype`、`typealias`，包括 `private` 私有类型，禁止添加前导 `_` 前缀）
 - Error 用途的 enum variant
 
 ### 示例

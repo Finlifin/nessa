@@ -197,9 +197,9 @@ fn derive_json_enums_newtypes_tuples_and_trait_bounds() {
         derive Json for Pair
 
         enum Shape {
-            Origin,
-            Circle(radius: i64),
-            Rect(w: i64, h: i64),
+            origin,
+            circle(radius: i64),
+            rect(w: i64, h: i64),
         }
         derive Json, Eq, PartialEq for Shape
 
@@ -224,16 +224,16 @@ fn derive_json_enums_newtypes_tuples_and_trait_bounds() {
             let p2 = Pair.from_json("[\"score\",100]").unwrap()
             if p2 != p { return 4 }
 
-            let s0 = Shape.Origin
-            let s1 = Shape.Circle(7)
-            let s2 = Shape.Rect(10, 20)
-            if s0.to_json().unwrap() != "\"Origin\"" { return 5 }
-            if s1.to_json().unwrap() != "{{\"Circle\":7}}" { return 6 }
-            if s2.to_json().unwrap() != "{{\"Rect\":[10,20]}}" { return 7 }
+            let s0 = Shape.origin
+            let s1 = Shape.circle(7)
+            let s2 = Shape.rect(10, 20)
+            if s0.to_json().unwrap() != "\"origin\"" { return 5 }
+            if s1.to_json().unwrap() != "{{\"circle\":7}}" { return 6 }
+            if s2.to_json().unwrap() != "{{\"rect\":[10,20]}}" { return 7 }
 
-            if Shape.from_json("\"Origin\"").unwrap() != s0 { return 8 }
-            if Shape.from_json("{{\"Circle\":7}}").unwrap() != s1 { return 9 }
-            if Shape.from_json("{{\"Rect\":[10,20]}}").unwrap() != s2 { return 10 }
+            if Shape.from_json("\"origin\"").unwrap() != s0 { return 8 }
+            if Shape.from_json("{{\"circle\":7}}").unwrap() != s1 { return 9 }
+            if Shape.from_json("{{\"rect\":[10,20]}}").unwrap() != s2 { return 10 }
 
             let c = Canvas {
                 owner: uid,
@@ -244,44 +244,44 @@ fn derive_json_enums_newtypes_tuples_and_trait_bounds() {
             if Canvas.from_json(c_json).unwrap() != c { return 11 }
 
             -- Enum error cases: InvalidVariant (string and object), wrong arity, multi-key object
-            let inv1 = Shape.from_json("\"Triangle\"") match {
+            let inv1 = Shape.from_json("\"triangle\"") match {
                 _! => false,
-                error JsonError.InvalidVariant(path, ty, v) => path == "$" and ty == "Shape" and v == "Triangle",
+                error JsonError.InvalidVariant(path, ty, v) => path == "$" and ty == "Shape" and v == "triangle",
                 error _ => false,
             }
             if not inv1 { return 12 }
 
-            let inv2 = Shape.from_json("{{\"Hexagon\":6}}") match {
+            let inv2 = Shape.from_json("{{\"hexagon\":6}}") match {
                 _! => false,
-                error JsonError.InvalidVariant(path, ty, v) => path == "$" and ty == "Shape" and v == "Hexagon",
+                error JsonError.InvalidVariant(path, ty, v) => path == "$" and ty == "Shape" and v == "hexagon",
                 error _ => false,
             }
             if not inv2 { return 13 }
 
-            let bad_unit = Shape.from_json("{{\"Origin\":null}}") match {
+            let bad_unit = Shape.from_json("{{\"origin\":null}}") match {
                 _! => false,
                 error JsonError.TypeMismatch(path, expected, actual) => path == "$" and expected == "string" and actual == "object",
                 error _ => false,
             }
             if not bad_unit { return 14 }
 
-            let bad_payload = Shape.from_json("\"Circle\"") match {
+            let bad_payload = Shape.from_json("\"circle\"") match {
                 _! => false,
                 error JsonError.TypeMismatch(path, expected, actual) => path == "$" and expected == "object" and actual == "string",
                 error _ => false,
             }
             if not bad_payload { return 15 }
 
-            let bad_multi_key = Shape.from_json("{{\"Circle\":1,\"Rect\":[2,3]}}") match {
+            let bad_multi_key = Shape.from_json("{{\"circle\":1,\"rect\":[2,3]}}") match {
                 _! => false,
                 error JsonError.TypeMismatch(path, _, actual) => path == "$" and actual == "object",
                 error _ => false,
             }
             if not bad_multi_key { return 16 }
 
-            let bad_arity = Shape.from_json("{{\"Rect\":[10]}}") match {
+            let bad_arity = Shape.from_json("{{\"rect\":[10]}}") match {
                 _! => false,
-                error JsonError.TypeMismatch(path, expected, actual) => path == "$.Rect" and expected == "array of length 2" and actual == "array",
+                error JsonError.TypeMismatch(path, expected, actual) => path == "$.rect" and expected == "array of length 2" and actual == "array",
                 error _ => false,
             }
             if not bad_arity { return 17 }
@@ -581,9 +581,9 @@ fn derive_json_standalone_nsbc_archive_roundtrip_without_sources() {
         derive Json, Eq, PartialEq for TagId
 
         enum Role {
-            Admin,
-            Member(level: u8),
-            Pair(a: String, b: i64),
+            admin,
+            member(level: u8),
+            pair(a: String, b: i64),
         }
         derive Json, Eq, PartialEq for Role
 
@@ -602,7 +602,7 @@ fn derive_json_standalone_nsbc_archive_roundtrip_without_sources() {
         fn main() -> i64 {
             let acc = Account {
                 id: TagId((512).as(u16)),
-                role: Role.Pair("team", 9),
+                role: Role.pair("team", 9),
                 active: true,
                 note: null,
             }

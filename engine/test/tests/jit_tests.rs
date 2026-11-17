@@ -371,9 +371,9 @@ struct Counter {
 }
 
 enum Op {
-    Add(delta: i64),
-    Scale(factor: i64),
-    Reset,
+    add(delta: i64),
+    scale(factor: i64),
+    clear,
 }
 
 newtype Score = i64
@@ -385,14 +385,14 @@ fn apply_op(c: Counter, op: Op) -> i64 {
     -- Exercises LoadField IC on Unit-typed field (`val == UNIT` guard)
     let _u: Unit = c.marker
     op match {
-        Op.Add(d) => {
+        Op.add(d) => {
             c.count = c.count + d
             c.weight = c.weight + 0.25
         },
-        Op.Scale(f) => {
+        Op.scale(f) => {
             c.count = c.count * f
         },
-        Op.Reset => {
+        Op.clear => {
             c.count = 1
         },
     }
@@ -412,11 +412,11 @@ fn main() -> i64 {
     var total: i64 = 0
     while i < 12000 {
         let op = if i % 97 == 0 {
-            Op.Reset
+            Op.clear
         } else if i % 5 == 0 {
-            Op.Scale(2)
+            Op.scale(2)
         } else {
-            Op.Add((i % 8) + 1)
+            Op.add((i % 8) + 1)
         }
         if c.count > 100000 {
             c.count = c.count / 8

@@ -559,7 +559,7 @@ fn std_task_sleep_timeout_introspection_and_static_combinator_typing() {
 use std.collections.*
 use std.sync.AtomicInt
 use std.task
-use std.task.{Left, Right, TimeoutError}
+use std.task.{left, right, TimeoutError}
 use std.time.Duration
 
 enum BizErr {
@@ -608,8 +608,8 @@ fn run_typed_combinators() -> #[compute_int, compute_str] i64 {
     -- 4. await_first pattern matching AND unwrap_left/unwrap_right WITHOUT .as(...)
     let race1 = task.await_first(compute_int(1, 100)#, compute_str(40, "slow")#)
     let matched_val: i64 = race1 match {
-        Left(num) => num + 5,
-        Right(txt) => txt.len(),
+        left(num) => num + 5,
+        right(txt) => txt.len(),
     }
     let race2 = task.await_first(compute_int(40, 0)#, compute_str(1, "hello")#)
     let unwrapped_len: i64 = race2.unwrap_right().len()

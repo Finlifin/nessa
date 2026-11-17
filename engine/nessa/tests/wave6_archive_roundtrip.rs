@@ -65,7 +65,7 @@ fn language_features_and_async_concurrency_execute_from_standalone_nsbc_without_
         r##"
 use std.collections.{HashMap, Set}
 use std.task
-use std.task.{Left, Right}
+use std.task.{left, right}
 
 newtype UserId = i64
 derive Eq, PartialEq, Ord, PartialOrd, Display, Hash for UserId
@@ -119,8 +119,8 @@ fn race_cancel() -> i64 {
     let fast = compute_chunk(4)#
     let spin = slow_spin()#
     task.await_first(fast, spin) match {
-        Left(v) => v.as(i64),
-        Right(_) => -999,
+        left(v) => v.as(i64),
+        right(_) => -999,
     }
 }
 

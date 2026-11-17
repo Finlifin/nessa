@@ -15,7 +15,7 @@
 - 有独立工作时使用 graph-engineering-workflow：先明确依赖、验收标准、文件所有者与可观测预算，再并行分派调查、实现或测试。
 - 在当前4个并发槽内安排任务；调查与测试尽早开始，不必等待无实际依赖的工作。共享 Rust 构建目录会串行获取锁，不把重复构建当作增加并发收益。
 - 并行写入使用隔离副本或工作树，禁止共同修改同一文件。一个合并者读回差异、核对基线并整合；生产实现与测试可以独立推进。
-- 独立验收者读取最终产物和实际日志，复跑检查；发现缺陷只修对应责任边界。运行中记录分派、修复、预算和验收结果，不靠子代理自报成功结束任务。
+- 独立验收者读取最终产物和实际日志，复跑检查，并逐项核查所有新增或修改的 Nessa 源码（含内嵌测试片段）是否严格符合 `docs/code-style.md` 的类型、枚举变体与代数效应命名规范；发现缺陷只修对应责任边界。运行中记录分派、修复、预算和验收结果，不靠子代理自报成功结束任务。
 
 ## 项目地图与设计依据
 
@@ -39,7 +39,7 @@
 
 - 语言修改先读 `docs/grammar/` 和对应主题文档；引擎修改先读 `docs/dev/architecture.md` 和对应子系统设计。
 - `docs/deprecated/` 仅作历史参考，不作为新增行为的规范。`docs/dev/intro.md` 的实现状态可能过时，必须通过代码和测试核实。
-- `docs/code-style.md` 描述 **Nessa 语言**风格；Rust 实现使用 Rust 命名惯例和 `rustfmt`，不要把 Nessa 的枚举命名规则套到 Rust。
+- `docs/code-style.md` 描述 **Nessa 语言**代码风格，仓库内**所有 Nessa 代码**（包括 `library/`、`tests/`、`docs/` 示例，以及 Rust 单元/集成测试中内嵌的 Nessa 源码字符串）必须严格遵守。Rust 与 Nessa 的命名边界双向隔离：Rust 引擎实现遵循 Rust `PascalCase` 枚举惯例与 `rustfmt`，不要把 Nessa 的枚举命名规则套到 Rust；反之，**编写 Nessa 代码时严禁照搬 Rust 枚举 variant 一律 `PascalCase` 的习惯**。
 - 设计与实现不一致时，明确差异：修复实现偏差，或说明必要的设计调整并同步文档。影响兼容性的语义选择需要用户明确决策。
 
 ## 结构与规整度
@@ -52,6 +52,15 @@
 - 导入放在文件顶部，按标准库、外部依赖、workspace crate、当前 crate 分组，遵循局部约定并由 `rustfmt` 排版。生产代码避免通配符导入。
 - 删除本次修改产生的死代码、旧分支、调试输出和失效注释。注释解释约束、原因与设计取舍，不重复代码字面含义。
 - 新依赖必须有明确收益，先检查标准库和现有依赖。共享依赖适合放在 `[workspace.dependencies]`；不顺带改动无关依赖或锁文件。
+
+### Nessa 语言命名规范（强制执行）
+
+所有 Nessa 源码（`library/`、`tests/`、`docs/` 示例，以及 Rust 单元与集成测试内嵌的 Nessa 源码字符串）必须严格符合 `docs/code-style.md`，严禁将 Rust 一律 `PascalCase` 的枚举习惯带入 Nessa：
+
+- **类型名（`PascalCase`）**：所有 `struct`、`enum`、`trait`、`newtype`、`typealias` 必须使用 `PascalCase`；`private` 私有类型同样使用 `PascalCase`（如 `private enum CoOutcome`、`private struct RegexGuard`），**禁止使用 `_Foo` 前导下划线前缀**。
+- **Error 用途的 `enum` variant（`PascalCase`）**：凡用于 `!E` 错误联合、`error E.Variant` 抛出或表达错误类别的枚举，其 variant 必须使用 `PascalCase`（如 `IoError.NotFound`、`ChannelError.Closed`、`HttpError.Timeout`）。
+- **非 Error 用途的普通 `enum` variant（`snake_case`）**：所有普通值构造枚举的 variant 必须使用 `snake_case`（如 `Either.left` / `Either.right`、`Ordering.less`、`SeekFrom.start`、`IpAddr.v4`、`Shape.circle`），严禁写成 `PascalCase`。
+- **其余标识符（`snake_case`）**：模块名、函数名、参数名、变量名、`struct` 字段名、代数效应名（`effect` / `async effect`，如 `effect co_yield`、`async effect timeout_work`）和包名必须使用 `snake_case`。
 
 ## 正确性与错误处理
 
@@ -115,6 +124,6 @@ git diff --stat
 ## 交付标准
 
 - 功能贯穿相关阶段，符合设计，错误路径明确；没有把必要工作藏在新占位符里。
-- 模块职责、命名、可见性与格式一致，相关文档和测试同步。
+- 模块职责、命名、可见性与格式一致，所有 Nessa 代码（含文档示例与测试内嵌代码）的 `enum` variant、`effect` 与类型命名已由独立验收者核验符合 `docs/code-style.md`，相关文档和测试同步。
 - 相关检查通过，或明确列出已有失败及环境限制。
 - 最终说明行为变化、验证证据和确切的剩余缺口，不以测试数量或文件数量代替完成度。
