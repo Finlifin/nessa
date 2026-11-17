@@ -262,25 +262,44 @@ fn fs_operations_cover_files_directories_metadata_copy_rename_and_errors() {
 #[test]
 fn path_manipulation_handles_lexical_normalization_stems_extensions_and_roots() {
     let src = r#"
+        use std.env
         use std.path
 
         fn main() -> i64 {
-            assert_eq(path.SEPARATOR, "/")
             assert(path.is_absolute("/usr/local"))
             assert(path.is_absolute("C:/Windows/System32"))
             assert(not path.is_absolute("relative/file.txt"))
             assert(not path.is_absolute(""))
 
-            assert_eq(path.join("a/b", "c.txt"), "a/b/c.txt")
-            assert_eq(path.join("a/b/", "c.txt"), "a/b/c.txt")
-            assert_eq(path.join("a/b", "/etc/hosts"), "/etc/hosts")
+            if env.os() == "windows" {
+                assert_eq(path.SEPARATOR, "\\")
+                assert(path.is_absolute("C:\\Windows\\System32"))
+                assert_eq(path.join("a\\b", "c.txt"), "a\\b\\c.txt")
+                assert_eq(path.join("a\\b\\", "c.txt"), "a\\b\\c.txt")
+                assert_eq(path.join("a\\b", "C:\\Windows"), "C:\\Windows")
+                assert_eq(path.join_all(["C:\\", "Users", "fin", "nessa.exe"]), "C:\\Users\\fin\\nessa.exe")
+                assert_eq(path.parent("C:\\Users\\fin"), "C:\\Users")
+                assert_eq(path.parent("C:\\Users"), "C:\\")
+                assert_eq(path.parent("C:\\"), null)
+                assert_eq(path.normalize("C:\\a\\b\\..\\c\\.\\d\\\\e\\"), "C:\\a\\c\\d\\e")
+                assert_eq(path.components("C:\\a\\b\\..\\c"), ["C:\\", "a", "b", "..", "c"])
+            } else {
+                assert_eq(path.SEPARATOR, "/")
+                assert_eq(path.join("a/b", "c.txt"), "a/b/c.txt")
+                assert_eq(path.join("a/b/", "c.txt"), "a/b/c.txt")
+                assert_eq(path.join("a/b", "/etc/hosts"), "/etc/hosts")
+                assert_eq(path.join_all(["usr", "local", "bin", "nessa"]), "usr/local/bin/nessa")
+                assert_eq(path.parent("/usr/local/bin"), "/usr/local")
+                assert_eq(path.parent("/usr"), "/")
+                assert_eq(path.parent("/"), null)
+                assert_eq(path.normalize("/a/b/../c/./d//e/"), "/a/c/d/e")
+                assert_eq(path.normalize("/../../etc"), "/etc")
+                assert_eq(path.normalize("a/../../b"), "../b")
+                assert_eq(path.components("/a/b/../c"), ["/", "a", "b", "..", "c"])
+            }
+
             assert_eq(path.join("", "c.txt"), "c.txt")
             assert_eq(path.join("a/b", ""), "a/b")
-            assert_eq(path.join_all(["usr", "local", "bin", "nessa"]), "usr/local/bin/nessa")
-
-            assert_eq(path.parent("/usr/local/bin"), "/usr/local")
-            assert_eq(path.parent("/usr"), "/")
-            assert_eq(path.parent("/"), null)
             assert_eq(path.parent("single"), null)
             assert_eq(path.parent("a/b/"), "a")
 
@@ -301,13 +320,8 @@ fn path_manipulation_handles_lexical_normalization_stems_extensions_and_roots() 
             assert_eq(path.with_extension("dir/main.ns", ""), "dir/main")
             assert_eq(path.with_extension("dir/.gitignore", "bak"), "dir/.gitignore.bak")
 
-            assert_eq(path.normalize("/a/b/../c/./d//e/"), "/a/c/d/e")
-            assert_eq(path.normalize("/../../etc"), "/etc")
-            assert_eq(path.normalize("a/../../b"), "../b")
             assert_eq(path.normalize(""), ".")
             assert_eq(path.normalize("./."), ".")
-
-            assert_eq(path.components("/a/b/../c"), ["/", "a", "b", "..", "c"])
             assert_eq(path.components("x//y/z/"), ["x", "y", "z"])
             55
         }
@@ -401,25 +415,47 @@ fn env_time_process_and_runtime_modules_work_end_to_end() {
             assert_eq(process.current_pid(), process.pid())
             assert(process.shell_available())
 
-            let sh_out = process.shell("printf '%s' 'hello-shell'").unwrap()
-            assert(sh_out.success())
-            assert_eq(sh_out.status, 0)
-            assert_eq(sh_out.stdout, "hello-shell")
+            if env.os() == "windows" {
+                let sh_out = process.shell("echo hello-shell").unwrap()
+                assert(sh_out.success())
+                assert_eq(sh_out.status, 0)
+                assert_eq(sh_out.stdout.trim(), "hello-shell")
 
-            let cat_out = process.exec("sh", args = ["-c", "cat"], stdin_data = "piped-input").unwrap()
-            assert(cat_out.success())
-            assert_eq(cat_out.stdout, "piped-input")
+                let cat_out = process.exec("findstr", args = ["piped"], stdin_data = "piped-input\r\n").unwrap()
+                assert(cat_out.success())
+                assert_eq(cat_out.stdout.trim(), "piped-input")
 
-            let nonzero = process.shell("exit 7").unwrap()
-            assert(not nonzero.success())
-            assert_eq(nonzero.status, 7)
+                let nonzero = process.shell("exit /b 7").unwrap()
+                assert(not nonzero.success())
+                assert_eq(nonzero.status, 7)
 
-            let missing_bin = process.exec("/nonexistent_nessa_binary_xyz_999") match {
-                _! => false,
-                error IoError.NotFound(_) => true,
-                error _ => false,
+                let missing_bin = process.exec("C:\\nonexistent_nessa_binary_xyz_999.exe") match {
+                    _! => false,
+                    error IoError.NotFound(_) => true,
+                    error _ => false,
+                }
+                assert(missing_bin)
+            } else {
+                let sh_out = process.shell("printf '%s' 'hello-shell'").unwrap()
+                assert(sh_out.success())
+                assert_eq(sh_out.status, 0)
+                assert_eq(sh_out.stdout, "hello-shell")
+
+                let cat_out = process.exec("sh", args = ["-c", "cat"], stdin_data = "piped-input").unwrap()
+                assert(cat_out.success())
+                assert_eq(cat_out.stdout, "piped-input")
+
+                let nonzero = process.shell("exit 7").unwrap()
+                assert(not nonzero.success())
+                assert_eq(nonzero.status, 7)
+
+                let missing_bin = process.exec("/nonexistent_nessa_binary_xyz_999") match {
+                    _! => false,
+                    error IoError.NotFound(_) => true,
+                    error _ => false,
+                }
+                assert(missing_bin)
             }
-            assert(missing_bin)
 
             -- runtime
             assert_eq(runtime.VERSION, "Nessa 0.1.0")

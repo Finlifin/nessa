@@ -89,6 +89,28 @@ pub(crate) fn fresh_entropy_pair() -> (i64, i64) {
         }
     }
 
+    #[cfg(windows)]
+    {
+        #[link(name = "bcryptprimitives")]
+        unsafe extern "system" {
+            fn ProcessPrng(pb_data: *mut u8, cb_data: usize) -> i32;
+        }
+        let mut buf = [0u8; 16];
+        // SAFETY: `ProcessPrng` (Windows 8+, already imported by Rust `std`) fills `buf`
+        // with 16 cryptographically random bytes in-place.
+        let ok = unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) };
+        if ok != 0 {
+            let r0 = u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            let r1 = u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]);
+            mix_a ^= r0;
+            mix_b ^= r1;
+        }
+    }
+
     let s1 = splitmix64_next(&mut mix_a) as i64;
     let s2 = splitmix64_next(&mut mix_b) as i64;
     (s1, s2)

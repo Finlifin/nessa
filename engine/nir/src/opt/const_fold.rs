@@ -72,16 +72,16 @@ pub(crate) fn try_eval_const_expr(expr: &NirExpr, type_pool: &TypePool) -> Optio
             ids::I128_BITS | ids::U128_BITS => Some(NirValue::ConstInt(128)),
             _ => None,
         },
-        NirExpr::CallBuiltin(ids::STR_LEN | ids::STR_BYTE_COUNT, args) => match args.as_slice() {
-            [NirValue::ConstStr(sid)] => {
-                Some(NirValue::ConstInt(str_interner::get(*sid).len() as i64))
-            }
+        NirExpr::CallBuiltin(ids::STR_LEN, args) => match args.as_slice() {
+            [NirValue::ConstStr(sid)] => Some(NirValue::ConstInt(
+                crate::decode_nir_const_str(*sid).len() as i64,
+            )),
             _ => None,
         },
         NirExpr::CallBuiltin(ids::STR_IS_EMPTY, args) => match args.as_slice() {
-            [NirValue::ConstStr(sid)] => {
-                Some(NirValue::ConstBool(str_interner::get(*sid).is_empty()))
-            }
+            [NirValue::ConstStr(sid)] => Some(NirValue::ConstBool(
+                crate::decode_nir_const_str(*sid).is_empty(),
+            )),
             _ => None,
         },
         _ => None,
@@ -565,4 +565,36 @@ fn collect_single_def_constants(func: &NirFunction) -> HashMap<NirLocal, NirValu
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_eval_const_expr_decodes_quoted_and_escaped_nir_const_strings() {
+        let pool = TypePool::new();
+
+        let empty_sid = str_interner::intern("\"\"");
+        let len_empty = try_eval_const_expr(
+            &NirExpr::CallBuiltin(ids::STR_LEN, vec![NirValue::ConstStr(empty_sid)]),
+            &pool,
+        );
+        assert!(matches!(len_empty, Some(NirValue::ConstInt(0))));
+
+        let is_empty = try_eval_const_expr(
+            &NirExpr::CallBuiltin(ids::STR_IS_EMPTY, vec![NirValue::ConstStr(empty_sid)]),
+            &pool,
+        );
+        assert!(matches!(is_empty, Some(NirValue::ConstBool(true))));
+
+        // Source literal `"C:\\win10"` has raw token `"\"C:\\\\win10\""` (11 bytes)
+        // and decoded runtime value `"C:\\win10"` (8 bytes).
+        let win_sid = str_interner::intern("\"C:\\\\win10\"");
+        let len_win = try_eval_const_expr(
+            &NirExpr::CallBuiltin(ids::STR_LEN, vec![NirValue::ConstStr(win_sid)]),
+            &pool,
+        );
+        assert!(matches!(len_win, Some(NirValue::ConstInt(8))));
+    }
 }

@@ -1096,13 +1096,7 @@ impl Codegen {
                 self.emit_load_const(emitter, dst, index);
             }
             NirValue::ConstStr(str_id) => {
-                // Strip surrounding quotes and process escape sequences.
-                let raw = str_interner::get(*str_id);
-                let content = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-                    process_string_escapes(&raw[1..raw.len() - 1])
-                } else {
-                    raw.to_string()
-                };
+                let content = nir::decode_nir_const_str(*str_id);
                 let global_idx = emitter.add_constant(Constant::Str(content));
                 self.emit_load_const(emitter, dst, global_idx);
             }
@@ -1135,53 +1129,6 @@ impl Default for Codegen {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Process Nessa string escape sequences: \n \t \r \0 \\ \" \' \xHH \uHHHH, and
-/// the doubled braces `{{` and `}}`. The lexer has validated the literal.
-fn process_string_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if matches!(c, '{' | '}') && chars.peek() == Some(&c) {
-            chars.next();
-            out.push(c);
-        } else if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('0') => out.push('\0'),
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some('\'') => out.push('\''),
-                Some('x') => {
-                    let h1 = chars.next().unwrap_or('0');
-                    let h2 = chars.next().unwrap_or('0');
-                    let hex = format!("{}{}", h1, h2);
-                    if let Ok(v) = u8::from_str_radix(&hex, 16) {
-                        out.push(v as char);
-                    }
-                }
-                Some('u') => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(v) = u32::from_str_radix(&hex, 16)
-                        && let Some(ch) = char::from_u32(v)
-                    {
-                        out.push(ch);
-                    }
-                }
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Compile a NIR module into bytecode.

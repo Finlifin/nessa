@@ -1,5 +1,7 @@
 pub mod reactor;
 pub mod reactor_net;
+#[cfg(windows)]
+mod win_reactor;
 
 use std::cell::UnsafeCell;
 use std::ptr;
@@ -16,10 +18,10 @@ pub use reactor::{ProcessOutcome, ProcessSpec, TaskOpPoll, TaskOpResult};
 pub use reactor_net::NetOutcome;
 
 // ---------------------------------------------------------------------------
-// EventLoop — safe wrapper around libuv's uv_loop_t
+// EventLoop — safe wrapper around libuv's uv_loop_t (Unix) / monotonic loop (Windows)
 // ---------------------------------------------------------------------------
 
-/// Run mode for the libuv event loop.
+/// Run mode for the host event loop.
 pub enum RunMode {
     /// Run until no active handles/requests.
     Default,
@@ -29,6 +31,7 @@ pub enum RunMode {
     NoWait,
 }
 
+#[cfg(unix)]
 impl RunMode {
     fn into_uv(self) -> libuv_sys2::uv_run_mode {
         match self {
@@ -39,11 +42,13 @@ impl RunMode {
     }
 }
 
-/// Thin safe wrapper around a libuv event loop (`uv_loop_t`).
+/// Thin safe wrapper around the platform event loop.
+#[cfg(unix)]
 pub struct EventLoop {
     handle: *mut libuv_sys2::uv_loop_t,
 }
 
+#[cfg(unix)]
 impl EventLoop {
     /// Create a new event loop.
     pub fn new() -> Self {
@@ -85,12 +90,7 @@ impl EventLoop {
     }
 }
 
-impl Default for EventLoop {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+#[cfg(unix)]
 impl Drop for EventLoop {
     fn drop(&mut self) {
         // SAFETY: Drain pending close callbacks before deleting the owned loop.
@@ -103,7 +103,48 @@ impl Drop for EventLoop {
 
 // SAFETY: `EventLoop` owns an isolated `uv_loop_t` heap allocation and has no thread-local ties
 // when moved between threads under synchronization.
+#[cfg(unix)]
 unsafe impl Send for EventLoop {}
+
+/// Lightweight Windows event-loop handle (all async I/O runs on `nessa-io-reactor`).
+#[cfg(windows)]
+pub struct EventLoop {
+    origin: std::time::Instant,
+}
+
+#[cfg(windows)]
+impl EventLoop {
+    /// Create a new event loop.
+    pub fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+        }
+    }
+
+    /// Poll once; async handles are driven on `nessa-io-reactor`.
+    pub fn run(&mut self, _mode: RunMode) -> i32 {
+        0
+    }
+
+    /// Check if the inline loop has active handles.
+    pub fn is_alive(&self) -> bool {
+        false
+    }
+
+    /// Stop the inline loop.
+    pub fn stop(&mut self) {}
+
+    /// Return monotonic elapsed milliseconds.
+    pub fn now(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+}
+
+impl Default for EventLoop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TaskArena — Lock-free chunked O(1) generational slot table

@@ -39,7 +39,7 @@ struct BridgeSession {
     jit_call_depth: u32,
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 static JIT_HELPERS: JitHelpers = JitHelpers {
     alloc_slots: helper_alloc_slots,
     safepoint: helper_safepoint,
@@ -58,7 +58,7 @@ static JIT_HELPERS: JitHelpers = JitHelpers {
     call_direct_fast: helper_call_direct_fast,
 };
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 static JIT_HELPERS: JitHelpers = JitHelpers {
     alloc_slots: helper_alloc_slots,
     safepoint: helper_safepoint,
@@ -497,10 +497,10 @@ fn finish_dispatch(
 
 macro_rules! def_jit_helper {
     (fn $name:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty $body:block) => {
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
         unsafe extern "sysv64" fn $name( $($arg : $ty),* ) -> $ret $body
 
-        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
         unsafe extern "C" fn $name( $($arg : $ty),* ) -> $ret $body
     };
 }

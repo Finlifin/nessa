@@ -167,6 +167,53 @@ fn process_cpu_seconds() -> f64 {
             return (ts.tv_sec as f64) + (ts.tv_nsec as f64) * 1e-9;
         }
     }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FileTime {
+            low_date_time: u32,
+            high_date_time: u32,
+        }
+        impl FileTime {
+            fn to_u64(self) -> u64 {
+                (u64::from(self.high_date_time) << 32) | u64::from(self.low_date_time)
+            }
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn GetProcessTimes(
+                process: *mut std::ffi::c_void,
+                creation_time: *mut FileTime,
+                exit_time: *mut FileTime,
+                kernel_time: *mut FileTime,
+                user_time: *mut FileTime,
+            ) -> i32;
+        }
+        let zero = FileTime {
+            low_date_time: 0,
+            high_date_time: 0,
+        };
+        let mut creation = zero;
+        let mut exit = zero;
+        let mut kernel = zero;
+        let mut user = zero;
+        // SAFETY: `GetProcessTimes` writes 100-ns ticks into stack-allocated `FileTime` structs.
+        let ok = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if ok != 0 {
+            let total_100ns = kernel.to_u64().saturating_add(user.to_u64());
+            return (total_100ns as f64) * 1e-7;
+        }
+    }
     monotonic_origin().elapsed().as_secs_f64()
 }
 
@@ -326,6 +373,113 @@ mod unix_time {
     }
 }
 
+#[cfg(windows)]
+mod win_time {
+    use std::ffi::c_int;
+
+    use super::{BrokenDownTime, CivilDateTimeInput, make_unix_utc};
+
+    #[repr(C)]
+    pub(super) struct WinTm {
+        pub tm_sec: c_int,
+        pub tm_min: c_int,
+        pub tm_hour: c_int,
+        pub tm_mday: c_int,
+        pub tm_mon: c_int,
+        pub tm_year: c_int,
+        pub tm_wday: c_int,
+        pub tm_yday: c_int,
+        pub tm_isdst: c_int,
+    }
+
+    // SAFETY: Standard Windows UCRT 64-bit time conversion routines (`api-ms-win-crt-time-l1-1-0`).
+    unsafe extern "C" {
+        fn _localtime64_s(tm_out: *mut WinTm, timep: *const i64) -> c_int;
+        fn _mktime64(tm: *mut WinTm) -> i64;
+    }
+
+    pub(super) fn breakdown_local_win(unix_secs: i64) -> Option<BrokenDownTime> {
+        if unix_secs < 0 {
+            return None;
+        }
+        let mut tm = WinTm {
+            tm_sec: 0,
+            tm_min: 0,
+            tm_hour: 0,
+            tm_mday: 0,
+            tm_mon: 0,
+            tm_year: 0,
+            tm_wday: 0,
+            tm_yday: 0,
+            tm_isdst: 0,
+        };
+        // SAFETY: `tm` and `unix_secs` are valid stack variables; `_localtime64_s` is thread-safe.
+        let rc = unsafe { _localtime64_s(&raw mut tm, &raw const unix_secs) };
+        if rc != 0 {
+            return None;
+        }
+        let year = i64::from(tm.tm_year) + 1900;
+        let month = i64::from(tm.tm_mon) + 1;
+        let day = i64::from(tm.tm_mday);
+        let hour = i64::from(tm.tm_hour);
+        let min = i64::from(tm.tm_min);
+        let sec = i64::from(tm.tm_sec);
+        let local_as_utc = make_unix_utc(CivilDateTimeInput {
+            year,
+            month,
+            day,
+            hour,
+            min,
+            sec: sec.min(59),
+            is_dst: 0,
+        })
+        .unwrap_or(unix_secs);
+        let gmtoff_secs = local_as_utc.saturating_sub(unix_secs);
+        Some(BrokenDownTime {
+            year,
+            month,
+            day,
+            hour,
+            min,
+            sec,
+            wday_sun1: i64::from(tm.tm_wday) + 1,
+            yday_1_366: i64::from(tm.tm_yday) + 1,
+            is_dst: tm.tm_isdst > 0,
+            gmtoff_secs,
+            tz_abbrev: String::new(),
+        })
+    }
+
+    pub(super) fn mktime_local_win(input: CivilDateTimeInput) -> Option<i64> {
+        let tm_year = c_int::try_from(input.year.checked_sub(1900)?).ok()?;
+        let tm_mon = c_int::try_from(input.month.checked_sub(1)?).ok()?;
+        let tm_mday = c_int::try_from(input.day).ok()?;
+        let tm_hour = c_int::try_from(input.hour).ok()?;
+        let tm_min = c_int::try_from(input.min).ok()?;
+        let tm_sec = c_int::try_from(input.sec).ok()?;
+        let tm_isdst = input.is_dst.clamp(-1, 1) as c_int;
+
+        let mut tm = WinTm {
+            tm_sec,
+            tm_min,
+            tm_hour,
+            tm_mday,
+            tm_mon,
+            tm_year,
+            tm_wday: -1,
+            tm_yday: 0,
+            tm_isdst,
+        };
+        // SAFETY: `tm` is a fully initialized local `struct tm` passed to `_mktime64`.
+        let res = unsafe { _mktime64(&raw mut tm) };
+        if res == -1 && tm.tm_wday == -1 {
+            None
+        } else {
+            Some(res)
+        }
+    }
+}
+
 fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
@@ -404,6 +558,12 @@ fn breakdown_timestamp(unix_secs: i64, utc: bool) -> BrokenDownTime {
             return bt;
         }
     }
+    #[cfg(windows)]
+    {
+        if let Some(bt) = win_time::breakdown_local_win(unix_secs) {
+            return bt;
+        }
+    }
     breakdown_civil_utc(unix_secs)
 }
 
@@ -475,16 +635,23 @@ pub fn time_make_unix(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
         {
             unix_time::mktime_local(input)
         }
-        #[cfg(not(all(
-            unix,
-            target_pointer_width = "64",
-            any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_os = "dragonfly",
+        #[cfg(windows)]
+        {
+            win_time::mktime_local_win(input)
+        }
+        #[cfg(not(any(
+            windows,
+            all(
+                unix,
+                target_pointer_width = "64",
+                any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                )
             )
         )))]
         {

@@ -10,6 +10,7 @@
 //!    verification in Node.js (V8 WebAssembly + `node:wasi`).
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -783,7 +784,8 @@ pub fn hypot_sq(a: f64, b: f64) -> f64 {
         vec![wasm::WasmVal::f64(25.0)]
     );
 
-    // 3. Cross-runtime verification against Node.js (V8 WebAssembly + `node:wasi`) if `/usr/bin/node` is present!
+    // 3. Cross-runtime verification against Node.js (V8 WebAssembly + `node:wasi`) on Unix hosts with `/usr/bin/node`!
+    #[cfg(unix)]
     if Path::new("/usr/bin/node").is_file() {
         let node_script = format!(
             r#"

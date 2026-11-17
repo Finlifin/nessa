@@ -89,6 +89,63 @@ pub enum NirValue {
     Null,
 }
 
+/// Decode an interned NIR `ConstStr` symbol into its runtime UTF-8 string value
+/// (stripping surrounding literal quotes and unescaping `\n`, `\t`, `\r`, `\0`, `\\`, `\"`,
+/// `\'`, `\xHH`, `\uHHHH`, and doubled interpolation braces `{{` / `}}`).
+pub fn decode_nir_const_str(str_id: StrId) -> String {
+    let raw = str_interner::get(str_id);
+    if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+        process_nir_string_escapes(&raw[1..raw.len() - 1])
+    } else {
+        raw.to_string()
+    }
+}
+
+fn process_nir_string_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '{' | '}') && chars.peek() == Some(&c) {
+            chars.next();
+            out.push(c);
+        } else if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('0') => out.push('\0'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('\'') => out.push('\''),
+                Some('x') => {
+                    let h1 = chars.next().unwrap_or('0');
+                    let h2 = chars.next().unwrap_or('0');
+                    let hex = format!("{h1}{h2}");
+                    if let Ok(v) = u8::from_str_radix(&hex, 16) {
+                        out.push(v as char);
+                    }
+                }
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(v) = u32::from_str_radix(&hex, 16)
+                        && let Some(ch) = char::from_u32(v)
+                    {
+                        out.push(ch);
+                    }
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // BinOp / UnaryOp — arithmetic and logic operations
 // ---------------------------------------------------------------------------

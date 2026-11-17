@@ -221,15 +221,25 @@ fn open_dynamic_library(spec: &str) -> Result<libloading::Library, VmError> {
     let has_sep = spec.contains('/') || spec.contains('\\');
     let path = Path::new(spec);
     if !has_sep && path.extension().is_none() {
-        let candidate = if cfg!(target_os = "macos") {
-            format!("lib{spec}.dylib")
+        if cfg!(target_os = "macos") {
+            let candidate = format!("lib{spec}.dylib");
+            // SAFETY: Capability-authorized dynamic library load outside managed GC frames.
+            if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
+                return Ok(lib);
+            }
         } else if cfg!(target_os = "windows") {
-            format!("{spec}.dll")
+            for candidate in [format!("{spec}.dll"), format!("lib{spec}.dll")] {
+                // SAFETY: Capability-authorized dynamic library load outside managed GC frames.
+                if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
+                    return Ok(lib);
+                }
+            }
         } else {
-            format!("lib{spec}.so")
-        };
-        if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
-            return Ok(lib);
+            let candidate = format!("lib{spec}.so");
+            // SAFETY: Capability-authorized dynamic library load outside managed GC frames.
+            if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
+                return Ok(lib);
+            }
         }
     }
     Err(VmError::InvalidArgument(

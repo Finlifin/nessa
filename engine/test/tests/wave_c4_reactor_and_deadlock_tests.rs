@@ -5,6 +5,7 @@
 //! - Global deadlock detection returns `VmError::DeadlockDetected` when tasks suspend cyclically with zero runnable tasks and zero active I/O
 
 use std::sync::Mutex;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use initialization::{Engine, EngineConfig};
@@ -151,6 +152,11 @@ fn single_worker_heartbeat_maintains_sub_5ms_latency_across_sleep_process_and_fs
     let tmp_file = tmp_dir.join("payload.txt");
     let tmp_file_str = tmp_file.to_string_lossy().replace('\\', "/");
 
+    #[cfg(windows)]
+    let proc_cmd = "echo ok >nul";
+    #[cfg(not(windows))]
+    let proc_cmd = "sleep 0.18";
+
     let source = format!(
         r#"
 use std.collections.*
@@ -188,7 +194,7 @@ pub fn main() -> i64 {{
             1
         }},
         async io_proc() => {{
-            let out = process.shell("sleep 0.18") ! {{
+            let out = process.shell("{proc_cmd}") ! {{
                 _ => CommandOutput {{ status: -99, stdout: "", stderr: "" }},
             }}
             out.status

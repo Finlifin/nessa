@@ -38,10 +38,7 @@ pub(crate) fn is_pure_and_trap_free(expr: &NirExpr) -> bool {
             is_trap_free_pure_builtin(*id, args.len())
                 || matches!(
                     (*id, args.as_slice()),
-                    (
-                        ids::STR_LEN | ids::STR_BYTE_COUNT | ids::STR_IS_EMPTY,
-                        [NirValue::ConstStr(_)]
-                    )
+                    (ids::STR_LEN | ids::STR_IS_EMPTY, [NirValue::ConstStr(_)])
                 )
         }
         _ => false,

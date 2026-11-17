@@ -17,11 +17,11 @@
 
 pub mod arch;
 pub mod code_cache;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod tier1;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod tier2;
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod x86_64;
 
 use std::ffi::c_void;
@@ -357,8 +357,8 @@ impl JitRuntimeCtx {
     pub const OFF_ALLOW_TIER2_LOOPS: i32 = std::mem::offset_of!(Self, allow_tier2_loops) as i32;
 }
 
-/// Trampoline function signature on `x86_64` Unix (`SysV64` calling convention).
-#[cfg(all(target_arch = "x86_64", unix))]
+/// Trampoline function signature on `x86_64` (`SysV64` calling convention across Unix & Windows).
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub type JitEntryFn = unsafe extern "sysv64" fn(
     vm_opaque: *mut c_void,
     regs_ptr: *mut u64,
@@ -367,7 +367,7 @@ pub type JitEntryFn = unsafe extern "sysv64" fn(
 );
 
 /// Trampoline function signature on non-`x86_64` targets.
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 pub type JitEntryFn = unsafe extern "C" fn(
     vm_opaque: *mut c_void,
     regs_ptr: *mut u64,
@@ -380,7 +380,7 @@ pub type JitEntryFn = unsafe extern "C" fn(
 /// Every callback returns `0` (`Continue`) or a non-zero [`JitExitKind`] discriminant
 /// (`Yield`, `SuspendRetry`, `Cancelled`, or `Trap`). All managed values reside in
 /// `StackContext` prior to any callback invocation.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 #[derive(Clone, Copy)]
 pub struct JitHelpers {
     pub alloc_slots: unsafe extern "sysv64" fn(vm_opaque: *mut c_void, count: u32) -> u32,
@@ -432,7 +432,7 @@ pub struct JitHelpers {
     ) -> u32,
 }
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
 #[derive(Clone, Copy)]
 pub struct JitHelpers {
     pub alloc_slots: unsafe extern "C" fn(vm_opaque: *mut c_void, count: u32) -> u32,

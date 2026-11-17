@@ -116,7 +116,7 @@ fn main() -> i64 {
         } else {
             expected_val = Some(val);
         }
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
         if mode != JitMode::Off {
             let stats = engine.vm.jit_stats();
             assert!(

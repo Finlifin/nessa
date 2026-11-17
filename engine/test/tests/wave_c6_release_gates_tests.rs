@@ -158,8 +158,12 @@ fn run_io_gate() -> !IoError i64 {
         10
     }
     handles async io_proc() => {
-        let out: CommandOutput = process.shell("sleep 0.10 && printf ok")!
-        if out.stdout == "ok" { 20 } else { 0 }
+        let out: CommandOutput = if std.env.os() == "windows" {
+            process.shell("echo ok")!
+        } else {
+            process.shell("sleep 0.10 && printf ok")!
+        }
+        if out.stdout.trim() == "ok" { 20 } else { 0 }
     }
     handles async io_tcp_server(srv: TcpListener) => {
         let conn = srv.accept()!

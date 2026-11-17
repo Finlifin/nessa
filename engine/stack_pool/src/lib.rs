@@ -34,16 +34,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Size of a single stack slot (8 MB on native Unix, 128 KB on portable/wasm32).
+/// Size of a single stack slot (8 MB on native Unix, 2 MB on Windows, 128 KB on portable/wasm32).
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 const SLOT_SIZE: usize = 8 * 1024 * 1024;
-#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+const SLOT_SIZE: usize = 2 * 1024 * 1024;
+#[cfg(not(all(any(unix, windows), not(target_arch = "wasm32"))))]
 const SLOT_SIZE: usize = 128 * 1024;
 
 /// Initial segment capacity (number of slots).
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 const INITIAL_SEGMENT_SLOTS: usize = 64;
-#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+#[cfg(not(all(any(unix, windows), not(target_arch = "wasm32"))))]
 const INITIAL_SEGMENT_SLOTS: usize = 16;
 
 /// Maximum slots per newly grown segment (caps VMA split burst while allowing >1M total slots).
@@ -119,8 +121,83 @@ struct Segment {
     guard_slot: Option<usize>,
     /// Tracks whether each slot's guard page has been `mprotect(PROT_NONE)`-initialized.
     guarded: Box<[AtomicBool]>,
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    #[cfg(not(all(any(unix, windows), not(target_arch = "wasm32"))))]
     _owned: Box<[u8]>,
+}
+
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+mod win_sys {
+    use std::ffi::c_void;
+
+    pub const MEM_COMMIT: u32 = 0x0000_1000;
+    pub const MEM_RESERVE: u32 = 0x0000_2000;
+    pub const MEM_DECOMMIT: u32 = 0x0000_4000;
+    pub const MEM_RELEASE: u32 = 0x0000_8000;
+    pub const PAGE_NOACCESS: u32 = 0x01;
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    pub const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    pub const STATUS_STACK_OVERFLOW_EXIT: u32 = 0xC000_00FD;
+
+    #[repr(C)]
+    pub struct SystemInfo {
+        pub processor_architecture: u16,
+        pub reserved: u16,
+        pub page_size: u32,
+        pub minimum_application_address: *mut c_void,
+        pub maximum_application_address: *mut c_void,
+        pub active_processor_mask: usize,
+        pub number_of_processors: u32,
+        pub processor_type: u32,
+        pub allocation_granularity: u32,
+        pub processor_level: u16,
+        pub processor_revision: u16,
+    }
+
+    #[repr(C)]
+    pub struct ExceptionRecord {
+        pub exception_code: u32,
+        pub exception_flags: u32,
+        pub exception_record: *mut ExceptionRecord,
+        pub exception_address: *mut c_void,
+        pub number_parameters: u32,
+        pub exception_information: [usize; 15],
+    }
+
+    #[repr(C)]
+    pub struct ExceptionPointers {
+        pub exception_record: *mut ExceptionRecord,
+        pub context_record: *mut c_void,
+    }
+
+    pub type VectoredExceptionHandler = unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn VirtualAlloc(
+            lp_address: *mut c_void,
+            dw_size: usize,
+            fl_allocation_type: u32,
+            fl_protect: u32,
+        ) -> *mut c_void;
+        pub fn VirtualFree(lp_address: *mut c_void, dw_size: usize, dw_free_type: u32) -> i32;
+        pub fn GetSystemInfo(lp_system_info: *mut SystemInfo);
+        pub fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: VectoredExceptionHandler,
+        ) -> *mut c_void;
+        pub fn GetStdHandle(n_std_handle: u32) -> *mut c_void;
+        pub fn WriteFile(
+            h_file: *mut c_void,
+            lp_buffer: *const u8,
+            n_number_of_bytes_to_write: u32,
+            lp_number_of_bytes_written: *mut u32,
+            lp_overlapped: *mut c_void,
+        ) -> i32;
+        pub fn GetCurrentProcess() -> *mut c_void;
+        pub fn TerminateProcess(h_process: *mut c_void, u_exit_code: u32) -> i32;
+    }
 }
 
 // SAFETY: Segment exclusively owns its mmap/heap reservation, which has no thread
@@ -162,7 +239,40 @@ impl Segment {
         }
     }
 
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    #[cfg(all(windows, not(target_arch = "wasm32")))]
+    fn new(slot_count: usize) -> Self {
+        let mmap_size = slot_count * SLOT_SIZE;
+        // Reserve virtual address space with `PAGE_NOACCESS` (0 bytes of pagefile commit charge).
+        // Each slot's usable pages are committed lazily on `StackPool::alloc`, keeping the
+        // bottom page of every slot as an unmapped `PAGE_NOACCESS` hardware guard page.
+        // SAFETY: `VirtualAlloc` with null address and `MEM_RESERVE` reserves fresh VA space.
+        let base = unsafe {
+            win_sys::VirtualAlloc(
+                ptr::null_mut(),
+                mmap_size,
+                win_sys::MEM_RESERVE,
+                win_sys::PAGE_NOACCESS,
+            )
+        };
+        assert!(
+            !base.is_null(),
+            "VirtualAlloc(MEM_RESERVE) failed for stack segment ({mmap_size} bytes)"
+        );
+        let base = base.cast::<u8>();
+
+        let guard_slot = register_guard_segment(base as usize, mmap_size);
+        let guarded: Vec<AtomicBool> = (0..slot_count).map(|_| AtomicBool::new(false)).collect();
+
+        Self {
+            base,
+            slot_count,
+            mmap_size,
+            guard_slot,
+            guarded: guarded.into_boxed_slice(),
+        }
+    }
+
+    #[cfg(not(all(any(unix, windows), not(target_arch = "wasm32"))))]
     fn new(slot_count: usize) -> Self {
         let mmap_size = slot_count * SLOT_SIZE;
         let mut owned = vec![0u8; mmap_size].into_boxed_slice();
@@ -205,7 +315,16 @@ impl Drop for Segment {
                 libc::munmap(self.base as *mut libc::c_void, self.mmap_size);
             }
         }
-        #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+        #[cfg(all(windows, not(target_arch = "wasm32")))]
+        {
+            unregister_guard_segment(self.guard_slot);
+            // SAFETY: `self.base` is the base address returned by `VirtualAlloc(MEM_RESERVE)`;
+            // `MEM_RELEASE` requires `dwSize == 0` and releases all reserved/committed pages.
+            unsafe {
+                let _ = win_sys::VirtualFree(self.base.cast(), 0, win_sys::MEM_RELEASE);
+            }
+        }
+        #[cfg(not(all(any(unix, windows), not(target_arch = "wasm32"))))]
         {
             let _ = self.guard_slot;
         }
@@ -281,6 +400,27 @@ impl StackPool {
             (handle, need_guard)
         };
 
+        #[cfg(all(windows, not(target_arch = "wasm32")))]
+        {
+            let _ = need_guard;
+            let usable_size = handle.usable_size();
+            // SAFETY: `[handle.base, handle.top)` lies strictly within the segment's live
+            // `MEM_RESERVE` region above the `PAGE_NOACCESS` guard page and is exclusively owned.
+            let committed = unsafe {
+                win_sys::VirtualAlloc(
+                    handle.base.cast(),
+                    usable_size,
+                    win_sys::MEM_COMMIT,
+                    win_sys::PAGE_READWRITE,
+                )
+            };
+            assert!(
+                !committed.is_null(),
+                "VirtualAlloc(MEM_COMMIT) failed for stack slot {:?}",
+                handle.id
+            );
+        }
+
         if need_guard {
             #[cfg(all(unix, not(target_arch = "wasm32")))]
             {
@@ -321,6 +461,19 @@ impl StackPool {
                     usable_size,
                     libc::MADV_DONTNEED,
                 );
+            }
+        }
+
+        #[cfg(all(windows, not(target_arch = "wasm32")))]
+        {
+            let usable_start = handle.base;
+            let usable_size = handle.usable_size();
+            // SAFETY: `[handle.base, handle.top)` is exclusively owned prior to returning `handle.id`
+            // to `free_list`; `MEM_DECOMMIT` reclaims physical pages and commit charge while keeping
+            // the segment's VA reservation and `PAGE_NOACCESS` guard page intact.
+            unsafe {
+                let _ =
+                    win_sys::VirtualFree(usable_start.cast(), usable_size, win_sys::MEM_DECOMMIT);
             }
         }
 
@@ -430,6 +583,8 @@ static CACHED_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 static SIGACTION_INIT: Once = Once::new();
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 static mut PREV_SIGACTION: libc::sigaction = unsafe { std::mem::zeroed() };
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+static VEH_INIT: Once = Once::new();
 
 fn register_guard_segment(base: usize, size: usize) -> Option<usize> {
     if base == 0 {
@@ -529,7 +684,59 @@ pub fn install_guard_page_handler() {
     });
 }
 
-#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+pub fn install_guard_page_handler() {
+    let _ = page_size();
+    VEH_INIT.call_once(|| {
+        // SAFETY: `guard_page_veh_handler` is a valid `extern "system"` callback inspecting only
+        // lock-free atomic guard-region bounds before chaining non-guard exceptions.
+        let handle = unsafe { win_sys::AddVectoredExceptionHandler(1, guard_page_veh_handler) };
+        assert!(!handle.is_null(), "AddVectoredExceptionHandler failed");
+    });
+}
+
+#[cfg(all(windows, not(target_arch = "wasm32")))]
+unsafe extern "system" fn guard_page_veh_handler(info: *mut win_sys::ExceptionPointers) -> i32 {
+    if !info.is_null() {
+        // SAFETY: Windows passes a valid `EXCEPTION_POINTERS` structure to registered VEH callbacks.
+        let rec = unsafe { (*info).exception_record };
+        if !rec.is_null() {
+            // SAFETY: `rec` was checked non-null above.
+            let (code, nparams, fault_addr) = unsafe {
+                (
+                    (*rec).exception_code,
+                    (*rec).number_parameters,
+                    (*rec).exception_information[1],
+                )
+            };
+            if code == win_sys::EXCEPTION_ACCESS_VIOLATION
+                && nparams >= 2
+                && is_registered_guard_page(fault_addr)
+            {
+                let msg = b"fatal: Nessa task stack overflow (guard page hit)\r\n";
+                // SAFETY: Direct Win32 handle write + process termination without heap allocation.
+                unsafe {
+                    let stderr_h = win_sys::GetStdHandle(win_sys::STD_ERROR_HANDLE);
+                    let mut written = 0u32;
+                    let _ = win_sys::WriteFile(
+                        stderr_h,
+                        msg.as_ptr(),
+                        msg.len() as u32,
+                        &raw mut written,
+                        ptr::null_mut(),
+                    );
+                    let _ = win_sys::TerminateProcess(
+                        win_sys::GetCurrentProcess(),
+                        win_sys::STATUS_STACK_OVERFLOW_EXIT,
+                    );
+                }
+            }
+        }
+    }
+    win_sys::EXCEPTION_CONTINUE_SEARCH
+}
+
+#[cfg(not(all(any(unix, windows), not(target_arch = "wasm32"))))]
 pub fn install_guard_page_handler() {}
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -581,7 +788,19 @@ fn page_size() -> usize {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no preconditions.
     let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    #[cfg(all(windows, not(target_arch = "wasm32")))]
+    let ps = {
+        let mut info: win_sys::SystemInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `GetSystemInfo` writes into caller-allocated `SystemInfo`.
+        unsafe { win_sys::GetSystemInfo(&raw mut info) };
+        let p = info.page_size as usize;
+        if p >= 4096 && p.is_power_of_two() {
+            p
+        } else {
+            4096
+        }
+    };
+    #[cfg(not(all(any(unix, windows), not(target_arch = "wasm32"))))]
     let ps = 4096usize;
     CACHED_PAGE_SIZE.store(ps, Ordering::Relaxed);
     ps

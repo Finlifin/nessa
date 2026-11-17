@@ -42,6 +42,75 @@ unsafe impl Send for ExecutableBuffer {}
 // SAFETY: Sealed `PROT_READ | PROT_EXEC` bytes are immutable and safe for concurrent reads.
 unsafe impl Sync for ExecutableBuffer {}
 
+#[cfg(windows)]
+mod win_mem {
+    use std::ffi::c_void;
+
+    pub const MEM_COMMIT: u32 = 0x0000_1000;
+    pub const MEM_RESERVE: u32 = 0x0000_2000;
+    pub const MEM_RELEASE: u32 = 0x0000_8000;
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    #[repr(C)]
+    pub struct SystemInfo {
+        pub processor_architecture: u16,
+        pub reserved: u16,
+        pub page_size: u32,
+        pub minimum_application_address: *mut c_void,
+        pub maximum_application_address: *mut c_void,
+        pub active_processor_mask: usize,
+        pub number_of_processors: u32,
+        pub processor_type: u32,
+        pub allocation_granularity: u32,
+        pub processor_level: u16,
+        pub processor_revision: u16,
+    }
+
+    #[cfg(test)]
+    #[repr(C)]
+    pub struct MemoryBasicInformation {
+        pub base_address: *mut c_void,
+        pub allocation_base: *mut c_void,
+        pub allocation_protect: u32,
+        pub partition_id: u16,
+        pub region_size: usize,
+        pub state: u32,
+        pub protect: u32,
+        pub type_: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn VirtualAlloc(
+            lp_address: *mut c_void,
+            dw_size: usize,
+            fl_allocation_type: u32,
+            fl_protect: u32,
+        ) -> *mut c_void;
+        pub fn VirtualProtect(
+            lp_address: *mut c_void,
+            dw_size: usize,
+            fl_new_protect: u32,
+            lpfl_old_protect: *mut u32,
+        ) -> i32;
+        pub fn VirtualFree(lp_address: *mut c_void, dw_size: usize, dw_free_type: u32) -> i32;
+        pub fn GetCurrentProcess() -> *mut c_void;
+        pub fn FlushInstructionCache(
+            h_process: *mut c_void,
+            lp_base_address: *const c_void,
+            dw_size: usize,
+        ) -> i32;
+        pub fn GetSystemInfo(lp_system_info: *mut SystemInfo);
+        #[cfg(test)]
+        pub fn VirtualQuery(
+            lp_address: *const c_void,
+            lp_buffer: *mut MemoryBasicInformation,
+            dw_length: usize,
+        ) -> usize;
+    }
+}
+
 impl ExecutableBuffer {
     /// Allocate, populate, and W^X-seal a native code buffer.
     #[cfg(unix)]
@@ -107,7 +176,65 @@ impl ExecutableBuffer {
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub fn from_code(code: &[u8]) -> Result<Self, JitError> {
+        if code.is_empty() {
+            return Err(JitError::AllocationFailed);
+        }
+        let page_size = os_page_size();
+        let mapped_len = align_up(code.len(), page_size).ok_or(JitError::AllocationFailed)?;
+
+        // Phase 1: Allocate RW pages via `VirtualAlloc` (strict W^X: non-executable while writing).
+        // SAFETY: `VirtualAlloc` with null hint and `MEM_COMMIT | MEM_RESERVE` returns fresh RW pages.
+        let raw = unsafe {
+            win_mem::VirtualAlloc(
+                std::ptr::null_mut(),
+                mapped_len,
+                win_mem::MEM_COMMIT | win_mem::MEM_RESERVE,
+                win_mem::PAGE_READWRITE,
+            )
+        };
+        let ptr = NonNull::new(raw.cast::<u8>()).ok_or(JitError::AllocationFailed)?;
+
+        // SAFETY: `ptr` points to a freshly allocated RW region of `mapped_len >= code.len()` bytes.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            std::ptr::write_bytes(ptr.as_ptr(), 0xCC, mapped_len);
+            #[cfg(not(target_arch = "x86_64"))]
+            std::ptr::write_bytes(ptr.as_ptr(), 0x00, mapped_len);
+
+            std::ptr::copy_nonoverlapping(code.as_ptr(), ptr.as_ptr(), code.len());
+        }
+
+        // Phase 2: Transition RW -> RX (`PAGE_EXECUTE_READ`) and flush icache.
+        let mut old_protect = 0u32;
+        // SAFETY: `ptr` and `mapped_len` match the `VirtualAlloc` region.
+        let protect_ok = unsafe {
+            win_mem::VirtualProtect(
+                ptr.as_ptr().cast(),
+                mapped_len,
+                win_mem::PAGE_EXECUTE_READ,
+                &raw mut old_protect,
+            )
+        };
+        if protect_ok == 0 {
+            // SAFETY: Free allocation on failure so no virtual pages leak.
+            unsafe {
+                let _ = win_mem::VirtualFree(ptr.as_ptr().cast(), 0, win_mem::MEM_RELEASE);
+            }
+            return Err(JitError::AllocationFailed);
+        }
+
+        flush_instruction_cache(ptr.as_ptr(), code.len());
+
+        Ok(Self {
+            ptr,
+            code_len: code.len(),
+            mapped_len,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn from_code(_code: &[u8]) -> Result<Self, JitError> {
         Err(JitError::UnsupportedTarget)
     }
@@ -141,9 +268,15 @@ impl Drop for ExecutableBuffer {
                 let _ = libc::munmap(self.ptr.as_ptr().cast::<libc::c_void>(), self.mapped_len);
             }
         }
+        #[cfg(windows)]
+        {
+            // SAFETY: `self.ptr` was returned by `VirtualAlloc` and is released once on drop.
+            unsafe {
+                let _ = win_mem::VirtualFree(self.ptr.as_ptr().cast(), 0, win_mem::MEM_RELEASE);
+            }
+        }
     }
 }
-
 /// Bounded per-VM executable code cache.
 #[derive(Debug)]
 pub struct CodeCache {
@@ -226,7 +359,20 @@ fn os_page_size() -> usize {
     if raw > 0 { raw as usize } else { 4096 }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn os_page_size() -> usize {
+    let mut info: win_mem::SystemInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `GetSystemInfo` writes into caller-allocated `SystemInfo`.
+    unsafe { win_mem::GetSystemInfo(&raw mut info) };
+    let ps = info.page_size as usize;
+    if ps >= 4096 && ps.is_power_of_two() {
+        ps
+    } else {
+        4096
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_page_size() -> usize {
     4096
 }
@@ -253,6 +399,13 @@ fn flush_instruction_cache(_ptr: *const u8, _len: usize) {
             __clear_cache(start, end);
         }
     }
+    #[cfg(windows)]
+    {
+        // SAFETY: `_ptr .. _ptr + _len` is a valid `VirtualAlloc` region owned by caller.
+        unsafe {
+            let _ = win_mem::FlushInstructionCache(win_mem::GetCurrentProcess(), _ptr.cast(), _len);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -277,10 +430,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn executable_buffer_enforces_strict_wx_permissions() {
         // Minimal `ret` instruction on x86_64 (or non-empty byte sequence).
-        let buf = ExecutableBuffer::from_code(&[0xC3]).expect("mmap + mprotect should succeed");
+        let buf = ExecutableBuffer::from_code(&[0xC3]).expect("executable alloc should succeed");
         assert_eq!(buf.code_len(), 1);
         assert!(buf.mapped_len() >= 4096);
 
@@ -293,10 +446,25 @@ mod tests {
                 "sealed JIT buffer must be readable+executable and NEVER writable (got {perms})"
             );
         }
+
+        #[cfg(windows)]
+        {
+            let mut mbi: win_mem::MemoryBasicInformation = unsafe { std::mem::zeroed() };
+            // SAFETY: `buf.as_ptr()` is a live page-aligned allocation and `mbi` is valid.
+            let n = unsafe {
+                win_mem::VirtualQuery(
+                    buf.as_ptr().cast(),
+                    &raw mut mbi,
+                    std::mem::size_of::<win_mem::MemoryBasicInformation>(),
+                )
+            };
+            assert!(n > 0);
+            assert_eq!(mbi.protect, win_mem::PAGE_EXECUTE_READ);
+        }
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn code_cache_enforces_budget_and_falls_back_cleanly() {
         let page = os_page_size();
         let mut cache = CodeCache::new(page);

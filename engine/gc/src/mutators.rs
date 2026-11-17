@@ -10,11 +10,22 @@ use std::rc::Rc;
 use std::sync::{Condvar, Mutex};
 use std::thread::ThreadId;
 
+#[cfg(windows)]
+use crate::win_gc::{VMMutatorThread, VMThread, WinMutator};
+#[cfg(unix)]
 use mmtk::Mutator;
+#[cfg(unix)]
 use mmtk::util::opaque_pointer::{VMMutatorThread, VMThread};
 
-use crate::{GC_FLAGS, NessaVM};
+use crate::GC_FLAGS;
+#[cfg(unix)]
+use crate::NessaVM;
 use std::sync::atomic::Ordering;
+
+#[cfg(unix)]
+pub(crate) type RawMutator = Mutator<NessaVM>;
+#[cfg(windows)]
+pub(crate) type RawMutator = WinMutator;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -287,7 +298,7 @@ impl MutatorLifecycle<'_> {
     fn unregister_raw(&self, identity: usize) {
         self.coordinator.unregister_reserved(identity);
     }
-    pub(crate) fn register(&self, tls: VMMutatorThread, pointer: *mut Mutator<NessaVM>) {
+    pub(crate) fn register(&self, tls: VMMutatorThread, pointer: *mut RawMutator) {
         self.register_raw(identity(tls.0), pointer as usize);
     }
     pub(crate) fn unregister(&self, tls: VMMutatorThread) {
@@ -340,13 +351,13 @@ pub(crate) fn block(tls: VMMutatorThread) {
     COORDINATOR.park(identity(tls.0), true);
 }
 
-pub(crate) fn stop_all() -> Vec<*mut Mutator<NessaVM>> {
+pub(crate) fn stop_all() -> Vec<*mut RawMutator> {
     // Publish the request before waiting, so running VM loops enter poll.
     GC_FLAGS.gc_requested.store(true, Ordering::Release);
     COORDINATOR
         .stop_all()
         .into_iter()
-        .map(|pointer| pointer as *mut Mutator<NessaVM>)
+        .map(|pointer| pointer as *mut RawMutator)
         .collect()
 }
 
@@ -365,28 +376,31 @@ pub(crate) fn contains(tls: VMThread) -> bool {
         .contains_key(&identity(tls))
 }
 
-pub(crate) fn lookup(tls: VMMutatorThread) -> *mut Mutator<NessaVM> {
+#[cfg(any(unix, test))]
+pub(crate) fn lookup(tls: VMMutatorThread) -> *mut RawMutator {
     COORDINATOR
         .registry
         .lock()
         .unwrap()
         .entries
         .get(&identity(tls.0))
-        .expect("MMTk requested an unregistered mutator")
-        .pointer as *mut Mutator<NessaVM>
+        .expect("collector requested an unregistered mutator")
+        .pointer as *mut RawMutator
 }
 
-pub(crate) fn pointers() -> Vec<*mut Mutator<NessaVM>> {
+#[cfg(any(unix, test))]
+pub(crate) fn pointers() -> Vec<*mut RawMutator> {
     COORDINATOR
         .registry
         .lock()
         .unwrap()
         .entries
         .values()
-        .map(|entry| entry.pointer as *mut Mutator<NessaVM>)
+        .map(|entry| entry.pointer as *mut RawMutator)
         .collect()
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn count() -> usize {
     COORDINATOR.registry.lock().unwrap().entries.len()
 }

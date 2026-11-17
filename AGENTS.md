@@ -78,6 +78,7 @@
 - 构建、测试、lint 和清理统一通过 `bash scripts/cargo.sh <cargo 参数>` 执行。隔离副本复制同一入口及根 `Cargo.toml` 的 profile 配置，设置共享 `CARGO_TARGET_DIR=/home/fin/nessa2/target`。入口持有目标目录外的独占锁，达到默认 6 GiB 缓存阈值时先自动 clean，避免清理正在运行的构建；使用同一目录的所有代理必须遵守该入口。
 - 开发/测试 profile 关闭增量缓存与完整调试信息，减少隔离副本产生的重复缓存。需要 Rust 调试信息时可临时用 `CARGO_PROFILE_DEV_DEBUG=2` / `CARGO_PROFILE_TEST_DEBUG=2`，调试后恢复；缓存阈值可通过正整数 `NESSA_BUILD_CACHE_LIMIT_KIB` 调整。不要修改宿主权限配置或将其它目录的删除混同为本次 clean 授权。
 - **并发执行测试二进制（默认要求）**：Cargo 原生 `cargo test` 会对工作区内近两百个独立测试二进制逐个串行执行。运行多目标集成测试（`nessa-test`）或全工作区回归时，**一律使用 `bash scripts/test-parallel.sh`**（内部先经 `scripts/cargo.sh` 独占锁一次性完成编译，再按最长作业优先与 `NESSA_TEST_JOBS` 并发度拉起多个测试二进制、为每个进程配置 `--test-threads=$NESSA_TEST_THREADS` 与独立 `NESSA_CACHE_DIR`，并将对 CPU 墙钟及进程级 STW GC 敏感的 `multicore`/`reactor`/`release_gates` 套件置于末尾单线程独占执行；推荐在 32 核环境下使用 `NESSA_TEST_JOBS=10 NESSA_TEST_THREADS=3`，兼顾速度与内存上限）。单目标快速迭代可继续使用 `bash scripts/cargo.sh test -p <crate> -- --test-threads=4`。
+- **后台命令与 Wine 测试强制超时**：执行耗时测试、子进程或 Wine 测试（`scripts/cargo-win.sh`、`scripts/test-wine.sh`，可通过 `NESSA_WINE_TIMEOUT` 控制单进程超时）时必须配置明确超时；任何转为后台运行的异步任务必须配合 `schedule` 定时器设置唤醒兜底，防止宿主任务完成通知丢失导致无限挂起。
 
 - 修复缺陷时补能复现原问题的回归测试；新增语言能力同时覆盖相关阶段和端到端行为。
 - 测试断言具体语义，如值、类型、绑定、诊断、退出状态或归档内容。只检查“不崩溃”“非空”“有 scope”不足以证明功能正确。

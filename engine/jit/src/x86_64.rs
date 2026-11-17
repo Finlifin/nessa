@@ -711,7 +711,7 @@ impl Assembler {
     }
 }
 
-#[cfg(all(test, target_arch = "x86_64", unix))]
+#[cfg(all(test, target_arch = "x86_64", any(unix, windows)))]
 mod tests {
     use super::*;
     use crate::code_cache::ExecutableBuffer;

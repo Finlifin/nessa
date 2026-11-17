@@ -945,3 +945,16 @@ NIR同时返回源函数符号到FuncId映射，driver发布TypePool之前原子
 trait impl和vtable。解释器的`fields`模块集中检查布局、边界及字段动态类型。
 元数据/归档布局保持原版本；源码private检查不等于归档数据的访问控制机制。
 集合布局及ABI兼容策略见 `collections-implementation-plan.md`，尚待真实实现。
+
+---
+
+## 十五、Windows 平台支持与向后兼容基线（Windows 10 1709+）
+
+Nessa 引擎原生支持 `x86_64` Windows，并以 **Windows 10 Version 1709（RS3，Build 16299，`_WIN32_WINNT = 0x0A00`）** 作为最低向后兼容基线，不依赖任何 1803+ 新增 Win32 API（如 `VirtualAlloc2`、`MapViewOfFile3`、`CreateFile3`、`GetTempPath2W` 或 `api-ms-win-core-memory-l1-1-6`）：
+
+- **`engine/stack_pool`**：基于 `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)` 预留连续任务栈虚拟地址空间（0 提交开销），按槽位 `VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)` / `VirtualFree(MEM_DECOMMIT)` 管理物理页，并通过 `AddVectoredExceptionHandler`（VEH）捕获 Guard Page 硬件栈溢出。
+- **`engine/gc`（`win_gc.rs`）**：由于上游 `mmtk 0.32` 仅支持 Linux/macOS，Windows 下采用共享同一 `ObjectHeader`、精确字段位图扫描、条件 Continuation 栈根定点迭代及 `WeakObject` 清理机制的原地精确 STW Mark-Sweep + 分块小对象/LOS 收集器，对解释器与 JIT 完全透明。
+- **`engine/jit`**：通过 `VirtualAlloc(PAGE_READWRITE)` -> `VirtualProtect(PAGE_EXECUTE_READ)` -> `FlushInstructionCache` 执行严格 W^X 权限切换；入口与辅助回调统一使用 Rust 原生跨平台支持的 `extern "sysv64"` 调用约定，在 Windows 下完整复用 `x86_64` Tier-1 与 Tier-2（含 OSR、内联缓存与溢出反优化）后端。
+- **`engine/scheduler`（`win_reactor.rs`）**：基于 Winsock2 `WSAPoll`（`ws2_32.dll`，Vista+）驱动非阻塞 `std.net` TCP/UDP、最小堆毫秒定时器、4 线程阻塞工作池，以及绑定 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Win32 Job Object 的可取消异步子进程树。
+- **平台内建与 C-FFI**：使用 `ProcessPrng`（`bcryptprimitives.dll`）混入密码学随机熵、`GetProcessTimes` 采集进程 CPU 时间、UCRT `_localtime64_s` / `_mktime64` 解析本地时区，并支持 `.dll` / `lib*.dll` 动态库解析。
+- **交叉编译与 Wine 1709 验证**：仓库提供 `scripts/cargo-win.sh`、`scripts/zig-win-linker.sh`、`scripts/wine-runner.sh` 与 `scripts/test-wine.sh`，可在 Linux 下离线构建自包含 PE64 产物并在配置为 Windows 10 1709（Build 16299）的 Wine 环境中执行端到端回归与 PE 导入表静态审计（`engine/nessa/tests/windows_compat.rs`）。

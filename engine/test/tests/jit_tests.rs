@@ -158,7 +158,7 @@ fn main() -> i64 {
     assert_eq!(base_sum, 10000);
     assert_eq!(off_stats.compiled_functions, 0);
 
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     for mode in [JitMode::Auto, JitMode::Tier1, JitMode::Tier2] {
         let (res, stats, enabled) = run_with_config(&archive, JitConfig::with_mode(mode));
         assert!(enabled);
@@ -594,7 +594,7 @@ fn main() -> i64 {
     let t2_elapsed = t_t2_start.elapsed();
     assert_eq!(t2_res.unwrap().to_i64_checked().unwrap(), expected);
 
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     {
         assert!(auto_enabled);
         assert!(
@@ -661,7 +661,7 @@ fn main() -> i64 {
         let (res, stats, enabled) = run_with_config(&archive, JitConfig::with_mode(mode));
         let got = res.unwrap().to_i64_checked().unwrap();
         assert_eq!(got, expected, "mismatch after deopt in {mode:?}");
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
         {
             assert!(enabled);
             assert!(

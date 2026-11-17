@@ -596,11 +596,19 @@ mod tests {
                     NirStmt::Assign(NirLocal(1), NirExpr::Use(NirValue::Local(NirLocal(0)))),
                     NirStmt::Assign(
                         NirLocal(0),
-                        NirExpr::BinOp(BinOp::Add, NirValue::Local(NirLocal(0)), NirValue::ConstInt(1)),
+                        NirExpr::BinOp(
+                            BinOp::Add,
+                            NirValue::Local(NirLocal(0)),
+                            NirValue::ConstInt(1),
+                        ),
                     ),
                     NirStmt::Assign(
                         NirLocal(2),
-                        NirExpr::BinOp(BinOp::Sub, NirValue::Local(NirLocal(0)), NirValue::Local(NirLocal(1))),
+                        NirExpr::BinOp(
+                            BinOp::Sub,
+                            NirValue::Local(NirLocal(0)),
+                            NirValue::Local(NirLocal(1)),
+                        ),
                     ),
                 ],
                 terminator: Terminator::Return(NirValue::Local(NirLocal(2))),

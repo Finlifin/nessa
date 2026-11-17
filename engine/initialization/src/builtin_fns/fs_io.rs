@@ -430,11 +430,18 @@ pub fn fs_copy(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
         let to = ctx.arg_string(1)?;
         Ok(Some(move |_io: &interpreter::VmIoContext| {
             match fs::copy(&from, &to) {
-                Ok(bytes) => Ok(NativeValue::Tuple(vec![
-                    NativeValue::I64(IO_OK),
-                    NativeValue::I64(i64::try_from(bytes).unwrap_or(i64::MAX)),
-                    NativeValue::Str(String::new()),
-                ])),
+                Ok(bytes) => {
+                    let actual_bytes = if bytes == 0 {
+                        fs::metadata(&to).map(|m| m.len()).unwrap_or(0)
+                    } else {
+                        bytes
+                    };
+                    Ok(NativeValue::Tuple(vec![
+                        NativeValue::I64(IO_OK),
+                        NativeValue::I64(i64::try_from(actual_bytes).unwrap_or(i64::MAX)),
+                        NativeValue::Str(String::new()),
+                    ]))
+                }
                 Err(err) => Ok(NativeValue::Tuple(vec![
                     NativeValue::I64(io_error_code(&err)),
                     NativeValue::I64(0),
