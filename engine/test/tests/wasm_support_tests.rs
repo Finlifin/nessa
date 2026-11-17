@@ -315,7 +315,7 @@ fn assert_eq(a: Any, b: Any) {{
 }}
 
 fn main() {{
-    let bin = Bytes.from_list(bytes.from_hex("{wasm_hex}").as(List))
+    let bin = Bytes.from_hex("{wasm_hex}")!{{ e => panic(e.to_string()) }}
     wasm.validate(bin)!{{ e => panic(e.to_string()) }}
 
     let bad = Bytes.from_list([0, 97, 115, 109, 99, 0, 0, 0])
@@ -428,7 +428,7 @@ use std.bytes
 use std.runtime
 
 fn main() {{
-    let bin = Bytes.from_list(bytes.from_hex("{cb_hex}").as(List))
+    let bin = Bytes.from_hex("{cb_hex}")!{{ e => panic(e.to_string()) }}
     let m = wasm.compile(bin)!{{ e => panic(e.to_string()) }}
     let prefix = "heap_captured_" ++ "tag"
     let weights = [10, 20, 30]
@@ -458,26 +458,26 @@ fn main() {{
         "GC host import callback test failed: {res:?}"
     );
 
-    // 2. Continuation capture (`coroutine.yield_val`) across an active Wasm stack frame raises `EffectAcrossNativeFrame`!
+    // 2. Continuation capture (`Coroutine.yield_val`) across an active Wasm stack frame raises `EffectAcrossNativeFrame`!
     let cont_script = format!(
         r#"
 use std.wasm
 use std.bytes
-use std.coroutine
+use std.coroutine.Coroutine
 
 fn main() {{
-    let bin = Bytes.from_list(bytes.from_hex("{cb_hex}").as(List))
+    let bin = Bytes.from_hex("{cb_hex}")!{{ e => panic(e.to_string()) }}
     let m = wasm.compile(bin)!{{ e => panic(e.to_string()) }}
-    let co = coroutine.create(|_: Any| -> Any {{
+    let co = Coroutine.create(|_: Any| -> Any {{
         let imp = Map()
         imp.set("env::step", |x: i64| -> i64 {{
-            let _ = coroutine.yield_val(value = x)
+            let _ = Coroutine.yield_val(value = x)
             x
         }})
         let inst = m.instantiate(imports = imp)!{{ e => panic(e.to_string()) }}
         inst.call_i64("drive", args = [2])!{{ e => panic(e.to_string()) }}
     }})
-    let _ = coroutine.step(co)
+    let _ = co.step()
 }}
 "#
     );
@@ -836,7 +836,7 @@ const {{ WASI }} = require("node:wasi");
 use std.coroutine
 fn main() {
     let co = coroutine.create(|_: Any| -> Any { let _ = coroutine.yield_val(value = 1); 2 })
-    println(coroutine.step(co))
+    println(coroutine.try_resume(co) ! { _ => -1 })
 }
 "#;
     let err = Driver::new()

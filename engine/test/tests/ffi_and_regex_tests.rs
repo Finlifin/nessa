@@ -239,23 +239,23 @@ fn main() -> i64 {
     m.insert(k1, 99)
     if m.get(k2).as(i64) != 99 { return -5 }
 
-    -- Verify 100% of existing `std.bytes` pack/unpack/hex/base64 helpers still work
+    -- Verify `std.bytes` pack/unpack/hex/base64 helpers
     let packed = pack("<I2I4", 513, 0x12345678)! { _ => panic("pack failed") }
     if (pack_size("<I2I4")! { _ => -1 }) != 6 { return -7 }
     let unpacked = unpack("<I2I4", packed)! { _ => panic("unpack failed") }
     let vals = unpacked.0
     let next_pos = unpacked.1
-    if next_pos != 6 or vals.get(0).as(i64) != 513 or vals.get(1).as(i64) != 0x12345678 {
+    if next_pos != (6).as(usize) or vals.get(0).as(i64) != 513 or vals.get(1).as(i64) != 0x12345678 {
         return -9
     }
-    let hex = to_hex([0xde, 0xad, 0xbe, 0xef])
+    let hex = to_hex(Bytes.from_list([0xde, 0xad, 0xbe, 0xef]))
     if hex != "deadbeef" { return -10 }
-    let unhex = from_hex(hex)
-    if unhex == null or unhex.as(List).len() != 4 { return -11 }
-    let b64 = base64_encode([78, 101, 115, 115, 97])
+    let unhex = from_hex(hex)! { _ => Bytes.new() }
+    if unhex.len() != (4).as(usize) { return -11 }
+    let b64 = to_base64(Bytes.from_list([78, 101, 115, 115, 97]))
     if b64 != "TmVzc2E=" { return -12 }
-    let unb64 = base64_decode(b64)
-    if unb64 == null or to_utf8(unb64.as(List)) != "Nessa" { return -13 }
+    let unb64 = from_base64(b64)! { _ => Bytes.new() }
+    if to_utf8(unb64) != "Nessa" { return -13 }
 
     42
 }
@@ -493,7 +493,7 @@ fn main() -> i64 {
     let co = Coroutine.create(|_: Any| -> Any {
         yield_val(value = 42)
     })
-    co.step().as(i64)
+    (co.try_resume() ! { _ => -1 }).as(i64)
 }
 "#;
     let compiled_cont = Driver::new().compile(cont_src);

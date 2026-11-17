@@ -162,6 +162,7 @@ fn single_worker_heartbeat_maintains_sub_5ms_latency_across_sleep_process_and_fs
 use std.collections.*
 use std.fs
 use std.process
+use std.process.CommandOutput
 use std.task
 use std.time
 
@@ -288,6 +289,7 @@ fn cancelling_parent_scope_immediately_terminates_external_long_running_child_pr
 use std.collections.*
 use std.fs
 use std.process
+use std.process.CommandOutput
 use std.task
 use std.time
 

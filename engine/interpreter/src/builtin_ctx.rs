@@ -930,6 +930,14 @@ impl<'vm> BuiltinCtx<'vm> {
         self.return_number(Number::U64(v))
     }
 
+    pub fn return_i8(&mut self, v: i8) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::I64(i64::from(v)), Intrinsic::I8)?;
+        self.write_return(val);
+        Ok(())
+    }
+
     pub fn return_u8(&mut self, v: u8) -> Result<(), VmError> {
         let val = self
             .vm
@@ -938,10 +946,58 @@ impl<'vm> BuiltinCtx<'vm> {
         Ok(())
     }
 
+    pub fn return_i16(&mut self, v: i16) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::I64(i64::from(v)), Intrinsic::I16)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn return_u16(&mut self, v: u16) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::U64(u64::from(v)), Intrinsic::U16)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn return_i32(&mut self, v: i32) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::I64(i64::from(v)), Intrinsic::I32)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn return_u32(&mut self, v: u32) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::U64(u64::from(v)), Intrinsic::U32)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn return_isize(&mut self, v: isize) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::I64(v as i64), Intrinsic::Isize)?;
+        self.write_return(val);
+        Ok(())
+    }
+
     pub fn return_usize(&mut self, v: usize) -> Result<(), VmError> {
         let val = self
             .vm
             .typed_number_value(Number::U64(v as u64), Intrinsic::Usize)?;
+        self.write_return(val);
+        Ok(())
+    }
+
+    pub fn return_f32(&mut self, v: f32) -> Result<(), VmError> {
+        let val = self
+            .vm
+            .typed_number_value(Number::F64(f64::from(v)), Intrinsic::F32)?;
         self.write_return(val);
         Ok(())
     }
@@ -1152,11 +1208,137 @@ impl<'vm> BuiltinCtx<'vm> {
         self.vm.register_weak_finalizer(target, cleanup)
     }
 
-    /// Detach any shared COW backing storage on a rooted `Bytes` value prior to a native FFI call.
+    /// True iff `val` is a heap-allocated `Err` `ErrorEnvelope` (`PayloadRole::ErrorEnvelope`
+    /// with a non-zero 128-bit error `TypeId` tag).
+    #[inline]
+    pub fn is_error_value(&self, val: TaggedValue) -> bool {
+        let Some(ptr) = val.as_heap_ptr() else {
+            return false;
+        };
+        // SAFETY: `val` is a live rooted VM object within the active mutator operation;
+        // `ObjectHeader` precedes the 8-byte-aligned payload pointer, and 3-word
+        // `ErrorEnvelope` payloads store two `u64` tag words at offsets 0 and 1.
+        let header = unsafe { gc::ObjectHeader::from_payload_ptr(ptr) };
+        if header.payload_role() != Some(gc::PayloadRole::ErrorEnvelope)
+            || header.payload_words() != 3
+        {
+            return false;
+        }
+        let base = ptr as *const u64;
+        (crate::collections::read_u64_atomic(base, 0)
+            | crate::collections::read_u64_atomic(base, 1))
+            != 0
+    }
+
+    /// If `val` is a heap-allocated `Ok` `ErrorEnvelope` (`PayloadRole::ErrorEnvelope` with
+    /// zero error `TypeId`), extract and root its inner payload; otherwise return `val` unchanged.
+    #[inline]
+    pub fn unwrap_ok_value(&self, val: TaggedValue) -> Result<TaggedValue, VmError> {
+        let Some(ptr) = val.as_heap_ptr() else {
+            return Ok(val);
+        };
+        // SAFETY: `val` is a live rooted VM object within the active mutator operation;
+        // `ObjectHeader` precedes the 8-byte-aligned payload pointer, and 3-word
+        // `ErrorEnvelope` payloads store `(tag_lo, tag_hi, payload)` at words `0..3`.
+        let header = unsafe { gc::ObjectHeader::from_payload_ptr(ptr) };
+        if header.payload_role() != Some(gc::PayloadRole::ErrorEnvelope)
+            || header.payload_words() != 3
+        {
+            return Ok(val);
+        }
+        let base = ptr as *const u64;
+        if (crate::collections::read_u64_atomic(base, 0)
+            | crate::collections::read_u64_atomic(base, 1))
+            != 0
+        {
+            return Ok(val);
+        }
+        let payload = TaggedValue::from_raw(crate::collections::read_u64_atomic(base, 2));
+        if payload.is_heap()
+            && !self
+                .vm
+                .worker_roots()
+                .temporary_values
+                .borrow()
+                .contains(&payload)
+        {
+            let _ = self.push_movable_root(payload)?;
+        }
+        Ok(payload)
+    }
+
+    /// Unwrap any 1-word `TypeKind::Newtype` heap wrappers around `val`, rooting the
+    /// unwrapped heap value in this context's movable root slots when needed.
+    pub fn peel_newtype(&self, val: TaggedValue) -> Result<TaggedValue, VmError> {
+        let unwrapped = self.vm.peel_newtype(val)?;
+        if unwrapped.is_heap()
+            && !self
+                .vm
+                .worker_roots()
+                .temporary_values
+                .borrow()
+                .contains(&unwrapped)
+        {
+            let _ = self.push_movable_root(unwrapped)?;
+        }
+        Ok(unwrapped)
+    }
+
+    /// Extract a raw `usize` C pointer address from `null` (`0`), an integer scalar,
+    /// or a 1-field `Struct` (`std.ffi.Ptr { addr: usize }`), peeling any `Newtype` wrappers.
+    pub fn extract_ptr_addr(&self, val: TaggedValue) -> Result<usize, VmError> {
+        let val = self.vm.peel_newtype(val)?;
+        if val.is_null() {
+            return Ok(0);
+        }
+        if let Ok(num) = self.number_of(val) {
+            if matches!(num, Number::F64(_)) {
+                return Err(VmError::TypeError);
+            }
+            let raw = num.to_u64_checked().ok_or(VmError::NumericOverflow)?;
+            return usize::try_from(raw).map_err(|_| VmError::NumericOverflow);
+        }
+        if let Some(ptr) = val.as_heap_ptr() {
+            // SAFETY: `val` is a live rooted VM object within the active mutator operation;
+            // `ObjectHeader` precedes the 8-byte-aligned payload pointer.
+            let header = unsafe { gc::ObjectHeader::from_payload_ptr(ptr) };
+            if header.payload_role() == Some(gc::PayloadRole::Ordinary)
+                && header.payload_words() == 1
+                && header.type_index.as_u32() >= Intrinsic::COUNT as u32
+            {
+                let canonical = self.vm.canonical_type(header.type_index)?;
+                let is_single_field_struct = {
+                    let tp = self.vm.type_pool_read();
+                    tp.checked_collection_role(canonical)
+                        .map_err(|_| VmError::TypeError)?
+                        .is_none()
+                        && matches!(
+                            &tp.get(canonical).kind,
+                            TypeKind::Struct { fields, .. } if fields.len() == 1
+                        )
+                };
+                if is_single_field_struct {
+                    let raw_field = crate::collections::read_u64_atomic(ptr.cast::<u64>(), 0);
+                    let field_val = self.vm.peel_newtype(TaggedValue::from_raw(raw_field))?;
+                    let num = self.number_of(field_val)?;
+                    if matches!(num, Number::F64(_)) {
+                        return Err(VmError::TypeError);
+                    }
+                    let raw = num.to_u64_checked().ok_or(VmError::NumericOverflow)?;
+                    return usize::try_from(raw).map_err(|_| VmError::NumericOverflow);
+                }
+            }
+        }
+        Err(VmError::TypeError)
+    }
+
+    /// Detach any shared COW backing storage on a rooted `Bytes` (or `Newtype` wrapping `Bytes`)
+    /// value prior to a native FFI call.
     pub fn prepare_ffi_bytes_mut(&mut self, root: &BuiltinRoot) -> Result<(), VmError> {
         let val = self.load_rooted(root)?;
-        let len = self.vm.bytes_len(val)?;
-        let _ = self.vm.ensure_bytes_unique(val, len)?;
+        let bytes_val = self.peel_newtype(val)?;
+        let len = self.vm.bytes_len(bytes_val)?;
+        let _ = self.vm.ensure_bytes_unique(bytes_val, len)?;
         Ok(())
     }
 
@@ -2849,6 +3031,35 @@ impl<'vm> BuiltinCtx<'vm> {
 }
 
 impl Vm {
+    /// Unwrap any chain of 1-word `TypeKind::Newtype` heap wrappers to the inner `TaggedValue`.
+    pub fn peel_newtype(&self, mut val: TaggedValue) -> Result<TaggedValue, VmError> {
+        for _ in 0..crate::error_values::MAX_VALUE_DEPTH {
+            let Some(ptr) = val.as_heap_ptr() else {
+                return Ok(val);
+            };
+            // SAFETY: `val` is a live rooted VM object within an active mutator or native-frame
+            // section; `ObjectHeader` precedes the 8-byte-aligned payload pointer.
+            let header = unsafe { gc::ObjectHeader::from_payload_ptr(ptr) };
+            if header.payload_role() != Some(gc::PayloadRole::Ordinary)
+                || header.payload_words() != 1
+                || header.type_index.as_u32() < Intrinsic::COUNT as u32
+            {
+                return Ok(val);
+            }
+            let canonical = self.canonical_type(header.type_index)?;
+            let is_newtype = matches!(
+                self.type_pool_read().get(canonical).kind,
+                TypeKind::Newtype { .. }
+            );
+            if !is_newtype {
+                return Ok(val);
+            }
+            let raw_slot = crate::collections::read_u64_atomic(ptr.cast::<u64>(), 0);
+            val = TaggedValue::from_raw(raw_slot);
+        }
+        Err(VmError::TypeError)
+    }
+
     fn intern_optional_type(&self, inner: TypeIndex) -> TypeIndex {
         {
             let tp = self.type_pool_read();

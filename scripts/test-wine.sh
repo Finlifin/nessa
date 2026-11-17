@@ -14,6 +14,7 @@ bash scripts/cargo-win.sh test \
     -p jit \
     -p runtime \
     -p scheduler \
+    -p ffi \
     -p regex_ffi \
     -p wasm \
     --lib --tests \
@@ -29,6 +30,9 @@ bash scripts/cargo-win.sh test -p nessa-test \
     --test jit_tests \
     --test jit_gc \
     --test ffi_and_regex_tests \
+    --test stdlib_ffi_redesign_tests \
+    --test stdlib_iterator_and_stream_tests \
+    --test stdlib_idiomatic_design_tests \
     --test wasm_support_tests \
     --test wave5_stdlib_io_sys_collections_tests \
     --test wave_c4_reactor_and_deadlock_tests \

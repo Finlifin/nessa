@@ -1,0 +1,1770 @@
+-- std.iter — lazy iterator adapters, generators, and trusted `Iterator` / `IntoIterator` default methods.
+
+use .builtin.*
+use .bytes.BytesIter
+use .collections.{Deque, DequeIter, HashMap, HashMapIter, List, ListIterator, Map, MapIterator, Set, SetIter}
+use .ordering.Ord
+use .range.{Range, RangeFrom, RangeFromIterator, RangeInclusive, RangeInclusiveIterator, RangeIterator, RevRangeIterator}
+use .stream.StreamIter
+use .string.{CharIndicesIter, CharsIter, StrLinesIter, StringBytesIter}
+use .traits.*
+
+private const panic_raw: fn(Any) -> NoReturn = .panic'builtin
+private const to_string_raw: fn(Any) -> String = .to_string'builtin
+private const runtime_type_raw: fn(Any) -> Type = .type_of'builtin
+private const is_error_value_raw: fn(Any) -> bool = .__is_error_value'builtin
+private const unwrap_ok_value_raw: fn(Any) -> Any = .__unwrap_ok_value'builtin
+private const forward_error_raw: fn(Any) -> NoReturn = .__forward_error_value'builtin
+
+private fn item_lt(left: Any, right: Any) -> bool {
+    left match {
+        ord_left: Ord => {
+            if runtime_type_raw(left) == runtime_type_raw(right) {
+                return ord_left.lt(right.as(Ord))
+            }
+            left < right
+        },
+        _ => left < right,
+    }
+}
+
+private struct BoolCell {
+    flag: bool,
+}
+
+private effect iter_suspend(value: Any, catch k) -> Unit
+
+private enum DynamicPullOutcome {
+    suspended(value: Any, next_cont: Continuation),
+    finished,
+}
+
+private struct DynamicPullCursor {
+    source: Any,
+    started: bool,
+    cont: ?Continuation,
+    done: bool,
+}
+
+private fn run_dynamic_iterable(source: Any) -> #iter_suspend DynamicPullOutcome {
+    for item in source {
+        iter_suspend(item)#
+    }
+    DynamicPullOutcome.finished
+}
+
+private fn step_dynamic_cursor(cursor: DynamicPullCursor) -> IterationStep(Any) {
+    if cursor.done {
+        return IterationStep(Any).done
+    }
+    let outcome: DynamicPullOutcome = if not cursor.started {
+        cursor.started = true
+        let src = cursor.source
+        cursor.source = null
+        (run_dynamic_iterable(src))# {
+            iter_suspend(val, k) => DynamicPullOutcome.suspended(val, k),
+        }
+    } else {
+        let saved? = cursor.cont else {
+            cursor.done = true
+            return IterationStep(Any).done
+        }
+        cursor.cont = null
+        saved(()).as(DynamicPullOutcome)
+    }
+
+    outcome match {
+        DynamicPullOutcome.suspended(val, next_k) => {
+            cursor.cont = next_k
+            IterationStep(Any).yielded(val)
+        },
+        DynamicPullOutcome.finished => {
+            cursor.done = true
+            IterationStep(Any).done
+        },
+    }
+}
+
+private fn item_to_display_string(val: Any) -> String {
+    val match {
+        s: String => s,
+        shown: Display => shown.to_string(),
+        _ => to_string_raw(val),
+    }
+}
+
+private fn unpack_map_pair(val: Any) -> (String, Any) = val.as((String, Any))
+
+private fn unpack_hash_pair(val: Any) -> (Any, Any) = val.as((Any, Any))
+
+private fn item_to_i64(val: Any) -> i64 = val.as(i64)
+
+private fn zero_usize() -> usize = 0
+
+-- Convert any iterable (`List`, `Range*`, `Map`, `HashMap`, `Set`, `Deque`, `Bytes`,
+-- `String`, any `std.iter` adapter, or any `Iterator` / `IntoIterator`) into a lazy
+-- pull function returning `IterationStep(Any)`.
+pub fn to_pull_fn(source: Any) -> fn() -> IterationStep(Any) {
+    source match {
+        it: PullIter => || -> IterationStep(Any) { it.next() },
+        it: MapIter => || -> IterationStep(Any) { it.next() },
+        it: FilterIter => || -> IterationStep(Any) { it.next() },
+        it: FilterMapIter => || -> IterationStep(Any) { it.next() },
+        it: FlatMapIter => || -> IterationStep(Any) { it.next() },
+        it: FlattenIter => || -> IterationStep(Any) { it.next() },
+        it: TakeIter => || -> IterationStep(Any) { it.next() },
+        it: SkipIter => || -> IterationStep(Any) { it.next() },
+        it: TakeWhileIter => || -> IterationStep(Any) { it.next() },
+        it: SkipWhileIter => || -> IterationStep(Any) { it.next() },
+        it: StepByIter => || -> IterationStep(Any) { it.next() },
+        it: ChainIter => || -> IterationStep(Any) { it.next() },
+        it: InspectIter => || -> IterationStep(Any) { it.next() },
+        it: PeekableIter => || -> IterationStep(Any) { it.next() },
+        it: EmptyIter => || -> IterationStep(Any) { it.next() },
+        it: OnceIter => || -> IterationStep(Any) { it.next() },
+        it: RepeatIter => || -> IterationStep(Any) { it.next() },
+        it: FromFnIter => || -> IterationStep(Any) { it.next() },
+        it: SuccessorsIter => || -> IterationStep(Any) { it.next() },
+        it: UnfoldIter => || -> IterationStep(Any) { it.next() },
+        it: StreamIter => || -> IterationStep(Any) { it.next() },
+        it: EnumerateIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep((usize, Any)).done => IterationStep(Any).done,
+                IterationStep((usize, Any)).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        it: ZipIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep((Any, Any)).done => IterationStep(Any).done,
+                IterationStep((Any, Any)).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        it: ChunksIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(List).done => IterationStep(Any).done,
+                IterationStep(List).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        lst: List => {
+            let it = lst.into_iter()
+            return || -> IterationStep(Any) { it.next() }
+        },
+        it: ListIterator => || -> IterationStep(Any) { it.next() },
+        rng: Range => {
+            let it = rng.into_iter()
+            return || -> IterationStep(Any) {
+                it.next() match {
+                    IterationStep(i64).done => IterationStep(Any).done,
+                    IterationStep(i64).yielded(v) => IterationStep(Any).yielded(v),
+                }
+            }
+        },
+        it: RangeIterator => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(i64).done => IterationStep(Any).done,
+                IterationStep(i64).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        it: RevRangeIterator => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(i64).done => IterationStep(Any).done,
+                IterationStep(i64).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        rng: RangeInclusive => {
+            let it = rng.into_iter()
+            return || -> IterationStep(Any) {
+                it.next() match {
+                    IterationStep(i64).done => IterationStep(Any).done,
+                    IterationStep(i64).yielded(v) => IterationStep(Any).yielded(v),
+                }
+            }
+        },
+        it: RangeInclusiveIterator => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(i64).done => IterationStep(Any).done,
+                IterationStep(i64).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        rng: RangeFrom => {
+            let it = rng.into_iter()
+            return || -> IterationStep(Any) {
+                it.next() match {
+                    IterationStep(i64).done => IterationStep(Any).done,
+                    IterationStep(i64).yielded(v) => IterationStep(Any).yielded(v),
+                }
+            }
+        },
+        it: RangeFromIterator => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(i64).done => IterationStep(Any).done,
+                IterationStep(i64).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        mp: Map => {
+            let it = mp.into_iter()
+            return || -> IterationStep(Any) {
+                it.next() match {
+                    IterationStep((String, Any)).done => IterationStep(Any).done,
+                    IterationStep((String, Any)).yielded(v) => IterationStep(Any).yielded(v),
+                }
+            }
+        },
+        it: MapIterator => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep((String, Any)).done => IterationStep(Any).done,
+                IterationStep((String, Any)).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        hm: HashMap => {
+            let it = hm.into_iter()
+            return || -> IterationStep(Any) {
+                it.next() match {
+                    IterationStep((Any, Any)).done => IterationStep(Any).done,
+                    IterationStep((Any, Any)).yielded(v) => IterationStep(Any).yielded(v),
+                }
+            }
+        },
+        it: HashMapIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep((Any, Any)).done => IterationStep(Any).done,
+                IterationStep((Any, Any)).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        st: Set => {
+            let it = st.into_iter()
+            return || -> IterationStep(Any) { it.next() }
+        },
+        it: SetIter => || -> IterationStep(Any) { it.next() },
+        dq: Deque => {
+            let it = dq.into_iter()
+            return || -> IterationStep(Any) { it.next() }
+        },
+        it: DequeIter => || -> IterationStep(Any) { it.next() },
+        bs: Bytes => {
+            let it = bs.iter()
+            return || -> IterationStep(Any) {
+                it.next() match {
+                    IterationStep(u8).done => IterationStep(Any).done,
+                    IterationStep(u8).yielded(v) => IterationStep(Any).yielded(v),
+                }
+            }
+        },
+        it: BytesIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(u8).done => IterationStep(Any).done,
+                IterationStep(u8).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        },
+        s: String => {
+            let it = s.chars_iter()
+            return || -> IterationStep(Any) {
+                it.next() match {
+                    IterationStep(char).done => IterationStep(Any).done,
+                    IterationStep(char).yielded(ch) => IterationStep(Any).yielded(ch),
+                }
+            }
+        },
+        it: CharsIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(char).done => IterationStep(Any).done,
+                IterationStep(char).yielded(ch) => IterationStep(Any).yielded(ch),
+            }
+        },
+        it: CharIndicesIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep((usize, char)).done => IterationStep(Any).done,
+                IterationStep((usize, char)).yielded(pair) => IterationStep(Any).yielded(pair),
+            }
+        },
+        it: StringBytesIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(u8).done => IterationStep(Any).done,
+                IterationStep(u8).yielded(b) => IterationStep(Any).yielded(b),
+            }
+        },
+        it: StrLinesIter => || -> IterationStep(Any) {
+            it.next() match {
+                IterationStep(String).done => IterationStep(Any).done,
+                IterationStep(String).yielded(line) => IterationStep(Any).yielded(line),
+            }
+        },
+        _ => {
+            let cursor = DynamicPullCursor {
+                source: source,
+                started: false,
+                cont: null,
+                done: false,
+            }
+            return || -> IterationStep(Any) { step_dynamic_cursor(cursor) }
+        },
+    }
+}
+
+-- ============================================================================
+-- Lazy Adapter Iterators
+-- ============================================================================
+
+pub struct PullIter {
+    step_fn: fn() -> IterationStep(Any),
+}
+
+impl Iterator for PullIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        let step = self.step_fn
+        step()
+    }
+}
+
+impl IntoIterator for PullIter {
+    assoc Iter: Type = PullIter
+    pub fn into_iter(self) -> PullIter = self
+}
+
+pub struct MapIter {
+    step_fn: fn() -> IterationStep(Any),
+}
+
+impl Iterator for MapIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        let step = self.step_fn
+        step()
+    }
+}
+
+impl IntoIterator for MapIter {
+    assoc Iter: Type = MapIter
+    pub fn into_iter(self) -> MapIter = self
+}
+
+pub struct FilterIter {
+    step_fn: fn() -> IterationStep(Any),
+}
+
+impl Iterator for FilterIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        let step = self.step_fn
+        step()
+    }
+}
+
+impl IntoIterator for FilterIter {
+    assoc Iter: Type = FilterIter
+    pub fn into_iter(self) -> FilterIter = self
+}
+
+pub struct FilterMapIter {
+    step_fn: fn() -> IterationStep(Any),
+}
+
+impl Iterator for FilterMapIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        let step = self.step_fn
+        step()
+    }
+}
+
+impl IntoIterator for FilterMapIter {
+    assoc Iter: Type = FilterMapIter
+    pub fn into_iter(self) -> FilterMapIter = self
+}
+
+pub struct FlatMapIter {
+    outer_fn: fn() -> IterationStep(Any),
+    inner_fn: ?(fn() -> IterationStep(Any)),
+    done: bool,
+}
+
+impl Iterator for FlatMapIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        while not self.done {
+            if self.inner_fn != null {
+                let pull_inner = self.inner_fn.as(fn() -> IterationStep(Any))
+                let inner_step = pull_inner()
+                inner_step match {
+                    IterationStep(Any).done => {
+                        self.inner_fn = null
+                    },
+                    IterationStep(Any).yielded(_) => {
+                        return inner_step
+                    },
+                }
+            } else {
+                let pull_outer = self.outer_fn
+                pull_outer() match {
+                    IterationStep(Any).done => {
+                        self.done = true
+                        return IterationStep(Any).done
+                    },
+                    IterationStep(Any).yielded(sub) => {
+                        if is_error_value_raw(sub) {
+                            self.done = true
+                            return IterationStep(Any).yielded(sub)
+                        }
+                        self.inner_fn = to_pull_fn(sub)
+                    },
+                }
+            }
+        }
+        IterationStep(Any).done
+    }
+}
+
+impl IntoIterator for FlatMapIter {
+    assoc Iter: Type = FlatMapIter
+    pub fn into_iter(self) -> FlatMapIter = self
+}
+
+pub struct FlattenIter {
+    outer_fn: fn() -> IterationStep(Any),
+    inner_fn: ?(fn() -> IterationStep(Any)),
+    done: bool,
+}
+
+impl Iterator for FlattenIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        while not self.done {
+            if self.inner_fn != null {
+                let pull_inner = self.inner_fn.as(fn() -> IterationStep(Any))
+                let inner_step = pull_inner()
+                inner_step match {
+                    IterationStep(Any).done => {
+                        self.inner_fn = null
+                    },
+                    IterationStep(Any).yielded(_) => {
+                        return inner_step
+                    },
+                }
+            } else {
+                let pull_outer = self.outer_fn
+                pull_outer() match {
+                    IterationStep(Any).done => {
+                        self.done = true
+                        return IterationStep(Any).done
+                    },
+                    IterationStep(Any).yielded(sub) => {
+                        if is_error_value_raw(sub) {
+                            self.done = true
+                            return IterationStep(Any).yielded(sub)
+                        }
+                        self.inner_fn = to_pull_fn(sub)
+                    },
+                }
+            }
+        }
+        IterationStep(Any).done
+    }
+}
+
+impl IntoIterator for FlattenIter {
+    assoc Iter: Type = FlattenIter
+    pub fn into_iter(self) -> FlattenIter = self
+}
+
+pub struct TakeIter {
+    step_fn: fn() -> IterationStep(Any),
+    remaining: usize,
+}
+
+impl Iterator for TakeIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.remaining == 0 {
+            return IterationStep(Any).done
+        }
+        let step = self.step_fn
+        let item = step()
+        item match {
+            IterationStep(Any).done => {
+                self.remaining = 0
+                IterationStep(Any).done
+            },
+            IterationStep(Any).yielded(_) => {
+                self.remaining -= 1
+                item
+            },
+        }
+    }
+}
+
+impl IntoIterator for TakeIter {
+    assoc Iter: Type = TakeIter
+    pub fn into_iter(self) -> TakeIter = self
+}
+
+pub struct SkipIter {
+    step_fn: fn() -> IterationStep(Any),
+    to_skip: usize,
+}
+
+impl Iterator for SkipIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        let step = self.step_fn
+        while self.to_skip > 0 {
+            self.to_skip -= 1
+            let skipped = step()
+            skipped match {
+                IterationStep(Any).done => {
+                    self.to_skip = 0
+                    return IterationStep(Any).done
+                },
+                IterationStep(Any).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        self.to_skip = 0
+                        return IterationStep(Any).yielded(v)
+                    }
+                },
+            }
+        }
+        step()
+    }
+}
+
+impl IntoIterator for SkipIter {
+    assoc Iter: Type = SkipIter
+    pub fn into_iter(self) -> SkipIter = self
+}
+
+pub struct TakeWhileIter {
+    step_fn: fn() -> IterationStep(Any),
+    done: bool,
+}
+
+impl Iterator for TakeWhileIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.done {
+            return IterationStep(Any).done
+        }
+        let step = self.step_fn
+        let item = step()
+        item match {
+            IterationStep(Any).done => {
+                self.done = true
+                IterationStep(Any).done
+            },
+            IterationStep(Any).yielded(v) => {
+                if is_error_value_raw(v) {
+                    self.done = true
+                }
+                item
+            },
+        }
+    }
+}
+
+impl IntoIterator for TakeWhileIter {
+    assoc Iter: Type = TakeWhileIter
+    pub fn into_iter(self) -> TakeWhileIter = self
+}
+
+pub struct SkipWhileIter {
+    step_fn: fn() -> IterationStep(Any),
+}
+
+impl Iterator for SkipWhileIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        let step = self.step_fn
+        step()
+    }
+}
+
+impl IntoIterator for SkipWhileIter {
+    assoc Iter: Type = SkipWhileIter
+    pub fn into_iter(self) -> SkipWhileIter = self
+}
+
+pub struct StepByIter {
+    step_fn: fn() -> IterationStep(Any),
+    step_size: usize,
+    first_step: bool,
+    done: bool,
+}
+
+impl Iterator for StepByIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.done {
+            return IterationStep(Any).done
+        }
+        let pull = self.step_fn
+        if self.first_step {
+            self.first_step = false
+            let first_item = pull()
+            first_item match {
+                IterationStep(Any).done => {
+                    self.done = true
+                    return IterationStep(Any).done
+                },
+                IterationStep(Any).yielded(_) => {
+                    return first_item
+                },
+            }
+        }
+        var skip_rem = self.step_size - 1
+        while skip_rem > 0 {
+            skip_rem -= 1
+            pull() match {
+                IterationStep(Any).done => {
+                    self.done = true
+                    return IterationStep(Any).done
+                },
+                IterationStep(Any).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        self.done = true
+                        return IterationStep(Any).yielded(v)
+                    }
+                },
+            }
+        }
+        let next_item = pull()
+        next_item match {
+            IterationStep(Any).done => {
+                self.done = true
+                IterationStep(Any).done
+            },
+            IterationStep(Any).yielded(_) => next_item,
+        }
+    }
+}
+
+impl IntoIterator for StepByIter {
+    assoc Iter: Type = StepByIter
+    pub fn into_iter(self) -> StepByIter = self
+}
+
+pub struct EnumerateIter {
+    step_fn: fn() -> IterationStep(Any),
+    index: usize,
+}
+
+impl Iterator for EnumerateIter {
+    assoc Item: Type = (usize, Any)
+    pub fn next(self) -> IterationStep((usize, Any)) {
+        let pull = self.step_fn
+        pull() match {
+            IterationStep(Any).done => IterationStep((usize, Any)).done,
+            IterationStep(Any).yielded(v) => {
+                let idx = self.index
+                self.index += 1
+                IterationStep((usize, Any)).yielded((idx, v))
+            },
+        }
+    }
+}
+
+impl IntoIterator for EnumerateIter {
+    assoc Iter: Type = EnumerateIter
+    pub fn into_iter(self) -> EnumerateIter = self
+}
+
+pub struct ZipIter {
+    left_fn: fn() -> IterationStep(Any),
+    right_fn: fn() -> IterationStep(Any),
+    done: bool,
+}
+
+impl Iterator for ZipIter {
+    assoc Item: Type = (Any, Any)
+    pub fn next(self) -> IterationStep((Any, Any)) {
+        if self.done {
+            return IterationStep((Any, Any)).done
+        }
+        let pull_l = self.left_fn
+        let pull_r = self.right_fn
+        pull_l() match {
+            IterationStep(Any).done => {
+                self.done = true
+                IterationStep((Any, Any)).done
+            },
+            IterationStep(Any).yielded(a) => {
+                pull_r() match {
+                    IterationStep(Any).done => {
+                        self.done = true
+                        IterationStep((Any, Any)).done
+                    },
+                    IterationStep(Any).yielded(b) => IterationStep((Any, Any)).yielded((a, b)),
+                }
+            },
+        }
+    }
+}
+
+impl IntoIterator for ZipIter {
+    assoc Iter: Type = ZipIter
+    pub fn into_iter(self) -> ZipIter = self
+}
+
+pub struct ChainIter {
+    first_fn: fn() -> IterationStep(Any),
+    second_fn: fn() -> IterationStep(Any),
+    first_done: bool,
+}
+
+impl Iterator for ChainIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if not self.first_done {
+            let pull_first = self.first_fn
+            let step = pull_first()
+            step match {
+                IterationStep(Any).done => {
+                    self.first_done = true
+                },
+                IterationStep(Any).yielded(_) => {
+                    return step
+                },
+            }
+        }
+        let pull_second = self.second_fn
+        pull_second()
+    }
+}
+
+impl IntoIterator for ChainIter {
+    assoc Iter: Type = ChainIter
+    pub fn into_iter(self) -> ChainIter = self
+}
+
+pub struct InspectIter {
+    step_fn: fn() -> IterationStep(Any),
+}
+
+impl Iterator for InspectIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        let step = self.step_fn
+        step()
+    }
+}
+
+impl IntoIterator for InspectIter {
+    assoc Iter: Type = InspectIter
+    pub fn into_iter(self) -> InspectIter = self
+}
+
+pub struct ChunksIter {
+    step_fn: fn() -> IterationStep(Any),
+    chunk_size: usize,
+    done: bool,
+}
+
+impl Iterator for ChunksIter {
+    assoc Item: Type = List
+    pub fn next(self) -> IterationStep(List) {
+        if self.done {
+            return IterationStep(List).done
+        }
+        let batch = List()
+        let pull = self.step_fn
+        var count: usize = 0
+        while count < self.chunk_size {
+            pull() match {
+                IterationStep(Any).done => {
+                    self.done = true
+                    break
+                },
+                IterationStep(Any).yielded(v) => {
+                    batch.push(v)
+                    count += 1
+                },
+            }
+        }
+        if batch.is_empty() {
+            IterationStep(List).done
+        } else {
+            IterationStep(List).yielded(batch)
+        }
+    }
+}
+
+impl IntoIterator for ChunksIter {
+    assoc Iter: Type = ChunksIter
+    pub fn into_iter(self) -> ChunksIter = self
+}
+
+pub struct PeekableIter {
+    step_fn: fn() -> IterationStep(Any),
+    buffered: IterationStep(Any),
+    has_peeked: bool,
+}
+
+impl PeekableIter {
+    pub fn peek_step(self) -> IterationStep(Any) {
+        if not self.has_peeked {
+            let pull = self.step_fn
+            self.buffered = pull()
+            self.has_peeked = true
+        }
+        self.buffered
+    }
+
+    pub fn peek(self) -> ?Any {
+        self.peek_step() match {
+            IterationStep(Any).done => null,
+            IterationStep(Any).yielded(v) => v,
+        }
+    }
+
+    pub fn next_if(self, predicate: fn(Any) -> bool) -> ?Any {
+        let current = self.peek_step()
+        current match {
+            IterationStep(Any).done => null,
+            IterationStep(Any).yielded(v) => {
+                let cb: Any = predicate
+                let keep = cb(v)
+                if is_error_value_raw(keep) {
+                    return forward_error_raw(keep)
+                }
+                if unwrap_ok_value_raw(keep).as(bool) {
+                    self.has_peeked = false
+                    self.buffered = IterationStep(Any).done
+                    v
+                } else {
+                    null
+                }
+            },
+        }
+    }
+}
+
+impl Iterator for PeekableIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.has_peeked {
+            let out = self.buffered
+            self.has_peeked = false
+            self.buffered = IterationStep(Any).done
+            out
+        } else {
+            let pull = self.step_fn
+            pull()
+        }
+    }
+}
+
+impl IntoIterator for PeekableIter {
+    assoc Iter: Type = PeekableIter
+    pub fn into_iter(self) -> PeekableIter = self
+}
+
+-- ============================================================================
+-- Source & Generator Iterators
+-- ============================================================================
+
+pub struct EmptyIter {}
+
+impl Iterator for EmptyIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) = IterationStep(Any).done
+}
+
+impl IntoIterator for EmptyIter {
+    assoc Iter: Type = EmptyIter
+    pub fn into_iter(self) -> EmptyIter = self
+}
+
+pub fn empty() -> EmptyIter = EmptyIter {}
+
+pub struct OnceIter {
+    value: Any,
+    exhausted: bool,
+}
+
+impl Iterator for OnceIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.exhausted {
+            IterationStep(Any).done
+        } else {
+            let v = self.value
+            self.value = null
+            self.exhausted = true
+            IterationStep(Any).yielded(v)
+        }
+    }
+}
+
+impl IntoIterator for OnceIter {
+    assoc Iter: Type = OnceIter
+    pub fn into_iter(self) -> OnceIter = self
+}
+
+pub fn once(value: Any) -> OnceIter = OnceIter { value: value, exhausted: false }
+
+pub struct RepeatIter {
+    value: Any,
+    remaining: ?usize,
+}
+
+impl Iterator for RepeatIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        self.remaining match {
+            rem? => {
+                if rem == 0 {
+                    IterationStep(Any).done
+                } else {
+                    self.remaining = rem - 1
+                    IterationStep(Any).yielded(self.value)
+                }
+            },
+            _ => IterationStep(Any).yielded(self.value),
+        }
+    }
+}
+
+impl IntoIterator for RepeatIter {
+    assoc Iter: Type = RepeatIter
+    pub fn into_iter(self) -> RepeatIter = self
+}
+
+pub fn repeat(value: Any, .times: ?usize = null) -> RepeatIter {
+    RepeatIter { value: value, remaining: times }
+}
+
+pub struct FromFnIter {
+    step_fn: Any,
+    done: bool,
+}
+
+impl Iterator for FromFnIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.done {
+            return IterationStep(Any).done
+        }
+        let step = self.step_fn
+        let val = step()
+        if val == null {
+            self.done = true
+            IterationStep(Any).done
+        } else {
+            IterationStep(Any).yielded(val)
+        }
+    }
+}
+
+impl IntoIterator for FromFnIter {
+    assoc Iter: Type = FromFnIter
+    pub fn into_iter(self) -> FromFnIter = self
+}
+
+pub fn from_fn(step: fn() -> ?Any) -> FromFnIter {
+    FromFnIter { step_fn: step, done: false }
+}
+
+-- Create a `PullIter` directly from an `IterationStep(Any)` closure, preserving `null` items.
+pub fn from_step(step: fn() -> IterationStep(Any)) -> PullIter {
+    PullIter { step_fn: step }
+}
+
+pub struct SuccessorsIter {
+    current: ?Any,
+    succ_fn: Any,
+}
+
+impl Iterator for SuccessorsIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.current == null {
+            return IterationStep(Any).done
+        }
+        let val = self.current
+        let succ = self.succ_fn
+        self.current = succ(val)
+        IterationStep(Any).yielded(val)
+    }
+}
+
+impl IntoIterator for SuccessorsIter {
+    assoc Iter: Type = SuccessorsIter
+    pub fn into_iter(self) -> SuccessorsIter = self
+}
+
+pub fn successors(first: ?Any, succ: fn(Any) -> ?Any) -> SuccessorsIter {
+    SuccessorsIter { current: first, succ_fn: succ }
+}
+
+pub struct UnfoldIter {
+    state: Any,
+    step_fn: Any,
+    done: bool,
+}
+
+impl Iterator for UnfoldIter {
+    assoc Item: Type = Any
+    pub fn next(self) -> IterationStep(Any) {
+        if self.done {
+            return IterationStep(Any).done
+        }
+        let step = self.step_fn
+        let res = step(self.state)
+        if res == null {
+            self.done = true
+            self.state = null
+            IterationStep(Any).done
+        } else {
+            let (item, next_state) = res.as((Any, Any))
+            self.state = next_state
+            IterationStep(Any).yielded(item)
+        }
+    }
+}
+
+impl IntoIterator for UnfoldIter {
+    assoc Iter: Type = UnfoldIter
+    pub fn into_iter(self) -> UnfoldIter = self
+}
+
+-- `step(state)` returns `(item, next_state)` or `null` to terminate.
+pub fn unfold(seed: Any, step: fn(Any) -> ?(Any, Any)) -> UnfoldIter {
+    UnfoldIter { state: seed, step_fn: step, done: false }
+}
+
+-- ============================================================================
+-- Trusted Default Methods for `IntoIterator` and `Iterator`
+-- ============================================================================
+
+impl IntoIterator {
+    pub fn iter(self) -> Iter { self.into_iter() }
+}
+
+impl Iterator {
+    pub fn map(self, mapper: fn(Item) -> Any) -> MapIter {
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return IterationStep(Any).yielded(v.as(Any))
+                    }
+                    let mapped = mapper(v)
+                    if is_error_value_raw(mapped) {
+                        return IterationStep(Any).yielded(mapped)
+                    }
+                    IterationStep(Any).yielded(unwrap_ok_value_raw(mapped))
+                },
+            }
+        }
+        MapIter { step_fn: pull }
+    }
+
+    pub fn filter(self, predicate: fn(Item) -> bool) -> FilterIter {
+        let cb: Any = predicate
+        let pull = || -> IterationStep(Any) {
+            while true {
+                self.next() match {
+                    IterationStep(Item).done => { return IterationStep(Any).done },
+                    IterationStep(Item).yielded(v) => {
+                        if is_error_value_raw(v) {
+                            return IterationStep(Any).yielded(v.as(Any))
+                        }
+                        let matched = cb(v)
+                        if is_error_value_raw(matched) {
+                            return IterationStep(Any).yielded(matched.as(Any))
+                        }
+                        if unwrap_ok_value_raw(matched).as(bool) {
+                            return IterationStep(Any).yielded(v)
+                        }
+                    },
+                }
+            }
+            IterationStep(Any).done
+        }
+        FilterIter { step_fn: pull }
+    }
+
+    pub fn filter_map(self, mapper: fn(Item) -> ?Any) -> FilterMapIter {
+        let cb: Any = mapper
+        let pull = || -> IterationStep(Any) {
+            while true {
+                self.next() match {
+                    IterationStep(Item).done => { return IterationStep(Any).done },
+                    IterationStep(Item).yielded(v) => {
+                        if is_error_value_raw(v) {
+                            return IterationStep(Any).yielded(v.as(Any))
+                        }
+                        let raw_mapped = cb(v)
+                        if is_error_value_raw(raw_mapped) {
+                            return IterationStep(Any).yielded(raw_mapped)
+                        }
+                        let mapped = unwrap_ok_value_raw(raw_mapped)
+                        if mapped != null {
+                            return IterationStep(Any).yielded(mapped)
+                        }
+                    },
+                }
+            }
+            IterationStep(Any).done
+        }
+        FilterMapIter { step_fn: pull }
+    }
+
+    pub fn flat_map(self, mapper: fn(Item) -> Any) -> FlatMapIter {
+        let cb: Any = mapper
+        let outer_pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return IterationStep(Any).yielded(v.as(Any))
+                    }
+                    let sub = cb(v)
+                    if is_error_value_raw(sub) {
+                        return IterationStep(Any).yielded(sub)
+                    }
+                    IterationStep(Any).yielded(unwrap_ok_value_raw(sub))
+                },
+            }
+        }
+        FlatMapIter { outer_fn: outer_pull, inner_fn: null, done: false }
+    }
+
+    pub fn flatten(self) -> FlattenIter {
+        let outer_pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        FlattenIter { outer_fn: outer_pull, inner_fn: null, done: false }
+    }
+
+    pub fn take(self, limit: usize) -> TakeIter {
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        TakeIter { step_fn: pull, remaining: limit }
+    }
+
+    pub fn skip(self, count: usize) -> SkipIter {
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        SkipIter { step_fn: pull, to_skip: count }
+    }
+
+    pub fn take_while(self, predicate: fn(Item) -> bool) -> TakeWhileIter {
+        let cb: Any = predicate
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return IterationStep(Any).yielded(v.as(Any))
+                    }
+                    let keep = cb(v)
+                    if is_error_value_raw(keep) {
+                        return IterationStep(Any).yielded(keep.as(Any))
+                    }
+                    if unwrap_ok_value_raw(keep).as(bool) {
+                        IterationStep(Any).yielded(v)
+                    } else {
+                        IterationStep(Any).done
+                    }
+                },
+            }
+        }
+        TakeWhileIter { step_fn: pull, done: false }
+    }
+
+    pub fn skip_while(self, predicate: fn(Item) -> bool) -> SkipWhileIter {
+        let state = BoolCell { flag: true }
+        let cb: Any = predicate
+        let pull = || -> IterationStep(Any) {
+            while true {
+                self.next() match {
+                    IterationStep(Item).done => { return IterationStep(Any).done },
+                    IterationStep(Item).yielded(v) => {
+                        if is_error_value_raw(v) {
+                            state.flag = false
+                            return IterationStep(Any).yielded(v.as(Any))
+                        }
+                        if state.flag {
+                            let should_skip = cb(v)
+                            if is_error_value_raw(should_skip) {
+                                state.flag = false
+                                return IterationStep(Any).yielded(should_skip.as(Any))
+                            }
+                            if not unwrap_ok_value_raw(should_skip).as(bool) {
+                                state.flag = false
+                                return IterationStep(Any).yielded(v)
+                            }
+                        } else {
+                            return IterationStep(Any).yielded(v)
+                        }
+                    },
+                }
+            }
+            IterationStep(Any).done
+        }
+        SkipWhileIter { step_fn: pull }
+    }
+
+    pub fn step_by(self, step: usize) -> StepByIter {
+        if step == 0 {
+            panic_raw("Iterator.step_by: step must be greater than zero")
+        }
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        StepByIter { step_fn: pull, step_size: step, first_step: true, done: false }
+    }
+
+    pub fn enumerate(self, .start: usize = zero_usize()) -> EnumerateIter {
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        EnumerateIter { step_fn: pull, index: start }
+    }
+
+    pub fn zip(self, other: Any) -> ZipIter {
+        let pull_self = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        ZipIter { left_fn: pull_self, right_fn: to_pull_fn(other), done: false }
+    }
+
+    pub fn chain(self, other: Any) -> ChainIter {
+        let pull_self = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        ChainIter { first_fn: pull_self, second_fn: to_pull_fn(other), first_done: false }
+    }
+
+    pub fn inspect(self, inspector: fn(Item) -> Unit) -> InspectIter {
+        let cb: Any = inspector
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return IterationStep(Any).yielded(v.as(Any))
+                    }
+                    let side = cb(v)
+                    if is_error_value_raw(side) {
+                        return IterationStep(Any).yielded(side.as(Any))
+                    }
+                    let _ = unwrap_ok_value_raw(side).as(Unit)
+                    IterationStep(Any).yielded(v)
+                },
+            }
+        }
+        InspectIter { step_fn: pull }
+    }
+
+    pub fn chunks(self, size: usize) -> ChunksIter {
+        if size == 0 {
+            panic_raw("Iterator.chunks: chunk size must be greater than zero")
+        }
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        ChunksIter { step_fn: pull, chunk_size: size, done: false }
+    }
+
+    pub fn peekable(self) -> PeekableIter {
+        let pull = || -> IterationStep(Any) {
+            self.next() match {
+                IterationStep(Item).done => IterationStep(Any).done,
+                IterationStep(Item).yielded(v) => IterationStep(Any).yielded(v),
+            }
+        }
+        PeekableIter {
+            step_fn: pull,
+            buffered: IterationStep(Any).done,
+            has_peeked: false,
+        }
+    }
+
+    -- Terminal / Consuming Methods
+
+    pub fn collect(self) -> List {
+        let out = List()
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return out },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    out.push(v)
+                },
+            }
+        }
+        out
+    }
+
+    pub fn to_list(self) -> List = self.collect()
+
+    pub fn to_set(self) -> Set {
+        let out = Set.new()
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return out },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let _ = out.insert(v)
+                },
+            }
+        }
+        out
+    }
+
+    pub fn to_map(self) -> Map {
+        let out = Map()
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return out },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let pair = unpack_map_pair(v)
+                    out.set(pair.0, pair.1)
+                },
+            }
+        }
+        out
+    }
+
+    pub fn to_hash_map(self) -> HashMap {
+        let out = HashMap.new()
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return out },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let pair = unpack_hash_pair(v)
+                    out.set(pair.0, pair.1)
+                },
+            }
+        }
+        out
+    }
+
+    pub fn count(self) -> usize {
+        var total: usize = 0
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return total },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    total += 1
+                },
+            }
+        }
+        total
+    }
+
+    pub fn fold(self, init: Any, folder: fn(Any, Item) -> Any) -> Any {
+        if is_error_value_raw(init) {
+            return init
+        }
+        let cb: Any = folder
+        var acc: Any = unwrap_ok_value_raw(init)
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return acc },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return v.as(Any)
+                    }
+                    let step_acc = cb(acc, v)
+                    if is_error_value_raw(step_acc) {
+                        return step_acc
+                    }
+                    acc = unwrap_ok_value_raw(step_acc)
+                },
+            }
+        }
+        acc
+    }
+
+    pub fn reduce(self, reducer: fn(Item, Item) -> Item) -> ?Item {
+        let cb: Any = reducer
+        self.next() match {
+            IterationStep(Item).done => null,
+            IterationStep(Item).yielded(first_val) => {
+                if is_error_value_raw(first_val) {
+                    return forward_error_raw(first_val)
+                }
+                var acc: Item = first_val
+                while true {
+                    self.next() match {
+                        IterationStep(Item).done => { return acc },
+                        IterationStep(Item).yielded(v) => {
+                            if is_error_value_raw(v) {
+                                return forward_error_raw(v)
+                            }
+                            let next_acc = cb(acc, v)
+                            if is_error_value_raw(next_acc) {
+                                return forward_error_raw(next_acc)
+                            }
+                            acc = unwrap_ok_value_raw(next_acc).as(Item)
+                        },
+                    }
+                }
+                acc
+            },
+        }
+    }
+
+    pub fn for_each(self, action: fn(Item) -> Unit) -> Unit {
+        let cb: Any = action
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return () },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let res = cb(v)
+                    if is_error_value_raw(res) {
+                        return forward_error_raw(res)
+                    }
+                    let _ = unwrap_ok_value_raw(res).as(Unit)
+                },
+            }
+        }
+    }
+
+    pub fn any(self, predicate: fn(Item) -> bool) -> bool {
+        let cb: Any = predicate
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return false },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let matched = cb(v)
+                    if is_error_value_raw(matched) {
+                        return forward_error_raw(matched)
+                    }
+                    if unwrap_ok_value_raw(matched).as(bool) {
+                        return true
+                    }
+                },
+            }
+        }
+        false
+    }
+
+    pub fn all(self, predicate: fn(Item) -> bool) -> bool {
+        let cb: Any = predicate
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return true },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let matched = cb(v)
+                    if is_error_value_raw(matched) {
+                        return forward_error_raw(matched)
+                    }
+                    if not unwrap_ok_value_raw(matched).as(bool) {
+                        return false
+                    }
+                },
+            }
+        }
+        true
+    }
+
+    pub fn find(self, predicate: fn(Item) -> bool) -> ?Item {
+        let cb: Any = predicate
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return null },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let matched = cb(v)
+                    if is_error_value_raw(matched) {
+                        return forward_error_raw(matched)
+                    }
+                    if unwrap_ok_value_raw(matched).as(bool) {
+                        return v
+                    }
+                },
+            }
+        }
+        null
+    }
+
+    pub fn find_map(self, mapper: fn(Item) -> ?Any) -> ?Any {
+        let cb: Any = mapper
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return null },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let raw_mapped = cb(v)
+                    if is_error_value_raw(raw_mapped) {
+                        return forward_error_raw(raw_mapped)
+                    }
+                    let mapped = unwrap_ok_value_raw(raw_mapped)
+                    if mapped != null {
+                        return mapped
+                    }
+                },
+            }
+        }
+        null
+    }
+
+    pub fn position(self, predicate: fn(Item) -> bool) -> ?usize {
+        let cb: Any = predicate
+        var idx: usize = 0
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return null },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let matched = cb(v)
+                    if is_error_value_raw(matched) {
+                        return forward_error_raw(matched)
+                    }
+                    if unwrap_ok_value_raw(matched).as(bool) {
+                        return idx
+                    }
+                    idx += 1
+                },
+            }
+        }
+        null
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.next() match {
+            IterationStep(Item).done => true,
+            IterationStep(Item).yielded(v) => {
+                if is_error_value_raw(v) {
+                    return forward_error_raw(v)
+                }
+                false
+            },
+        }
+    }
+
+    pub fn min(self) -> ?Item {
+        self.next() match {
+            IterationStep(Item).done => null,
+            IterationStep(Item).yielded(first_val) => {
+                if is_error_value_raw(first_val) {
+                    return forward_error_raw(first_val)
+                }
+                var best: Item = first_val
+                while true {
+                    self.next() match {
+                        IterationStep(Item).done => { return best },
+                        IterationStep(Item).yielded(v) => {
+                            if is_error_value_raw(v) {
+                                return forward_error_raw(v)
+                            }
+                            if item_lt(v.as(Any), best.as(Any)) {
+                                best = v
+                            }
+                        },
+                    }
+                }
+                best
+            },
+        }
+    }
+
+    pub fn max(self) -> ?Item {
+        self.next() match {
+            IterationStep(Item).done => null,
+            IterationStep(Item).yielded(first_val) => {
+                if is_error_value_raw(first_val) {
+                    return forward_error_raw(first_val)
+                }
+                var best: Item = first_val
+                while true {
+                    self.next() match {
+                        IterationStep(Item).done => { return best },
+                        IterationStep(Item).yielded(v) => {
+                            if is_error_value_raw(v) {
+                                return forward_error_raw(v)
+                            }
+                            if item_lt(best.as(Any), v.as(Any)) {
+                                best = v
+                            }
+                        },
+                    }
+                }
+                best
+            },
+        }
+    }
+
+    pub fn nth(self, index: usize) -> ?Item {
+        var skipped: usize = 0
+        while skipped < index {
+            self.next() match {
+                IterationStep(Item).done => { return null },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    skipped += 1
+                },
+            }
+        }
+        self.next() match {
+            IterationStep(Item).done => null,
+            IterationStep(Item).yielded(v) => {
+                if is_error_value_raw(v) {
+                    return forward_error_raw(v)
+                }
+                v
+            },
+        }
+    }
+
+    pub fn first(self) -> ?Item {
+        self.next() match {
+            IterationStep(Item).done => null,
+            IterationStep(Item).yielded(v) => {
+                if is_error_value_raw(v) {
+                    return forward_error_raw(v)
+                }
+                v
+            },
+        }
+    }
+
+    pub fn last(self) -> ?Item {
+        var found: ?Item = null
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return found },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    found = v
+                },
+            }
+        }
+        found
+    }
+
+    pub fn partition(self, predicate: fn(Item) -> bool) -> (List, List) {
+        let matched = List()
+        let unmatched = List()
+        let cb: Any = predicate
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return (matched, unmatched) },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    let keep = cb(v)
+                    if is_error_value_raw(keep) {
+                        return forward_error_raw(keep)
+                    }
+                    if unwrap_ok_value_raw(keep).as(bool) {
+                        matched.push(v)
+                    } else {
+                        unmatched.push(v)
+                    }
+                },
+            }
+        }
+        (matched, unmatched)
+    }
+
+    pub fn sum(self) -> i64 {
+        var total: i64 = 0
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return total },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    total = total + item_to_i64(v)
+                },
+            }
+        }
+        total
+    }
+
+    pub fn product(self) -> i64 {
+        var acc: i64 = 1
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return acc },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    acc = acc * item_to_i64(v)
+                },
+            }
+        }
+        acc
+    }
+
+    pub fn join(self, .sep: String = "") -> String {
+        let pieces = List()
+        while true {
+            self.next() match {
+                IterationStep(Item).done => { return pieces.join(sep) },
+                IterationStep(Item).yielded(v) => {
+                    if is_error_value_raw(v) {
+                        return forward_error_raw(v)
+                    }
+                    pieces.push(item_to_display_string(v))
+                },
+            }
+        }
+        pieces.join(sep)
+    }
+}

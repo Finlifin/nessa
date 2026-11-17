@@ -1,4 +1,4 @@
--- std.fmt — printf / Lua string.format style formatting.
+-- std.fmt — checked printf-style string formatting and formatted stream output.
 
 use .builtin.*
 use .traits.*
@@ -30,7 +30,7 @@ impl Display for FormatError {
 }
 
 -- Format `args` according to `spec`, returning a typed `FormatError` on failure.
-pub fn try_sprintf_list(spec: String, args: List) -> !FormatError String {
+pub fn format_list(spec: String, args: List) -> !FormatError String {
     let (code, payload) = native_sprintf(spec, args)
     when {
         code == 0 => payload
@@ -42,33 +42,35 @@ pub fn try_sprintf_list(spec: String, args: List) -> !FormatError String {
     }
 }
 
--- Variadic wrapper around `try_sprintf_list`.
-pub fn try_sprintf(spec: String, ...args: List) -> !FormatError String {
-    try_sprintf_list(spec, args)
+-- Checked variadic formatting according to `spec`.
+pub fn format(spec: String, ...args: List) -> !FormatError String {
+    format_list(spec, args)
 }
 
 -- Format `args` according to `spec`, panicking with the diagnostic message on error.
-pub fn format(spec: String, ...args: List) -> String {
-    try_sprintf_list(spec, args) match {
+pub fn sprintf_list(spec: String, args: List) -> String {
+    format_list(spec, args) match {
         formatted! => formatted,
         error err => native_panic(err.to_string()),
     }
+}
+
+-- Panicking variadic convenience formatter.
+pub fn sprintf(spec: String, ...args: List) -> String {
+    sprintf_list(spec, args)
+}
+
+-- Alias for `sprintf` when a format specification is statically known to be valid.
+pub fn must_format(spec: String, ...args: List) -> String {
+    sprintf_list(spec, args)
 }
 
 -- Format and write directly to stdout without adding a trailing newline.
 pub fn printf(spec: String, ...args: List) -> Unit {
-    let rendered = try_sprintf_list(spec, args) match {
-        formatted! => formatted,
-        error err => native_panic(err.to_string()),
-    }
-    native_print(rendered)
+    native_print(sprintf_list(spec, args))
 }
 
 -- Format and write directly to stderr without adding a trailing newline.
 pub fn eprintf(spec: String, ...args: List) -> Unit {
-    let rendered = try_sprintf_list(spec, args) match {
-        formatted! => formatted,
-        error err => native_panic(err.to_string()),
-    }
-    native_eprint(rendered)
+    native_eprint(sprintf_list(spec, args))
 }

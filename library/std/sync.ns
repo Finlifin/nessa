@@ -3,56 +3,58 @@
 use .builtin.*
 use .traits.*
 
-private const _to_string_raw: fn(Any) -> String = .to_string'builtin
+private const native_to_string: fn(Any) -> String = .to_string'builtin
+private const native_is_error_value: fn(Any) -> bool = .__is_error_value'builtin
+private const native_unwrap_ok_value: fn(Any) -> Any = .__unwrap_ok_value'builtin
 
-private const _sync_chan_new: fn(i64) -> i64 = .__sync_chan_new'builtin
-private const _sync_chan_send: fn(i64, Any) -> i64 = .__sync_chan_send'builtin
-private const _sync_chan_try_send: fn(i64, Any) -> i64 = .__sync_chan_try_send'builtin
-private const _sync_chan_recv: fn(i64) -> (i64, Any) = .__sync_chan_recv'builtin
-private const _sync_chan_try_recv: fn(i64) -> (i64, Any) = .__sync_chan_try_recv'builtin
-private const _sync_chan_close: fn(i64) -> Unit = .__sync_chan_close'builtin
-private const _sync_chan_is_closed: fn(i64) -> bool = .__sync_chan_is_closed'builtin
-private const _sync_chan_len: fn(i64) -> i64 = .__sync_chan_len'builtin
+private const native_sync_chan_new: fn(i64) -> i64 = .__sync_chan_new'builtin
+private const native_sync_chan_send: fn(i64, Any) -> i64 = .__sync_chan_send'builtin
+private const native_sync_chan_try_send: fn(i64, Any) -> i64 = .__sync_chan_try_send'builtin
+private const native_sync_chan_recv: fn(i64) -> (i64, Any) = .__sync_chan_recv'builtin
+private const native_sync_chan_try_recv: fn(i64) -> (i64, Any) = .__sync_chan_try_recv'builtin
+private const native_sync_chan_close: fn(i64) -> Unit = .__sync_chan_close'builtin
+private const native_sync_chan_is_closed: fn(i64) -> bool = .__sync_chan_is_closed'builtin
+private const native_sync_chan_len: fn(i64) -> i64 = .__sync_chan_len'builtin
 
-private const _sync_mutex_new: fn(Any) -> i64 = .__sync_mutex_new'builtin
-private const _sync_mutex_lock: fn(i64) -> Any = .__sync_mutex_lock'builtin
-private const _sync_mutex_try_lock: fn(i64) -> bool = .__sync_mutex_try_lock'builtin
-private const _sync_mutex_unlock: fn(i64) -> Unit = .__sync_mutex_unlock'builtin
-private const _sync_mutex_get: fn(i64) -> Any = .__sync_mutex_get'builtin
-private const _sync_mutex_set: fn(i64, Any) -> Unit = .__sync_mutex_set'builtin
-private const _sync_mutex_is_locked: fn(i64) -> bool = .__sync_mutex_is_locked'builtin
+private const native_sync_mutex_new: fn(Any) -> i64 = .__sync_mutex_new'builtin
+private const native_sync_mutex_lock: fn(i64) -> Any = .__sync_mutex_lock'builtin
+private const native_sync_mutex_try_lock: fn(i64) -> bool = .__sync_mutex_try_lock'builtin
+private const native_sync_mutex_unlock: fn(i64) -> Unit = .__sync_mutex_unlock'builtin
+private const native_sync_mutex_get: fn(i64) -> Any = .__sync_mutex_get'builtin
+private const native_sync_mutex_set: fn(i64, Any) -> Unit = .__sync_mutex_set'builtin
+private const native_sync_mutex_is_locked: fn(i64) -> bool = .__sync_mutex_is_locked'builtin
 
-private const _sync_rwlock_new: fn(Any) -> i64 = .__sync_rwlock_new'builtin
-private const _sync_rwlock_read_lock: fn(i64) -> Any = .__sync_rwlock_read_lock'builtin
-private const _sync_rwlock_try_read_lock: fn(i64) -> bool = .__sync_rwlock_try_read_lock'builtin
-private const _sync_rwlock_read_unlock: fn(i64) -> Unit = .__sync_rwlock_read_unlock'builtin
-private const _sync_rwlock_write_lock: fn(i64) -> Any = .__sync_rwlock_write_lock'builtin
-private const _sync_rwlock_try_write_lock: fn(i64) -> bool = .__sync_rwlock_try_write_lock'builtin
-private const _sync_rwlock_write_unlock: fn(i64) -> Unit = .__sync_rwlock_write_unlock'builtin
-private const _sync_rwlock_get: fn(i64) -> Any = .__sync_rwlock_get'builtin
-private const _sync_rwlock_set: fn(i64, Any) -> Unit = .__sync_rwlock_set'builtin
+private const native_sync_rwlock_new: fn(Any) -> i64 = .__sync_rwlock_new'builtin
+private const native_sync_rwlock_read_lock: fn(i64) -> Any = .__sync_rwlock_read_lock'builtin
+private const native_sync_rwlock_try_read_lock: fn(i64) -> bool = .__sync_rwlock_try_read_lock'builtin
+private const native_sync_rwlock_read_unlock: fn(i64) -> Unit = .__sync_rwlock_read_unlock'builtin
+private const native_sync_rwlock_write_lock: fn(i64) -> Any = .__sync_rwlock_write_lock'builtin
+private const native_sync_rwlock_try_write_lock: fn(i64) -> bool = .__sync_rwlock_try_write_lock'builtin
+private const native_sync_rwlock_write_unlock: fn(i64) -> Unit = .__sync_rwlock_write_unlock'builtin
+private const native_sync_rwlock_get: fn(i64) -> Any = .__sync_rwlock_get'builtin
+private const native_sync_rwlock_set: fn(i64, Any) -> Unit = .__sync_rwlock_set'builtin
 
-private const _sync_sem_new: fn(i64) -> i64 = .__sync_sem_new'builtin
-private const _sync_sem_acquire: fn(i64) -> Unit = .__sync_sem_acquire'builtin
-private const _sync_sem_try_acquire: fn(i64) -> bool = .__sync_sem_try_acquire'builtin
-private const _sync_sem_release: fn(i64, i64) -> Unit = .__sync_sem_release'builtin
-private const _sync_sem_available: fn(i64) -> i64 = .__sync_sem_available'builtin
+private const native_sync_sem_new: fn(i64) -> i64 = .__sync_sem_new'builtin
+private const native_sync_sem_acquire: fn(i64) -> Unit = .__sync_sem_acquire'builtin
+private const native_sync_sem_try_acquire: fn(i64) -> bool = .__sync_sem_try_acquire'builtin
+private const native_sync_sem_release: fn(i64, i64) -> Unit = .__sync_sem_release'builtin
+private const native_sync_sem_available: fn(i64) -> i64 = .__sync_sem_available'builtin
 
-private const _sync_once_new: fn() -> i64 = .__sync_once_new'builtin
-private const _sync_once_begin: fn(i64) -> (i64, Any) = .__sync_once_begin'builtin
-private const _sync_once_complete: fn(i64, Any) -> Unit = .__sync_once_complete'builtin
-private const _sync_once_abort: fn(i64) -> Unit = .__sync_once_abort'builtin
-private const _sync_once_get: fn(i64) -> (bool, Any) = .__sync_once_get'builtin
+private const native_sync_once_new: fn() -> i64 = .__sync_once_new'builtin
+private const native_sync_once_begin: fn(i64) -> (i64, Any) = .__sync_once_begin'builtin
+private const native_sync_once_complete: fn(i64, Any) -> Unit = .__sync_once_complete'builtin
+private const native_sync_once_abort: fn(i64) -> Unit = .__sync_once_abort'builtin
+private const native_sync_once_get: fn(i64) -> (bool, Any) = .__sync_once_get'builtin
 
-private const _sync_barrier_new: fn(i64) -> i64 = .__sync_barrier_new'builtin
-private const _sync_barrier_wait: fn(i64) -> bool = .__sync_barrier_wait'builtin
+private const native_sync_barrier_new: fn(i64) -> i64 = .__sync_barrier_new'builtin
+private const native_sync_barrier_wait: fn(i64) -> Any = .__sync_barrier_wait'builtin
 
-private const _sync_atomic_new: fn(i64) -> i64 = .__sync_atomic_new'builtin
-private const _sync_atomic_load: fn(i64) -> i64 = .__sync_atomic_load'builtin
-private const _sync_atomic_store: fn(i64, i64) -> Unit = .__sync_atomic_store'builtin
-private const _sync_atomic_swap: fn(i64, i64) -> i64 = .__sync_atomic_swap'builtin
-private const _sync_atomic_fetch_add: fn(i64, i64) -> i64 = .__sync_atomic_fetch_add'builtin
-private const _sync_atomic_cas: fn(i64, i64, i64) -> (bool, i64) = .__sync_atomic_cas'builtin
+private const native_sync_atomic_new: fn(i64) -> i64 = .__sync_atomic_new'builtin
+private const native_sync_atomic_load: fn(i64) -> i64 = .__sync_atomic_load'builtin
+private const native_sync_atomic_store: fn(i64, i64) -> Unit = .__sync_atomic_store'builtin
+private const native_sync_atomic_swap: fn(i64, i64) -> i64 = .__sync_atomic_swap'builtin
+private const native_sync_atomic_fetch_add: fn(i64, i64) -> i64 = .__sync_atomic_fetch_add'builtin
+private const native_sync_atomic_cas: fn(i64, i64, i64) -> (bool, i64) = .__sync_atomic_cas'builtin
 
 pub enum ChannelError {
     pub Closed,
@@ -71,6 +73,11 @@ impl Display for ChannelError {
     }
 }
 
+pub enum SyncError {
+    pub BrokenBarrier,
+}
+derive Eq, PartialEq, Display for SyncError
+
 pub struct Channel {
     handle_id: i64,
 }
@@ -78,22 +85,22 @@ derive Eq, PartialEq for Channel
 
 impl Display for Channel {
     pub fn to_string(self) -> String {
-        "Channel(#" ++ _to_string_raw(self.handle_id) ++ ")"
+        "Channel(#" ++ native_to_string(self.handle_id) ++ ")"
     }
 }
 
 impl Channel {
-    pub fn new(.capacity: i64 = 0) -> Channel = Channel { handle_id: _sync_chan_new(capacity) }
-    pub fn unbuffered() -> Channel = Channel { handle_id: _sync_chan_new(0) }
-    pub fn buffered(capacity: i64) -> Channel = Channel { handle_id: _sync_chan_new(capacity) }
+    pub fn new(.capacity: i64 = 0) -> Channel = Channel { handle_id: native_sync_chan_new(capacity) }
+    pub fn unbuffered() -> Channel = Channel { handle_id: native_sync_chan_new(0) }
+    pub fn buffered(capacity: i64) -> Channel = Channel { handle_id: native_sync_chan_new(capacity) }
 
     pub fn send(self, val: Any) -> !ChannelError Unit {
-        let code = _sync_chan_send(self.handle_id, val)
+        let code = native_sync_chan_send(self.handle_id, val)
         if code == 0 { () } else { error ChannelError.Closed }
     }
 
     pub fn try_send(self, val: Any) -> !ChannelError Unit {
-        let code = _sync_chan_try_send(self.handle_id, val)
+        let code = native_sync_chan_try_send(self.handle_id, val)
         when {
             code == 0 => ()
             code == 1 => error ChannelError.Closed
@@ -102,12 +109,12 @@ impl Channel {
     }
 
     pub fn recv(self) -> !ChannelError Any {
-        let (code, val) = _sync_chan_recv(self.handle_id)
+        let (code, val) = native_sync_chan_recv(self.handle_id)
         if code == 0 { val } else { error ChannelError.Closed }
     }
 
     pub fn try_recv(self) -> !ChannelError Any {
-        let (code, val) = _sync_chan_try_recv(self.handle_id)
+        let (code, val) = native_sync_chan_try_recv(self.handle_id)
         when {
             code == 0 => val
             code == 1 => error ChannelError.Closed
@@ -115,10 +122,10 @@ impl Channel {
         }
     }
 
-    pub fn close(self) -> Unit = _sync_chan_close(self.handle_id)
-    pub fn is_closed(self) -> bool = _sync_chan_is_closed(self.handle_id)
-    pub fn len(self) -> i64 = _sync_chan_len(self.handle_id)
-    pub fn is_empty(self) -> bool = _sync_chan_len(self.handle_id) == 0
+    pub fn close(self) -> Unit = native_sync_chan_close(self.handle_id)
+    pub fn is_closed(self) -> bool = native_sync_chan_is_closed(self.handle_id)
+    pub fn len(self) -> i64 = native_sync_chan_len(self.handle_id)
+    pub fn is_empty(self) -> bool = native_sync_chan_len(self.handle_id) == 0
 }
 
 pub struct Mutex {
@@ -128,27 +135,27 @@ derive Eq, PartialEq for Mutex
 
 impl Display for Mutex {
     pub fn to_string(self) -> String {
-        "Mutex(#" ++ _to_string_raw(self.handle_id) ++ ")"
+        "Mutex(#" ++ native_to_string(self.handle_id) ++ ")"
     }
 }
 
 impl Mutex {
-    pub fn new(initial: Any) -> Mutex = Mutex { handle_id: _sync_mutex_new(initial) }
-    pub fn lock(self) -> Any = _sync_mutex_lock(self.handle_id)
-    pub fn try_lock(self) -> bool = _sync_mutex_try_lock(self.handle_id)
-    pub fn unlock(self) -> Unit = _sync_mutex_unlock(self.handle_id)
-    pub fn get(self) -> Any = _sync_mutex_get(self.handle_id)
-    pub fn set(self, val: Any) -> Unit = _sync_mutex_set(self.handle_id, val)
-    pub fn is_locked(self) -> bool = _sync_mutex_is_locked(self.handle_id)
+    pub fn new(initial: Any) -> Mutex = Mutex { handle_id: native_sync_mutex_new(initial) }
+    pub fn lock(self) -> Any = native_sync_mutex_lock(self.handle_id)
+    pub fn try_lock(self) -> bool = native_sync_mutex_try_lock(self.handle_id)
+    pub fn unlock(self) -> Unit = native_sync_mutex_unlock(self.handle_id)
+    pub fn get(self) -> Any = native_sync_mutex_get(self.handle_id)
+    pub fn set(self, val: Any) -> Unit = native_sync_mutex_set(self.handle_id, val)
+    pub fn is_locked(self) -> bool = native_sync_mutex_is_locked(self.handle_id)
 
     pub fn with_lock(self, f: fn(Any) -> Any) -> Any {
         var acquired = false
         defer {
             if acquired {
-                _sync_mutex_unlock(self.handle_id)
+                native_sync_mutex_unlock(self.handle_id)
             }
         }
-        let current = _sync_mutex_lock(self.handle_id)
+        let current = native_sync_mutex_lock(self.handle_id)
         acquired = true
         f(current)
     }
@@ -157,14 +164,18 @@ impl Mutex {
         var acquired = false
         defer {
             if acquired {
-                _sync_mutex_unlock(self.handle_id)
+                native_sync_mutex_unlock(self.handle_id)
             }
         }
-        let current = _sync_mutex_lock(self.handle_id)
+        let current = native_sync_mutex_lock(self.handle_id)
         acquired = true
         let next = f(current)
-        _sync_mutex_set(self.handle_id, next)
-        next
+        if native_is_error_value(next) {
+            return next
+        }
+        let clean = native_unwrap_ok_value(next)
+        native_sync_mutex_set(self.handle_id, clean)
+        clean
     }
 }
 
@@ -175,29 +186,29 @@ derive Eq, PartialEq for RwLock
 
 impl Display for RwLock {
     pub fn to_string(self) -> String {
-        "RwLock(#" ++ _to_string_raw(self.handle_id) ++ ")"
+        "RwLock(#" ++ native_to_string(self.handle_id) ++ ")"
     }
 }
 
 impl RwLock {
-    pub fn new(initial: Any) -> RwLock = RwLock { handle_id: _sync_rwlock_new(initial) }
-    pub fn read_lock(self) -> Any = _sync_rwlock_read_lock(self.handle_id)
-    pub fn try_read_lock(self) -> bool = _sync_rwlock_try_read_lock(self.handle_id)
-    pub fn read_unlock(self) -> Unit = _sync_rwlock_read_unlock(self.handle_id)
-    pub fn write_lock(self) -> Any = _sync_rwlock_write_lock(self.handle_id)
-    pub fn try_write_lock(self) -> bool = _sync_rwlock_try_write_lock(self.handle_id)
-    pub fn write_unlock(self) -> Unit = _sync_rwlock_write_unlock(self.handle_id)
-    pub fn get(self) -> Any = _sync_rwlock_get(self.handle_id)
-    pub fn set(self, val: Any) -> Unit = _sync_rwlock_set(self.handle_id, val)
+    pub fn new(initial: Any) -> RwLock = RwLock { handle_id: native_sync_rwlock_new(initial) }
+    pub fn read_lock(self) -> Any = native_sync_rwlock_read_lock(self.handle_id)
+    pub fn try_read_lock(self) -> bool = native_sync_rwlock_try_read_lock(self.handle_id)
+    pub fn read_unlock(self) -> Unit = native_sync_rwlock_read_unlock(self.handle_id)
+    pub fn write_lock(self) -> Any = native_sync_rwlock_write_lock(self.handle_id)
+    pub fn try_write_lock(self) -> bool = native_sync_rwlock_try_write_lock(self.handle_id)
+    pub fn write_unlock(self) -> Unit = native_sync_rwlock_write_unlock(self.handle_id)
+    pub fn get(self) -> Any = native_sync_rwlock_get(self.handle_id)
+    pub fn set(self, val: Any) -> Unit = native_sync_rwlock_set(self.handle_id, val)
 
     pub fn with_read(self, f: fn(Any) -> Any) -> Any {
         var acquired = false
         defer {
             if acquired {
-                _sync_rwlock_read_unlock(self.handle_id)
+                native_sync_rwlock_read_unlock(self.handle_id)
             }
         }
-        let current = _sync_rwlock_read_lock(self.handle_id)
+        let current = native_sync_rwlock_read_lock(self.handle_id)
         acquired = true
         f(current)
     }
@@ -206,14 +217,18 @@ impl RwLock {
         var acquired = false
         defer {
             if acquired {
-                _sync_rwlock_write_unlock(self.handle_id)
+                native_sync_rwlock_write_unlock(self.handle_id)
             }
         }
-        let current = _sync_rwlock_write_lock(self.handle_id)
+        let current = native_sync_rwlock_write_lock(self.handle_id)
         acquired = true
         let next = f(current)
-        _sync_rwlock_set(self.handle_id, next)
-        next
+        if native_is_error_value(next) {
+            return next
+        }
+        let clean = native_unwrap_ok_value(next)
+        native_sync_rwlock_set(self.handle_id, clean)
+        clean
     }
 }
 
@@ -224,26 +239,25 @@ derive Eq, PartialEq for Semaphore
 
 impl Display for Semaphore {
     pub fn to_string(self) -> String {
-        "Semaphore(#" ++ _to_string_raw(self.handle_id) ++ ")"
+        "Semaphore(#" ++ native_to_string(self.handle_id) ++ ")"
     }
 }
 
 impl Semaphore {
-    pub fn new(permits: i64) -> Semaphore = Semaphore { handle_id: _sync_sem_new(permits) }
-    pub fn acquire(self) -> Unit = _sync_sem_acquire(self.handle_id)
-    pub fn try_acquire(self) -> bool = _sync_sem_try_acquire(self.handle_id)
-    pub fn release(self, .count: i64 = 1) -> Unit = _sync_sem_release(self.handle_id, count)
-    pub fn release_many(self, count: i64) -> Unit = _sync_sem_release(self.handle_id, count)
-    pub fn available(self) -> i64 = _sync_sem_available(self.handle_id)
+    pub fn new(permits: i64) -> Semaphore = Semaphore { handle_id: native_sync_sem_new(permits) }
+    pub fn acquire(self) -> Unit = native_sync_sem_acquire(self.handle_id)
+    pub fn try_acquire(self) -> bool = native_sync_sem_try_acquire(self.handle_id)
+    pub fn release(self, .count: i64 = 1) -> Unit = native_sync_sem_release(self.handle_id, count)
+    pub fn available(self) -> i64 = native_sync_sem_available(self.handle_id)
 
     pub fn with_permit(self, f: fn() -> Any) -> Any {
         var acquired = false
         defer {
             if acquired {
-                _sync_sem_release(self.handle_id, 1)
+                native_sync_sem_release(self.handle_id, 1)
             }
         }
-        _sync_sem_acquire(self.handle_id)
+        native_sync_sem_acquire(self.handle_id)
         acquired = true
         f()
     }
@@ -256,31 +270,35 @@ derive Eq, PartialEq for Once
 
 impl Display for Once {
     pub fn to_string(self) -> String {
-        "Once(#" ++ _to_string_raw(self.handle_id) ++ ")"
+        "Once(#" ++ native_to_string(self.handle_id) ++ ")"
     }
 }
 
 impl Once {
-    pub fn new() -> Once = Once { handle_id: _sync_once_new() }
+    pub fn new() -> Once = Once { handle_id: native_sync_once_new() }
 
     pub fn call_once(self, init: fn() -> Any) -> Any {
-        defer { _sync_once_abort(self.handle_id) }
-        let (code, existing) = _sync_once_begin(self.handle_id)
+        defer { native_sync_once_abort(self.handle_id) }
+        let (code, existing) = native_sync_once_begin(self.handle_id)
         if code == 0 {
             return existing
         }
         let computed = init()
-        _sync_once_complete(self.handle_id, computed)
-        computed
+        if native_is_error_value(computed) {
+            return computed
+        }
+        let clean = native_unwrap_ok_value(computed)
+        native_sync_once_complete(self.handle_id, clean)
+        clean
     }
 
     pub fn get(self) -> ?Any {
-        let (ready, val) = _sync_once_get(self.handle_id)
+        let (ready, val) = native_sync_once_get(self.handle_id)
         if ready { val } else { null }
     }
 
     pub fn is_completed(self) -> bool {
-        let (ready, _) = _sync_once_get(self.handle_id)
+        let (ready, _) = native_sync_once_get(self.handle_id)
         ready
     }
 }
@@ -303,13 +321,27 @@ derive Eq, PartialEq for Barrier
 
 impl Display for Barrier {
     pub fn to_string(self) -> String {
-        "Barrier(#" ++ _to_string_raw(self.handle_id) ++ ")"
+        "Barrier(#" ++ native_to_string(self.handle_id) ++ ")"
     }
 }
 
 impl Barrier {
-    pub fn new(parties: i64) -> Barrier = Barrier { handle_id: _sync_barrier_new(parties) }
-    pub fn wait(self) -> bool = _sync_barrier_wait(self.handle_id)
+    pub fn new(parties: i64) -> Barrier = Barrier { handle_id: native_sync_barrier_new(parties) }
+
+    pub fn wait(self) -> !SyncError bool {
+        let outcome = native_sync_barrier_wait(self.handle_id)
+        outcome match {
+            is_leader: bool => is_leader,
+            code: i64 => {
+                if code < 0 {
+                    error SyncError.BrokenBarrier
+                } else {
+                    code != 0
+                }
+            },
+            _ => error SyncError.BrokenBarrier,
+        }
+    }
 }
 
 pub struct AtomicInt {
@@ -319,20 +351,20 @@ derive Eq, PartialEq for AtomicInt
 
 impl Display for AtomicInt {
     pub fn to_string(self) -> String {
-        "AtomicInt(" ++ _to_string_raw(_sync_atomic_load(self.handle_id)) ++ ")"
+        "AtomicInt(" ++ native_to_string(native_sync_atomic_load(self.handle_id)) ++ ")"
     }
 }
 
 impl AtomicInt {
-    pub fn new(initial: i64) -> AtomicInt = AtomicInt { handle_id: _sync_atomic_new(initial) }
-    pub fn zero() -> AtomicInt = AtomicInt { handle_id: _sync_atomic_new(0) }
-    pub fn load(self) -> i64 = _sync_atomic_load(self.handle_id)
-    pub fn store(self, val: i64) -> Unit = _sync_atomic_store(self.handle_id, val)
-    pub fn swap(self, val: i64) -> i64 = _sync_atomic_swap(self.handle_id, val)
-    pub fn fetch_add(self, delta: i64) -> i64 = _sync_atomic_fetch_add(self.handle_id, delta)
-    pub fn fetch_sub(self, delta: i64) -> i64 = _sync_atomic_fetch_add(self.handle_id, 0 - delta)
+    pub fn new(initial: i64) -> AtomicInt = AtomicInt { handle_id: native_sync_atomic_new(initial) }
+    pub fn zero() -> AtomicInt = AtomicInt { handle_id: native_sync_atomic_new(0) }
+    pub fn load(self) -> i64 = native_sync_atomic_load(self.handle_id)
+    pub fn store(self, val: i64) -> Unit = native_sync_atomic_store(self.handle_id, val)
+    pub fn swap(self, val: i64) -> i64 = native_sync_atomic_swap(self.handle_id, val)
+    pub fn fetch_add(self, delta: i64) -> i64 = native_sync_atomic_fetch_add(self.handle_id, delta)
+    pub fn fetch_sub(self, delta: i64) -> i64 = native_sync_atomic_fetch_add(self.handle_id, 0 - delta)
     pub fn compare_exchange(self, expected: i64, desired: i64) -> (bool, i64) {
-        _sync_atomic_cas(self.handle_id, expected, desired)
+        native_sync_atomic_cas(self.handle_id, expected, desired)
     }
 }
 
@@ -343,7 +375,7 @@ derive Eq, PartialEq for AtomicBool
 
 impl Display for AtomicBool {
     pub fn to_string(self) -> String {
-        if _sync_atomic_load(self.handle_id) != 0 {
+        if native_sync_atomic_load(self.handle_id) != 0 {
             "AtomicBool(true)"
         } else {
             "AtomicBool(false)"
@@ -353,23 +385,23 @@ impl Display for AtomicBool {
 
 impl AtomicBool {
     pub fn new(initial: bool) -> AtomicBool {
-        AtomicBool { handle_id: _sync_atomic_new(if initial { 1 } else { 0 }) }
+        AtomicBool { handle_id: native_sync_atomic_new(if initial { 1 } else { 0 }) }
     }
 
-    pub fn load(self) -> bool = _sync_atomic_load(self.handle_id) != 0
+    pub fn load(self) -> bool = native_sync_atomic_load(self.handle_id) != 0
 
     pub fn store(self, val: bool) -> Unit {
-        _sync_atomic_store(self.handle_id, if val { 1 } else { 0 })
+        native_sync_atomic_store(self.handle_id, if val { 1 } else { 0 })
     }
 
     pub fn swap(self, val: bool) -> bool {
-        _sync_atomic_swap(self.handle_id, if val { 1 } else { 0 }) != 0
+        native_sync_atomic_swap(self.handle_id, if val { 1 } else { 0 }) != 0
     }
 
     pub fn compare_exchange(self, expected: bool, desired: bool) -> (bool, bool) {
         let exp_num = if expected { 1 } else { 0 }
         let des_num = if desired { 1 } else { 0 }
-        let (ok, prev) = _sync_atomic_cas(self.handle_id, exp_num, des_num)
+        let (ok, prev) = native_sync_atomic_cas(self.handle_id, exp_num, des_num)
         (ok, prev != 0)
     }
 }

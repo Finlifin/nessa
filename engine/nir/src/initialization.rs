@@ -772,10 +772,13 @@ impl<'a> Planner<'a> {
             return symbol;
         };
         if definition.def_node.is_null()
-            || !matches!(
+            || (!matches!(
                 self.resolved.ast.node(definition.def_node).kind,
                 NodeKind::TraitDefFn | NodeKind::TraitDeriveFn
-            )
+            ) && !self
+                .resolved
+                .iterator_template_nodes
+                .contains(&definition.def_node))
         {
             return symbol;
         }
@@ -1007,6 +1010,9 @@ impl<'a> Planner<'a> {
             }
             _ => {}
         }
+        if let Some(&(get_sym_fn, _)) = self.resolved.ffi_symbol_projections.get(&node) {
+            self.scan_called_symbol_in(get_sym_fn, dependencies, visited, None);
+        }
         for (_, expression) in self.selected_defaults(node, context) {
             self.scan_initializer_in(expression, dependencies, visited, context);
         }
@@ -1087,10 +1093,13 @@ impl<'a> Planner<'a> {
             return false;
         };
         if definition.def_node.is_null()
-            || !matches!(
+            || (!matches!(
                 ast.node(definition.def_node).kind,
                 NodeKind::TraitDefFn | NodeKind::TraitDeriveFn
-            )
+            ) && !self
+                .resolved
+                .iterator_template_nodes
+                .contains(&definition.def_node))
         {
             return false;
         }
@@ -1139,6 +1148,11 @@ impl<'a> Planner<'a> {
 
     fn called_symbol(&self, node: NodeIndex, context: Option<DefaultScan<'_>>) -> Option<SymbolId> {
         let facts = self.body_facts(context, node);
+        if facts.is_none()
+            && let Some(plan) = self.resolved.json_decode_calls.get(&node)
+        {
+            return Some(plan.from_json_symbol);
+        }
         if let Some(&symbol) = facts
             .map(|facts| &facts.concat_calls)
             .unwrap_or(&self.resolved.concat_calls)

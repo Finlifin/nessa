@@ -1923,7 +1923,8 @@ pub(crate) fn coerce_inferred_returns(
 }
 
 pub(crate) fn resolve_function_def_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
-    if ast.node(node_idx).kind == NodeKind::TraitDeriveFn
+    if (ast.node(node_idx).kind == NodeKind::TraitDeriveFn
+        || crate::iterator_defaults::is_template_node(r, node_idx))
         && r.default_body_context.is_none()
         && r.node_scopes
             .get(&node_idx)
@@ -2593,6 +2594,7 @@ pub(crate) fn resolve_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
                 children[2],
                 false,
             );
+            crate::ffi_bindings::record_decl(r, ast, children[0], children[2], false);
         }
         if !children[0].is_null()
             && ast.node(children[0]).kind == NodeKind::Id
@@ -3074,16 +3076,7 @@ fn resolve_call_types(
     }
     for (i, &arg) in args.iter().enumerate() {
         let parameter_index = argument_parameters[i].unwrap_or(i);
-        let unconstrained_thunk = crate::task_combinators::should_infer_unconstrained_lambda(
-            r,
-            ast,
-            callee,
-            parameter_index,
-            arg,
-        );
-        let expected = if unconstrained_thunk {
-            None
-        } else if unpacked_call {
+        let raw_param_expected = if unpacked_call {
             argument_parameters[i].and_then(|param_idx| {
                 param_types
                     .as_ref()
@@ -3102,15 +3095,43 @@ fn resolve_call_types(
                 }
             })
         };
-        let expected = crate::collection_inference::expected_callback_arg_type(
+        let unconstrained_thunk = crate::task_combinators::should_infer_unconstrained_lambda(
+            r,
+            ast,
+            callee,
+            parameter_index,
+            arg,
+        ) || crate::stdlib_refinements::prepare_callback_inference(
             r,
             ast,
             node_idx,
             callee,
             parameter_index,
             arg,
-            expected,
         );
+        if unconstrained_thunk
+            && let Some(param_ty) = raw_param_expected
+            && let Some(canon_pt) = r.type_pool.canonical_type(param_ty)
+            && matches!(r.type_pool.get(canon_pt).kind, TypeKind::Function { .. })
+        {
+            let val_node = crate::argument_value_node(ast, arg);
+            if !val_node.is_null() && ast.node(val_node).kind == NodeKind::Lambda {
+                r.erased_callback_lambdas.insert(val_node, canon_pt);
+            }
+        }
+        let expected = if unconstrained_thunk {
+            None
+        } else {
+            crate::collection_inference::expected_callback_arg_type(
+                r,
+                ast,
+                node_idx,
+                callee,
+                parameter_index,
+                arg,
+                raw_param_expected,
+            )
+        };
         let check_ctx = (declaration_bound && expected.is_some()).then_some("argument");
         resolve_call_argument_or_spread(r, ast, arg, expected, check_ctx);
     }
@@ -3284,6 +3305,9 @@ fn resolve_call_types(
     let collection_refined =
         crate::collection_inference::finalize_collection_call(r, ast, node_idx, callee, args);
     if let Some(refined) = crate::task_combinators::refine_call(r, ast, node_idx, callee, args) {
+        return Some(refined);
+    }
+    if let Some(refined) = crate::stdlib_refinements::refine_call(r, ast, node_idx, callee, args) {
         return Some(refined);
     }
     if let Some(refined) = collection_refined {
@@ -4073,6 +4097,16 @@ fn resolve_projection_types(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) ->
         return Some(signature);
     }
     if let Some(lhs_ti) = lhs_type {
+        if let Some(ffi_proj) = crate::ffi_bindings::resolve_bound_library_projection(
+            r,
+            ast,
+            node_idx,
+            children[0],
+            lhs_ti,
+            member_node,
+        ) {
+            return ffi_proj;
+        }
         crate::associated::validate_instance_member(r, ast, node_idx, lhs_ti);
         if let Some(kind) = crate::collections::CollectionKind::from_type(&r.type_pool, lhs_ti) {
             return crate::collections::method_signature(r, ast, node_idx, lhs_ti, kind);

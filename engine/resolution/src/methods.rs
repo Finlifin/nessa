@@ -160,7 +160,8 @@ pub(crate) fn checked_method(
     if let Some(receiver) = trait_receiver.or_else(|| {
         (ast.node(declaration).kind == NodeKind::TraitDeriveFn
             || crate::ordering::default_template(r, name) == Some(function)
-            || crate::json_derivation::default_template(r, name) == Some(function))
+            || crate::json_derivation::default_template(r, name) == Some(function)
+            || crate::iterator_defaults::is_default_template(r, function))
         .then_some(receiver)
     }) {
         let owner = r.scopes[r.symbols[function.0 as usize].scope.0 as usize].assoc_type?;
@@ -309,6 +310,60 @@ pub(crate) fn projection(
                 "bound method values are not implemented; call the method directly",
             );
             return None;
+        }
+        let internal_default = r.default_body_context.as_ref().is_some_and(|context| {
+            let receiver_node = ast.fixed_children(node).first().copied().unwrap_or(node);
+            context
+                .self_value_paths
+                .get(&receiver_node)
+                .is_some_and(|paths| paths.iter().any(Vec::is_empty))
+        });
+        if internal_default && let Some(context) = r.default_body_context.as_ref() {
+            let implementor = context.implementor;
+            let implementation_trait = context.implementation_trait;
+            let impl_scope = context.scope;
+            let record = match impl_scope {
+                Some(vis_scope) => r
+                    .type_pool
+                    .find_trait_impl_scoped(implementor, implementation_trait, vis_scope)
+                    .ok()
+                    .flatten(),
+                None => r.type_pool.trait_impls_snapshot().iter().find(|rec| {
+                    rec.implementor == implementor
+                        && rec.trait_type == implementation_trait
+                        && rec.visible_scope.is_none()
+                }),
+            };
+            if let Some(rec) = record
+                && let Some(slot) = rec.methods.iter().find(|m| m.name == name)
+                && slot.func_id != type_pool::DERIVE_FUNC_ID
+            {
+                r.instance_methods.insert(node, SymbolId(slot.func_id));
+            }
+            let signature = match r.type_pool.instantiate_trait_method_signature_in_impl(
+                &key,
+                implementor,
+                implementation_trait,
+                impl_scope,
+            ) {
+                Ok(signature) => signature,
+                Err(error) => {
+                    report(
+                        r,
+                        ast,
+                        node,
+                        format!("cannot specialize bootstrap method signature: {error}"),
+                    );
+                    return None;
+                }
+            };
+            let TypeKind::Function { params, ret } = r.type_pool.get(signature).kind.clone() else {
+                return None;
+            };
+            return Some(r.register_type(TypeKind::Function {
+                params: params[1..].to_vec(),
+                ret,
+            }));
         }
         let signature = match r.type_pool.instantiate_trait_method_signature(&key, owner) {
             Ok(signature) => signature,

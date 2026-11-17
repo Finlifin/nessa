@@ -187,16 +187,21 @@ fn main() {
     let target_file = args.get(1).as(String)
 
     -- fmt + pattern + string UTF-8 + bytes pack/unpack
-    let formatted = fmt.format("%s:%04d", "ok", 42)
-    let matched = pattern.match_once("id=987!", "id=(%d+)")
-    let packed = bytes.pack("<i2I2", -12, 500)! { _ => List() }
-    let (unpacked_vals, _) = bytes.unpack("<i2I2", packed)! { _ => (List(), 1) }
+    let formatted = fmt.format("%s:%04d", "ok", 42)! { _ => "" }
+    let matched_opt = pattern.find("id=987!", "id=(%d+)")! { _ => null }
+    let matched = if matched_opt == null {
+        ""
+    } else {
+        matched_opt.as(pattern.PatternMatch).captures.get(0).as(String)
+    }
+    let packed = bytes.pack("<i2I2", -12, 500)! { _ => Bytes.new() }
+    let (unpacked_vals, _) = bytes.unpack("<i2I2", packed)! { _ => (List(), (0).as(usize)) }
 
     -- math + deterministic rand
-    let _ = rand.seed(s1 = 12345)
-    let r1 = rand.random_int(1, 1000)
-    let _ = rand.seed(s1 = 12345)
-    let r2 = rand.random_int(1, 1000)
+    rand.seed(value = (12345).as(u64))
+    let r1 = rand.int_range(1, 1000)
+    rand.seed(value = (12345).as(u64))
+    let r2 = rand.int_range(1, 1000)
     let trig_ok = (math.sin(0.0) == 0.0) and (r1 == r2)
 
     -- fs + io + path + json
@@ -207,7 +212,7 @@ fn main() {
     fs.write_string(target_file, encoded)! { _ => () }
     let loaded_raw = fs.read_to_string(target_file)! { _ => "" }
     let decoded = json.parse(loaded_raw)! { _ => Map() }
-    let base_name = path.file_name(target_file)
+    let base_name = path.Path.new(target_file).file_name()
 
     -- coroutine + Deque + time + runtime
     let co = coroutine.create(|x: Any| {

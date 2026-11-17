@@ -1,23 +1,29 @@
--- std.task — cooperative task control, structured Future combinators, timeouts, and introspection.
+-- std.task — cooperative task control, structured `async effect` combinators, timeouts, and introspection.
 
 use .builtin.*
 use .collections.*
 use .time.Duration
 use .traits.*
 
-private const _panic: fn(Any) -> NoReturn = .panic'builtin
-private const _to_string_raw: fn(Any) -> String = .to_string'builtin
-private const _time_sleep_ms: fn(i64) -> Unit = .__time_sleep_ms'builtin
-private const _task_yield: fn() -> Unit = .__task_yield'builtin
-private const _task_await_all: fn(List) -> List = .__task_await_all'builtin
-private const _task_await_any: fn(List) -> Any = .__task_await_any'builtin
-private const _task_is_ready: fn(Future) -> bool = .__task_is_ready'builtin
-private const _task_await_indexed: fn(List) -> (i64, Any) = .__task_await_indexed'builtin
-private const _task_current_id: fn() -> i64 = .__task_current_id'builtin
-private const _task_tree_snapshot: fn() -> String = .__task_tree_snapshot'builtin
+private const native_panic: fn(Any) -> NoReturn = .panic'builtin
+private const native_to_string: fn(Any) -> String = .to_string'builtin
+private const native_is_error_value: fn(Any) -> bool = .__is_error_value'builtin
+private const native_unwrap_ok_value: fn(Any) -> Any = .__unwrap_ok_value'builtin
+private const native_forward_error_value: fn(Any) -> NoReturn = .__forward_error_value'builtin
+private const native_time_sleep_ms: fn(i64) -> Unit = .__time_sleep_ms'builtin
+private const native_task_yield: fn() -> Unit = .__task_yield'builtin
+private const native_task_await_all: fn(List) -> List = .__task_await_all'builtin
+private const native_task_await_any: fn(List) -> Any = .__task_await_any'builtin
+private const native_task_is_ready: fn(Future) -> bool = .__task_is_ready'builtin
+private const native_task_await_indexed: fn(List) -> (i64, Any) = .__task_await_indexed'builtin
+private const native_task_current_id: fn() -> i64 = .__task_current_id'builtin
+private const native_task_tree_snapshot: fn() -> String = .__task_tree_snapshot'builtin
 
 private async effect timeout_work() -> Any
 private async effect timeout_timer(ms: i64) -> Unit
+private async effect par_item_work(item: Any) -> Any
+private async effect par_for_each_work(item: Any) -> Any
+private async effect race_branch_work(branch: fn() -> Any) -> Any
 
 pub struct TimeoutError {
     pub millis: i64,
@@ -28,7 +34,7 @@ derive Eq, PartialEq for TimeoutError
 
 impl Display for TimeoutError {
     pub fn to_string(self) -> String {
-        "TimeoutError(" ++ _to_string_raw(self.millis) ++ "ms)"
+        "TimeoutError(" ++ native_to_string(self.millis) ++ "ms)"
     }
 }
 
@@ -47,14 +53,14 @@ pub enum Either {
     pub fn unwrap_left(self) -> Any {
         self match {
             Either.left(v) => v,
-            Either.right(_) => _panic("Either.unwrap_left called on right"),
+            Either.right(_) => native_panic("Either.unwrap_left called on right"),
         }
     }
 
     pub fn unwrap_right(self) -> Any {
         self match {
             Either.right(v) => v,
-            Either.left(_) => _panic("Either.unwrap_right called on left"),
+            Either.left(_) => native_panic("Either.unwrap_right called on left"),
         }
     }
 }
@@ -77,8 +83,8 @@ impl PartialEq for Either {
 impl Display for Either {
     pub fn to_string(self) -> String {
         self match {
-            Either.left(v) => "left(" ++ _to_string_raw(v) ++ ")",
-            Either.right(v) => "right(" ++ _to_string_raw(v) ++ ")",
+            Either.left(v) => "left(" ++ native_to_string(v) ++ ")",
+            Either.right(v) => "right(" ++ native_to_string(v) ++ ")",
         }
     }
 }
@@ -86,42 +92,42 @@ impl Display for Either {
 pub use Either.{left, right}
 
 pub fn yield_now() -> Unit {
-    _task_yield()
+    native_task_yield()
 }
 
 pub fn sleep_ms(ms: i64) -> Unit {
-    _time_sleep_ms(ms)
+    native_time_sleep_ms(ms)
 }
 
 pub fn sleep(dur: Duration) -> Unit {
-    _time_sleep_ms(dur.as_millis())
+    native_time_sleep_ms(dur.as_millis())
 }
 
 pub fn current_id() -> i64 {
-    _task_current_id()
+    native_task_current_id()
 }
 
 pub fn tree_snapshot() -> String {
-    _task_tree_snapshot()
+    native_task_tree_snapshot()
 }
 
 pub fn is_ready(f: Future) -> bool {
-    _task_is_ready(f)
+    native_task_is_ready(f)
 }
 
 pub fn await_all(futures: List) -> List {
-    _task_await_all(futures)
+    native_task_await_all(futures)
 }
 
 pub fn await_any(futures: List) -> Any {
-    _task_await_any(futures)
+    native_task_await_any(futures)
 }
 
 pub fn await_first(first: Future, second: Future) -> Either {
     let pair = List()
     pair.push(first)
     pair.push(second)
-    let (idx, value) = _task_await_indexed(pair)
+    let (idx, value) = native_task_await_indexed(pair)
     if idx == 0 {
         Either.left(value)
     } else {
@@ -129,25 +135,101 @@ pub fn await_first(first: Future, second: Future) -> Either {
     }
 }
 
-private fn _make_timeout_err(ms: i64) -> !TimeoutError Any {
+private fn make_timeout_err(ms: i64) -> !TimeoutError Any {
     error TimeoutError.new(ms)
 }
 
 pub fn with_timeout(ms: i64, thunk: fn() -> Any) -> Any {
     if ms < 0 {
-        let e: Any = _make_timeout_err(ms)
+        let e: Any = make_timeout_err(ms)
         return e
     }
     handles timeout_work() => thunk()
-    handles timeout_timer(d: i64) => _time_sleep_ms(d)
+    handles timeout_timer(d: i64) => native_time_sleep_ms(d)
     let pair = List()
     pair.push(timeout_work())
     pair.push(timeout_timer(ms))
-    let (idx, value) = _task_await_indexed(pair)
+    let (idx, value) = native_task_await_indexed(pair)
     if idx == 0 {
         value
     } else {
-        let e: Any = _make_timeout_err(ms)
+        let e: Any = make_timeout_err(ms)
         e
     }
+}
+
+private fn unwrap_or_error_envelope(val: Any) -> (bool, Any) {
+    if native_is_error_value(val) {
+        return (true, val)
+    }
+    (false, native_unwrap_ok_value(val))
+}
+
+pub fn par_map(items: List, mapper: fn(Any) -> Any) -> List {
+    let snap = items.copy()
+    if snap.is_empty() {
+        return List()
+    }
+    handles async par_item_work(item: Any) -> Any => mapper(item)
+    let futures = List()
+    var i: usize = 0
+    while i < snap.len() {
+        futures.push(par_item_work(snap.get(i))#)
+        i += 1
+    }
+    let raw_results = native_task_await_all(futures)
+    let out = List()
+    var j: usize = 0
+    while j < raw_results.len() {
+        let (is_err, payload) = unwrap_or_error_envelope(raw_results.get(j))
+        if is_err {
+            return native_forward_error_value(payload)
+        }
+        out.push(payload)
+        j += 1
+    }
+    out
+}
+
+pub fn par_for_each(items: List, action: fn(Any) -> Unit) -> Unit {
+    let snap = items.copy()
+    if snap.is_empty() {
+        return ()
+    }
+    handles async par_for_each_work(item: Any) -> Any => {
+        let f: Any = action
+        f(item)
+    }
+    let futures = List()
+    var i: usize = 0
+    while i < snap.len() {
+        futures.push(par_for_each_work(snap.get(i))#)
+        i += 1
+    }
+    let raw_results = native_task_await_all(futures)
+    var j: usize = 0
+    while j < raw_results.len() {
+        let (is_err, payload) = unwrap_or_error_envelope(raw_results.get(j))
+        if is_err {
+            return native_forward_error_value(payload)
+        }
+        j += 1
+    }
+    ()
+}
+
+pub fn race(branches: List) -> Any {
+    let snap = branches.copy()
+    if snap.is_empty() {
+        native_panic("task.race requires at least one branch")
+    }
+    handles async race_branch_work(branch: Any) -> Any => branch()
+    let futures = List()
+    var i: usize = 0
+    while i < snap.len() {
+        let thunk: Any = snap.get(i)
+        futures.push(race_branch_work(thunk)#)
+        i += 1
+    }
+    native_task_await_any(futures)
 }

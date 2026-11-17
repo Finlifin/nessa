@@ -3,6 +3,7 @@
 `std.sync` 提供面向多核结构化并发的任务间通信与同步设施。
 
 - **任务级非阻塞挂起（分片锁等待队列）**：`Channel`、`Mutex`、`RwLock`、`Semaphore`、`Once` 与 `Barrier` 内部采用 64 路分片互斥锁保护等待队列；未就绪时仅将当前 `TaskId` 挂入队列并立即释放 OS Worker 线程去执行其它就绪任务，绝不自旋阻塞 Worker 线程。
+- **高阶闭包静态精化与错误/效应传播**：`Mutex.{with_lock, update}`、`RwLock.{with_read, with_write}`、`Semaphore.with_permit` 与 `Once.call_once` 在编译期自动推导内联闭包的返回类型、受检错误集（`!Error`）与代数效应（`#Effect`）；当 `Mutex.update`、`RwLock.with_write` 或 `Once.call_once` 的闭包返回受检错误时，锁或初始化状态自动回滚，绝不写入错误信封值。
 - **无锁原子单元**：`AtomicInt` 与 `AtomicBool` 的加载、存储、加减与 CAS 均为 `SeqCst` 无锁原子指令（仅在每 1024 个原子单元扩容新块时获取一次块分配锁）。
 - **精确 GC 与全局死锁检测**：所有存储在同步原语内部的托管堆对象均纳入精确 GC 根追踪（支持移动式回收槽位更新）；挂起等待纳入全局死锁检测图（无外部唤醒源的环形锁/空通道等待确定性报告 `VmError::DeadlockDetected`）。
 - **取消安全与异常退出兜底**：等待中的任务被结构化取消（且未处于 `defer` 展开期）时自动从等待队列摘除，并将已交接的锁/信号量令牌级联传递给下一名合法等待者；若持锁任务因未捕获运行时错误异常终止，调度器任务退出钩子会自动释放其持有的 `Mutex` / `RwLock` 并回滚运行中的 `Once`，防止永久死锁。
@@ -58,8 +59,8 @@ impl Mutex {
 }
 ```
 
-- 优先使用 `with_lock(|val| ...)` 与 `update(|val| next_val)`：内部通过 `defer { self.unlock() }` 保证即使闭包提前返回、抛出受检错误或被结构化取消，互斥锁也必定被释放并唤醒下一个等待任务。
-- `get()` / `set(val)` 校验当前任务确实持有该锁，未持锁访问会显式报运行时错误。
+- 优先使用 `with_lock(|val| ...)` 与 `update(|val| next_val)`：内部通过 `defer` 保证即使闭包提前返回、抛出受检错误（`!E`）或被结构化取消，互斥锁也必定被释放并唤醒下一个等待任务，且调用点静态恢复闭包的返回类型与 `!Error` / `#Effect`。
+- 若 `update` 闭包返回 `!E` 错误，原有锁内值保持不变，错误原样向上传播。
 
 ## `RwLock`（写优先公平读写锁）
 
@@ -93,7 +94,6 @@ impl Semaphore {
     pub fn acquire(self) -> Unit
     pub fn try_acquire(self) -> bool
     pub fn release(self, .count: i64 = 1) -> Unit
-    pub fn release_many(self, count: i64) -> Unit
     pub fn available(self) -> i64
 }
 ```
@@ -119,16 +119,20 @@ impl Lazy {
 }
 ```
 
-### `Barrier`
+### `Barrier` 与 `SyncError`
 
 可重用多阶段多任务同步栅栏。当第 `parties` 个任务到达 `wait()` 时，一次性放行本轮全部任务并开启下一代（最后一个到达的 leader 任务返回 `true`，其余任务返回 `false`）。
 
-若某个已到达 `wait()` 的参与者任务在本轮凑齐 `parties` 之前被结构化取消，栅栏立即进入**破损（Broken）**状态并唤醒所有已到达的等待任务，报告破损栅栏错误而非让其余 $N-1$ 个任务永久挂死：
+若某个已到达 `wait()` 的参与者任务在本轮凑齐 `parties` 之前被结构化取消，栅栏立即进入**破损（Broken）**状态并唤醒所有已到达的等待任务，以受检错误 `SyncError.BrokenBarrier` 返回而非让其余 $N-1$ 个任务永久挂死：
 
 ```nessa
+pub enum SyncError {
+    pub BrokenBarrier,
+}
+
 impl Barrier {
     pub fn new(parties: i64) -> Barrier
-    pub fn wait(self) -> bool
+    pub fn wait(self) -> !SyncError bool
 }
 ```
 
@@ -184,9 +188,10 @@ fn main() {
             ChannelError.Closed => break,
             _ => break,
         }
-        total.update(|acc| acc.as(i64) + next.as(i64))
+        let _: i64 = total.update(|acc| acc.as(i64) + next.as(i64))
     }
 
-    assert_eq(total.with_lock(|v| v).as(i64), 30)
+    let final_sum: i64 = total.with_lock(|v| v.as(i64))
+    assert_eq(final_sum, 30)
 }
 ```

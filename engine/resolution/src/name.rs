@@ -1247,6 +1247,9 @@ fn resolve_impl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         r.push_scope(node_idx, target);
         forward_declare_scope(r, ast, node_idx);
     }
+    if r.options.builtin_access || r.options.privileged_nodes.contains(&node_idx) {
+        crate::iterator_defaults::bind_bootstrap_assoc_types(r, r.current_scope);
+    }
     for &member in ast.multi_children(node_idx) {
         resolve_names(r, ast, member);
     }
@@ -1520,7 +1523,12 @@ fn resolve_view(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
 fn is_ffi_builtin_name(symbol_name: &str) -> bool {
     matches!(
         symbol_name,
-        "__ffi_dlopen" | "__ffi_dlsym" | "__ffi_call" | "__ffi_call4" | "__ffi_call6"
+        "__ffi_dlopen"
+            | "__ffi_dlsym"
+            | "__ffi_call"
+            | "__ffi_call4"
+            | "__ffi_call6"
+            | "__ffi_read_cstr"
     )
 }
 

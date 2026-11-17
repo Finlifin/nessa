@@ -1,46 +1,23 @@
 -- regex — linear-time O(N) regular expressions backed by the native C-ABI `nessa_regex_ffi` library.
--- Zero compiler or VM regex magic: all automata operations cross the capability-gated C FFI
--- using pinned read-only UTF-8/Bytes slices and preallocated Span Buffer `Bytes` batches.
+-- Zero compiler or VM regex magic: all automata operations cross `std.ffi`
+-- using pinned read-only `SliceRo` views and preallocated `BufMut` `Bytes` batches.
 
 use std.bytes.*
+use std.ffi
+use std.ffi.types.{BufMut, SliceRo}
 
-private const _ffi_dlopen: fn(String) -> i64 = .__ffi_dlopen'builtin
-private const _ffi_dlsym: fn(i64, String, String) -> i64 = .__ffi_dlsym'builtin
-
-private global _ffi_ready: bool = false
-private global _lib_handle: i64 = 0
-private global _sym_compile: i64 = 0
-private global _sym_free: i64 = 0
-private global _sym_free_on_gc: i64 = 0
-private global _sym_group_count: i64 = 0
-private global _sym_group_by_name: i64 = 0
-private global _sym_is_match: i64 = 0
-private global _sym_captures: i64 = 0
-private global _sym_find_batch: i64 = 0
-private global _sym_find_bytes: i64 = 0
-
-private fn _ensure_ffi() -> Unit {
-    if _ffi_ready {
-        return
-    }
-    let lib = _ffi_dlopen("nessa_regex_ffi")
-    if lib <= 0 {
-        panic("failed to load native nessa_regex_ffi library")
-    }
-    _lib_handle = lib
-    _sym_compile = _ffi_dlsym(lib, "nessa_regex_compile", "slice_ro,u32,usize,usize,buf_mut->i64")
-    _sym_free = _ffi_dlsym(lib, "nessa_regex_free", "i64->void")
-    _sym_free_on_gc = _ffi_dlsym(lib, "nessa_regex_free", "on_gc:any,i64->void")
-    _sym_group_count = _ffi_dlsym(lib, "nessa_regex_group_count", "i64->isize")
-    _sym_group_by_name = _ffi_dlsym(lib, "nessa_regex_group_index_by_name", "i64,slice_ro->isize")
-    _sym_is_match = _ffi_dlsym(lib, "nessa_regex_is_match", "i64,slice_ro,usize,u32->i32")
-    _sym_captures = _ffi_dlsym(lib, "nessa_regex_captures", "i64,slice_ro,usize,buf_mut->i32")
-    _sym_find_batch = _ffi_dlsym(lib, "nessa_regex_find_batch", "i64,slice_ro,usize,isize,buf_mut->isize")
-    _sym_find_bytes = _ffi_dlsym(lib, "nessa_regex_find_bytes", "i64,slice_ro,usize,buf_mut->i32")
-    _ffi_ready = true
+private const regex_lib = ffi.must_load("nessa_regex_ffi") {
+    compile: ffi.func(fn(SliceRo, u32, usize, usize, BufMut) -> i64, symbol = "nessa_regex_compile"),
+    free: ffi.func(fn(i64) -> Unit, symbol = "nessa_regex_free"),
+    group_count: ffi.func(fn(i64) -> isize, symbol = "nessa_regex_group_count"),
+    group_by_name: ffi.func(fn(i64, SliceRo) -> isize, symbol = "nessa_regex_group_index_by_name"),
+    is_match: ffi.func(fn(i64, SliceRo, usize, u32) -> i32, symbol = "nessa_regex_is_match"),
+    captures: ffi.func(fn(i64, SliceRo, usize, BufMut) -> i32, symbol = "nessa_regex_captures"),
+    find_batch: ffi.func(fn(i64, SliceRo, usize, isize, BufMut) -> isize, symbol = "nessa_regex_find_batch"),
+    find_bytes: ffi.func(fn(i64, SliceRo, usize, BufMut) -> i32, symbol = "nessa_regex_find_bytes"),
 }
 
-private fn _slice_utf8_bytes(text: String, start: usize, end: usize) -> String {
+private fn slice_utf8_bytes(text: String, start: usize, end: usize) -> String {
     let sub = text.get(start.as(i64), end.as(i64))
     if sub == null {
         panic("invalid UTF-8 byte span in regex match")
@@ -48,7 +25,7 @@ private fn _slice_utf8_bytes(text: String, start: usize, end: usize) -> String {
     sub.as(String)
 }
 
-private fn _check_str_start(text: String, start: usize) -> Unit {
+private fn check_str_start(text: String, start: usize) -> Unit {
     let byte_len = text.len().as(usize)
     if start > byte_len {
         panic("regex start offset out of bounds")
@@ -58,7 +35,7 @@ private fn _check_str_start(text: String, start: usize) -> Unit {
     }
 }
 
-private fn _check_bytes_start(data: Bytes, start: usize) -> Unit {
+private fn check_bytes_start(data: Bytes, start: usize) -> Unit {
     if start > data.len() {
         panic("regex start offset out of bounds")
     }
@@ -167,7 +144,7 @@ impl Captures {
             return null
         }
         let (s, e) = sp.as((usize, usize))
-        _slice_utf8_bytes(self.text, s, e)
+        slice_utf8_bytes(self.text, s, e)
     }
 
     pub fn match_at(self, index: usize) -> ?SpanMatch {
@@ -179,12 +156,12 @@ impl Captures {
         SpanMatch {
             start: s,
             end: e,
-            text: _slice_utf8_bytes(self.text, s, e),
+            text: slice_utf8_bytes(self.text, s, e),
         }
     }
 
     pub fn name_span(self, group_name: String) -> ?(usize, usize) {
-        let idx = _group_index_by_name(self.re, group_name)
+        let idx = group_index_by_name(self.re, group_name)
         if idx < 0 {
             return null
         }
@@ -192,7 +169,7 @@ impl Captures {
     }
 
     pub fn name(self, group_name: String) -> ?String {
-        let idx = _group_index_by_name(self.re, group_name)
+        let idx = group_index_by_name(self.re, group_name)
         if idx < 0 {
             return null
         }
@@ -200,7 +177,7 @@ impl Captures {
     }
 }
 
-private fn _live_handle(re: Regex) -> i64 {
+private fn live_handle(re: Regex) -> i64 {
     let h = re.handle
     if h <= 0 {
         panic("regex handle has already been closed")
@@ -208,11 +185,10 @@ private fn _live_handle(re: Regex) -> i64 {
     h
 }
 
-private fn _group_index_by_name(re: Regex, group_name: String) -> i64 {
-    _ensure_ffi()
-    let h = _live_handle(re)
-    let call_two: fn(i64, i64, String) -> i64 = .__ffi_call4'builtin
-    call_two(_sym_group_by_name, h, group_name)
+private fn group_index_by_name(re: Regex, group_name: String) -> isize {
+    let h = live_handle(re)
+    let idx: isize = regex_lib.group_by_name(h, SliceRo(group_name))
+    idx
 }
 
 pub struct MatchIter {
@@ -226,14 +202,18 @@ pub struct MatchIter {
     finished: bool,
 }
 
-private fn _refill_match_iter(it: MatchIter) -> bool {
+private fn refill_match_iter(it: MatchIter) -> bool {
     if it.finished {
         return false
     }
-    _ensure_ffi()
-    let h = _live_handle(it.re)
-    let call_batch: fn(i64, i64, String, usize, isize, Bytes) -> i64 = .__ffi_call6'builtin
-    let written = call_batch(_sym_find_batch, h, it.text, it.next_start, it.last_match_end, it.buf)
+    let h = live_handle(it.re)
+    let written: isize = regex_lib.find_batch(
+        h,
+        SliceRo(it.text),
+        it.next_start,
+        it.last_match_end,
+        BufMut(it.buf),
+    )
     if written < 0 {
         panic("regex UTF-8 matching failed (closed handle or non-UTF-8 byte pattern)")
     }
@@ -260,7 +240,7 @@ impl Iterator for MatchIter {
 
     pub fn next(self) -> IterationStep(SpanMatch) {
         if self.batch_idx >= self.batch_len {
-            if not _refill_match_iter(self) {
+            if not refill_match_iter(self) {
                 return IterationStep(SpanMatch).done
             }
         }
@@ -271,7 +251,7 @@ impl Iterator for MatchIter {
         IterationStep(SpanMatch).yielded(SpanMatch {
             start: s,
             end: e,
-            text: _slice_utf8_bytes(self.text, s, e),
+            text: slice_utf8_bytes(self.text, s, e),
         })
     }
 }
@@ -306,19 +286,160 @@ impl MatchIter {
     }
 }
 
-private fn _is_ascii_digit_byte(b: i64) -> bool {
+pub struct ByteMatchIter {
+    re: Regex,
+    data: Bytes,
+    search_pos: usize,
+    prev_end: isize,
+    finished: bool,
+}
+
+impl Iterator for ByteMatchIter {
+    assoc Item: Type = ByteMatch
+
+    pub fn next(self) -> IterationStep(ByteMatch) {
+        if self.finished {
+            return IterationStep(ByteMatch).done
+        }
+        let data_len = self.data.len()
+        if self.search_pos > data_len {
+            self.finished = true
+            return IterationStep(ByteMatch).done
+        }
+        let m_opt = self.re.find_bytes(self.data, start = self.search_pos)
+        if m_opt == null {
+            self.finished = true
+            return IterationStep(ByteMatch).done
+        }
+        var m = m_opt.as(ByteMatch)
+        if m.start == m.end and self.prev_end >= 0 and m.end == self.prev_end.as(usize) {
+            if self.search_pos >= data_len {
+                self.finished = true
+                return IterationStep(ByteMatch).done
+            }
+            self.search_pos += 1
+            let next_opt = self.re.find_bytes(self.data, start = self.search_pos)
+            if next_opt == null {
+                self.finished = true
+                return IterationStep(ByteMatch).done
+            }
+            m = next_opt.as(ByteMatch)
+        }
+        self.prev_end = m.end.as(isize)
+        self.search_pos = m.end
+        IterationStep(ByteMatch).yielded(m)
+    }
+}
+
+impl IntoIterator for ByteMatchIter {
+    assoc Iter: Type = ByteMatchIter
+
+    pub fn into_iter(self) -> ByteMatchIter {
+        self
+    }
+}
+
+impl ByteMatchIter {
+    pub fn to_list(self) -> List {
+        let out = List()
+        for m in self {
+            out.push(m)
+        }
+        out
+    }
+
+    pub fn collect(self) -> List {
+        self.to_list()
+    }
+
+    pub fn count(self) -> usize {
+        var n: usize = 0
+        for _ in self {
+            n += 1
+        }
+        n
+    }
+}
+
+pub struct SplitIter {
+    match_iter: MatchIter,
+    text: String,
+    byte_len: usize,
+    last: usize,
+    pieces: usize,
+    limit: usize,
+    done: bool,
+}
+
+impl Iterator for SplitIter {
+    assoc Item: Type = String
+
+    pub fn next(self) -> IterationStep(String) {
+        if self.done {
+            return IterationStep(String).done
+        }
+        if self.limit == 1 {
+            self.done = true
+            return IterationStep(String).yielded(self.text)
+        }
+        if self.limit > 0 and self.pieces + 1 >= self.limit {
+            self.done = true
+            return IterationStep(String).yielded(
+                slice_utf8_bytes(self.text, self.last, self.byte_len)
+            )
+        }
+        self.match_iter.next() match {
+            IterationStep(SpanMatch).yielded(m) => {
+                let seg = slice_utf8_bytes(self.text, self.last, m.start)
+                self.last = m.end
+                self.pieces += 1
+                IterationStep(String).yielded(seg)
+            },
+            IterationStep(SpanMatch).done => {
+                self.done = true
+                IterationStep(String).yielded(
+                    slice_utf8_bytes(self.text, self.last, self.byte_len)
+                )
+            },
+        }
+    }
+}
+
+impl IntoIterator for SplitIter {
+    assoc Iter: Type = SplitIter
+
+    pub fn into_iter(self) -> SplitIter {
+        self
+    }
+}
+
+impl SplitIter {
+    pub fn to_list(self) -> List {
+        let out = List()
+        for s in self {
+            out.push(s)
+        }
+        out
+    }
+
+    pub fn collect(self) -> List {
+        self.to_list()
+    }
+}
+
+private fn is_ascii_digit_byte(b: i64) -> bool {
     b >= 48 and b <= 57
 }
 
-private fn _is_ident_start_byte(b: i64) -> bool {
+private fn is_ident_start_byte(b: i64) -> bool {
     (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
 }
 
-private fn _is_ident_continue_byte(b: i64) -> bool {
-    _is_ident_start_byte(b) or _is_ascii_digit_byte(b)
+private fn is_ident_continue_byte(b: i64) -> bool {
+    is_ident_start_byte(b) or is_ascii_digit_byte(b)
 }
 
-private fn _expand_replacement(out: Bytes, caps: Captures, replacement: String) -> Unit {
+private fn expand_replacement(out: Bytes, caps: Captures, replacement: String) -> Unit {
     let rep_len = replacement.len()
     var i: i64 = 0
     var seg_start: i64 = 0
@@ -328,7 +449,7 @@ private fn _expand_replacement(out: Bytes, caps: Captures, replacement: String) 
             i += 1
         } else {
             if i > seg_start {
-                out.extend_str(_slice_utf8_bytes(replacement, seg_start.as(usize), i.as(usize)))
+                out.extend_str(slice_utf8_bytes(replacement, seg_start.as(usize), i.as(usize)))
             }
             if i + 1 >= rep_len {
                 out.push(36)
@@ -346,7 +467,7 @@ private fn _expand_replacement(out: Bytes, caps: Captures, replacement: String) 
                         close_idx += 1
                     }
                     if close_idx < rep_len {
-                        let key = _slice_utf8_bytes(replacement, (i + 2).as(usize), close_idx.as(usize))
+                        let key = slice_utf8_bytes(replacement, (i + 2).as(usize), close_idx.as(usize))
                         if key != "" and key.is_ascii_digit() {
                             let parsed = key.parse_usize()
                             if parsed != null {
@@ -368,12 +489,12 @@ private fn _expand_replacement(out: Bytes, caps: Captures, replacement: String) 
                         i += 1
                         seg_start = i
                     }
-                } else if _is_ascii_digit_byte(next_b) {
+                } else if is_ascii_digit_byte(next_b) {
                     var end_idx = i + 2
-                    while end_idx < rep_len and _is_ascii_digit_byte(replacement.byte_at(end_idx)) {
+                    while end_idx < rep_len and is_ascii_digit_byte(replacement.byte_at(end_idx)) {
                         end_idx += 1
                     }
-                    let digits = _slice_utf8_bytes(replacement, (i + 1).as(usize), end_idx.as(usize))
+                    let digits = slice_utf8_bytes(replacement, (i + 1).as(usize), end_idx.as(usize))
                     let parsed = digits.parse_usize()
                     if parsed != null {
                         let val = caps.get(parsed.as(usize))
@@ -383,12 +504,12 @@ private fn _expand_replacement(out: Bytes, caps: Captures, replacement: String) 
                     }
                     i = end_idx
                     seg_start = i
-                } else if _is_ident_start_byte(next_b) {
+                } else if is_ident_start_byte(next_b) {
                     var end_idx = i + 2
-                    while end_idx < rep_len and _is_ident_continue_byte(replacement.byte_at(end_idx)) {
+                    while end_idx < rep_len and is_ident_continue_byte(replacement.byte_at(end_idx)) {
                         end_idx += 1
                     }
-                    let name = _slice_utf8_bytes(replacement, (i + 1).as(usize), end_idx.as(usize))
+                    let name = slice_utf8_bytes(replacement, (i + 1).as(usize), end_idx.as(usize))
                     let val = caps.name(name)
                     if val != null {
                         out.extend_str(val.as(String))
@@ -404,7 +525,7 @@ private fn _expand_replacement(out: Bytes, caps: Captures, replacement: String) 
         }
     }
     if seg_start < rep_len {
-        out.extend_str(_slice_utf8_bytes(replacement, seg_start.as(usize), rep_len.as(usize)))
+        out.extend_str(slice_utf8_bytes(replacement, seg_start.as(usize), rep_len.as(usize)))
     }
 }
 
@@ -418,7 +539,6 @@ impl Regex {
         .size_limit: usize = 10485760,
         .dfa_size_limit: usize = 2097152,
     ) -> !RegexError Regex {
-        _ensure_ffi()
         var flags: u32 = 0
         if case_insensitive {
             flags = flags + 1
@@ -433,8 +553,13 @@ impl Regex {
             flags = flags + 8
         }
         let err_buf = Bytes.zeroed(1024)
-        let call_compile: fn(i64, String, u32, usize, usize, Bytes) -> i64 = .__ffi_call6'builtin
-        let handle = call_compile(_sym_compile, pattern, flags, size_limit, dfa_size_limit, err_buf)
+        let handle: i64 = regex_lib.compile(
+            SliceRo(pattern),
+            flags,
+            size_limit,
+            dfa_size_limit,
+            BufMut(err_buf),
+        )
         if handle <= 0 {
             let msg_len = err_buf.read_u64_le(0).as(usize)
             let msg_bytes = err_buf.slice(8, 8 + msg_len)
@@ -446,11 +571,11 @@ impl Regex {
             }
             return error RegexError.InvalidSyntax(msg)
         }
-        let call_gc: fn(i64, Any, i64) -> Unit = .__ffi_call4'builtin
-        let call_one: fn(i64, i64) -> i64 = .__ffi_call4'builtin
-        let gcount = call_one(_sym_group_count, handle)
+        let gcount: isize = regex_lib.group_count(handle)
         let guard = RegexGuard { raw_id: handle }
-        call_gc(_sym_free_on_gc, guard, handle)
+        regex_lib.attach_finalizer(guard, "nessa_regex_free", handle)! {
+            err => panic(err.to_string())
+        }
         Regex {
             pat: pattern,
             handle: handle,
@@ -474,19 +599,16 @@ impl Regex {
     pub fn close(self) -> Unit {
         let h = self.handle
         if h > 0 {
-            _ensure_ffi()
             self.handle = 0
-            let call_free: fn(i64, i64) -> Unit = .__ffi_call4'builtin
-            call_free(_sym_free, h)
+            let _ = regex_lib.free(h)
         }
     }
 
     pub fn is_match(self, text: String, .start: usize = 0) -> bool {
-        _check_str_start(text, start)
-        _ensure_ffi()
-        let h = _live_handle(self)
-        let call_is_match: fn(i64, i64, String, usize, u32) -> i64 = .__ffi_call4'builtin
-        let rc = call_is_match(_sym_is_match, h, text, start, 0)
+        check_str_start(text, start)
+        let h = live_handle(self)
+        let utf8_mode: u32 = 0
+        let rc: i32 = regex_lib.is_match(h, SliceRo(text), start, utf8_mode)
         if rc < 0 {
             panic("regex UTF-8 is_match failed (non-UTF-8 byte pattern used on String)")
         }
@@ -494,12 +616,11 @@ impl Regex {
     }
 
     pub fn find(self, text: String, .start: usize = 0) -> ?SpanMatch {
-        _check_str_start(text, start)
-        _ensure_ffi()
-        let h = _live_handle(self)
+        check_str_start(text, start)
+        let h = live_handle(self)
         let buf = Bytes.zeroed(16)
-        let call_batch: fn(i64, i64, String, usize, isize, Bytes) -> i64 = .__ffi_call6'builtin
-        let n = call_batch(_sym_find_batch, h, text, start, -1, buf)
+        let no_prev_end: isize = -1
+        let n: isize = regex_lib.find_batch(h, SliceRo(text), start, no_prev_end, BufMut(buf))
         if n < 0 {
             panic("regex UTF-8 find failed (non-UTF-8 byte pattern used on String)")
         }
@@ -511,17 +632,15 @@ impl Regex {
         SpanMatch {
             start: s,
             end: e,
-            text: _slice_utf8_bytes(text, s, e),
+            text: slice_utf8_bytes(text, s, e),
         }
     }
 
     pub fn captures(self, text: String, .start: usize = 0) -> ?Captures {
-        _check_str_start(text, start)
-        _ensure_ffi()
-        let h = _live_handle(self)
+        check_str_start(text, start)
+        let h = live_handle(self)
         let slots = Bytes.zeroed(self.groups * 16)
-        let call_caps: fn(i64, i64, String, usize, Bytes) -> i64 = .__ffi_call4'builtin
-        let rc = call_caps(_sym_captures, h, text, start, slots)
+        let rc: i32 = regex_lib.captures(h, SliceRo(text), start, BufMut(slots))
         if rc < 0 {
             panic("regex UTF-8 captures failed (non-UTF-8 byte pattern used on String)")
         }
@@ -537,7 +656,7 @@ impl Regex {
     }
 
     pub fn find_all(self, text: String) -> MatchIter {
-        let _ = _live_handle(self)
+        let _ = live_handle(self)
         MatchIter {
             re: self,
             text: text,
@@ -554,8 +673,21 @@ impl Regex {
         self.find_all(text)
     }
 
+    pub fn split_iter(self, text: String, .limit: usize = 0) -> SplitIter {
+        let match_iter = self.find_all(text)
+        SplitIter {
+            match_iter: match_iter,
+            text: text,
+            byte_len: text.len().as(usize),
+            last: 0,
+            pieces: 0,
+            limit: limit,
+            done: false,
+        }
+    }
+
     pub fn split(self, text: String, .limit: usize = 0) -> List {
-        let _ = _live_handle(self)
+        let _ = live_handle(self)
         let out = List()
         if limit == 1 {
             out.push(text)
@@ -565,14 +697,14 @@ impl Regex {
         var last: usize = 0
         var pieces: usize = 0
         for m in self.find_all(text) {
-            out.push(_slice_utf8_bytes(text, last, m.start))
+            out.push(slice_utf8_bytes(text, last, m.start))
             last = m.end
             pieces += 1
             if limit > 0 and pieces + 1 >= limit {
                 break
             }
         }
-        out.push(_slice_utf8_bytes(text, last, byte_len))
+        out.push(slice_utf8_bytes(text, last, byte_len))
         out
     }
 
@@ -586,11 +718,11 @@ impl Regex {
             let byte_len = text.len().as(usize)
             let out = Bytes.with_capacity(byte_len + replacement.len().as(usize))
             if m.start > 0 {
-                out.extend_str(_slice_utf8_bytes(text, 0, m.start))
+                out.extend_str(slice_utf8_bytes(text, 0, m.start))
             }
             out.extend_str(replacement)
             if m.end < byte_len {
-                out.extend_str(_slice_utf8_bytes(text, m.end, byte_len))
+                out.extend_str(slice_utf8_bytes(text, m.end, byte_len))
             }
             return out.to_utf8().as(String)
         }
@@ -604,11 +736,11 @@ impl Regex {
         let byte_len = text.len().as(usize)
         let out = Bytes.with_capacity(byte_len + replacement.len().as(usize))
         if s > 0 {
-            out.extend_str(_slice_utf8_bytes(text, 0, s))
+            out.extend_str(slice_utf8_bytes(text, 0, s))
         }
-        _expand_replacement(out, caps, replacement)
+        expand_replacement(out, caps, replacement)
         if e < byte_len {
-            out.extend_str(_slice_utf8_bytes(text, e, byte_len))
+            out.extend_str(slice_utf8_bytes(text, e, byte_len))
         }
         out.to_utf8().as(String)
     }
@@ -622,7 +754,7 @@ impl Regex {
             for m in self.find_all(text) {
                 any_matched = true
                 if m.start > last {
-                    out.extend_str(_slice_utf8_bytes(text, last, m.start))
+                    out.extend_str(slice_utf8_bytes(text, last, m.start))
                 }
                 out.extend_str(replacement)
                 last = m.end
@@ -631,7 +763,7 @@ impl Regex {
                 return text
             }
             if last < byte_len {
-                out.extend_str(_slice_utf8_bytes(text, last, byte_len))
+                out.extend_str(slice_utf8_bytes(text, last, byte_len))
             }
             return out.to_utf8().as(String)
         }
@@ -667,9 +799,9 @@ impl Regex {
             }
             any_matched = true
             if s > last_copied {
-                out.extend_str(_slice_utf8_bytes(text, last_copied, s))
+                out.extend_str(slice_utf8_bytes(text, last_copied, s))
             }
-            _expand_replacement(out, caps, replacement)
+            expand_replacement(out, caps, replacement)
             last_copied = e
             prev_end = e.as(isize)
             search_pos = e
@@ -678,17 +810,16 @@ impl Regex {
             return text
         }
         if last_copied < byte_len {
-            out.extend_str(_slice_utf8_bytes(text, last_copied, byte_len))
+            out.extend_str(slice_utf8_bytes(text, last_copied, byte_len))
         }
         out.to_utf8().as(String)
     }
 
     pub fn is_match_bytes(self, data: Bytes, .start: usize = 0) -> bool {
-        _check_bytes_start(data, start)
-        _ensure_ffi()
-        let h = _live_handle(self)
-        let call_is_match: fn(i64, i64, Bytes, usize, u32) -> i64 = .__ffi_call4'builtin
-        let rc = call_is_match(_sym_is_match, h, data, start, 1)
+        check_bytes_start(data, start)
+        let h = live_handle(self)
+        let bytes_mode: u32 = 1
+        let rc: i32 = regex_lib.is_match(h, SliceRo(data), start, bytes_mode)
         if rc < 0 {
             panic("regex binary is_match_bytes failed")
         }
@@ -696,12 +827,10 @@ impl Regex {
     }
 
     pub fn find_bytes(self, data: Bytes, .start: usize = 0) -> ?ByteMatch {
-        _check_bytes_start(data, start)
-        _ensure_ffi()
-        let h = _live_handle(self)
+        check_bytes_start(data, start)
+        let h = live_handle(self)
         let buf = Bytes.zeroed(16)
-        let call_find_bytes: fn(i64, i64, Bytes, usize, Bytes) -> i64 = .__ffi_call4'builtin
-        let rc = call_find_bytes(_sym_find_bytes, h, data, start, buf)
+        let rc: i32 = regex_lib.find_bytes(h, SliceRo(data), start, BufMut(buf))
         if rc < 0 {
             panic("regex binary find_bytes failed")
         }
@@ -714,6 +843,17 @@ impl Regex {
             start: s,
             end: e,
             data: data.slice(s, e),
+        }
+    }
+
+    pub fn find_all_bytes(self, data: Bytes) -> ByteMatchIter {
+        let _ = live_handle(self)
+        ByteMatchIter {
+            re: self,
+            data: data,
+            search_pos: 0,
+            prev_end: -1,
+            finished: false,
         }
     }
 }

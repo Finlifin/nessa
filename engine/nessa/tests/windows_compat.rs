@@ -368,7 +368,7 @@ fn udp_and_dns() -> !IoError i64 {{
 
 fn main() {{
     assert_eq(env.os(), "windows")
-    assert_eq(path.SEPARATOR, "\\")
+    assert_eq(path.separator(), "\\")
     assert_eq(path.join("C:\\win10", "1709"), "C:\\win10\\1709")
 
     fs.write_raw_bytes("{payload_path}", std.bytes.Bytes.from_string("nessa-win1709")).unwrap()
@@ -376,8 +376,8 @@ fn main() {{
     assert_eq(rb.to_utf8(), "nessa-win1709")
 
     assert(time.cpu_secs() >= 0.0)
-    let dt = DateTime.from_unix_local(1700000000)
-    assert_eq(dt.to_unix_local(), 1700000000)
+    let dt = DateTime.from_unix(1700000000, utc = false)
+    assert_eq(dt.to_unix(utc = false), 1700000000)
     let _r = rand.next_u64()
 
     let sh = process.shell("echo win1709-shell").unwrap()

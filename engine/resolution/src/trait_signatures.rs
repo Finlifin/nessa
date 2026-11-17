@@ -293,6 +293,16 @@ fn self_paths(
                             path: path.clone(),
                         });
                     }
+                } else if declaration.is_null()
+                    && source.type_index != TypeIndex::INVALID
+                    && let TypeKind::AssociatedType { trait_owner, name } =
+                        r.type_pool.get(source.type_index).kind
+                {
+                    context.associated.push(type_pool::TraitAssociatedPath {
+                        trait_owner,
+                        name,
+                        path: path.clone(),
+                    });
                 }
                 if !declaration.is_null() && ast.node(declaration).kind == NodeKind::Typealias {
                     if !context.aliases.insert(declaration) {
@@ -501,7 +511,8 @@ pub(crate) fn specialize_function_signature(
     if !matches!(
         ast.node(node).kind,
         NodeKind::Lambda | NodeKind::FunctionDef
-    ) {
+    ) || crate::iterator_defaults::is_template_node(r, node)
+    {
         return Ok(None);
     }
     let declaration = if ast.node(node).kind == NodeKind::FunctionDef {

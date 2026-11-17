@@ -32,7 +32,13 @@ fn bootstrap_names(r: &Resolver<'_>, ty: TypeIndex) -> Option<&'static [&'static
         Some(&["into_iter"])
     } else if ty == known.json {
         if crate::json_derivation::error_type(r).is_some() {
-            Some(&["to_json", "to_json_pretty"])
+            if crate::json_derivation::default_template(r, str_interner::intern("to_json_string"))
+                .is_some()
+            {
+                Some(&["to_json", "to_json_pretty", "to_json_string"])
+            } else {
+                Some(&["to_json", "to_json_pretty"])
+            }
         } else {
             Some(&["to_json"])
         }
@@ -69,7 +75,7 @@ fn bootstrap_schema(r: &mut Resolver<'_>, ty: TypeIndex) -> TraitDispatchSchema 
                         .type_pool
                         .normalize_error_type(vec![err_ty], Intrinsic::Str.type_index())
                         .ok()?;
-                    if name == "to_json_pretty" {
+                    if name == "to_json_pretty" || name == "to_json_string" {
                         let declaration = r.type_pool.intern_structural(TypeKind::Function {
                             params: vec![ty, Intrinsic::I64.type_index()],
                             ret,

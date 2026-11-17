@@ -2,11 +2,15 @@
 pub use .builtin.*
 pub use .ordering.*
 pub use .traits.*
-pub use .io.*
+pub use .range.*
+pub use .scalar.*
 pub use .math.*
 pub use .string.*
-pub use .process.*
-pub use .scalar.*
 pub use .fmt.{format, printf, eprintf}
-pub use .collections.{HashMap, Set, Deque}
+pub use .path.Path
+pub use .conv.{ParseError, Utf8Error, type_of, to_i64, to_f64, to_string}
+pub use .collections.{List, Map, HashMap, Set, Deque}
+pub use .io.{print, println, eprint, eprintln, IoError, File, OpenMode}
+pub use .process.exit
+pub use .runtime.{assert, assert_eq, panic, error_message}
 pub use .json.JsonError

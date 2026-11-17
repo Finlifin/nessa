@@ -257,7 +257,10 @@ pub(crate) fn prepare_signatures(r: &mut Resolver<'_>, ast: &Ast) {
 }
 
 pub(crate) fn default_template(r: &Resolver<'_>, name: StrId) -> Option<SymbolId> {
-    if error_type(r).is_none() || name != str_interner::intern("to_json_pretty") {
+    if error_type(r).is_none()
+        || (name != str_interner::intern("to_json_pretty")
+            && name != str_interner::intern("to_json_string"))
+    {
         return None;
     }
     r.symbols
@@ -275,56 +278,60 @@ pub(crate) fn complete_records(r: &mut Resolver<'_>, ast: &Ast) {
     if error_type(r).is_none() {
         return;
     }
-    let name = str_interner::intern("to_json_pretty");
-    let Some(declaration) = default_template(r, name) else {
-        return;
-    };
-    let provider = r.symbols[declaration.0 as usize].scope.0;
-    let records = r.type_pool.trait_impls_snapshot().to_vec();
-    for record in records {
-        if record.trait_type != r.type_pool.well_known.json {
+    for method_str in ["to_json_pretty", "to_json_string"] {
+        let name = str_interner::intern(method_str);
+        let Some(declaration) = default_template(r, name) else {
             continue;
-        }
-        if record.methods.iter().any(|method| method.name == name) {
-            continue;
-        }
-        let function = match crate::default_methods::register(
-            r,
-            ast,
-            declaration,
-            record.implementor,
-            record.trait_type,
-            record.visible_scope,
-            provider,
-        ) {
-            Ok(function) => function,
-            Err(error) => {
+        };
+        let provider = r.symbols[declaration.0 as usize].scope.0;
+        let records = r.type_pool.trait_impls_snapshot().to_vec();
+        for record in records {
+            if record.trait_type != r.type_pool.well_known.json {
+                continue;
+            }
+            if record.methods.iter().any(|method| method.name == name) {
+                continue;
+            }
+            let function = match crate::default_methods::register(
+                r,
+                ast,
+                declaration,
+                record.implementor,
+                record.trait_type,
+                record.visible_scope,
+                provider,
+            ) {
+                Ok(function) => function,
+                Err(error) => {
+                    r.diag_ctx
+                        .error(error)
+                        .with_primary_span(
+                            ast.node(r.symbols[declaration.0 as usize].def_node).span,
+                        )
+                        .emit(r.diag_ctx);
+                    continue;
+                }
+            };
+            let slot = type_pool::MethodSlot {
+                access: type_pool::MethodAccess::Public,
+                name,
+                func_id: function.0,
+                trait_impl: Some(record.trait_type),
+                visible_scope: record.visible_scope,
+            };
+            if let Err(error) = r.type_pool.add_trait_method(
+                record.implementor,
+                record.trait_type,
+                record.visible_scope,
+                slot.clone(),
+            ) {
                 r.diag_ctx
-                    .error(error)
-                    .with_primary_span(ast.node(r.symbols[declaration.0 as usize].def_node).span)
+                    .error(format!("cannot publish Json default: {error}"))
                     .emit(r.diag_ctx);
                 continue;
             }
-        };
-        let slot = type_pool::MethodSlot {
-            access: type_pool::MethodAccess::Public,
-            name,
-            func_id: function.0,
-            trait_impl: Some(record.trait_type),
-            visible_scope: record.visible_scope,
-        };
-        if let Err(error) = r.type_pool.add_trait_method(
-            record.implementor,
-            record.trait_type,
-            record.visible_scope,
-            slot.clone(),
-        ) {
-            r.diag_ctx
-                .error(format!("cannot publish Json default: {error}"))
-                .emit(r.diag_ctx);
-            continue;
+            r.type_pool.add_method(record.implementor, slot);
         }
-        r.type_pool.add_method(record.implementor, slot);
     }
 }
 

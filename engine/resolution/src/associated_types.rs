@@ -437,7 +437,10 @@ pub(crate) fn contains_dynamic_view(r: &Resolver<'_>, ty: TypeIndex, depth: usiz
 
 pub(crate) fn validate_dynamic_functions(r: &Resolver<'_>, ast: &Ast) {
     for symbol in &r.symbols {
-        if symbol.def_node.is_null() || ast.node(symbol.def_node).kind != NodeKind::FunctionDef {
+        if symbol.def_node.is_null()
+            || ast.node(symbol.def_node).kind != NodeKind::FunctionDef
+            || crate::iterator_defaults::is_template_node(r, symbol.def_node)
+        {
             continue;
         }
         if contains_dynamic_view(r, symbol.type_index, 0) {
@@ -559,7 +562,8 @@ pub(crate) fn validate_abstract_values(r: &Resolver<'_>, ast: &Ast) {
         if matches!(
             ast.node(node).kind,
             NodeKind::TraitDef | NodeKind::AssocDecl | NodeKind::Typealias
-        ) {
+        ) || crate::iterator_defaults::is_template_node(r, node)
+        {
             continue;
         }
         if r.node_types.get(&node).copied() == Some(Intrinsic::Type.type_index())
@@ -584,7 +588,8 @@ pub(crate) fn validate_abstract_values(r: &Resolver<'_>, ast: &Ast) {
         if matches!(
             ast.node(symbol.def_node).kind,
             NodeKind::FunctionDef | NodeKind::StructDef | NodeKind::EnumDef | NodeKind::Newtype
-        ) && r.type_pool.contains_associated_type(symbol.type_index)
+        ) && !crate::iterator_defaults::is_template_node(r, symbol.def_node)
+            && r.type_pool.contains_associated_type(symbol.type_index)
         {
             report(
                 r,

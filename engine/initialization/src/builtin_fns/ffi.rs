@@ -1,4 +1,4 @@
-//! Builtin functions for the capability-gated C FFI (`__ffi_dlopen`..`__ffi_call6`).
+//! Builtin functions for the capability-gated C FFI (`__ffi_dlopen`..`__ffi_read_cstr`).
 
 use interpreter::{BuiltinCtx, VmError};
 
@@ -20,4 +20,8 @@ pub fn ffi_call4(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
 
 pub fn ffi_call6(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
     ::ffi::ffi_call6(ctx)
+}
+
+pub fn ffi_read_cstr(ctx: &mut BuiltinCtx<'_>) -> Result<(), VmError> {
+    ::ffi::ffi_read_cstr(ctx)
 }

@@ -1,0 +1,436 @@
+-- std.conv — type-directed scalar parsing and checked UTF-8 error definitions.
+
+use .builtin.*
+use .traits.*
+
+private const _str_len: fn(String) -> i64 = .str_len'builtin
+private const _str_is_empty: fn(String) -> bool = .str_is_empty'builtin
+private const _str_byte_at: fn(String, i64) -> i64 = .str_byte_at'builtin
+private const _str_char_len: fn(String) -> i64 = .str_char_len'builtin
+private const _str_first: fn(String) -> ?char = .str_first'builtin
+private const _str_chars: fn(String) -> List = .str_chars'builtin
+private const _list_len: fn(List) -> i64 = .__list_len'builtin
+private const _list_get: fn(List, usize) -> Any = .__list_get'builtin
+private const _char_to_digit: fn(char, i64) -> ?i64 = .char_to_digit'builtin
+private const _i64_from_str_radix: fn(String, i64) -> Any = .i64_from_str_radix'builtin
+private const _u64_from_str_radix: fn(String, i64) -> Any = .u64_from_str_radix'builtin
+private const _i128_from_str_radix: fn(String, i64) -> Any = .i128_from_str_radix'builtin
+private const _u128_from_str_radix: fn(String, i64) -> Any = .u128_from_str_radix'builtin
+private const _str_parse_f64: fn(String) -> ?f64 = .str_parse_f64'builtin
+private const _is_finite: fn(f64) -> bool = .is_finite'builtin
+private const _abs: fn(Any) -> Any = .abs'builtin
+private const _from_bits: fn(u64) -> f64 = .from_bits'builtin
+private const _to_string: fn(Any) -> String = .to_string'builtin
+
+pub const type_of: fn(Any) -> Type = .type_of'builtin
+pub const to_i64: fn(Any) -> i64 = .to_i64'builtin
+pub const to_f64: fn(Any) -> f64 = .to_f64'builtin
+pub const to_string: fn(Any) -> String = .to_string'builtin
+
+pub enum ParseError {
+    pub Empty,
+    pub InvalidDigit(ch: char, radix: i64),
+    pub InvalidFormat(text: String),
+    pub InvalidRadix(radix: i64),
+    pub Overflow(target: String),
+    pub UnsupportedType(target: String),
+}
+derive Eq, PartialEq for ParseError
+
+impl Display for ParseError {
+    pub fn to_string(self) -> String {
+        self match {
+            ParseError.Empty => "cannot parse value from empty string",
+            ParseError.InvalidDigit(ch, radix) => {
+                "invalid digit '" ++ _to_string(ch) ++ "' for radix " ++ _to_string(radix)
+            },
+            ParseError.InvalidFormat(text) => "invalid format: " ++ text,
+            ParseError.InvalidRadix(radix) => {
+                "invalid radix " ++ _to_string(radix) ++ " (expected 2..=36)"
+            },
+            ParseError.Overflow(target) => "numeric literal out of range for " ++ target,
+            ParseError.UnsupportedType(target) => "unsupported parse target type: " ++ target,
+        }
+    }
+}
+
+pub enum Utf8Error {
+    pub InvalidByte(offset: usize),
+}
+derive Eq, PartialEq for Utf8Error
+
+impl Display for Utf8Error {
+    pub fn to_string(self) -> String {
+        self match {
+            Utf8Error.InvalidByte(offset) => {
+                "invalid UTF-8 byte sequence at offset " ++ _to_string(offset)
+            },
+        }
+    }
+}
+
+private fn _is_signed_int_type(target: Type) -> bool {
+    target == i8
+        or target == i16
+        or target == i32
+        or target == i64
+        or target == i128
+        or target == isize
+}
+
+private fn _is_unsigned_int_type(target: Type) -> bool {
+    target == u8
+        or target == u16
+        or target == u32
+        or target == u64
+        or target == u128
+        or target == usize
+}
+
+private fn _is_float_type(target: Type) -> bool {
+    target == f32 or target == f64
+}
+
+private fn _f32_max_as_f64() -> f64 {
+    let bits: u64 = 0x47EFFFFFE0000000
+    _from_bits(bits)
+}
+
+private fn _is_valid_float_syntax(text: String) -> bool {
+    let n = _str_len(text)
+    if n == 0 { return false }
+    var i: i64 = 0
+    let b0 = _str_byte_at(text, 0)
+    if b0 == 43 or b0 == 45 {
+        i += 1
+        if i >= n { return false }
+    }
+    let first_d = _str_byte_at(text, i)
+    if first_d < 48 or first_d > 57 {
+        return false
+    }
+    while i < n {
+        let b = _str_byte_at(text, i)
+        if b >= 48 and b <= 57 {
+            i += 1
+        } else {
+            break
+        }
+    }
+    if i < n and _str_byte_at(text, i) == 46 {
+        i += 1
+        if i >= n { return false }
+        let after_dot = _str_byte_at(text, i)
+        if after_dot < 48 or after_dot > 57 {
+            return false
+        }
+        while i < n {
+            let b = _str_byte_at(text, i)
+            if b >= 48 and b <= 57 {
+                i += 1
+            } else {
+                break
+            }
+        }
+    }
+    if i < n {
+        let eb = _str_byte_at(text, i)
+        if eb != 101 and eb != 69 {
+            return false
+        }
+        i += 1
+        if i >= n { return false }
+        let es = _str_byte_at(text, i)
+        if es == 43 or es == 45 {
+            i += 1
+            if i >= n { return false }
+        }
+        let ed0 = _str_byte_at(text, i)
+        if ed0 < 48 or ed0 > 57 {
+            return false
+        }
+        while i < n {
+            let db = _str_byte_at(text, i)
+            if db < 48 or db > 57 {
+                return false
+            }
+            i += 1
+        }
+    }
+    i == n
+}
+
+private fn _f64_text_within_range(text: String) -> bool {
+    let n = _str_len(text)
+    if n == 0 { return false }
+    var i: i64 = 0
+    let b0 = _str_byte_at(text, 0)
+    if b0 == 43 or b0 == 45 {
+        i += 1
+        if i >= n { return false }
+    }
+    var first_nz_pos: i64 = -1
+    var digit_pos: i64 = 0
+    var dot_pos: i64 = -1
+    var saw_digit = false
+    while i < n {
+        let b = _str_byte_at(text, i)
+        if b >= 48 and b <= 57 {
+            saw_digit = true
+            if b != 48 and first_nz_pos < 0 {
+                first_nz_pos = digit_pos
+            }
+            digit_pos += 1
+            i += 1
+        } else if b == 46 and dot_pos < 0 {
+            if not saw_digit { return false }
+            dot_pos = digit_pos
+            i += 1
+            if i >= n { return false }
+            let after_dot = _str_byte_at(text, i)
+            if after_dot < 48 or after_dot > 57 { return false }
+        } else {
+            break
+        }
+    }
+    if not saw_digit { return false }
+    if dot_pos < 0 { dot_pos = digit_pos }
+
+    var exp_val: i64 = 0
+    if i < n {
+        let eb = _str_byte_at(text, i)
+        if eb != 101 and eb != 69 { return false }
+        i += 1
+        if i >= n { return false }
+        var exp_neg = false
+        let es = _str_byte_at(text, i)
+        if es == 43 or es == 45 {
+            exp_neg = es == 45
+            i += 1
+            if i >= n { return false }
+        }
+        var exp_digits: i64 = 0
+        while i < n {
+            let db = _str_byte_at(text, i)
+            if db < 48 or db > 57 { return false }
+            exp_digits += 1
+            if exp_val < 1000000 {
+                exp_val = exp_val * 10 + (db - 48)
+            }
+            i += 1
+        }
+        if exp_digits == 0 { return false }
+        if exp_neg { exp_val = -exp_val }
+    }
+    if first_nz_pos < 0 {
+        return true
+    }
+    let sci_exp = (dot_pos - 1 - first_nz_pos) + exp_val
+    if sci_exp > 308 { return false }
+    if sci_exp < 308 { return true }
+    let max_digits = "17976931348623157"
+    var sig_idx: i64 = 0
+    var scan: i64 = 0
+    let start_b = _str_byte_at(text, 0)
+    if start_b == 43 or start_b == 45 { scan = 1 }
+    var started = false
+    while scan < n and sig_idx < 17 {
+        let b = _str_byte_at(text, scan)
+        if b == 101 or b == 69 { break }
+        if b == 46 {
+            scan += 1
+        } else if (not started) and b == 48 {
+            scan += 1
+        } else if b >= 48 and b <= 57 {
+            started = true
+            let mb = _str_byte_at(max_digits, sig_idx)
+            if b < mb { return true }
+            if b > mb { return false }
+            sig_idx += 1
+            scan += 1
+        } else {
+            break
+        }
+    }
+    while sig_idx < 17 {
+        let mb = _str_byte_at(max_digits, sig_idx)
+        if 48 < mb { return true }
+        sig_idx += 1
+    }
+    true
+}
+
+-- Parse `text` into the scalar runtime type `target` (`i8..i128`, `isize`, `u8..u128`,
+-- `usize`, `f32`, `f64`, `bool`, `char`), returning an exact-width value or `ParseError`.
+pub fn parse(target: Type, text: String, .radix: i64 = 10) -> !ParseError Any {
+    let is_signed = _is_signed_int_type(target)
+    let is_unsigned = _is_unsigned_int_type(target)
+    let is_float = _is_float_type(target)
+    let is_supported = is_signed or is_unsigned or is_float or target == bool or target == char
+
+    if not is_supported {
+        return error ParseError.UnsupportedType(_to_string(target))
+    }
+
+    if is_signed or is_unsigned {
+        if radix < 2 or radix > 36 {
+            return error ParseError.InvalidRadix(radix)
+        }
+    } else if radix != 10 {
+        return error ParseError.InvalidRadix(radix)
+    }
+
+    if _str_is_empty(text) {
+        return error ParseError.Empty
+    }
+
+    if target == bool {
+        if text == "true" {
+            return true
+        }
+        if text == "false" {
+            return false
+        }
+        return error ParseError.InvalidFormat(text)
+    }
+
+    if target == char {
+        if _str_char_len(text) == 1 {
+            return _str_first(text).as(char)
+        }
+        return error ParseError.InvalidFormat(text)
+    }
+
+    if is_float {
+        if not _is_valid_float_syntax(text) {
+            return error ParseError.InvalidFormat(text)
+        }
+        if not _f64_text_within_range(text) {
+            return error ParseError.Overflow(_to_string(target))
+        }
+        let parsed = _str_parse_f64(text)
+        if parsed == null {
+            return error ParseError.InvalidFormat(text)
+        }
+        let f = parsed.as(f64)
+        if target == f64 {
+            return f
+        }
+        if _abs(f).as(f64) > _f32_max_as_f64() {
+            return error ParseError.Overflow("f32")
+        }
+        let narrow = f.as(f32)
+        if not _is_finite(narrow.as(f64)) {
+            return error ParseError.Overflow("f32")
+        }
+        return narrow
+    }
+
+    let chars = _str_chars(text)
+    let total_chars = _list_len(chars)
+    let c0 = _list_get(chars, 0).as(char)
+    var start_idx: i64 = 0
+    var has_minus = false
+    if c0 == '+' or c0 == '-' {
+        if total_chars == 1 {
+            return error ParseError.InvalidFormat(text)
+        }
+        has_minus = c0 == '-'
+        start_idx = 1
+    }
+
+    var scan_idx = start_idx
+    while scan_idx < total_chars {
+        let ch = _list_get(chars, scan_idx.as(usize)).as(char)
+        if _char_to_digit(ch, radix) == null {
+            return error ParseError.InvalidDigit(ch, radix)
+        }
+        scan_idx += 1
+    }
+
+    if is_signed {
+        if target == i128 {
+            let parsed128 = _i128_from_str_radix(text, radix)
+            if parsed128 == null {
+                return error ParseError.Overflow("i128")
+            }
+            return parsed128.as(i128)
+        }
+        let parsed64 = _i64_from_str_radix(text, radix)
+        if parsed64 == null {
+            return error ParseError.Overflow(_to_string(target))
+        }
+        let v = parsed64.as(i64)
+        if target == i8 {
+            if v < -128 or v > 127 {
+                return error ParseError.Overflow("i8")
+            }
+            return v.as(i8)
+        }
+        if target == i16 {
+            if v < -32768 or v > 32767 {
+                return error ParseError.Overflow("i16")
+            }
+            return v.as(i16)
+        }
+        if target == i32 {
+            if v < -2147483648 or v > 2147483647 {
+                return error ParseError.Overflow("i32")
+            }
+            return v.as(i32)
+        }
+        if target == isize {
+            return v.as(isize)
+        }
+        return v
+    }
+
+    -- Unsigned integer types
+    if has_minus {
+        return error ParseError.Overflow(_to_string(target))
+    }
+    if target == u128 {
+        let parsed128 = _u128_from_str_radix(text, radix)
+        if parsed128 == null {
+            return error ParseError.Overflow("u128")
+        }
+        return parsed128.as(u128)
+    }
+    let parsed_u64 = _u64_from_str_radix(text, radix)
+    if parsed_u64 == null {
+        return error ParseError.Overflow(_to_string(target))
+    }
+    let u = parsed_u64.as(u64)
+    if target == u8 {
+        let max_u8: u64 = 255
+        if u > max_u8 {
+            return error ParseError.Overflow("u8")
+        }
+        return u.as(u8)
+    }
+    if target == u16 {
+        let max_u16: u64 = 65535
+        if u > max_u16 {
+            return error ParseError.Overflow("u16")
+        }
+        return u.as(u16)
+    }
+    if target == u32 {
+        let max_u32: u64 = 4294967295
+        if u > max_u32 {
+            return error ParseError.Overflow("u32")
+        }
+        return u.as(u32)
+    }
+    if target == usize {
+        return u.as(usize)
+    }
+    u
+}
+
+-- Parse `text` into `target`, returning `null` instead of a `ParseError` on failure.
+pub fn try_parse(target: Type, text: String, .radix: i64 = 10) -> ?Any {
+    parse(target, text, radix = radix)! {
+        _ => null,
+    }
+}

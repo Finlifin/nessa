@@ -825,7 +825,9 @@ fn lower_direct_builtin_call(
     ));
 
     let canon_ret = resolved.type_pool.canonical_type(ret_ty).unwrap_or(ret_ty);
-    if resolved.type_pool.as_intrinsic(canon_ret) != Some(type_pool::Intrinsic::Any) {
+    if builtin_id != runtime::ids::FORWARD_ERROR_VALUE
+        && resolved.type_pool.as_intrinsic(canon_ret) != Some(type_pool::Intrinsic::Any)
+    {
         let assert_ret = match def_scope {
             Some(sc) => NirExpr::TypeAssert(NirValue::Local(result), ret_ty).in_scope(sc),
             None => NirExpr::TypeAssert(NirValue::Local(result), ret_ty),
@@ -891,7 +893,9 @@ fn callable_function(
     adapter.blocks[entry.0 as usize]
         .stmts
         .push(NirStmt::Assign(result, NirExpr::CallBuiltin(native, args)));
-    if resolved.type_pool.as_intrinsic(*ret) != Some(type_pool::Intrinsic::Any) {
+    if native != runtime::ids::FORWARD_ERROR_VALUE
+        && resolved.type_pool.as_intrinsic(*ret) != Some(type_pool::Intrinsic::Any)
+    {
         adapter.blocks[entry.0 as usize].stmts.push(NirStmt::Assign(
             result,
             match adapter.entry_scope {
@@ -1621,6 +1625,36 @@ fn lower_call(
         ));
         return NirValue::Local(local);
     }
+    if builder.body_facts.is_none()
+        && let Some(plan) = resolved.json_decode_calls.get(&node_idx)
+    {
+        let is_pipeline = resolved.pipeline_calls.contains(&node_idx);
+        let pre_first_arg = if is_pipeline && !ast.multi_children(node_idx).is_empty() {
+            let first_node = resolution::argument_value_node(ast, ast.multi_children(node_idx)[0]);
+            let val = lower_expr(resolved, first_node, builder, block);
+            Some(crate::arguments::snapshot(val, builder, *block))
+        } else {
+            None
+        };
+        let lowered_args = crate::arguments::lower_arguments_with_first(
+            resolved,
+            node_idx,
+            pre_first_arg,
+            builder,
+            block,
+        );
+        let call_args = if plan.takes_allow_unknown {
+            vec![lowered_args[1], lowered_args[2]]
+        } else {
+            vec![lowered_args[1]]
+        };
+        let target_fn = builder.func_map[&plan.from_json_symbol];
+        let local = builder.alloc_local();
+        builder.blocks[block.0 as usize]
+            .stmts
+            .push(NirStmt::Assign(local, NirExpr::Call(target_fn, call_args)));
+        return NirValue::Local(local);
+    }
     let is_pipeline = resolved.pipeline_calls.contains(&node_idx);
     let pre_first_arg = if is_pipeline && !ast.multi_children(node_idx).is_empty() {
         let first_node = resolution::argument_value_node(ast, ast.multi_children(node_idx)[0]);
@@ -1658,6 +1692,7 @@ fn lower_call(
         if builder.node_symbol(resolved, callee_node).is_none()
             && builder.node_symbol(resolved, projection[1]).is_none()
             && builder.field_index(resolved, callee_node).is_none()
+            && !resolved.ffi_symbol_projections.contains_key(&callee_node)
         {
             Some((projection[0], ast.node(projection[1]).str_id))
         } else {
@@ -2182,6 +2217,29 @@ fn lower_projection(
     // Fallback: regular field access / method call.
     let object = lower_expr(resolved, children[0], builder, block);
 
+    if builder.body_facts.is_none()
+        && let Some(&(get_sym_fn, member_str)) = resolved.ffi_symbol_projections.get(&node_idx)
+    {
+        let get_sym_id = builder.func_map[&get_sym_fn];
+        let raw_local = builder.alloc_local();
+        builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+            raw_local,
+            NirExpr::Call(get_sym_id, vec![object, NirValue::ConstStr(member_str)]),
+        ));
+        if let Some(expected_ty) = builder.node_type(resolved, node_idx)
+            && resolved.type_pool.as_intrinsic(expected_ty) != Some(type_pool::Intrinsic::Any)
+        {
+            let checked = builder.alloc_local();
+            builder.blocks[block.0 as usize].stmts.push(NirStmt::Assign(
+                checked,
+                NirExpr::TypeAssert(NirValue::Local(raw_local), expected_ty)
+                    .in_source_scope(resolved, node_idx),
+            ));
+            return NirValue::Local(checked);
+        }
+        return NirValue::Local(raw_local);
+    }
+
     // If type resolution populated a field index for this projection, emit FieldAccess.
     if let Some(field_idx) = builder.field_index(resolved, node_idx) {
         let local = builder.alloc_local();
@@ -2325,7 +2383,11 @@ fn lower_lambda(
             .iter_mut()
             .find(|generated| generated.func_id == function)
     {
-        generated.function_type = signature;
+        generated.function_type = resolved
+            .erased_callback_lambdas
+            .get(&node_idx)
+            .and_then(|&erased| resolved.type_pool.canonical_type(erased))
+            .unwrap_or(signature);
         generated.return_type = ret;
     }
     value

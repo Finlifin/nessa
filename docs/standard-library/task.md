@@ -1,8 +1,8 @@
 # `std.task` — 结构化并发组合子、超时控制与任务内省
 
-`std.task` 提供面向 `async effect` 与 `Future(T)` 的任务调度协作、批量等待/竞速组合子、基于跨平台 I/O Reactor 非阻塞定时器的结构化超时包装器以及任务树调试内省 API。
+`std.task` 提供面向 `async effect` 与 `Future(T)` 的任务调度协作、批量等待/竞速组合子、结构化数据并行（`par_map` / `par_for_each` / `race`）、基于跨平台 I/O Reactor 非阻塞定时器的结构化超时包装器以及任务树调试内省 API。
 
-> 在 Nessa 中，新任务的创建始终通过 `async effect` handler 完成，`std.task` 不提供脱离效应作用域的非结构化裸 `spawn`。
+> 在 Nessa 中，所有并发子任务均受结构化词法作用域管理，`std.task` 不提供脱离父任务生命周期的裸 `spawn`。
 
 ## 类型定义
 
@@ -41,7 +41,7 @@ pub use Either.{left, right}
 | 函数签名 | 说明 |
 | --- | --- |
 | `yield_now() -> Unit` | 主动让出当前任务时间片，重新排入调度器就绪队列 |
-| `sleep_ms(ms: i64) -> Unit` | 在 `libuv` Reactor 注册非阻塞定时器并挂起当前任务 `ms` 毫秒（`ms <= 0` 立即返回），绝不阻塞 OS Worker 线程；被取消时立即解除定时器并展开 `defer` |
+| `sleep_ms(ms: i64) -> Unit` | 在 Reactor 注册非阻塞定时器并挂起当前任务 `ms` 毫秒（`ms <= 0` 立即返回），绝不阻塞 OS Worker 线程；被取消时立即解除定时器并展开 `defer` |
 | `sleep(dur: Duration) -> Unit` | 等价于 `sleep_ms(dur.as_millis())` |
 | `is_ready(f: Future) -> bool` | 非阻塞查询 `f` 是否已完成 |
 | `current_id() -> i64` | 返回当前正在执行的代际 `TaskId` |
@@ -49,35 +49,36 @@ pub use Either.{left, right}
 
 ## 组合子与编译期静态类型精化
 
-### `await_all`
+### `par_map` 与 `par_for_each`
+
+```nessa
+pub fn par_map(items: List, mapper: fn(Any) -> Any) -> List
+pub fn par_for_each(items: List, action: fn(Any) -> Unit) -> Unit
+```
+
+在内部词法作用域的结构化 `handles async` 下为 `items` 中每个元素派生并发子任务并等待全部收敛：
+
+- **静态元素推导与错误传播**：若 `items` 元素静态已知为 `T`，内联 `mapper` / `action` 参数自动推导为 `T`；若 `mapper` 返回 `!E Out`，`par_map` 返回类型自动精化为 `!E List`（且输出 `List` 的同构元素类型追踪为 `Out`），首个子任务错误按序透传。
+
+### `race`
+
+```nessa
+pub fn race(branches: List) -> Any
+```
+
+接收非空无参闭包列表 `[|| branch_a(), || branch_b(), ...]`，并发启动全部支路，返回首个完成支路的结果并结构化取消其余未完成支路（等待所有败者 `defer` 清理完成后再返回）。对列表字面量传入的支路，编译期自动求并各支路返回类型与受检错误集。
+
+### `await_all` / `await_any` / `await_first`
 
 ```nessa
 pub fn await_all(futures: List) -> List
--- 同时作为 List 方法提供：futures.await_all() -> List
-```
-
-并发等待列表中的所有 `Future` 完成，按原顺序返回结果列表：
-
-- **静态类型精化**：若 `futures` 来自字面量 `[f1, f2]` 或通过 `List()` + `.push(fut)` 构造，编译器自动检查所有元素均为 `Future(T)`（否则编译期直接报错），并将结果列表元素类型追踪为 `T`（`done(i)`、列表解构 `[a, b]` 直接获得类型 `T`）。
-
-### `await_any`
-
-```nessa
 pub fn await_any(futures: List) -> Any
--- 同时作为 List 方法提供：futures.await_any() -> Any
-```
-
-竞速等待非空 `Future` 列表，返回第一个完成的 `Future` 的结果，**立即取消其余未完成的兄弟子任务，并等待所有被取消败者的 `defer` 清理块完全收敛后再返回**（败者在被取消后若产生未捕获失败，亦自动标记为已观察，不会在退出外层 `handles` 作用域时误伤父任务）：
-
-- **静态类型精化**：当输入列表元素静态已知为 `Future(T)` 时，表达式返回类型自动精化为 `T`。
-
-### `await_first`
-
-```nessa
 pub fn await_first(first: Future, second: Future) -> Either
 ```
 
-二元竞速组合子：`first` 先完成时取消 `second` 并返回 `Either.left(v1)`；`second` 先完成时取消 `first` 并返回 `Either.right(v2)`。对 `Future(A)` 与 `Future(B)`，解构 `left(x)` 得到 `A`，解构 `right(y)` 得到 `B`。
+- `await_all`：并发等待列表中所有 `Future(T)` 完成，返回有序结果 `List`（并保留元素类型 `T` 供索引与循环推导）。
+- `await_any`：返回首个完成的 `Future(T)` 结果 `T`，自动取消其余未完成兄弟子任务并等待其 `defer` 收敛。
+- `await_first`：二元异构竞速，按完成先后返回 `Either.left(v1)` 或 `Either.right(v2)`。
 
 ### `with_timeout`
 
@@ -85,39 +86,45 @@ pub fn await_first(first: Future, second: Future) -> Either
 pub fn with_timeout(ms: i64, thunk: fn() -> Any) -> Any
 ```
 
-在独立子任务中执行 `thunk()`，与 `ms` 毫秒 `libuv` 定时器竞速：
+在独立子任务中执行 `thunk()`，与 `ms` 毫秒非阻塞定时器竞速：
 
 - 若 `thunk()` 在超时前返回，取消定时器并原样透传其返回值或业务错误；
 - 若定时器先到期（或 `ms < 0`），自动级联取消 `thunk` 子任务树（完整执行内部全部 `defer` 清理），并返回 `error TimeoutError.new(ms)`；
-- **静态类型精化**：若 `thunk` 的返回类型为 `T`（无受检错误），调用点类型为 `!TimeoutError T`；若 `thunk` 返回 `![E1, E2] T`，调用点类型自动合并为 `![TimeoutError, E1, E2] T`。
+- **静态类型精化**：若 `thunk` 返回 `T`，调用点精化为 `!TimeoutError T`；若 `thunk` 返回 `![E1, E2] T`，调用点合并为 `![TimeoutError, E1, E2] T`。
 
 ## 示例
 
 ```nessa
 use std.task
-use std.task.{left, right, TimeoutError}
-
-async effect compute(x: i64) -> i64
+use std.task.TimeoutError
 
 fn main() {
-    handles async compute(x: i64) => {
-        task.sleep_ms(5)
-        x * 10
+    -- 1. 结构化数据并行：x 自动推导为 i64，squares 元素静态追踪为 i64
+    let squares = task.par_map([1, 2, 3, 4]) do |x| {
+        x * x
     }
+    assert_eq(squares, [1, 4, 9, 16])
 
-    -- 1. 强类型 await_all：done(0) 静态类型为 i64
-    let done = [compute(1)#, compute(2)#, compute(3)#].await_all()
-    let total: i64 = done(0) + done(1) + done(2)
+    -- 2. 结构化多路竞速：自动取消慢支路
+    let fastest: String = task.race([
+        || -> String {
+            task.sleep_ms(80)
+            "slow"
+        },
+        || -> String {
+            task.sleep_ms(5)
+            "fast"
+        },
+    ])
+    assert_eq(fastest, "fast")
 
-    -- 2. 结构化超时：超时后自动取消慢任务并执行其内部 defer
+    -- 3. 结构化超时：超时后自动取消慢任务并执行其内部 defer
     let res = task.with_timeout(20, || -> i64 {
         task.sleep_ms(200)
         999
     }) ! {
         TimeoutError { millis } => millis,
     }
-
-    assert_eq(total, 60)
     assert_eq(res, 20)
 }
 ```

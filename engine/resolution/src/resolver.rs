@@ -96,6 +96,10 @@ pub(crate) struct Resolver<'a> {
     pub(crate) active_blocks: Vec<NodeIndex>,
     pub(crate) resolving_assign_lhs: bool,
     pub(crate) restricted_dlopen_views: HashMap<NodeIndex, HashSet<String>>,
+    pub(crate) ffi_bindings: crate::ffi_bindings::FfiBindingState,
+    pub(crate) iterator_defaults: crate::iterator_defaults::IteratorDefaultCache,
+    pub(crate) json_decode_calls: HashMap<NodeIndex, crate::JsonDecodeCallPlan>,
+    pub(crate) erased_callback_lambdas: HashMap<NodeIndex, TypeIndex>,
     next_symbol_id: u32,
     pub(crate) current_scope: ScopeId,
 }
@@ -179,6 +183,10 @@ impl<'a> Resolver<'a> {
             active_blocks: Vec::new(),
             resolving_assign_lhs: false,
             restricted_dlopen_views: HashMap::new(),
+            ffi_bindings: Default::default(),
+            iterator_defaults: Default::default(),
+            json_decode_calls: HashMap::new(),
+            erased_callback_lambdas: HashMap::new(),
             next_symbol_id: 0,
             current_scope: ScopeId::ROOT,
         };
@@ -279,6 +287,7 @@ impl<'a> Resolver<'a> {
         crate::typing::prepare_type_aliases(&mut self, &ast);
         crate::newtype::prepare(&mut self, &ast);
         crate::ordering::prepare(&mut self);
+        crate::iterator_defaults::prepare(&mut self, &ast);
         crate::json_derivation::prepare_signatures(&mut self, &ast);
         crate::access::publish_scopes(&mut self);
         crate::associated_types::stage_implementations(&mut self, &ast);
@@ -292,6 +301,7 @@ impl<'a> Resolver<'a> {
         crate::defaults::validate_default_expansions(&self, &ast);
         crate::typing::validate_native_values(&self, &ast);
         crate::typing::validate_restricted_ffi_dlopen(&self, &ast);
+        crate::ffi_bindings::validate_ffi_value_references(&self, &ast);
         crate::initialization::validate(&self, &ast);
 
         // Phase 3d: Trait & method resolution.
@@ -311,6 +321,8 @@ impl<'a> Resolver<'a> {
         {
             crate::identity::finalize(&mut self, &ast);
         }
+
+        let iterator_template_nodes = self.iterator_defaults.nested_template_nodes;
 
         ResolvedAst {
             ast,
@@ -359,6 +371,10 @@ impl<'a> Resolver<'a> {
             node_field_indices: self.node_field_indices,
             pipeline_calls: self.pipeline_calls,
             annotation_typed_patterns: self.annotation_typed_patterns,
+            ffi_symbol_projections: self.ffi_bindings.symbol_projections,
+            json_decode_calls: self.json_decode_calls,
+            iterator_template_nodes,
+            erased_callback_lambdas: self.erased_callback_lambdas,
         }
     }
 

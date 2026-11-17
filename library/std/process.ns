@@ -1,27 +1,59 @@
--- std.process — process control, assertions, and child command execution.
+-- std.process — process control, `Command` builder, and child command execution.
 
 use .builtin.*
+use .collections.*
 use .io.{IoError, io_error_from_code}
+use .path.{Path, to_path_string}
+pub use .runtime.{assert, assert_eq, panic}
 use .traits.*
 
-private const _proc_exec: fn(String, List, ?String) -> (i64, i64, String, String) = .__proc_exec'builtin
-private const _proc_exec_cwd: fn(String, List, ?String, ?String) -> (i64, i64, String, String) = .__proc_exec_cwd'builtin
-private const _proc_shell: fn(String, ?String) -> (i64, i64, String, String) = .__proc_shell'builtin
-private const _proc_shell_cwd: fn(String, ?String, ?String) -> (i64, i64, String, String) = .__proc_shell_cwd'builtin
-private const _proc_pid: fn() -> i64 = .__proc_pid'builtin
-private const _list_init: fn() -> List = .__list_init'builtin
+private const native_proc_exec: fn(String, List, ?String) -> (i64, i64, String, String) = .__proc_exec'builtin
+private const native_proc_exec_cwd: fn(String, List, ?String, ?String) -> (i64, i64, String, String) = .__proc_exec_cwd'builtin
+private const native_proc_shell: fn(String, ?String) -> (i64, i64, String, String) = .__proc_shell'builtin
+private const native_proc_shell_cwd: fn(String, ?String, ?String) -> (i64, i64, String, String) = .__proc_shell_cwd'builtin
+private const native_proc_pid: fn() -> i64 = .__proc_pid'builtin
+private const native_exit: fn(i64) -> NoReturn = .exit'builtin
+private const native_to_string: fn(Any) -> String = .to_string'builtin
 
-pub const exit: fn(i64) -> NoReturn = .exit'builtin
-pub const panic: fn(Any) -> NoReturn = .panic'builtin
+pub fn exit(.code: i64 = 0) -> NoReturn = native_exit(code)
 
--- The message is an optional named argument. It is formatted by `panic`.
-pub fn assert(condition: bool, .message: Any = "assertion failed") {
-    if not condition { panic(message) }
+pub fn pid() -> i64 = native_proc_pid()
+
+private fn arg_to_string(val: Any) -> String {
+    val match {
+        s: String => s,
+        p: Path => p.raw,
+        shown: Display => shown.to_string(),
+        _ => native_to_string(val),
+    }
 }
 
--- Compared with `==`, including lists, tuples and Any values.
-pub fn assert_eq(left: Any, right: Any, .message: Any = "values are not equal") {
-    if left != right { panic(message) }
+private fn normalize_args_list(items: List) -> List {
+    let out = List()
+    var i: usize = 0
+    while i < items.len() {
+        let elem = items.get(i)
+        elem match {
+            nested: List => {
+                var j: usize = 0
+                while j < nested.len() {
+                    out.push(arg_to_string(nested.get(j)))
+                    j += 1
+                }
+            },
+            _ => out.push(arg_to_string(elem)),
+        }
+        i += 1
+    }
+    out
+}
+
+private fn optional_cwd_string(cwd: Any) -> ?String {
+    if cwd == null {
+        null
+    } else {
+        to_path_string(cwd)
+    }
 }
 
 pub struct CommandOutput {
@@ -32,19 +64,22 @@ pub struct CommandOutput {
 derive Eq, PartialEq, Display for CommandOutput
 
 impl CommandOutput {
-    pub fn success(self) -> bool = self.status == 0
+    pub fn is_success(self) -> bool = self.status == 0
 }
 
-pub fn exec_command(
-    program: String,
-    .args: List = _list_init(),
-    .stdin_data: ?String = null,
-    .cwd: ?String = null,
+private fn run_process(
+    program: Any,
+    args: List,
+    stdin: ?String,
+    cwd: Any,
 ) -> !IoError CommandOutput {
-    let (code, exit_code, out, err) = if cwd != null {
-        _proc_exec_cwd(program, args, stdin_data, cwd)
+    let prog_str = to_path_string(program)
+    let str_args = normalize_args_list(args)
+    let cwd_str = optional_cwd_string(cwd)
+    let (code, exit_code, out, err) = if cwd_str != null {
+        native_proc_exec_cwd(prog_str, str_args, stdin, cwd_str)
     } else {
-        _proc_exec(program, args, stdin_data)
+        native_proc_exec(prog_str, str_args, stdin)
     }
     if code == 0 {
         CommandOutput { status: exit_code, stdout: out, stderr: err }
@@ -53,44 +88,187 @@ pub fn exec_command(
     }
 }
 
-pub fn exec(
-    program: String,
-    .args: List = _list_init(),
-    .stdin_data: ?String = null,
-    .cwd: ?String = null,
+pub fn run(
+    program: Any,
+    .args: List = [],
+    .stdin: ?String = null,
+    .cwd: Any = null,
 ) -> !IoError CommandOutput {
-    exec_command(program, args = args, stdin_data = stdin_data, cwd = cwd)
-}
-
-pub fn shell_command(
-    cmd: String,
-    .stdin_data: ?String = null,
-    .cwd: ?String = null,
-) -> !IoError CommandOutput {
-    let (code, exit_code, out, err) = if cwd != null {
-        _proc_shell_cwd(cmd, stdin_data, cwd)
-    } else {
-        _proc_shell(cmd, stdin_data)
-    }
-    if code == 0 {
-        CommandOutput { status: exit_code, stdout: out, stderr: err }
-    } else {
-        error io_error_from_code(code, err)
-    }
+    run_process(program, args, stdin, cwd)
 }
 
 pub fn shell(
-    cmd: String,
-    .stdin_data: ?String = null,
-    .cwd: ?String = null,
+    command: String,
+    .stdin: ?String = null,
+    .cwd: Any = null,
 ) -> !IoError CommandOutput {
-    shell_command(cmd, stdin_data = stdin_data, cwd = cwd)
+    let cwd_str = optional_cwd_string(cwd)
+    let (code, exit_code, out, err) = if cwd_str != null {
+        native_proc_shell_cwd(command, stdin, cwd_str)
+    } else {
+        native_proc_shell(command, stdin)
+    }
+    if code == 0 {
+        CommandOutput { status: exit_code, stdout: out, stderr: err }
+    } else {
+        error io_error_from_code(code, err)
+    }
 }
 
 pub fn shell_available() -> bool {
-    let (code, status, _, _) = _proc_shell("", null)
+    let (code, status, _, _) = native_proc_shell("", null)
     code == 0 and status != 0
 }
 
-pub fn current_pid() -> i64 = _proc_pid()
-pub fn pid() -> i64 = _proc_pid()
+pub struct Command {
+    pub program: String,
+    pub argv: List,
+    pub cwd_dir: ?String,
+    pub stdin_text: ?String,
+}
+
+impl PartialEq for Command {
+    pub fn eq(self, other: Self) -> bool {
+        self.program == other.program
+            and self.argv == other.argv
+            and self.cwd_dir == other.cwd_dir
+            and self.stdin_text == other.stdin_text
+    }
+}
+
+impl Display for Command {
+    pub fn to_string(self) -> String {
+        if self.argv.is_empty() {
+            "Command(" ++ self.program ++ ")"
+        } else {
+            "Command(" ++ self.program ++ " " ++ self.argv.join(" ") ++ ")"
+        }
+    }
+}
+
+private fn build_command_from_spec(argv: List, options: Map) -> !IoError Command {
+    var prog_opt: ?String = null
+    let collected_args = List()
+
+    if not argv.is_empty() {
+        prog_opt = to_path_string(argv.get(0))
+        var idx: usize = 1
+        while idx < argv.len() {
+            collected_args.push(arg_to_string(argv.get(idx)))
+            idx += 1
+        }
+    }
+
+    var cwd_val: ?String = null
+    var stdin_val: ?String = null
+
+    let keys = options.keys()
+    var k_idx: usize = 0
+    while k_idx < keys.len() {
+        let key = keys.get(k_idx).as(String)
+        let val = options.get(key)
+        when {
+            key == "program" => {
+                if val == null {
+                    return error IoError.InvalidInput("Command.spec `program` option cannot be null")
+                }
+                prog_opt = to_path_string(val)
+            }
+            key == "args" => {
+                val match {
+                    extra: List => collected_args.append(normalize_args_list(extra)),
+                    _ => return error IoError.InvalidInput("Command.spec `args` option must be a List"),
+                }
+            }
+            key == "cwd" => {
+                cwd_val = optional_cwd_string(val)
+            }
+            key == "stdin" => {
+                if val == null {
+                    stdin_val = null
+                } else {
+                    val match {
+                        s: String => stdin_val = s,
+                        _ => return error IoError.InvalidInput("Command.spec `stdin` option must be a String"),
+                    }
+                }
+            }
+            else => return error IoError.InvalidInput("unknown Command.spec option: " ++ key)
+        }
+        k_idx += 1
+    }
+
+    let final_prog? = prog_opt else {
+        return error IoError.InvalidInput("Command.spec requires a program argument")
+    }
+
+    Command {
+        program: final_prog,
+        argv: collected_args,
+        cwd_dir: cwd_val,
+        stdin_text: stdin_val,
+    }
+}
+
+impl Command {
+    pub fn new(program: Any) -> Command {
+        Command {
+            program: to_path_string(program),
+            argv: List(),
+            cwd_dir: null,
+            stdin_text: null,
+        }
+    }
+
+    pub fn spec(...argv: List, ...options: Map) -> !IoError Command {
+        build_command_from_spec(argv, options)
+    }
+
+    pub fn arg(self, a: Any) -> Command {
+        let next_args = self.argv.copy()
+        next_args.push(arg_to_string(a))
+        Command {
+            program: self.program,
+            argv: next_args,
+            cwd_dir: self.cwd_dir,
+            stdin_text: self.stdin_text,
+        }
+    }
+
+    pub fn args(self, ...items: List) -> Command {
+        let next_args = self.argv.copy()
+        next_args.append(normalize_args_list(items))
+        Command {
+            program: self.program,
+            argv: next_args,
+            cwd_dir: self.cwd_dir,
+            stdin_text: self.stdin_text,
+        }
+    }
+
+    pub fn cwd(self, dir: Any) -> Command {
+        Command {
+            program: self.program,
+            argv: self.argv.copy(),
+            cwd_dir: optional_cwd_string(dir),
+            stdin_text: self.stdin_text,
+        }
+    }
+
+    pub fn stdin(self, input: String) -> Command {
+        Command {
+            program: self.program,
+            argv: self.argv.copy(),
+            cwd_dir: self.cwd_dir,
+            stdin_text: input,
+        }
+    }
+
+    pub fn run(self) -> !IoError CommandOutput {
+        run_process(self.program, self.argv, self.stdin_text, self.cwd_dir)
+    }
+}
+
+pub fn command(...argv: List, ...options: Map) -> !IoError Command {
+    build_command_from_spec(argv, options)
+}

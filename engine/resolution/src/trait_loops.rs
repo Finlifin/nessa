@@ -250,24 +250,19 @@ impl ForLoopPlan {
 pub(crate) fn type_loop(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) {
     let children = ast.fixed_children(node);
     crate::typing::resolve_types(r, ast, children[2]);
-    let mut narrowed_loop_binder: Option<(SymbolId, Option<TypeIndex>)> = None;
+    let mut narrowed_loop_binders: Vec<(SymbolId, Option<TypeIndex>)> = Vec::new();
     if let Some(&ty) = r.node_types.get(&children[2]) {
         let ty = crate::default_methods::checked_self_value_type(r, ast, children[2], ty);
         match plan(r, node, children[2], ty) {
             Ok(plan) => {
                 let item_ty = plan.item_type();
                 crate::enums::pattern(r, ast, children[1], Some(item_ty));
-                // When iterating over a known homogeneous dynamic collection (`List`, `Set`,
-                // `Deque`, `Map`) with a plain unannotated identifier pattern `for x in xs`,
-                // narrow `x` inside the loop body while keeping `plan.item_type() == Any`
-                // so refutable typed patterns `for x: T in xs` keep their runtime semantics.
-                if r.type_pool.as_intrinsic(item_ty) == Some(type_pool::Intrinsic::Any)
-                    && !children[1].is_null()
-                    && ast.node(children[1]).kind == NodeKind::Id
-                    && !r.enum_variants.contains_key(&children[1])
-                    && let Some(&sym_id) = r.node_symbols.get(&children[1])
-                    && !r.closure_mutated_symbols.contains(&sym_id)
-                {
+                // When iterating over a known homogeneous dynamic collection or iterator
+                // pipeline (`List`, `Set`, `Deque`, `Map`, `EnumerateIter`, `ZipIter`, ...)
+                // with plain unannotated identifier or tuple-of-identifier patterns,
+                // narrow the loop binders inside the body while keeping `plan.item_type()`
+                // unchanged so refutable typed patterns keep their runtime semantics.
+                if !children[1].is_null() {
                     let mut mutated_in_body = std::collections::HashSet::new();
                     crate::flow_narrowing::collect_mutated_symbols_in_subtree(
                         r,
@@ -275,12 +270,41 @@ pub(crate) fn type_loop(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) {
                         children[3],
                         &mut mutated_in_body,
                     );
-                    if !mutated_in_body.contains(&sym_id)
+                    if r.type_pool.as_intrinsic(item_ty) == Some(type_pool::Intrinsic::Any)
+                        && ast.node(children[1]).kind == NodeKind::Id
+                        && !r.enum_variants.contains_key(&children[1])
+                        && let Some(&sym_id) = r.node_symbols.get(&children[1])
+                        && !r.closure_mutated_symbols.contains(&sym_id)
+                        && !mutated_in_body.contains(&sym_id)
                         && let Some(elem_ty) =
                             crate::collection_inference::iterable_element_type(r, ast, children[2])
                     {
                         let prev = r.narrowed_symbols.insert(sym_id, elem_ty);
-                        narrowed_loop_binder = Some((sym_id, prev));
+                        narrowed_loop_binders.push((sym_id, prev));
+                    } else if ast.node(children[1]).kind == NodeKind::Tuple
+                        && let Some(elem_ty) =
+                            crate::collection_inference::iterable_element_type(r, ast, children[2])
+                        && let Some(canon_elem) = r.type_pool.canonical_type(elem_ty)
+                        && let type_pool::TypeKind::Tuple { elements } =
+                            r.type_pool.get(canon_elem).kind.clone()
+                    {
+                        let pat_elems = ast.multi_children(children[1]);
+                        if pat_elems.len() == elements.len() {
+                            for (&pat_el, &refined_ty) in pat_elems.iter().zip(elements.iter()) {
+                                if !pat_el.is_null()
+                                    && ast.node(pat_el).kind == NodeKind::Id
+                                    && !r.enum_variants.contains_key(&pat_el)
+                                    && let Some(&sym_id) = r.node_symbols.get(&pat_el)
+                                    && !r.closure_mutated_symbols.contains(&sym_id)
+                                    && !mutated_in_body.contains(&sym_id)
+                                    && r.type_pool.as_intrinsic(refined_ty)
+                                        != Some(type_pool::Intrinsic::Any)
+                                {
+                                    let prev = r.narrowed_symbols.insert(sym_id, refined_ty);
+                                    narrowed_loop_binders.push((sym_id, prev));
+                                }
+                            }
+                        }
                     }
                 }
                 r.for_loops.insert(node, plan);
@@ -296,7 +320,7 @@ pub(crate) fn type_loop(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) {
         );
     }
     crate::typing::resolve_types(r, ast, children[3]);
-    if let Some((sym_id, prev)) = narrowed_loop_binder {
+    for (sym_id, prev) in narrowed_loop_binders.into_iter().rev() {
         match prev {
             Some(old) => {
                 r.narrowed_symbols.insert(sym_id, old);

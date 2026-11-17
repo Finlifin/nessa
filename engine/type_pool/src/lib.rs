@@ -1021,6 +1021,16 @@ impl TypePool {
             | (TypeKind::Future { inner: ai }, TypeKind::Future { inner: bi }) => {
                 self.is_gradually_consistent(*ai, *bi)
             }
+            (
+                TypeKind::EffectQualified {
+                    effects: ae,
+                    inner: ai,
+                },
+                TypeKind::EffectQualified {
+                    effects: be,
+                    inner: bi,
+                },
+            ) if ae == be => self.is_gradually_consistent(*ai, *bi),
             (TypeKind::Tuple { elements: ae }, TypeKind::Tuple { elements: be }) => {
                 ae.len() == be.len()
                     && ae

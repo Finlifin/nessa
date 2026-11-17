@@ -8,7 +8,7 @@ pub type BuiltinFnId = u32;
 
 /// Version of the stable builtin IDs and calling semantics stored in artifacts.
 /// Increment when an ID changes meaning or compilation requires new native capabilities.
-pub const BUILTIN_ABI_VERSION: u32 = 13;
+pub const BUILTIN_ABI_VERSION: u32 = 14;
 
 // ---------------------------------------------------------------------------
 // Stable builtin function IDs (sparse ranges by domain)
@@ -1288,6 +1288,16 @@ pub mod ids {
     pub const WASM_FUEL: BuiltinFnId = 880;
     pub const WASM_RUN_WASI: BuiltinFnId = 881;
     pub const WASM_CLOSE: BuiltinFnId = 882;
+
+    // ── Error envelope inspection & C FFI C-string read (883..=886) ──
+    /// True iff the value is a heap `Err` `ErrorEnvelope` (`PayloadRole::ErrorEnvelope` with non-zero tag).
+    pub const IS_ERROR_VALUE: BuiltinFnId = 883;
+    /// Read a bounded NUL-terminated UTF-8 C string from raw address `addr` (`0` -> `null`).
+    pub const FFI_READ_CSTR: BuiltinFnId = 884;
+    /// If the value is an `Ok` `ErrorEnvelope` (zero error tag), unwrap its inner payload; else return unchanged.
+    pub const UNWRAP_OK_VALUE: BuiltinFnId = 885;
+    /// Verify the argument is a heap `Err` `ErrorEnvelope` and return it unchanged (privileged `NoReturn` error forwarding).
+    pub const FORWARD_ERROR_VALUE: BuiltinFnId = 886;
 }
 
 /// Static metadata for a builtin function (no function pointer).
@@ -4039,6 +4049,22 @@ pub const BUILTIN_FN_META: &[BuiltinFnMeta] = &[
         id: ids::WASM_CLOSE,
         name: "__wasm_close",
     },
+    BuiltinFnMeta {
+        id: ids::IS_ERROR_VALUE,
+        name: "__is_error_value",
+    },
+    BuiltinFnMeta {
+        id: ids::FFI_READ_CSTR,
+        name: "__ffi_read_cstr",
+    },
+    BuiltinFnMeta {
+        id: ids::UNWRAP_OK_VALUE,
+        name: "__unwrap_ok_value",
+    },
+    BuiltinFnMeta {
+        id: ids::FORWARD_ERROR_VALUE,
+        name: "__forward_error_value",
+    },
 ];
 
 /// Look up a builtin function id by its language-facing name.
@@ -4061,7 +4087,7 @@ mod tests {
 
     #[test]
     fn fn_ids_are_stable_and_named() {
-        assert_eq!(BUILTIN_ABI_VERSION, 13);
+        assert_eq!(BUILTIN_ABI_VERSION, 14);
         assert!(lookup_builtin_fn_meta(120).is_none());
         assert_eq!(lookup_builtin_fn_id("print"), Some(ids::PRINT));
         assert_eq!(lookup_builtin_fn_id("str_concat"), Some(ids::STR_CONCAT));
@@ -4082,8 +4108,8 @@ mod tests {
             );
             assert_eq!(lookup_builtin_fn_id(meta.name), Some(meta.id));
         }
-        for id in
-            (ids::SCALAR_HASH..=ids::RT_JIT_DEOPT_COUNT).chain(ids::DEFER_PUSH..=ids::WASM_CLOSE)
+        for id in (ids::SCALAR_HASH..=ids::RT_JIT_DEOPT_COUNT)
+            .chain(ids::DEFER_PUSH..=ids::FORWARD_ERROR_VALUE)
         {
             let meta = lookup_builtin_fn_meta(id)
                 .unwrap_or_else(|| panic!("missing metadata for builtin id {id}"));

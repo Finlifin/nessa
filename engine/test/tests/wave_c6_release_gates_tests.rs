@@ -406,7 +406,7 @@ fn run_four_level_handlers(
         }).as(i64)
     }
     handles async spawn_l3(mode: i64) => {
-        let f = File.open(tmp_path, mode = "a") ! { _ => return -100 }
+        let f = File.open(tmp_path, mode = .append) ! { _ => return -100 }
         defer {
             let _ = f.write("L3;") ! { _ => () }
             let _ = f.close() ! { _ => () }
@@ -716,9 +716,9 @@ fn run_task_body(seed: i64) -> i64 {
         let r2 = coroutine.yield_val(value = start + r1).as(i64)
         start + r1 + r2
     })
-    let y1 = co.step(arg = seed).as(i64)
-    let y2 = co.step(arg = 5).as(i64)
-    let y3 = co.step(arg = 7).as(i64)
+    let y1 = (co.try_resume(arg = seed) ! { _ => -999 }).as(i64)
+    let y2 = (co.try_resume(arg = 5) ! { _ => -999 }).as(i64)
+    let y3 = (co.try_resume(arg = 7) ! { _ => -999 }).as(i64)
 
     let gen = coroutine.generator(|| {
         var i: i64 = 1

@@ -1,0 +1,713 @@
+-- std.ffi — capability-gated C-ABI Foreign Function Interface.
+--
+-- Provides declarative library loading (`ffi.load` / `ffi.must_load`), explicit
+-- calling conventions (`CallConv`), nominal pointer & slice markers (`Ptr`, `CStr`,
+-- `PtrRo`, `PtrMut`, `SliceRo`, `BufMut`), checked C string decoding, and weak GC
+-- finalizer attachment (`Library.attach_finalizer`).
+
+use .builtin.*
+use .collections.*
+use .ordering.*
+use .scalar.*
+use .string.*
+use .traits.*
+
+private const panic_raw: fn(Any) -> NoReturn = .panic'builtin
+private const ffi_dlopen: fn(String) -> i64 = .__ffi_dlopen'builtin
+private const ffi_dlsym: fn(i64, String, String) -> i64 = .__ffi_dlsym'builtin
+private const ffi_call_list: fn(i64, List) -> Any = .__ffi_call'builtin
+private const ffi_call1: fn(i64, Any) -> Any = .__ffi_call4'builtin
+private const ffi_call2: fn(i64, Any, Any) -> Any = .__ffi_call4'builtin
+private const ffi_call3: fn(i64, Any, Any, Any) -> Any = .__ffi_call4'builtin
+private const ffi_call4: fn(i64, Any, Any, Any, Any) -> Any = .__ffi_call4'builtin
+private const ffi_call5: fn(i64, Any, Any, Any, Any, Any) -> Any = .__ffi_call6'builtin
+private const ffi_call6: fn(i64, Any, Any, Any, Any, Any, Any) -> Any = .__ffi_call6'builtin
+private const ffi_read_cstr_raw: fn(usize, usize) -> ?String = .__ffi_read_cstr'builtin
+private const ffi_close_call: fn(i64, i64) -> bool = .__ffi_call4'builtin
+private const ffi_gc_call: fn(i64, Any, i64) -> Unit = .__ffi_call4'builtin
+
+private global close_sym_id: i64 = 0
+
+private fn ensure_close_sym() -> i64 {
+    if close_sym_id <= 0 {
+        close_sym_id = ffi_dlsym(0, "close", "i64->bool")
+    }
+    close_sym_id
+}
+
+-- Foreign calling convention selector.
+pub enum CallConv {
+    pub c,
+    pub system,
+}
+
+derive Eq, PartialEq for CallConv
+
+impl Display for CallConv {
+    pub fn to_string(self) -> String {
+        self match {
+            CallConv.c => "c",
+            CallConv.system => "system",
+        }
+    }
+}
+
+-- Checked FFI errors returned by library opening, symbol binding, and pointer reads.
+pub enum FfiError {
+    pub LibraryNotFound(library: String),
+    pub SymbolNotFound(library: String, symbol: String),
+    pub InvalidSignature(symbol: String, message: String),
+    pub NullPointer(message: String),
+    pub InvalidUtf8(message: String),
+    pub Closed,
+}
+
+derive Eq, PartialEq for FfiError
+
+impl Display for FfiError {
+    pub fn to_string(self) -> String {
+        self match {
+            FfiError.LibraryNotFound(library) => "FFI library not found: `" ++ library ++ "`",
+            FfiError.SymbolNotFound(library, symbol) => {
+                "FFI symbol `" ++ symbol ++ "` not found in `" ++ library ++ "`"
+            },
+            FfiError.InvalidSignature(symbol, message) => {
+                "invalid FFI signature for `" ++ symbol ++ "`: " ++ message
+            },
+            FfiError.NullPointer(message) => "null FFI pointer: " ++ message,
+            FfiError.InvalidUtf8(message) => "invalid UTF-8 from FFI: " ++ message,
+            FfiError.Closed => "FFI library handle is closed",
+        }
+    }
+}
+
+-- Opaque foreign memory address (`void*` / `const void*`).
+pub struct Ptr {
+    pub addr: usize,
+}
+
+derive Eq, PartialEq, Ord, PartialOrd, Hash for Ptr
+
+impl Display for Ptr {
+    pub fn to_string(self) -> String = "Ptr(0x" ++ self.addr.to_str_radix(16) ++ ")"
+}
+
+impl Ptr {
+    pub const NULL: Ptr = Ptr { addr: 0 }
+
+    pub fn zero() -> Ptr = Ptr { addr: 0 }
+
+    pub fn from_addr(addr: usize) -> Ptr = Ptr { addr: addr }
+
+    pub fn is_null(self) -> bool = self.addr == 0
+
+    pub fn offset(self, delta: isize) -> Ptr = Ptr {
+        addr: self.addr.wrapping_add_signed(delta),
+    }
+
+    pub fn read_cstr(self, .max_len: usize = 65536) -> !FfiError String {
+        if self.addr == 0 {
+            return error FfiError.NullPointer("cannot read CStr from null Ptr")
+        }
+        let decoded = ffi_read_cstr_raw(self.addr, max_len)
+        decoded match {
+            text? => text,
+            _ => error FfiError.InvalidUtf8(
+                "C string is invalid UTF-8 or exceeds max_len (" ++ max_len.to_string() ++ ")"
+            ),
+        }
+    }
+}
+
+-- Read a NUL-terminated UTF-8 C string from `ptr` bounded by `max_len` bytes.
+pub fn read_cstr(ptr: Ptr, .max_len: usize = 65536) -> !FfiError String =
+    ptr.read_cstr(max_len = max_len)
+
+-- NUL-terminated C string marker (`const char*`).
+pub newtype CStr = String
+derive Eq, PartialEq, Display for CStr
+
+impl CStr {
+    pub fn new(text: String) -> CStr = CStr(text)
+
+    pub fn as_str(self) -> String = self.as(String)
+}
+
+-- Pinned read-only byte pointer (`const uint8_t*`) backed by a `String` or `Bytes`.
+pub newtype PtrRo = Any
+
+impl PtrRo {
+    pub fn new(buf: Any) -> PtrRo = PtrRo(buf)
+}
+
+-- Pinned mutable byte pointer (`uint8_t*`) backed by a `Bytes` buffer.
+pub newtype PtrMut = Bytes
+
+impl PtrMut {
+    pub fn new(buf: Bytes) -> PtrMut = PtrMut(buf)
+}
+
+-- Pinned read-only `(const uint8_t* ptr, size_t len)` pair backed by a `String` or `Bytes`.
+pub newtype SliceRo = Any
+
+impl SliceRo {
+    pub fn new(buf: Any) -> SliceRo = SliceRo(buf)
+}
+
+-- Pinned mutable `(uint8_t* ptr, size_t len)` pair backed by a `Bytes` buffer.
+pub newtype BufMut = Bytes
+
+impl BufMut {
+    pub fn new(buf: Bytes) -> BufMut = BufMut(buf)
+}
+
+-- Explicit foreign function binding descriptor for `ffi.load` / `ffi.must_load`.
+pub struct Func {
+    pub sig: Type,
+    pub symbol: ?String = null,
+    pub callconv: CallConv = CallConv.c,
+}
+
+impl Func {
+    pub fn new(
+        sig: Type,
+        .symbol: ?String = null,
+        .callconv: CallConv = CallConv.c,
+    ) -> Func = Func {
+        sig: sig,
+        symbol: symbol,
+        callconv: callconv,
+    }
+}
+
+-- Construct a `Func` descriptor with optional C `symbol` override and `callconv`.
+pub fn func(
+    sig: Type,
+    .symbol: ?String = null,
+    .callconv: CallConv = CallConv.c,
+) -> Func = Func {
+    sig: sig,
+    symbol: symbol,
+    callconv: callconv,
+}
+
+-- Re-exported FFI types and descriptors (`use std.ffi.types.*`).
+pub mod types {
+    pub use .BufMut
+    pub use .CStr
+    pub use .CallConv
+    pub use .Func
+    pub use .Ptr
+    pub use .PtrMut
+    pub use .PtrRo
+    pub use .SliceRo
+    pub use .func
+}
+
+private fn parse_param_c_words(param_name: String) -> ?usize {
+    if param_name == "SliceRo" or param_name == "BufMut" {
+        return 2
+    }
+    if param_name == "i8"
+        or param_name == "i16"
+        or param_name == "i32"
+        or param_name == "i64"
+        or param_name == "isize"
+        or param_name == "u8"
+        or param_name == "u16"
+        or param_name == "u32"
+        or param_name == "u64"
+        or param_name == "usize"
+        or param_name == "f32"
+        or param_name == "f64"
+        or param_name == "bool"
+        or param_name == "Ptr"
+        or param_name == "CStr"
+        or param_name == "PtrRo"
+        or param_name == "PtrMut" {
+        return 1
+    }
+    null
+}
+
+private fn is_valid_return_type(ret_name: String) -> bool {
+    ret_name == "Unit"
+        or ret_name == "i8"
+        or ret_name == "i16"
+        or ret_name == "i32"
+        or ret_name == "i64"
+        or ret_name == "isize"
+        or ret_name == "u8"
+        or ret_name == "u16"
+        or ret_name == "u32"
+        or ret_name == "u64"
+        or ret_name == "usize"
+        or ret_name == "f32"
+        or ret_name == "f64"
+        or ret_name == "bool"
+        or ret_name == "Ptr"
+        or ret_name == "CStr"
+}
+
+private fn parse_fn_sig_meta(sig_str: String) -> ?(usize, String) {
+    let trimmed = sig_str.trim()
+    if not trimmed.starts_with("fn(") {
+        return null
+    }
+    let total_len = trimmed.len()
+    var idx: i64 = 3
+    var depth: i64 = 1
+    var close_idx: i64 = -1
+    while idx < total_len {
+        let b = trimmed.byte_at(idx)
+        if b == 40 {
+            depth += 1
+        } else if b == 41 {
+            depth -= 1
+            if depth == 0 {
+                close_idx = idx
+                break
+            }
+        }
+        idx += 1
+    }
+    if close_idx < 0 {
+        return null
+    }
+    let params_sub = trimmed.get(3, close_idx)
+    let rest_sub = trimmed.get(close_idx + 1, total_len)
+    if params_sub == null or rest_sub == null {
+        return null
+    }
+    let tail = rest_sub.as(String).trim()
+    if not tail.starts_with("->") {
+        return null
+    }
+    let ret_name = tail.trim_prefix("->").trim()
+    if not is_valid_return_type(ret_name) {
+        return null
+    }
+    let params_text = params_sub.as(String).trim()
+    if params_text.is_empty() {
+        return (0, ret_name)
+    }
+    let raw_parts = params_text.split(",")
+    let arity = raw_parts.len().as(usize)
+    if arity > 12 {
+        return null
+    }
+    var c_words: usize = 0
+    var p_idx: usize = 0
+    while p_idx < arity {
+        let part = raw_parts.get(p_idx).as(String).trim()
+        let words_opt = parse_param_c_words(part)
+        if words_opt == null {
+            return null
+        }
+        c_words += words_opt.as(usize)
+        p_idx += 1
+    }
+    if c_words > 12 {
+        return null
+    }
+    (arity, ret_name)
+}
+
+private fn unwrap_ffi_arg(arg: Any) -> Any {
+    arg match {
+        p: Ptr => p.addr,
+        CStr(s) => s,
+        PtrRo(r) => r,
+        PtrMut(m) => m,
+        SliceRo(sr) => sr,
+        BufMut(bm) => bm,
+        _ => arg,
+    }
+}
+
+private fn wrap_return_value(raw: Any, ret_kind: i64) -> Any {
+    if ret_kind == 0 {
+        raw
+    } else if ret_kind == 1 {
+        Ptr { addr: raw.as(usize) }
+    } else {
+        CStr(raw.as(String))
+    }
+}
+
+private fn make_symbol_closure(sym_id: i64, arity: usize, ret_type_name: String) -> Any {
+    let ret_kind: i64 = if ret_type_name == "Ptr" {
+        1
+    } else if ret_type_name == "CStr" {
+        2
+    } else {
+        0
+    }
+    if arity == 0 {
+        return || -> Any { wrap_return_value(ffi_call_list(sym_id, []), ret_kind) }
+    }
+    if arity == 1 {
+        return |a0: Any| -> Any {
+            wrap_return_value(ffi_call1(sym_id, unwrap_ffi_arg(a0)), ret_kind)
+        }
+    }
+    if arity == 2 {
+        return |a0: Any, a1: Any| -> Any {
+            wrap_return_value(
+                ffi_call2(sym_id, unwrap_ffi_arg(a0), unwrap_ffi_arg(a1)),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 3 {
+        return |a0: Any, a1: Any, a2: Any| -> Any {
+            wrap_return_value(
+                ffi_call3(
+                    sym_id,
+                    unwrap_ffi_arg(a0),
+                    unwrap_ffi_arg(a1),
+                    unwrap_ffi_arg(a2),
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 4 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any| -> Any {
+            wrap_return_value(
+                ffi_call4(
+                    sym_id,
+                    unwrap_ffi_arg(a0),
+                    unwrap_ffi_arg(a1),
+                    unwrap_ffi_arg(a2),
+                    unwrap_ffi_arg(a3),
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 5 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any| -> Any {
+            wrap_return_value(
+                ffi_call5(
+                    sym_id,
+                    unwrap_ffi_arg(a0),
+                    unwrap_ffi_arg(a1),
+                    unwrap_ffi_arg(a2),
+                    unwrap_ffi_arg(a3),
+                    unwrap_ffi_arg(a4),
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 6 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any| -> Any {
+            wrap_return_value(
+                ffi_call6(
+                    sym_id,
+                    unwrap_ffi_arg(a0),
+                    unwrap_ffi_arg(a1),
+                    unwrap_ffi_arg(a2),
+                    unwrap_ffi_arg(a3),
+                    unwrap_ffi_arg(a4),
+                    unwrap_ffi_arg(a5),
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 7 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any, a6: Any| -> Any {
+            wrap_return_value(
+                ffi_call_list(
+                    sym_id,
+                    [
+                        unwrap_ffi_arg(a0),
+                        unwrap_ffi_arg(a1),
+                        unwrap_ffi_arg(a2),
+                        unwrap_ffi_arg(a3),
+                        unwrap_ffi_arg(a4),
+                        unwrap_ffi_arg(a5),
+                        unwrap_ffi_arg(a6),
+                    ],
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 8 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any, a6: Any, a7: Any| -> Any {
+            wrap_return_value(
+                ffi_call_list(
+                    sym_id,
+                    [
+                        unwrap_ffi_arg(a0),
+                        unwrap_ffi_arg(a1),
+                        unwrap_ffi_arg(a2),
+                        unwrap_ffi_arg(a3),
+                        unwrap_ffi_arg(a4),
+                        unwrap_ffi_arg(a5),
+                        unwrap_ffi_arg(a6),
+                        unwrap_ffi_arg(a7),
+                    ],
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 9 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any, a6: Any, a7: Any, a8: Any| -> Any {
+            wrap_return_value(
+                ffi_call_list(
+                    sym_id,
+                    [
+                        unwrap_ffi_arg(a0),
+                        unwrap_ffi_arg(a1),
+                        unwrap_ffi_arg(a2),
+                        unwrap_ffi_arg(a3),
+                        unwrap_ffi_arg(a4),
+                        unwrap_ffi_arg(a5),
+                        unwrap_ffi_arg(a6),
+                        unwrap_ffi_arg(a7),
+                        unwrap_ffi_arg(a8),
+                    ],
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 10 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any, a6: Any, a7: Any, a8: Any, a9: Any| -> Any {
+            wrap_return_value(
+                ffi_call_list(
+                    sym_id,
+                    [
+                        unwrap_ffi_arg(a0),
+                        unwrap_ffi_arg(a1),
+                        unwrap_ffi_arg(a2),
+                        unwrap_ffi_arg(a3),
+                        unwrap_ffi_arg(a4),
+                        unwrap_ffi_arg(a5),
+                        unwrap_ffi_arg(a6),
+                        unwrap_ffi_arg(a7),
+                        unwrap_ffi_arg(a8),
+                        unwrap_ffi_arg(a9),
+                    ],
+                ),
+                ret_kind,
+            )
+        }
+    }
+    if arity == 11 {
+        return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any, a6: Any, a7: Any, a8: Any, a9: Any, a10: Any| -> Any {
+            wrap_return_value(
+                ffi_call_list(
+                    sym_id,
+                    [
+                        unwrap_ffi_arg(a0),
+                        unwrap_ffi_arg(a1),
+                        unwrap_ffi_arg(a2),
+                        unwrap_ffi_arg(a3),
+                        unwrap_ffi_arg(a4),
+                        unwrap_ffi_arg(a5),
+                        unwrap_ffi_arg(a6),
+                        unwrap_ffi_arg(a7),
+                        unwrap_ffi_arg(a8),
+                        unwrap_ffi_arg(a9),
+                        unwrap_ffi_arg(a10),
+                    ],
+                ),
+                ret_kind,
+            )
+        }
+    }
+    return |a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any, a6: Any, a7: Any, a8: Any, a9: Any, a10: Any, a11: Any| -> Any {
+        wrap_return_value(
+            ffi_call_list(
+                sym_id,
+                [
+                    unwrap_ffi_arg(a0),
+                    unwrap_ffi_arg(a1),
+                    unwrap_ffi_arg(a2),
+                    unwrap_ffi_arg(a3),
+                    unwrap_ffi_arg(a4),
+                    unwrap_ffi_arg(a5),
+                    unwrap_ffi_arg(a6),
+                    unwrap_ffi_arg(a7),
+                    unwrap_ffi_arg(a8),
+                    unwrap_ffi_arg(a9),
+                    unwrap_ffi_arg(a10),
+                    unwrap_ffi_arg(a11),
+                ],
+            ),
+            ret_kind,
+        )
+    }
+}
+
+-- Loaded foreign dynamic/host library handle and its bound symbol closures.
+pub struct Library {
+    handle: i64,
+    pub name: String,
+    symbols: Map,
+    gc_symbols: Map,
+}
+
+impl Display for Library {
+    pub fn to_string(self) -> String = "Library(" ++ self.name ++ ")"
+}
+
+impl Library {
+    pub fn open(name: String) -> !FfiError Library {
+        if name.is_empty() or name.contains_char('\0') {
+            return error FfiError.LibraryNotFound(name)
+        }
+        let h = ffi_dlopen(name)
+        if h <= 0 {
+            return error FfiError.LibraryNotFound(name)
+        }
+        Library {
+            handle: h,
+            name: name,
+            symbols: Map.new(),
+            gc_symbols: Map.new(),
+        }
+    }
+
+    pub fn is_open(self) -> bool = self.handle > 0
+
+    pub fn close(self) -> bool {
+        let h = self.handle
+        if h <= 0 {
+            return false
+        }
+        self.handle = -1
+        let closer = ensure_close_sym()
+        ffi_close_call(closer, h)
+    }
+
+    pub fn bind(
+        self,
+        symbol: String,
+        sig: Type,
+        .callconv: CallConv = CallConv.c,
+    ) -> !FfiError Any {
+        if self.handle <= 0 {
+            return error FfiError.Closed
+        }
+        if symbol.is_empty() or symbol.contains_char('\0') {
+            return error FfiError.InvalidSignature(
+                symbol,
+                "symbol name must be non-empty and free of NUL bytes",
+            )
+        }
+        let sig_str = sig.to_string()
+        let meta_opt = parse_fn_sig_meta(sig_str)
+        if meta_opt == null {
+            return error FfiError.InvalidSignature(
+                symbol,
+                "unsupported FFI function signature `" ++ sig_str ++ "`",
+            )
+        }
+        let (arity, ret_type_name) = meta_opt.as((usize, String))
+        let descriptor = callconv.to_string() ++ ":" ++ sig_str
+        let sym_id = ffi_dlsym(self.handle, symbol, descriptor)
+        if sym_id <= 0 {
+            return error FfiError.SymbolNotFound(self.name, symbol)
+        }
+        make_symbol_closure(sym_id, arity, ret_type_name)
+    }
+
+    pub fn attach_finalizer(
+        self,
+        owner: Any,
+        symbol: String,
+        raw_handle: i64,
+    ) -> !FfiError Unit {
+        if self.handle <= 0 {
+            return error FfiError.Closed
+        }
+        if symbol.is_empty() or symbol.contains_char('\0') {
+            return error FfiError.InvalidSignature(
+                symbol,
+                "symbol name must be non-empty and free of NUL bytes",
+            )
+        }
+        let sym_id = if self.gc_symbols.contains(symbol) {
+            self.gc_symbols.get(symbol).as(i64)
+        } else {
+            let resolved = ffi_dlsym(self.handle, symbol, "on_gc:any,i64->void")
+            if resolved <= 0 {
+                return error FfiError.SymbolNotFound(self.name, symbol)
+            }
+            self.gc_symbols.set(symbol, resolved)
+            resolved
+        }
+        ffi_gc_call(sym_id, owner, raw_handle)
+    }
+
+    pub fn has_symbol(self, name: String) -> bool = self.symbols.contains(name)
+
+    pub fn get_symbol(self, name: String) -> Any = self.symbols.get(name)
+}
+
+private fn load_bindings(lib_name: String, items: List, bindings: Map) -> !FfiError Library {
+    if not items.is_empty() {
+        return error FfiError.InvalidSignature(
+            "<positional>",
+            "ffi.load block only accepts named symbol bindings",
+        )
+    }
+    let lib = Library.open(lib_name)!
+    for (prop_name, spec) in bindings {
+        let bound = (spec match {
+            fn_spec: Func => {
+                let c_sym = fn_spec.symbol match {
+                    explicit? => explicit,
+                    _ => prop_name,
+                }
+                lib.bind(c_sym, fn_spec.sig, callconv = fn_spec.callconv)
+            },
+            sig_ty: Type => lib.bind(prop_name, sig_ty),
+            _ => error FfiError.InvalidSignature(
+                prop_name,
+                "expected a function `Type` or `ffi.Func` descriptor",
+            ),
+        })! {
+            err => {
+                let _ = lib.close()
+                return error err
+            }
+        }
+        lib.symbols.set(prop_name, bound)
+    }
+    lib
+}
+
+-- Declarative checked loader invoked via `ffi.load("lib") { sym: fn(...) -> ..., ... }`.
+pub struct Loader {
+    lib_name: String,
+}
+
+pub fn load(name: String) -> Loader = Loader { lib_name: name }
+
+impl Loader {
+    pub fn apply(self, ...items: List, ...bindings: Map) -> !FfiError Library =
+        load_bindings(self.lib_name, items, bindings)
+}
+
+-- Declarative panicking loader invoked via `ffi.must_load("lib") { sym: fn(...) -> ..., ... }`.
+pub struct MustLoader {
+    lib_name: String,
+}
+
+pub fn must_load(name: String) -> MustLoader = MustLoader { lib_name: name }
+
+impl MustLoader {
+    pub fn apply(self, ...items: List, ...bindings: Map) -> Library {
+        load_bindings(self.lib_name, items, bindings)! {
+            err => panic_raw(err.to_string())
+        }
+    }
+}

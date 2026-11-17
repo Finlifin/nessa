@@ -82,6 +82,10 @@ mod type_patterns;
 pub use enums::{EnumConstructionPlan, EnumVariantRef};
 pub use type_factories::TypeFactory;
 mod extended;
+mod ffi_bindings;
+mod iterator_defaults;
+mod stdlib_refinements;
+pub use stdlib_refinements::JsonDecodeCallPlan;
 mod typing;
 mod variadics;
 
@@ -386,6 +390,15 @@ pub struct ResolvedAst {
     /// `case (x: T) => ...` parameter annotations or typed declarations) rather
     /// than dynamic `Any`/trait runtime type tests.
     pub annotation_typed_patterns: HashSet<NodeIndex>,
+    /// Bound `std.ffi.Library` projections (`c.add`) rewritten to `Library.get_symbol(c, "add")`.
+    pub ffi_symbol_projections: HashMap<NodeIndex, (SymbolId, StrId)>,
+    /// Statically dispatched `std.json.decode(T, ...)` call plans.
+    pub json_decode_calls: HashMap<NodeIndex, JsonDecodeCallPlan>,
+    /// Privileged `impl Iterator` / `impl IntoIterator` default template AST nodes skipped as raw functions.
+    pub iterator_template_nodes: HashSet<NodeIndex>,
+    /// Inline callback `NodeKind::Lambda` nodes passed to statically refined stdlib combinators,
+    /// mapped to the callee's erased runtime parameter `Function` descriptor.
+    pub erased_callback_lambdas: HashMap<NodeIndex, TypeIndex>,
 }
 
 /// Flatten a `CaseAlternative` / `CaseMap` tree left-to-right into `CaseMap` arm nodes.

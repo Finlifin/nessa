@@ -126,6 +126,11 @@ pub(crate) fn lookup_expr_elem(r: &Resolver<'_>, ast: &Ast, expr: NodeIndex) -> 
     if let Some(elem_ty) = crate::task_combinators::lookup_await_all_element(r, ast, expr) {
         return normalize_elem_type(r, elem_ty);
     }
+    if ast.node(expr).kind == NodeKind::ErrorPropagation
+        || ast.node(expr).kind == NodeKind::EffectPropagation
+    {
+        return lookup_expr_elem(r, ast, ast.fixed_children(expr)[0]);
+    }
     if ast.node(expr).kind == NodeKind::Id
         && let Some(&sym) = r.node_symbols.get(&expr)
         && let Some(&state) = r.collection_provenance.symbol_elements.get(&sym)
@@ -135,8 +140,77 @@ pub(crate) fn lookup_expr_elem(r: &Resolver<'_>, ast: &Ast, expr: NodeIndex) -> 
     TrackedElem::Dynamic
 }
 
+fn static_iterator_item_type(
+    r: &Resolver<'_>,
+    expr: NodeIndex,
+    canon_ty: TypeIndex,
+) -> Option<TypeIndex> {
+    let scope = r.node_scopes.get(&expr).copied().unwrap_or(r.current_scope);
+    let wk = r.type_pool.well_known;
+    let iter_ty = if let Ok(Some(record)) =
+        r.type_pool
+            .find_trait_impl_scoped(canon_ty, wk.iterator, scope.0)
+    {
+        record.implementor
+    } else if let Ok(Some(into_rec)) =
+        r.type_pool
+            .find_trait_impl_scoped(canon_ty, wk.into_iterator, scope.0)
+    {
+        let iter_bind = r
+            .type_pool
+            .associated_bindings_snapshot()
+            .iter()
+            .find(|b| {
+                b.implementor == into_rec.implementor
+                    && b.trait_type == into_rec.trait_type
+                    && b.visible_scope == into_rec.visible_scope
+                    && b.trait_owner == wk.into_iterator
+                    && b.name == str_interner::intern("Iter")
+            })?;
+        r.type_pool.canonical_type(iter_bind.value)?
+    } else {
+        return None;
+    };
+    let record = r
+        .type_pool
+        .find_trait_impl_scoped(iter_ty, wk.iterator, scope.0)
+        .ok()
+        .flatten()?;
+    let binding = r
+        .type_pool
+        .associated_bindings_snapshot()
+        .iter()
+        .find(|b| {
+            b.implementor == record.implementor
+                && b.trait_type == record.trait_type
+                && b.visible_scope == record.visible_scope
+                && b.trait_owner == wk.iterator
+                && b.name == str_interner::intern("Item")
+        })?;
+    let item_ty = r.type_pool.canonical_type(binding.value)?;
+    (r.type_pool.as_intrinsic(item_ty) != Some(Intrinsic::Any)).then_some(item_ty)
+}
+
+fn iterator_item_for_expr(r: &mut Resolver<'_>, ast: &Ast, expr: NodeIndex) -> Option<TypeIndex> {
+    let ty = *r.node_types.get(&expr)?;
+    let canon = r.type_pool.canonical_type(ty)?;
+    if r.type_pool.collection_role(canon) == Some(CollectionRole::Map) {
+        let val_ty = match lookup_expr_elem(r, ast, expr) {
+            TrackedElem::Known(v) => v,
+            _ => Intrinsic::Any.type_index(),
+        };
+        return Some(r.register_type(TypeKind::Tuple {
+            elements: vec![Intrinsic::Str.type_index(), val_ty],
+        }));
+    }
+    if let TrackedElem::Known(t) = lookup_expr_elem(r, ast, expr) {
+        return Some(t);
+    }
+    static_iterator_item_type(r, expr, canon)
+}
+
 /// Return a concrete element type `T != Any` when `iterable` is a known homogeneous
-/// `List`, `Set`, or `Deque` (or `(String, V)` for homogeneous `Map`).
+/// `List`, `Set`, `Deque`, `Map`, or `Iterator` pipeline.
 pub(crate) fn iterable_element_type(
     r: &mut Resolver<'_>,
     ast: &Ast,
@@ -162,6 +236,19 @@ pub(crate) fn iterable_element_type(
             return Some(elem);
         }
     }
+    let scope = r
+        .node_scopes
+        .get(&iterable)
+        .copied()
+        .unwrap_or(r.current_scope);
+    if r.type_pool
+        .find_trait_impl_scoped(canon, r.type_pool.well_known.iterator, scope.0)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Some(elem);
+    }
     None
 }
 
@@ -176,12 +263,13 @@ fn is_tracked_collection_type(r: &Resolver<'_>, ty: TypeIndex) -> bool {
         return true;
     }
     if let TypeKind::Struct { name, .. } = r.type_pool.get(canon).kind {
-        return matches!(
-            str_interner::get(name).as_str(),
-            "Set" | "Deque" | "HashMap"
-        );
+        let sname = str_interner::get(name);
+        if matches!(sname.as_str(), "Set" | "Deque" | "HashMap") {
+            return true;
+        }
     }
-    false
+    r.type_pool
+        .has_trait_impl(canon, r.type_pool.well_known.iterator)
 }
 
 /// Record local variable collection provenance at `let`/`var`/`const` declaration time,
@@ -493,6 +581,28 @@ impl CollectionMutationScan {
                             | "symmetric_difference"
                             | "is_subset"
                             | "is_superset"
+                            | "iter"
+                            | "into_iter"
+                            | "next"
+                            | "peek"
+                            | "filter_map"
+                            | "skip"
+                            | "take_while"
+                            | "skip_while"
+                            | "step_by"
+                            | "chain"
+                            | "inspect"
+                            | "peekable"
+                            | "collect"
+                            | "to_set"
+                            | "for_each"
+                            | "find_map"
+                            | "count"
+                            | "sum"
+                            | "product"
+                            | "min"
+                            | "max"
+                            | "nth"
                             | "eq" => {}
                             // Single-argument element insertion
                             "push" | "push_back" | "push_front" | "fill" if args.len() == 1 => {
@@ -630,7 +740,6 @@ fn try_expected_callback_arg_type(
     }
     let receiver = ast.fixed_children(callee)[0];
     let receiver_ty = *r.node_types.get(&receiver)?;
-    let role = r.type_pool.collection_role(receiver_ty)?;
     let method_name = str_interner::get(method_info.name);
     let args = ast.multi_children(call_node);
 
@@ -642,6 +751,75 @@ fn try_expected_callback_arg_type(
             _ => None,
         })
         .unwrap_or(Intrinsic::Any.type_index());
+
+    if crate::iterator_defaults::is_default_template(r, method_sym) {
+        let elem_opt = iterator_item_for_expr(r, ast, receiver);
+        return match (method_name.as_str(), arg_index) {
+            (
+                "map" | "filter" | "filter_map" | "flat_map" | "take_while" | "skip_while"
+                | "inspect" | "for_each" | "any" | "all" | "find" | "find_map" | "position"
+                | "partition",
+                0,
+            ) if args.len() == 1 => {
+                let elem_ty = elem_opt?;
+                Some(r.register_type(TypeKind::Function {
+                    params: vec![elem_ty],
+                    ret: declared_cb_ret,
+                }))
+            }
+            ("reduce", 0) if args.len() == 1 && arg_kind == NodeKind::Lambda => {
+                let elem_ty = elem_opt?;
+                let acc_ty =
+                    if let Some(body_ret) = crate::flow_narrowing::preview_binary_lambda_return(
+                        r, ast, arg_node, elem_ty, elem_ty,
+                    ) && r.type_pool.is_subtype(body_ret, elem_ty)
+                    {
+                        elem_ty
+                    } else {
+                        Intrinsic::Any.type_index()
+                    };
+                Some(r.register_type(TypeKind::Function {
+                    params: vec![acc_ty, elem_ty],
+                    ret: Intrinsic::Any.type_index(),
+                }))
+            }
+            ("fold", 1) if args.len() == 2 && arg_kind == NodeKind::Lambda => {
+                let elem_ty = elem_opt.unwrap_or(Intrinsic::Any.type_index());
+                let init_ty = r
+                    .node_types
+                    .get(&args[0])
+                    .copied()
+                    .unwrap_or(Intrinsic::Any.type_index());
+                let init_is_concrete = init_ty != TypeIndex::INVALID
+                    && r.type_pool.as_intrinsic(init_ty) != Some(Intrinsic::Any)
+                    && r.type_pool.as_intrinsic(init_ty) != Some(Intrinsic::NoReturn)
+                    && init_ty != r.type_pool.null_type();
+                let acc_ty = if init_is_concrete
+                    && let Some(body_ret) = crate::flow_narrowing::preview_binary_lambda_return(
+                        r, ast, arg_node, init_ty, elem_ty,
+                    )
+                    && r.type_pool.is_subtype(body_ret, init_ty)
+                {
+                    r.collection_provenance
+                        .refined_call_results
+                        .insert(call_node, init_ty);
+                    init_ty
+                } else {
+                    Intrinsic::Any.type_index()
+                };
+                if acc_ty == Intrinsic::Any.type_index() && elem_ty == Intrinsic::Any.type_index() {
+                    return default_expected;
+                }
+                Some(r.register_type(TypeKind::Function {
+                    params: vec![acc_ty, elem_ty],
+                    ret: Intrinsic::Any.type_index(),
+                }))
+            }
+            _ => default_expected,
+        };
+    }
+
+    let role = r.type_pool.collection_role(receiver_ty)?;
 
     match role {
         CollectionRole::List => {
@@ -813,6 +991,24 @@ pub(crate) fn finalize_collection_call(
         }
     }
 
+    // 2b. `std.iter.{once, repeat}` element provenance.
+    if let Some(&fn_sym) = r.node_symbols.get(&callee) {
+        let fn_info = &r.symbols[fn_sym.0 as usize];
+        if r.options.privileged_nodes.contains(&fn_info.def_node)
+            && (fn_info.name == str_interner::intern("once")
+                || fn_info.name == str_interner::intern("repeat"))
+            && (crate::trusted::std_function(r, "iter", "once") == Some(fn_sym)
+                || crate::trusted::std_function(r, "iter", "repeat") == Some(fn_sym))
+            && let Some(&val_node) = args.first()
+            && let Some(&val_ty) = r.node_types.get(&crate::argument_value_node(ast, val_node))
+        {
+            let tracked = normalize_elem_type(r, val_ty);
+            r.collection_provenance
+                .node_elements
+                .insert(call_node, tracked);
+        }
+    }
+
     // 3. Instance method calls (`xs.map(...)`, `xs.filter(...)`, `xs.fold(...)`, `str.split(...)`, ...).
     if ast.node(callee).kind == NodeKind::Projection
         && let Some(&method_sym) = r.instance_methods.get(&callee)
@@ -823,7 +1019,130 @@ pub(crate) fn finalize_collection_call(
         if let Some(&recv_ty) = r.node_types.get(&receiver)
             && let Some(recv_canon) = r.type_pool.canonical_type(recv_ty)
         {
-            if r.type_pool.collection_role(recv_canon) == Some(CollectionRole::List) {
+            if matches!(mname.as_str(), "iter" | "into_iter") && args.is_empty() {
+                if let Some(item_ty) = iterator_item_for_expr(r, ast, receiver) {
+                    let tracked = normalize_elem_type(r, item_ty);
+                    r.collection_provenance
+                        .node_elements
+                        .insert(call_node, tracked);
+                }
+            } else if crate::iterator_defaults::is_default_template(r, method_sym) {
+                let recv_item = iterator_item_for_expr(r, ast, receiver)
+                    .map(|t| normalize_elem_type(r, t))
+                    .unwrap_or(TrackedElem::Dynamic);
+                match mname.as_str() {
+                    "filter" | "take" | "skip" | "take_while" | "skip_while" | "step_by"
+                    | "inspect" | "peekable" | "collect" | "to_list" | "to_set" => {
+                        r.collection_provenance
+                            .node_elements
+                            .insert(call_node, recv_item);
+                    }
+                    "chain" if args.len() == 1 => {
+                        let other_arg = crate::argument_value_node(ast, args[0]);
+                        let other_item = iterator_item_for_expr(r, ast, other_arg)
+                            .map(|t| normalize_elem_type(r, t))
+                            .unwrap_or(TrackedElem::Dynamic);
+                        let combined = combine_elem(r, recv_item, other_item);
+                        r.collection_provenance
+                            .node_elements
+                            .insert(call_node, combined);
+                    }
+                    "enumerate" if args.is_empty() => {
+                        if let TrackedElem::Known(item_ty) = recv_item {
+                            let pair_ty = r.register_type(TypeKind::Tuple {
+                                elements: vec![Intrinsic::Usize.type_index(), item_ty],
+                            });
+                            r.collection_provenance
+                                .node_elements
+                                .insert(call_node, TrackedElem::Known(pair_ty));
+                        }
+                    }
+                    "zip" if args.len() == 1 => {
+                        let other_arg = crate::argument_value_node(ast, args[0]);
+                        let other_item = iterator_item_for_expr(r, ast, other_arg)
+                            .map(|t| normalize_elem_type(r, t))
+                            .unwrap_or(TrackedElem::Dynamic);
+                        let a_ty = match recv_item {
+                            TrackedElem::Known(t) => Some(t),
+                            _ => None,
+                        };
+                        let b_ty = match other_item {
+                            TrackedElem::Known(t) => Some(t),
+                            _ => None,
+                        };
+                        if a_ty.is_some() || b_ty.is_some() {
+                            let pair_ty = r.register_type(TypeKind::Tuple {
+                                elements: vec![
+                                    a_ty.unwrap_or(Intrinsic::Any.type_index()),
+                                    b_ty.unwrap_or(Intrinsic::Any.type_index()),
+                                ],
+                            });
+                            r.collection_provenance
+                                .node_elements
+                                .insert(call_node, TrackedElem::Known(pair_ty));
+                        }
+                    }
+                    "map" if args.len() == 1 => {
+                        let cb = crate::argument_value_node(ast, args[0]);
+                        let raw_ret = r
+                            .collection_provenance
+                            .lambda_body_returns
+                            .get(&cb)
+                            .copied()
+                            .or_else(|| {
+                                let cb_ty = *r.node_types.get(&cb)?;
+                                let cb_canon = r.type_pool.canonical_type(cb_ty)?;
+                                match r.type_pool.get(cb_canon).kind {
+                                    TypeKind::Function { ret, .. } => Some(ret),
+                                    _ => None,
+                                }
+                            });
+                        let mapped_elem = match raw_ret {
+                            Some(ret_ty) => {
+                                let (_, _, _, core_ret) =
+                                    crate::stdlib_refinements::decompose_return_qualifiers(
+                                        r, ret_ty,
+                                    );
+                                normalize_elem_type(r, core_ret)
+                            }
+                            None => TrackedElem::Dynamic,
+                        };
+                        r.collection_provenance
+                            .node_elements
+                            .insert(call_node, mapped_elem);
+                    }
+                    "filter_map" if args.len() == 1 => {
+                        let cb = crate::argument_value_node(ast, args[0]);
+                        let raw_ret = r
+                            .collection_provenance
+                            .lambda_body_returns
+                            .get(&cb)
+                            .copied()
+                            .or_else(|| {
+                                let cb_ty = *r.node_types.get(&cb)?;
+                                let cb_canon = r.type_pool.canonical_type(cb_ty)?;
+                                match r.type_pool.get(cb_canon).kind {
+                                    TypeKind::Function { ret, .. } => Some(ret),
+                                    _ => None,
+                                }
+                            });
+                        if let Some(ret_ty) = raw_ret {
+                            let (_, _, _, core_ret) =
+                                crate::stdlib_refinements::decompose_return_qualifiers(r, ret_ty);
+                            if let Some(canon_core) = r.type_pool.canonical_type(core_ret)
+                                && let TypeKind::Optional { inner } =
+                                    r.type_pool.get(canon_core).kind
+                            {
+                                let tracked = normalize_elem_type(r, inner);
+                                r.collection_provenance
+                                    .node_elements
+                                    .insert(call_node, tracked);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if r.type_pool.collection_role(recv_canon) == Some(CollectionRole::List) {
                 let recv_elem = lookup_expr_elem(r, ast, receiver);
                 match mname.as_str() {
                     "copy" | "slice" | "take" | "drop" | "reverse" | "unique" | "filter"
@@ -840,16 +1159,20 @@ pub(crate) fn finalize_collection_call(
                             .insert(call_node, combined);
                     }
                     "map" if args.len() == 1 => {
-                        let cb = args[0];
+                        let cb = crate::argument_value_node(ast, args[0]);
                         let mapped_elem = if let Some(&ret_ty) =
                             r.collection_provenance.lambda_body_returns.get(&cb)
                         {
-                            normalize_elem_type(r, ret_ty)
+                            let (_, _, _, core_ret) =
+                                crate::stdlib_refinements::decompose_return_qualifiers(r, ret_ty);
+                            normalize_elem_type(r, core_ret)
                         } else if let Some(&cb_ty) = r.node_types.get(&cb)
                             && let Some(cb_canon) = r.type_pool.canonical_type(cb_ty)
                             && let TypeKind::Function { ret, .. } = r.type_pool.get(cb_canon).kind
                         {
-                            normalize_elem_type(r, ret)
+                            let (_, _, _, core_ret) =
+                                crate::stdlib_refinements::decompose_return_qualifiers(r, ret);
+                            normalize_elem_type(r, core_ret)
                         } else {
                             TrackedElem::Dynamic
                         };
@@ -885,11 +1208,13 @@ pub(crate) fn finalize_collection_call(
                             .insert(call_node, TrackedElem::Known(pair_ty));
                     }
                     "map_values" if args.len() == 1 => {
-                        let cb = args[0];
+                        let cb = crate::argument_value_node(ast, args[0]);
                         let mapped_val = if let Some(&ret_ty) =
                             r.collection_provenance.lambda_body_returns.get(&cb)
                         {
-                            normalize_elem_type(r, ret_ty)
+                            let (_, _, _, core_ret) =
+                                crate::stdlib_refinements::decompose_return_qualifiers(r, ret_ty);
+                            normalize_elem_type(r, core_ret)
                         } else {
                             TrackedElem::Dynamic
                         };
@@ -903,6 +1228,7 @@ pub(crate) fn finalize_collection_call(
                 match mname.as_str() {
                     "split"
                     | "lines"
+                    | "lines_iter"
                     | "split_whitespace"
                     | "split_ascii_whitespace"
                     | "splitn"
@@ -915,25 +1241,47 @@ pub(crate) fn finalize_collection_call(
                             .node_elements
                             .insert(call_node, TrackedElem::Known(Intrinsic::Str.type_index()));
                     }
-                    "chars" => {
+                    "chars" | "chars_iter" => {
                         r.collection_provenance
                             .node_elements
                             .insert(call_node, TrackedElem::Known(Intrinsic::Char.type_index()));
                     }
-                    "bytes" => {
+                    "char_indices" => {
+                        r.collection_provenance
+                            .node_elements
+                            .insert(call_node, TrackedElem::Known(Intrinsic::I64.type_index()));
+                    }
+                    "char_indices_iter" => {
+                        let pair_ty = r.register_type(TypeKind::Tuple {
+                            elements: vec![
+                                Intrinsic::Usize.type_index(),
+                                Intrinsic::Char.type_index(),
+                            ],
+                        });
+                        r.collection_provenance
+                            .node_elements
+                            .insert(call_node, TrackedElem::Known(pair_ty));
+                    }
+                    "bytes" | "bytes_iter" => {
                         r.collection_provenance
                             .node_elements
                             .insert(call_node, TrackedElem::Known(Intrinsic::U8.type_index()));
                     }
                     _ => {}
                 }
-            } else if Some(recv_canon) == r.type_pool.bytes_type() && mname == "to_list" {
+            } else if Some(recv_canon) == r.type_pool.bytes_type()
+                && matches!(mname.as_str(), "to_list" | "iter")
+            {
                 r.collection_provenance
                     .node_elements
                     .insert(call_node, TrackedElem::Known(Intrinsic::U8.type_index()));
             } else if let TypeKind::Struct { name, .. } = r.type_pool.get(recv_canon).kind {
                 let sname = str_interner::get(name);
-                if matches!(sname.as_str(), "Set" | "Deque")
+                if matches!(sname.as_str(), "Range" | "RangeInclusive") && mname == "rev" {
+                    r.collection_provenance
+                        .node_elements
+                        .insert(call_node, TrackedElem::Known(Intrinsic::I64.type_index()));
+                } else if matches!(sname.as_str(), "Set" | "Deque")
                     && matches!(
                         mname.as_str(),
                         "copy"

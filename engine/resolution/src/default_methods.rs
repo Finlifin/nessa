@@ -38,7 +38,8 @@ fn search_derived_owner(
             !definition.is_null()
                 && (ast.node(definition).kind == NodeKind::TraitDeriveFn
                     || crate::ordering::default_template(r, name) == Some(symbol)
-                    || crate::json_derivation::default_template(r, name) == Some(symbol))
+                    || crate::json_derivation::default_template(r, name) == Some(symbol)
+                    || crate::iterator_defaults::default_template(r, owner, name) == Some(symbol))
         }) {
             let symbol = crate::associated::member_from(r, owner, name, from)?;
             if selected.is_some_and(|previous| previous != symbol) {

@@ -1,0 +1,257 @@
+-- std.stream — declarative push/pull streams powered by algebraic effects and continuations.
+
+use .builtin.*
+use .collections.List
+use .iter.to_pull_fn
+
+private const is_error_value_raw: fn(Any) -> bool = .__is_error_value'builtin
+private const unwrap_ok_value_raw: fn(Any) -> Any = .__unwrap_ok_value'builtin
+private const forward_error_raw: fn(Any) -> NoReturn = .__forward_error_value'builtin
+
+-- Primary stream emission effect. Terminal consumers (`collect`, `for_each`, `fold`)
+-- handle `emit` in-place without continuation allocation; `take`, `filter`, `map`,
+-- and `to_iter` bridge `#emit` producers lazily via delimited continuations.
+pub effect emit(value: Any) -> Unit
+
+private effect stream_suspend(value: Any, catch k) -> Unit
+private effect stream_abort(err: Any, catch k) -> Any
+
+private struct AccCell {
+    value: Any,
+}
+
+private enum StreamOutcome {
+    suspended(value: Any, next_cont: Continuation),
+    finished,
+    errored(err: Any),
+}
+
+private fn run_stream_entry(entry: Any) -> #stream_suspend StreamOutcome {
+    let res = entry()# {
+        emit(val) => stream_suspend(val)#,
+    }
+    if is_error_value_raw(res) {
+        StreamOutcome.errored(res)
+    } else {
+        StreamOutcome.finished
+    }
+}
+
+pub struct StreamIter {
+    producer: Any,
+    cont: ?Continuation,
+    done: bool,
+}
+
+impl Iterator for StreamIter {
+    assoc Item: Type = Any
+
+    pub fn next(self) -> IterationStep(Any) {
+        if self.done {
+            return IterationStep(Any).done
+        }
+        let outcome: StreamOutcome = if self.cont == null {
+            if self.producer == null {
+                self.done = true
+                return IterationStep(Any).done
+            }
+            let entry = self.producer
+            self.producer = null
+            (run_stream_entry(entry))# {
+                stream_suspend(val, k) => StreamOutcome.suspended(val, k),
+            }
+        } else {
+            let saved = self.cont.as(Continuation)
+            self.cont = null
+            saved(()).as(StreamOutcome)
+        }
+
+        outcome match {
+            StreamOutcome.suspended(val, next_k) => {
+                self.cont = next_k
+                IterationStep(Any).yielded(val)
+            },
+            StreamOutcome.finished => {
+                self.done = true
+                IterationStep(Any).done
+            },
+            StreamOutcome.errored(err) => {
+                self.done = true
+                IterationStep(Any).yielded(err)
+            },
+        }
+    }
+}
+
+impl IntoIterator for StreamIter {
+    assoc Iter: Type = StreamIter
+    pub fn into_iter(self) -> StreamIter = self
+}
+
+-- Convert any `#emit` producer into a lazy pull-based `Iterator`.
+pub fn to_iter(producer: fn() -> #emit Any) -> StreamIter {
+    StreamIter {
+        producer: producer,
+        cont: null,
+        done: false,
+    }
+}
+
+-- Re-emit every element of an iterable into the active `#emit` stream.
+pub fn from_iter(iterable: Any) -> #emit Unit {
+    let pull = to_pull_fn(iterable)
+    while true {
+        pull() match {
+            IterationStep(Any).done => { return () },
+            IterationStep(Any).yielded(item) => {
+                if is_error_value_raw(item) {
+                    return forward_error_raw(item)
+                }
+                emit(item)#
+            },
+        }
+    }
+}
+
+-- Collect all emitted values from `producer` into a `List` using an in-place handler.
+pub fn collect(producer: fn() -> #emit Any) -> List {
+    let out = List()
+    let res = producer()# {
+        emit(val) => {
+            out.push(val)
+        },
+    }
+    if is_error_value_raw(res) {
+        return forward_error_raw(res)
+    }
+    out
+}
+
+private fn run_for_each(producer: fn() -> #emit Any, consumer: fn(Any) -> Unit) -> #stream_abort Any {
+    let cb: Any = consumer
+    let prod_res = producer()# {
+        emit(val) => {
+            let step_res = cb(val)
+            if is_error_value_raw(step_res) {
+                let _ = stream_abort(step_res)#
+            }
+            let _ = unwrap_ok_value_raw(step_res).as(Unit)
+            ()
+        },
+    }
+    if is_error_value_raw(prod_res) {
+        return prod_res
+    }
+    ()
+}
+
+-- Invoke `consumer` on each value emitted by `producer`, supporting trailing `do`
+-- blocks and `!` error short-circuiting.
+pub fn for_each(producer: fn() -> #emit Any, consumer: fn(Any) -> Unit) -> Unit {
+    let outcome = (run_for_each(producer, consumer))# {
+        stream_abort(err, k) => {
+            let _ = k
+            err
+        },
+    }
+    if is_error_value_raw(outcome) {
+        return forward_error_raw(outcome)
+    }
+    ()
+}
+
+private fn run_fold(producer: fn() -> #emit Any, cell: AccCell, folder: fn(Any, Any) -> Any) -> #stream_abort Any {
+    let prod_res = producer()# {
+        emit(val) => {
+            let next_acc = folder(cell.value, val)
+            if is_error_value_raw(next_acc) {
+                let _ = stream_abort(next_acc)#
+            }
+            cell.value = unwrap_ok_value_raw(next_acc)
+        },
+    }
+    if is_error_value_raw(prod_res) {
+        return prod_res
+    }
+    cell.value
+}
+
+-- Fold all values emitted by `producer` starting from `init`.
+pub fn fold(producer: fn() -> #emit Any, init: Any, folder: fn(Any, Any) -> Any) -> Any {
+    if is_error_value_raw(init) {
+        return init
+    }
+    let cell = AccCell { value: unwrap_ok_value_raw(init) }
+    (run_fold(producer, cell, folder))# {
+        stream_abort(err, k) => {
+            let _ = k
+            err
+        },
+    }
+}
+
+-- Re-emit at most `limit` values from `producer`, aborting `producer` cleanly once
+-- `limit` items have been emitted without resuming its continuation.
+pub fn take(limit: usize, producer: fn() -> #emit Any) -> #emit Unit {
+    if limit == 0 {
+        return ()
+    }
+    let it = to_iter(producer)
+    var count: usize = 0
+    while count < limit {
+        it.next() match {
+            IterationStep(Any).done => { return () },
+            IterationStep(Any).yielded(val) => {
+                if is_error_value_raw(val) {
+                    return forward_error_raw(val)
+                }
+                emit(val)#
+                count += 1
+            },
+        }
+    }
+    ()
+}
+
+-- Re-emit only values from `producer` that satisfy `predicate`.
+pub fn filter(predicate: fn(Any) -> bool, producer: fn() -> #emit Any) -> #emit Unit {
+    let it = to_iter(producer)
+    let cb: Any = predicate
+    while true {
+        it.next() match {
+            IterationStep(Any).done => { return () },
+            IterationStep(Any).yielded(val) => {
+                if is_error_value_raw(val) {
+                    return forward_error_raw(val)
+                }
+                let keep = cb(val)
+                if is_error_value_raw(keep) {
+                    return forward_error_raw(keep)
+                }
+                if unwrap_ok_value_raw(keep).as(bool) {
+                    emit(val)#
+                }
+            },
+        }
+    }
+}
+
+-- Transform each value emitted by `producer` with `mapper` and re-emit the result.
+pub fn map(mapper: fn(Any) -> Any, producer: fn() -> #emit Any) -> #emit Unit {
+    let it = to_iter(producer)
+    while true {
+        it.next() match {
+            IterationStep(Any).done => { return () },
+            IterationStep(Any).yielded(val) => {
+                if is_error_value_raw(val) {
+                    return forward_error_raw(val)
+                }
+                let mapped = mapper(val)
+                if is_error_value_raw(mapped) {
+                    return forward_error_raw(mapped)
+                }
+                emit(unwrap_ok_value_raw(mapped))#
+            },
+        }
+    }
+}

@@ -213,14 +213,18 @@ pub fn usize_from_le_bytes(bytes: List) -> usize { native_u64_from_le_bytes(byte
 
 pub const i64_min: fn() -> i64 = .i64_min'builtin
 pub const i64_max: fn() -> i64 = .i64_max'builtin
+pub fn u64_min() -> u64 { (0).as(u64) }
 pub const u64_max: fn() -> u64 = .u64_max'builtin
 pub const i128_min: fn() -> i128 = .i128_min'builtin
 pub const i128_max: fn() -> i128 = .i128_max'builtin
+pub fn u128_min() -> u128 { (0).as(u128) }
 pub const u128_max: fn() -> u128 = .u128_max'builtin
 pub fn isize_min() -> isize { i64_min().as(isize) }
 pub fn isize_max() -> isize { i64_max().as(isize) }
+pub fn usize_min() -> usize { (0).as(usize) }
 pub fn usize_max() -> usize { u64_max().as(usize) }
 pub const i64_bits: fn() -> i64 = .i64_bits'builtin
+pub fn u64_bits() -> i64 { 64 }
 pub const i128_bits: fn() -> i64 = .i128_bits'builtin
 pub const isize_bits: fn() -> i64 = .isize_bits'builtin
 pub const u128_bits: fn() -> i64 = .u128_bits'builtin

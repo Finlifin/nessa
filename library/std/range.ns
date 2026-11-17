@@ -19,13 +19,6 @@ const native_range_from_contains: fn(i64, i64) -> bool = .range_from_contains'bu
 const native_range_to_contains: fn(i64, i64) -> bool = .range_to_contains'builtin
 const native_range_to_inclusive_contains: fn(i64, i64) -> bool = .range_to_inclusive_contains'builtin
 
-impl Range {
-    pub fn contains(self, value: i64) -> bool { native_range_contains(self.start, self.end, value) }
-    pub fn is_empty(self) -> bool { native_range_is_empty(self.start, self.end) }
-    -- Overflow of a span that does not fit in i64 is NumericOverflow.
-    pub fn len(self) -> i64 { native_range_len(self.start, self.end) }
-}
-
 pub struct RangeIterator {
     cursor: i64,
     end: i64
@@ -44,6 +37,54 @@ impl Iterator for RangeIterator {
     }
 }
 
+impl IntoIterator for RangeIterator {
+    assoc Iter: Type = RangeIterator
+    pub fn into_iter(self) -> RangeIterator = self
+}
+
+pub struct RevRangeIterator {
+    cursor: i64,
+    start: i64,
+    exhausted: bool
+}
+
+impl Iterator for RevRangeIterator {
+    assoc Item: Type = i64
+    pub fn next(self) -> IterationStep(i64) {
+        if self.exhausted or self.cursor < self.start {
+            IterationStep(i64).done
+        } else {
+            let value = self.cursor
+            if value == self.start {
+                self.exhausted = true
+            } else {
+                self.cursor = value - 1
+            }
+            IterationStep(i64).yielded(value)
+        }
+    }
+}
+
+impl IntoIterator for RevRangeIterator {
+    assoc Iter: Type = RevRangeIterator
+    pub fn into_iter(self) -> RevRangeIterator = self
+}
+
+impl Range {
+    pub fn contains(self, value: i64) -> bool { native_range_contains(self.start, self.end, value) }
+    pub fn is_empty(self) -> bool { native_range_is_empty(self.start, self.end) }
+    -- Overflow of a span that does not fit in i64 is NumericOverflow.
+    pub fn len(self) -> i64 { native_range_len(self.start, self.end) }
+    pub fn iter(self) -> RangeIterator { RangeIterator { cursor: self.start, end: self.end } }
+    pub fn rev(self) -> RevRangeIterator {
+        if self.start >= self.end {
+            RevRangeIterator { cursor: 0, start: 0, exhausted: true }
+        } else {
+            RevRangeIterator { cursor: self.end - 1, start: self.start, exhausted: false }
+        }
+    }
+}
+
 impl IntoIterator for Range {
     assoc Iter: Type = RangeIterator
     pub fn into_iter(self) -> RangeIterator {
@@ -55,12 +96,6 @@ impl IntoIterator for Range {
 pub struct RangeInclusive {
     pub start: i64,
     pub end: i64
-}
-
-impl RangeInclusive {
-    pub fn contains(self, value: i64) -> bool { native_range_inclusive_contains(self.start, self.end, value) }
-    pub fn is_empty(self) -> bool { native_range_inclusive_is_empty(self.start, self.end) }
-    pub fn len(self) -> i64 { native_range_inclusive_len(self.start, self.end) }
 }
 
 -- `exhausted` lets `..=i64::MAX` finish without computing `end + 1`.
@@ -87,6 +122,27 @@ impl Iterator for RangeInclusiveIterator {
     }
 }
 
+impl IntoIterator for RangeInclusiveIterator {
+    assoc Iter: Type = RangeInclusiveIterator
+    pub fn into_iter(self) -> RangeInclusiveIterator = self
+}
+
+impl RangeInclusive {
+    pub fn contains(self, value: i64) -> bool { native_range_inclusive_contains(self.start, self.end, value) }
+    pub fn is_empty(self) -> bool { native_range_inclusive_is_empty(self.start, self.end) }
+    pub fn len(self) -> i64 { native_range_inclusive_len(self.start, self.end) }
+    pub fn iter(self) -> RangeInclusiveIterator {
+        RangeInclusiveIterator { cursor: self.start, end: self.end, exhausted: false }
+    }
+    pub fn rev(self) -> RevRangeIterator {
+        if self.start > self.end {
+            RevRangeIterator { cursor: 0, start: 0, exhausted: true }
+        } else {
+            RevRangeIterator { cursor: self.end, start: self.start, exhausted: false }
+        }
+    }
+}
+
 impl IntoIterator for RangeInclusive {
     assoc Iter: Type = RangeInclusiveIterator
     pub fn into_iter(self) -> RangeInclusiveIterator {
@@ -100,10 +156,6 @@ pub struct RangeFrom {
     pub start: i64
 }
 
-impl RangeFrom {
-    pub fn contains(self, value: i64) -> bool { native_range_from_contains(self.start, value) }
-}
-
 pub struct RangeFromIterator {
     cursor: i64
 }
@@ -115,6 +167,16 @@ impl Iterator for RangeFromIterator {
         self.cursor = value + 1
         IterationStep(i64).yielded(value)
     }
+}
+
+impl IntoIterator for RangeFromIterator {
+    assoc Iter: Type = RangeFromIterator
+    pub fn into_iter(self) -> RangeFromIterator = self
+}
+
+impl RangeFrom {
+    pub fn contains(self, value: i64) -> bool { native_range_from_contains(self.start, value) }
+    pub fn iter(self) -> RangeFromIterator { RangeFromIterator { cursor: self.start } }
 }
 
 impl IntoIterator for RangeFrom {

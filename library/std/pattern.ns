@@ -1,4 +1,4 @@
--- std.pattern — Lua 5.4 pattern matching, captures, iteration, and substitution.
+-- std.pattern — compact byte/UTF-8 pattern matching, captures, lazy iteration, and replacement.
 
 use .builtin.*
 use .collections.*
@@ -15,8 +15,10 @@ const native_char_utf8_len: fn(char) -> i64 = .char_utf8_len'builtin
 const native_starts_with: fn(String, String) -> bool = .str_starts_with'builtin
 const native_chars: fn(String) -> List = .str_chars'builtin
 const native_into_string: fn(char) -> String = .char_into_string'builtin
-const native_to_string: fn(Any) -> String = .to_string'builtin
 const native_panic: fn(Any) -> NoReturn = .panic'builtin
+const native_is_error_value: fn(Any) -> bool = .__is_error_value'builtin
+const native_unwrap_ok_value: fn(Any) -> Any = .__unwrap_ok_value'builtin
+const native_forward_error_value: fn(Any) -> NoReturn = .__forward_error_value'builtin
 
 pub enum PatternError {
     pub InvalidPattern(message: String),
@@ -32,25 +34,33 @@ impl Display for PatternError {
     }
 }
 
-pub struct Match {
-    pub start: i64,
-    pub end: i64,
-    pub text: String,
+pub struct PatternMatch {
+    pub start: usize,
+    pub end: usize,
     pub captures: List,
 }
 
-impl PartialEq for Match {
+impl PatternMatch {
+    pub fn len(self) -> usize = self.end - self.start
+
+    pub fn is_empty(self) -> bool = self.start == self.end
+
+    pub fn slice_of(self, text: String) -> String {
+        slice_bytes_lossy(text, self.start.as(i64), self.end.as(i64))
+    }
+}
+
+impl PartialEq for PatternMatch {
     pub fn eq(self, other: Self) -> bool {
         self.start == other.start
             and self.end == other.end
-            and self.text == other.text
             and self.captures == other.captures
     }
 }
 
-impl Display for Match {
+impl Display for PatternMatch {
     pub fn to_string(self) -> String {
-        "Match(" ++ self.start.to_string() ++ ".." ++ self.end.to_string() ++ ", " ++ self.text ++ ")"
+        "PatternMatch(" ++ self.start.to_string() ++ ".." ++ self.end.to_string() ++ ")"
     }
 }
 
@@ -82,61 +92,27 @@ fn next_search_byte(text: String, pos: i64, text_len: i64) -> i64 {
     }
 }
 
-fn value_to_display_string(val: Any) -> String {
-    val match {
-        shown: Display => shown.to_string(),
-        _ => native_to_string(val),
-    }
-}
-
--- Find the first match of `pat` in `text` starting at 0-based byte offset `init`.
--- Negative `init` counts from the end of `text`. When `plain` is true, magic characters are literal.
-pub fn try_find(text: String, pat: String, .init: i64 = 0, .plain: bool = false) -> !PatternError ?Match {
-    let (start, end_byte, cap_list, err_msg) = native_pat_find(text, pat, init, plain)
+-- Find the first match of `pat` in `text` starting at 0-based byte offset `start`.
+-- When `plain` is true, pattern metacharacters are matched literally.
+pub fn find(text: String, pat: String, .start: usize = 0, .plain: bool = false) -> !PatternError ?PatternMatch {
+    let (m_start, m_end, cap_list, err_msg) = native_pat_find(text, pat, start.as(i64), plain)
     if err_msg != "" {
         return error PatternError.InvalidPattern(err_msg)
     }
-    if start < 0 {
+    if m_start < 0 {
         return null
     }
-    Match {
-        start: start,
-        end: end_byte,
-        text: slice_bytes_lossy(text, start, end_byte),
+    PatternMatch {
+        start: m_start.as(usize),
+        end: m_end.as(usize),
         captures: cap_list,
     }
 }
 
--- Find the first match of `pat` in `text`, panicking if `pat` is malformed.
-pub fn find(text: String, pat: String, .init: i64 = 0, .plain: bool = false) -> ?Match {
-    try_find(text, pat, init = init, plain = plain) match {
-        res! => res,
-        error err => native_panic(err.to_string()),
-    }
-}
-
--- Return the first capture as a String (or the full matched text when `pat` has no captures).
-pub fn match_once(text: String, pat: String, .init: i64 = 0) -> ?String {
-    let found? = find(text, pat, init = init) else {
-        return null
-    }
-    if found.captures.len() > 0 {
-        value_to_display_string(found.captures.get(0))
-    } else {
-        found.text
-    }
-}
-
--- Return the capture list if `pat` has captures, `[matched_text]` if not, or `null` if unmatched.
-pub fn captures(text: String, pat: String, .init: i64 = 0) -> ?List {
-    let found? = find(text, pat, init = init) else {
-        return null
-    }
-    if found.captures.len() > 0 {
-        found.captures
-    } else {
-        [found.text]
-    }
+-- Return `true` when `pat` matches `text` at or after 0-based byte offset `start`.
+pub fn is_match(text: String, pat: String, .start: usize = 0) -> !PatternError bool {
+    let found = find(text, pat, start = start)!
+    found != null
 }
 
 pub struct PatternIter {
@@ -150,49 +126,48 @@ pub struct PatternIter {
 }
 
 impl Iterator for PatternIter {
-    assoc Item: Type = Match
+    assoc Item: Type = PatternMatch
 
-    pub fn next(self) -> IterationStep(Match) {
+    pub fn next(self) -> IterationStep(PatternMatch) {
         while (not self.finished) and self.pos <= self.text_len {
-            let (start, end_byte, cap_list, err_msg) = native_pat_find(self.text, self.pat, self.pos, false)
+            let (m_start, m_end, cap_list, err_msg) = native_pat_find(self.text, self.pat, self.pos, false)
             if err_msg != "" {
                 self.finished = true
                 native_panic("invalid pattern: " ++ err_msg)
             }
-            if start < 0 {
+            if m_start < 0 {
                 self.finished = true
-                return IterationStep(Match).done
+                return IterationStep(PatternMatch).done
             }
-            if start == end_byte and end_byte == self.last_match_end {
+            if m_start == m_end and m_end == self.last_match_end {
                 if self.anchored or self.pos >= self.text_len {
                     self.finished = true
-                    return IterationStep(Match).done
+                    return IterationStep(PatternMatch).done
                 }
                 self.pos = next_search_byte(self.text, self.pos, self.text_len)
             } else {
-                let item = Match {
-                    start: start,
-                    end: end_byte,
-                    text: slice_bytes_lossy(self.text, start, end_byte),
+                let item = PatternMatch {
+                    start: m_start.as(usize),
+                    end: m_end.as(usize),
                     captures: cap_list,
                 }
-                self.last_match_end = end_byte
+                self.last_match_end = m_end
                 if self.anchored {
                     self.finished = true
-                } else if start == end_byte {
-                    if end_byte >= self.text_len {
+                } else if m_start == m_end {
+                    if m_end >= self.text_len {
                         self.finished = true
                     } else {
-                        self.pos = next_search_byte(self.text, end_byte, self.text_len)
+                        self.pos = next_search_byte(self.text, m_end, self.text_len)
                     }
                 } else {
-                    self.pos = end_byte
+                    self.pos = m_end
                 }
-                return IterationStep(Match).yielded(item)
+                return IterationStep(PatternMatch).yielded(item)
             }
         }
         self.finished = true
-        IterationStep(Match).done
+        IterationStep(PatternMatch).done
     }
 }
 
@@ -204,8 +179,8 @@ impl IntoIterator for PatternIter {
     }
 }
 
--- Validate `pat` and return an iterator over all non-overlapping matches in `text`.
-pub fn gmatch(text: String, pat: String) -> !PatternError PatternIter {
+-- Validate `pat` and return a lazy iterator over all non-overlapping `PatternMatch` spans in `text`.
+pub fn find_iter(text: String, pat: String) -> !PatternError PatternIter {
     let (_, _, _, err_msg) = native_pat_find("", pat, 0, false)
     if err_msg != "" {
         return error PatternError.InvalidPattern(err_msg)
@@ -221,93 +196,113 @@ pub fn gmatch(text: String, pat: String) -> !PatternError PatternIter {
     }
 }
 
--- Panicking convenience wrapper around `gmatch` for `for m in pattern.gmatch_iter(s, pat)`.
-pub fn gmatch_iter(text: String, pat: String) -> PatternIter {
-    gmatch(text, pat) match {
-        iter! => iter,
-        error err => native_panic(err.to_string()),
+-- Collect all non-overlapping `PatternMatch` items of `pat` in `text`.
+pub fn find_all(text: String, pat: String) -> !PatternError List {
+    let it = find_iter(text, pat)!
+    let out = List()
+    while true {
+        it.next() match {
+            IterationStep(PatternMatch).done => { return out },
+            IterationStep(PatternMatch).yielded(item) => { out.push(item) },
+        }
     }
+    out
 }
 
--- Substitute matches of `pat` using a Lua replacement template (`%0`, `%1`..`%9`, `%%`).
-pub fn try_gsub(text: String, pat: String, repl: String, .limit: i64 = -1) -> !PatternError (String, i64) {
-    let (out, count, err_msg) = native_pat_gsub(text, pat, repl, limit)
+-- Replace matches of `pat` using a capture template (`%0`, `%1`..`%9`, `%%`),
+-- returning `(replaced_text, replacement_count)`.
+pub fn replace(text: String, pat: String, repl: String, .limit: ?usize = null) -> !PatternError (String, usize) {
+    let raw_limit: i64 = limit match {
+        lim? => {
+            if lim == 0 {
+                let (_, _, _, init_err) = native_pat_find("", pat, 0, false)
+                if init_err != "" {
+                    return error PatternError.InvalidPattern(init_err)
+                }
+                let zero_u: usize = 0
+                return (text, zero_u)
+            }
+            lim.as(i64)
+        },
+        _ => -1,
+    }
+    let (out, count, err_msg) = native_pat_gsub(text, pat, repl, raw_limit)
     if err_msg != "" {
         return error PatternError.InvalidPattern(err_msg)
     }
-    (out, count)
+    (out, count.as(usize))
 }
 
--- Panicking wrapper around `try_gsub`.
-pub fn gsub(text: String, pat: String, repl: String, .limit: i64 = -1) -> (String, i64) {
-    try_gsub(text, pat, repl, limit = limit) match {
-        res! => res,
-        error err => native_panic(err.to_string()),
-    }
-}
-
--- Substitute matches of `pat` by calling `replacer(m)`. Returning `null` keeps the original match text.
-pub fn gsub_with(text: String, pat: String, replacer: fn(Match) -> ?String, .limit: i64 = -1) -> !PatternError (String, i64) {
+-- Replace matches of `pat` by calling `repl(match_item)`, returning `(replaced_text, replacement_count)`.
+pub fn replace_with(
+    text: String,
+    pat: String,
+    repl: fn(PatternMatch) -> String,
+    .limit: ?usize = null
+) -> !PatternError (String, usize) {
     let (_, _, _, init_err) = native_pat_find("", pat, 0, false)
     if init_err != "" {
         return error PatternError.InvalidPattern(init_err)
     }
-    if limit == 0 {
-        return (text, 0)
+    let has_limit = limit != null
+    let max_count: usize = if has_limit { limit.as(usize) } else { 0 }
+    if has_limit and max_count == 0 {
+        let zero_u: usize = 0
+        return (text, zero_u)
     }
+
     let text_len = native_str_len(text)
     let anchored = native_starts_with(pat, "^")
     let pieces = List()
     var search_pos: i64 = 0
     var copy_from: i64 = 0
     var last_match_end: i64 = -1
-    var count: i64 = 0
+    var count: usize = 0
 
     while search_pos <= text_len {
-        if limit >= 0 and count >= limit {
+        if has_limit and count >= max_count {
             break
         }
-        let (start, end_byte, cap_list, err_msg) = native_pat_find(text, pat, search_pos, false)
+        let (m_start, m_end, cap_list, err_msg) = native_pat_find(text, pat, search_pos, false)
         if err_msg != "" {
             return error PatternError.InvalidPattern(err_msg)
         }
-        if start < 0 {
+        if m_start < 0 {
             break
         }
-        if start == end_byte and end_byte == last_match_end {
+        if m_start == m_end and m_end == last_match_end {
             if anchored or search_pos >= text_len {
                 break
             }
             search_pos = next_search_byte(text, search_pos, text_len)
         } else {
-            if start > copy_from {
-                pieces.push(slice_bytes_lossy(text, copy_from, start))
+            if m_start > copy_from {
+                pieces.push(slice_bytes_lossy(text, copy_from, m_start))
             }
-            let matched_text = slice_bytes_lossy(text, start, end_byte)
-            let item = Match {
-                start: start,
-                end: end_byte,
-                text: matched_text,
+            let item = PatternMatch {
+                start: m_start.as(usize),
+                end: m_end.as(usize),
                 captures: cap_list,
             }
-            let replaced = replacer(item) match {
-                s? => s,
-                _ => matched_text,
+            let cb: Any = repl
+            let replaced = cb(item)
+            if native_is_error_value(replaced) {
+                return native_forward_error_value(replaced)
             }
-            pieces.push(replaced)
+            pieces.push(native_unwrap_ok_value(replaced).as(String))
             count += 1
-            copy_from = end_byte
-            last_match_end = end_byte
+            copy_from = m_end
+            last_match_end = m_end
             if anchored {
                 break
             }
-            if start == end_byte {
-                if end_byte >= text_len {
+            if m_start == m_end {
+                if m_end >= text_len {
                     break
                 }
-                search_pos = next_search_byte(text, end_byte, text_len)
+                search_pos = next_search_byte(text, m_end, text_len)
             } else {
-                search_pos = end_byte
+                search_pos = m_end
             }
         }
     }
@@ -316,32 +311,6 @@ pub fn gsub_with(text: String, pat: String, replacer: fn(Match) -> ?String, .lim
         pieces.push(slice_bytes_lossy(text, copy_from, text_len))
     }
     (pieces.join(""), count)
-}
-
--- Substitute matches of `pat` by looking up the first capture (or full match) in `table`.
-pub fn gsub_map(text: String, pat: String, table: Map, .limit: i64 = -1) -> !PatternError (String, i64) {
-    gsub_with(
-        text,
-        pat,
-        |item: Match| -> ?String {
-            let key = if item.captures.len() > 0 {
-                value_to_display_string(item.captures.get(0))
-            } else {
-                item.text
-            }
-            if table.contains(key) {
-                let found = table.get(key)
-                if found == null or found == false {
-                    null
-                } else {
-                    value_to_display_string(found)
-                }
-            } else {
-                null
-            }
-        },
-        limit = limit,
-    )
 }
 
 fn is_pattern_magic(ch: char) -> bool {
@@ -359,10 +328,7 @@ fn is_pattern_magic(ch: char) -> bool {
         or ch == '?'
 }
 
--- Pattern matching one UTF-8 byte sequence (Lua 5.4 `utf8.charpattern`: `[\0-\x7F\xC2-\xFD][\x80-\xBF]*`).
-pub const UTF8_CHARPATTERN: String = "[%B00-%B7F%BC2-%BFD][%B80-%BBF]*"
-
--- Escape all Lua pattern magic characters (`^$()%.[]*+-?`) with `%`.
+-- Escape all pattern magic characters (`^$()%.[]*+-?`) with `%`.
 pub fn escape(text: String) -> String {
     let chars = native_chars(text)
     let pieces = List()

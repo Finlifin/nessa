@@ -53,6 +53,9 @@ private const _native_equal: fn(Any, Any) -> ?bool = .__native_equal'builtin
 private const _tuple_len: fn(Any) -> ?i64 = .__tuple_len'builtin
 private const _tuple_get: fn(Any, i64) -> Any = .__tuple_get'builtin
 private const _runtime_type: fn(Any) -> Type = .type_of'builtin
+private const is_error_value_raw: fn(Any) -> bool = .__is_error_value'builtin
+private const unwrap_ok_value_raw: fn(Any) -> Any = .__unwrap_ok_value'builtin
+private const forward_error_value_raw: fn(Any) -> NoReturn = .__forward_error_value'builtin
 
 private fn _any_lt(left: Any, right: Any) -> bool {
     left match {
@@ -168,14 +171,18 @@ impl List {
     pub fn copy(self) -> List { _copy(self) }
     -- Empty lists return null; pop clears the removed slot for GC.
     pub fn pop(self) -> Any { _pop(self) }
+    pub fn iter(self) -> ListIterator = self.into_iter()
     -- A shallow snapshot freezes input slots; element objects remain shared.
     -- The local cursor belongs to the call frame, including continuation forks.
     pub fn map(self, callback: fn(Any) -> Any) -> List {
         let result = List()
         let values = self.concat(List())
+        let cb: Any = callback
         var index: usize = 0
         while index < values.len() {
-            result.push(callback(values.get(index)))
+            let mapped = cb(values.get(index))
+            if is_error_value_raw(mapped) { return forward_error_value_raw(mapped) }
+            result.push(unwrap_ok_value_raw(mapped))
             index = index + 1
         }
         result
@@ -183,29 +190,53 @@ impl List {
     pub fn filter(self, predicate: fn(Any) -> bool) -> List {
         let result = List()
         let values = self.concat(List())
+        let cb: Any = predicate
         var index: usize = 0
         while index < values.len() {
             let value = values.get(index)
-            if predicate(value) { result.push(value) }
+            let matched = cb(value)
+            if is_error_value_raw(matched) { return forward_error_value_raw(matched) }
+            if unwrap_ok_value_raw(matched).as(bool) { result.push(value) }
+            index = index + 1
+        }
+        result
+    }
+    pub fn filter_map(self, mapper: fn(Any) -> ?Any) -> List {
+        let result = List()
+        let values = self.concat(List())
+        let cb: Any = mapper
+        var index: usize = 0
+        while index < values.len() {
+            let raw_mapped = cb(values.get(index))
+            if is_error_value_raw(raw_mapped) { return forward_error_value_raw(raw_mapped) }
+            let mapped = unwrap_ok_value_raw(raw_mapped)
+            if mapped != null { result.push(mapped) }
             index = index + 1
         }
         result
     }
     pub fn fold(self, initial: Any, callback: fn(Any, Any) -> Any) -> Any {
-        var result: Any = initial
+        if is_error_value_raw(initial) { return initial }
+        var result: Any = unwrap_ok_value_raw(initial)
         let values = self.concat(List())
+        let cb: Any = callback
         var index: usize = 0
         while index < values.len() {
-            result = callback(result, values.get(index))
+            let step = cb(result, values.get(index))
+            if is_error_value_raw(step) { return step }
+            result = unwrap_ok_value_raw(step)
             index = index + 1
         }
         result
     }
     pub fn each(self, callback: fn(Any) -> Unit) {
         let values = self.concat(List())
+        let cb: Any = callback
         var index: usize = 0
         while index < values.len() {
-            callback(values.get(index))
+            let res = cb(values.get(index))
+            if is_error_value_raw(res) { return forward_error_value_raw(res) }
+            let _ = unwrap_ok_value_raw(res).as(Unit)
             index = index + 1
         }
     }
@@ -248,18 +279,24 @@ impl List {
     pub fn enumerate(self) -> List { _enumerate(self) }
     pub fn any(self, predicate: fn(Any) -> bool) -> bool {
         let values = self.concat(List())
+        let cb: Any = predicate
         var index: usize = 0
         while index < values.len() {
-            if predicate(values.get(index)) { return true }
+            let matched = cb(values.get(index))
+            if is_error_value_raw(matched) { return forward_error_value_raw(matched) }
+            if unwrap_ok_value_raw(matched).as(bool) { return true }
             index = index + 1
         }
         false
     }
     pub fn all(self, predicate: fn(Any) -> bool) -> bool {
         let values = self.concat(List())
+        let cb: Any = predicate
         var index: usize = 0
         while index < values.len() {
-            if not predicate(values.get(index)) { return false }
+            let matched = cb(values.get(index))
+            if is_error_value_raw(matched) { return forward_error_value_raw(matched) }
+            if not unwrap_ok_value_raw(matched).as(bool) { return false }
             index = index + 1
         }
         true
@@ -284,6 +321,7 @@ impl List {
     -- Groups elements into new lists of `size`, with a shorter final group.
     -- A size of zero panics. A negative size is rejected because `size` is `usize`.
     pub fn chunks(self, size: usize) -> List { _chunks(self, size) }
+    pub fn chunked(self, size: usize) -> List { _chunks(self, size) }
     -- Overlapping groups of `size`. A larger size yields an empty list. A size
     -- of zero is an error. Copies are shallow, and the source stays unchanged.
     pub fn windows(self, size: usize) -> List { _windows(self, size) }
@@ -333,7 +371,7 @@ impl List {
         _merge_sort_by_lt(self, |a: Any, b: Any| -> bool { cmp(a, b) == Ordering.less })
     }
 
-    -- In-place stable merge sort using a strict `<` predicate (Lua `table.sort`).
+    -- In-place stable merge sort using a strict `<` predicate.
     pub fn sort_by_lt(self, less: fn(Any, Any) -> bool) -> Unit {
         _merge_sort_by_lt(self, less)
     }
@@ -496,9 +534,12 @@ impl List {
     pub fn flat_map(self, callback: fn(Any) -> List) -> List {
         let out = List()
         let snap = self.concat(List())
+        let cb: Any = callback
         var i: usize = 0
         while i < snap.len() {
-            out.append(callback(snap.get(i)))
+            let sub = cb(snap.get(i))
+            if is_error_value_raw(sub) { return forward_error_value_raw(sub) }
+            out.append(unwrap_ok_value_raw(sub).as(List))
             i += 1
         }
         out
@@ -506,10 +547,27 @@ impl List {
 
     pub fn find(self, predicate: fn(Any) -> bool) -> Any {
         let snap = self.concat(List())
+        let cb: Any = predicate
         var i: usize = 0
         while i < snap.len() {
             let elem = snap.get(i)
-            if predicate(elem) { return elem }
+            let matched = cb(elem)
+            if is_error_value_raw(matched) { return forward_error_value_raw(matched) }
+            if unwrap_ok_value_raw(matched).as(bool) { return elem }
+            i += 1
+        }
+        null
+    }
+
+    pub fn find_map(self, mapper: fn(Any) -> ?Any) -> ?Any {
+        let snap = self.concat(List())
+        let cb: Any = mapper
+        var i: usize = 0
+        while i < snap.len() {
+            let raw_mapped = cb(snap.get(i))
+            if is_error_value_raw(raw_mapped) { return forward_error_value_raw(raw_mapped) }
+            let mapped = unwrap_ok_value_raw(raw_mapped)
+            if mapped != null { return mapped }
             i += 1
         }
         null
@@ -517,9 +575,12 @@ impl List {
 
     pub fn position(self, predicate: fn(Any) -> bool) -> ?i64 {
         let snap = self.concat(List())
+        let cb: Any = predicate
         var i: usize = 0
         while i < snap.len() {
-            if predicate(snap.get(i)) { return i.as(i64) }
+            let matched = cb(snap.get(i))
+            if is_error_value_raw(matched) { return forward_error_value_raw(matched) }
+            if unwrap_ok_value_raw(matched).as(bool) { return i.as(i64) }
             i += 1
         }
         null
@@ -527,10 +588,13 @@ impl List {
 
     pub fn rposition(self, predicate: fn(Any) -> bool) -> ?i64 {
         let snap = self.concat(List())
+        let cb: Any = predicate
         var i = snap.len()
         while i > 0 {
             i -= 1
-            if predicate(snap.get(i.as(usize))) { return i }
+            let matched = cb(snap.get(i.as(usize)))
+            if is_error_value_raw(matched) { return forward_error_value_raw(matched) }
+            if unwrap_ok_value_raw(matched).as(bool) { return i }
         }
         null
     }
@@ -538,10 +602,13 @@ impl List {
     pub fn reduce(self, callback: fn(Any, Any) -> Any) -> Any {
         let snap = self.concat(List())
         if snap.is_empty() { return null }
+        let cb: Any = callback
         var acc = snap.get(0)
         var i: usize = 1
         while i < snap.len() {
-            acc = callback(acc, snap.get(i))
+            let step = cb(acc, snap.get(i))
+            if is_error_value_raw(step) { return step }
+            acc = unwrap_ok_value_raw(step)
             i += 1
         }
         acc
@@ -551,10 +618,13 @@ impl List {
         let matched = List()
         let unmatched = List()
         let snap = self.concat(List())
+        let cb: Any = predicate
         var i: usize = 0
         while i < snap.len() {
             let elem = snap.get(i)
-            if predicate(elem) {
+            let keep = cb(elem)
+            if is_error_value_raw(keep) { return forward_error_value_raw(keep) }
+            if unwrap_ok_value_raw(keep).as(bool) {
                 matched.push(elem)
             } else {
                 unmatched.push(elem)
@@ -565,12 +635,18 @@ impl List {
     }
 
     pub fn retain(self, predicate: fn(Any) -> bool) -> Unit {
+        let cb: Any = predicate
         var write_idx: usize = 0
         var read_idx: usize = 0
         let total = self.len().as(usize)
         while read_idx < total {
             let elem = self.get(read_idx)
-            if predicate(elem) {
+            let keep = cb(elem)
+            if is_error_value_raw(keep) {
+                self.truncate(total)
+                return forward_error_value_raw(keep)
+            }
+            if unwrap_ok_value_raw(keep).as(bool) {
                 if write_idx != read_idx {
                     self.set(write_idx, elem)
                 }
@@ -724,13 +800,18 @@ impl Map {
         self.contains(key)
     }
 
+    pub fn iter(self) -> MapIterator = self.into_iter()
+
     pub fn filter(self, predicate: fn(String, Any) -> bool) -> Map {
         let out = Map()
         let snap = self.entries()
+        let cb: Any = predicate
         var i: usize = 0
         while i < snap.len() {
             let pair = snap.get(i).as((String, Any))
-            if predicate(pair.0, pair.1) {
+            let keep = cb(pair.0, pair.1)
+            if is_error_value_raw(keep) { return forward_error_value_raw(keep) }
+            if unwrap_ok_value_raw(keep).as(bool) {
                 out.set(pair.0, pair.1)
             }
             i += 1
@@ -741,10 +822,13 @@ impl Map {
     pub fn map_values(self, callback: fn(String, Any) -> Any) -> Map {
         let out = Map()
         let snap = self.entries()
+        let cb: Any = callback
         var i: usize = 0
         while i < snap.len() {
             let pair = snap.get(i).as((String, Any))
-            out.set(pair.0, callback(pair.0, pair.1))
+            let mapped = cb(pair.0, pair.1)
+            if is_error_value_raw(mapped) { return forward_error_value_raw(mapped) }
+            out.set(pair.0, unwrap_ok_value_raw(mapped))
             i += 1
         }
         out
@@ -752,10 +836,13 @@ impl Map {
 
     pub fn retain(self, predicate: fn(String, Any) -> bool) -> Unit {
         let snap = self.entries()
+        let cb: Any = predicate
         var i: usize = 0
         while i < snap.len() {
             let pair = snap.get(i).as((String, Any))
-            if not predicate(pair.0, pair.1) {
+            let keep = cb(pair.0, pair.1)
+            if is_error_value_raw(keep) { return forward_error_value_raw(keep) }
+            if not unwrap_ok_value_raw(keep).as(bool) {
                 let _ = self.remove(pair.0)
             }
             i += 1
@@ -802,6 +889,11 @@ impl Iterator for ListIterator {
     }
 }
 
+impl IntoIterator for ListIterator {
+    assoc Iter: Type = ListIterator
+    pub fn into_iter(self) -> ListIterator = self
+}
+
 impl IntoIterator for List {
     assoc Iter: Type = ListIterator
     pub fn into_iter(self) -> ListIterator {
@@ -825,6 +917,11 @@ impl Iterator for MapIterator {
             IterationStep((String, Any)).done
         }
     }
+}
+
+impl IntoIterator for MapIterator {
+    assoc Iter: Type = MapIterator
+    pub fn into_iter(self) -> MapIterator = self
 }
 
 impl IntoIterator for Map {
@@ -1076,6 +1173,8 @@ impl HashMap {
         }
         dup
     }
+
+    pub fn iter(self) -> HashMapIter = self.into_iter()
 }
 
 impl PartialEq for HashMap {
@@ -1109,6 +1208,11 @@ impl Iterator for HashMapIter {
             IterationStep((Any, Any)).done
         }
     }
+}
+
+impl IntoIterator for HashMapIter {
+    assoc Iter: Type = HashMapIter
+    pub fn into_iter(self) -> HashMapIter = self
 }
 
 impl IntoIterator for HashMap {
@@ -1234,6 +1338,8 @@ impl Set {
     }
 
     pub fn is_superset(self, other: Set) -> bool = other.is_subset(self)
+
+    pub fn iter(self) -> SetIter = self.into_iter()
 }
 
 impl PartialEq for Set {
@@ -1258,6 +1364,11 @@ impl Iterator for SetIter {
             IterationStep(Any).done
         }
     }
+}
+
+impl IntoIterator for SetIter {
+    assoc Iter: Type = SetIter
+    pub fn into_iter(self) -> SetIter = self
 }
 
 impl IntoIterator for Set {
@@ -1414,6 +1525,8 @@ impl Deque {
         }
         out
     }
+
+    pub fn iter(self) -> DequeIter = self.into_iter()
 }
 
 impl PartialEq for Deque {
@@ -1444,6 +1557,11 @@ impl Iterator for DequeIter {
             IterationStep(Any).done
         }
     }
+}
+
+impl IntoIterator for DequeIter {
+    assoc Iter: Type = DequeIter
+    pub fn into_iter(self) -> DequeIter = self
 }
 
 impl IntoIterator for Deque {

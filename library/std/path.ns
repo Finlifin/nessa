@@ -1,60 +1,98 @@
--- std.path — pure-Nessa lexical path manipulation across POSIX and Windows.
+-- std.path — nominal `Path` type and cross-platform lexical path operations.
 
 use .builtin.*
 use .collections.*
+use .json.*
+use .ordering.*
 use .string.*
+use .traits.*
 
-private const _env_os: fn() -> String = .__env_os'builtin
+private const native_env_os: fn() -> String = .__env_os'builtin
+private const native_panic: fn(Any) -> NoReturn = .panic'builtin
 
-pub const SEPARATOR: String = if _env_os() == "windows" { "\\" } else { "/" }
-
-private fn _is_sep_byte(b: i64) -> bool {
-    b == 47 or b == 92
+private fn sep_str() -> String {
+    if native_env_os() == "windows" { "\\" } else { "/" }
 }
 
-private fn _is_ascii_alpha_byte(b: i64) -> bool {
+pub fn separator() -> String = sep_str()
+
+pub struct Path {
+    pub raw: String,
+}
+derive Eq, PartialEq, Ord, PartialOrd, Hash for Path
+
+impl Json for Path {
+    pub fn to_json(self) -> !JsonError String = stringify(self.raw)!
+}
+
+impl Path {
+    pub fn from_json(text: String, .allow_unknown_fields: bool = false) -> !JsonError Path {
+        let _ = allow_unknown_fields
+        let parsed = parse(text)!
+        parsed match {
+            s: String => Path { raw: s },
+            _ => error JsonError.TypeMismatch("$", "String", "non-string"),
+        }
+    }
+}
+
+impl Display for Path {
+    pub fn to_string(self) -> String = self.raw
+}
+
+pub fn to_path_string(p: Any) -> String {
+    p match {
+        s: String => s,
+        path_val: Path => path_val.raw,
+        _ => native_panic("expected Path or String"),
+    }
+}
+
+private fn is_sep_byte(b: i64) -> bool = b == 47 or b == 92
+
+private fn is_ascii_alpha_byte(b: i64) -> bool {
     (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
 }
 
 -- Returns `(root, rest_start_byte)` where `root` is `""`, `"/"`, or `"C:/"`.
-private fn _split_root(p: String) -> (String, i64) {
+private fn split_root(p: String) -> (String, i64) {
     let n = p.len()
     if n == 0 { return ("", 0) }
-    if _is_sep_byte(p.byte_at(0)) {
+    if is_sep_byte(p.byte_at(0)) {
         var i = 1
-        while i < n and _is_sep_byte(p.byte_at(i)) {
+        while i < n and is_sep_byte(p.byte_at(i)) {
             i += 1
         }
-        return (SEPARATOR, i)
+        return (sep_str(), i)
     }
-    if n >= 3 and _is_ascii_alpha_byte(p.byte_at(0)) and p.byte_at(1) == 58 and _is_sep_byte(p.byte_at(2)) {
+    if n >= 3 and is_ascii_alpha_byte(p.byte_at(0)) and p.byte_at(1) == 58 and is_sep_byte(p.byte_at(2)) {
         var i = 3
-        while i < n and _is_sep_byte(p.byte_at(i)) {
+        while i < n and is_sep_byte(p.byte_at(i)) {
             i += 1
         }
-        let drive = p.get(0, 2).as(String) ++ SEPARATOR
+        let drive = p.get(0, 2).as(String) ++ sep_str()
         return (drive, i)
     }
     ("", 0)
 }
 
-private fn _trim_trailing_seps(p: String) -> String {
-    let (root, rest_start) = _split_root(p)
+private fn trim_trailing_seps(p: String) -> String {
+    let (root, rest_start) = split_root(p)
     let n = p.len()
     if root != "" and rest_start >= n {
         return root
     }
     var end_idx = n
-    while end_idx > rest_start and _is_sep_byte(p.byte_at(end_idx - 1)) {
+    while end_idx > rest_start and is_sep_byte(p.byte_at(end_idx - 1)) {
         end_idx -= 1
     }
     p.get(0, end_idx).as(String)
 }
 
-private fn _last_sep_byte(p: String, min_idx: i64) -> i64 {
+private fn last_sep_byte(p: String, min_idx: i64) -> i64 {
     var i = p.len() - 1
     while i >= min_idx {
-        if _is_sep_byte(p.byte_at(i)) {
+        if is_sep_byte(p.byte_at(i)) {
             return i
         }
         i -= 1
@@ -62,52 +100,70 @@ private fn _last_sep_byte(p: String, min_idx: i64) -> i64 {
     -1
 }
 
-pub fn is_absolute(p: String) -> bool {
-    let (root, _) = _split_root(p)
+private fn last_dot_in_name(name: String) -> i64 {
+    var i = name.len() - 1
+    while i > 0 {
+        if name.byte_at(i) == 46 {
+            return i
+        }
+        i -= 1
+    }
+    -1
+}
+
+private fn path_is_absolute(p: Any) -> bool {
+    let raw = to_path_string(p)
+    let (root, _) = split_root(raw)
     root != ""
 }
 
-pub fn join(base: String, child: String) -> String {
-    if child.is_empty() { return base }
-    if base.is_empty() or is_absolute(child) { return child }
-    let last_b = base.byte_at(base.len() - 1)
-    if _is_sep_byte(last_b) {
-        base ++ child
+pub fn is_absolute(p: Any) -> bool = path_is_absolute(p)
+
+private fn path_join(base: Any, child: Any) -> String {
+    let base_str = to_path_string(base)
+    let child_str = to_path_string(child)
+    if child_str.is_empty() { return base_str }
+    if base_str.is_empty() or path_is_absolute(child_str) { return child_str }
+    let last_b = base_str.byte_at(base_str.len() - 1)
+    if is_sep_byte(last_b) {
+        base_str ++ child_str
     } else {
-        base ++ SEPARATOR ++ child
+        base_str ++ sep_str() ++ child_str
     }
 }
+
+pub fn join(base: Any, child: Any) -> String = path_join(base, child)
 
 pub fn join_all(parts: List) -> String {
     var acc = ""
     var idx: usize = 0
     while idx < parts.len() {
-        let part = parts.get(idx).as(String)
-        acc = join(acc, part)
+        acc = path_join(acc, parts.get(idx))
         idx += 1
     }
     acc
 }
 
-pub fn components(p: String) -> List {
+private fn path_components(p: Any) -> List {
+    let raw = to_path_string(p)
     let out = List()
-    if p.is_empty() { return out }
-    let (root, rest_start) = _split_root(p)
+    if raw.is_empty() { return out }
+    let (root, rest_start) = split_root(raw)
     if root != "" {
         out.push(root)
     }
-    let n = p.len()
+    let n = raw.len()
     var i = rest_start
     while i < n {
-        while i < n and _is_sep_byte(p.byte_at(i)) {
+        while i < n and is_sep_byte(raw.byte_at(i)) {
             i += 1
         }
         if i >= n { break }
         let seg_start = i
-        while i < n and (not _is_sep_byte(p.byte_at(i))) {
+        while i < n and (not is_sep_byte(raw.byte_at(i))) {
             i += 1
         }
-        let seg = p.get(seg_start, i).as(String)
+        let seg = raw.get(seg_start, i).as(String)
         if not seg.is_empty() {
             out.push(seg)
         }
@@ -115,22 +171,25 @@ pub fn components(p: String) -> List {
     out
 }
 
-pub fn normalize(p: String) -> String {
-    if p.is_empty() { return "." }
-    let (root, rest_start) = _split_root(p)
+pub fn components(p: Any) -> List = path_components(p)
+
+private fn path_normalize(p: Any) -> String {
+    let raw = to_path_string(p)
+    if raw.is_empty() { return "." }
+    let (root, rest_start) = split_root(raw)
     let stack = List()
-    let n = p.len()
+    let n = raw.len()
     var i = rest_start
     while i < n {
-        while i < n and _is_sep_byte(p.byte_at(i)) {
+        while i < n and is_sep_byte(raw.byte_at(i)) {
             i += 1
         }
         if i >= n { break }
         let seg_start = i
-        while i < n and (not _is_sep_byte(p.byte_at(i))) {
+        while i < n and (not is_sep_byte(raw.byte_at(i))) {
             i += 1
         }
-        let seg = p.get(seg_start, i).as(String)
+        let seg = raw.get(seg_start, i).as(String)
         if seg == "" or seg == "." {
             -- skip redundant current-directory segments
         } else if seg == ".." {
@@ -147,25 +206,28 @@ pub fn normalize(p: String) -> String {
         if stack.is_empty() {
             root
         } else {
-            root ++ stack.join(SEPARATOR)
+            root ++ stack.join(sep_str())
         }
     } else {
         if stack.is_empty() {
             "."
         } else {
-            stack.join(SEPARATOR)
+            stack.join(sep_str())
         }
     }
 }
 
-pub fn parent(p: String) -> ?String {
-    if p.is_empty() { return null }
-    let (root, rest_start) = _split_root(p)
-    let trimmed = _trim_trailing_seps(p)
+pub fn normalize(p: Any) -> String = path_normalize(p)
+
+private fn path_parent(p: Any) -> ?String {
+    let raw = to_path_string(p)
+    if raw.is_empty() { return null }
+    let (root, rest_start) = split_root(raw)
+    let trimmed = trim_trailing_seps(raw)
     if root != "" and trimmed == root {
         return null
     }
-    let sep_idx = _last_sep_byte(trimmed, rest_start)
+    let sep_idx = last_sep_byte(trimmed, rest_start)
     if sep_idx < 0 {
         if root != "" {
             return root
@@ -173,23 +235,26 @@ pub fn parent(p: String) -> ?String {
         return null
     }
     var end_idx = sep_idx
-    while end_idx > rest_start and _is_sep_byte(trimmed.byte_at(end_idx - 1)) {
+    while end_idx > rest_start and is_sep_byte(trimmed.byte_at(end_idx - 1)) {
         end_idx -= 1
     }
     if end_idx == 0 {
-        return SEPARATOR
+        return sep_str()
     }
     trimmed.get(0, end_idx)
 }
 
-pub fn file_name(p: String) -> ?String {
-    if p.is_empty() { return null }
-    let (root, rest_start) = _split_root(p)
-    let trimmed = _trim_trailing_seps(p)
+pub fn parent(p: Any) -> ?String = path_parent(p)
+
+private fn path_file_name(p: Any) -> ?String {
+    let raw = to_path_string(p)
+    if raw.is_empty() { return null }
+    let (root, rest_start) = split_root(raw)
+    let trimmed = trim_trailing_seps(raw)
     if root != "" and trimmed == root {
         return null
     }
-    let sep_idx = _last_sep_byte(trimmed, rest_start)
+    let sep_idx = last_sep_byte(trimmed, rest_start)
     let name = if sep_idx < 0 {
         if root != "" {
             trimmed.get(rest_start, trimmed.len()).as(String)
@@ -206,20 +271,11 @@ pub fn file_name(p: String) -> ?String {
     }
 }
 
-private fn _last_dot_in_name(name: String) -> i64 {
-    var i = name.len() - 1
-    while i > 0 {
-        if name.byte_at(i) == 46 {
-            return i
-        }
-        i -= 1
-    }
-    -1
-}
+pub fn file_name(p: Any) -> ?String = path_file_name(p)
 
-pub fn file_stem(p: String) -> ?String {
-    let name? = file_name(p) else { return null }
-    let dot_idx = _last_dot_in_name(name)
+private fn path_stem(p: Any) -> ?String {
+    let name? = path_file_name(p) else { return null }
+    let dot_idx = last_dot_in_name(name)
     if dot_idx <= 0 {
         name
     } else {
@@ -227,9 +283,11 @@ pub fn file_stem(p: String) -> ?String {
     }
 }
 
-pub fn extension(p: String) -> ?String {
-    let name? = file_name(p) else { return null }
-    let dot_idx = _last_dot_in_name(name)
+pub fn stem(p: Any) -> ?String = path_stem(p)
+
+private fn path_extension(p: Any) -> ?String {
+    let name? = path_file_name(p) else { return null }
+    let dot_idx = last_dot_in_name(name)
     if dot_idx <= 0 {
         null
     } else {
@@ -237,17 +295,86 @@ pub fn extension(p: String) -> ?String {
     }
 }
 
-pub fn with_extension(p: String, ext: String) -> String {
-    let name? = file_name(p) else { return p }
-    let trimmed = _trim_trailing_seps(p)
+pub fn extension(p: Any) -> ?String = path_extension(p)
+
+private fn path_with_extension(p: Any, ext: String) -> String {
+    let raw = to_path_string(p)
+    let name? = path_file_name(raw) else { return raw }
+    let trimmed = trim_trailing_seps(raw)
     let prefix_len = trimmed.len() - name.len()
     let dir_prefix = trimmed.get(0, prefix_len).as(String)
-    let dot_idx = _last_dot_in_name(name)
-    let stem = if dot_idx <= 0 { name } else { name.get(0, dot_idx).as(String) }
+    let dot_idx = last_dot_in_name(name)
+    let base_stem = if dot_idx <= 0 { name } else { name.get(0, dot_idx).as(String) }
     let clean_ext = if ext.starts_with(".") { ext.drop(1) } else { ext }
     if clean_ext.is_empty() {
-        dir_prefix ++ stem
+        dir_prefix ++ base_stem
     } else {
-        dir_prefix ++ stem ++ "." ++ clean_ext
+        dir_prefix ++ base_stem ++ "." ++ clean_ext
     }
+}
+
+pub fn with_extension(p: Any, ext: String) -> String = path_with_extension(p, ext)
+
+private fn path_with_file_name(p: Any, name: String) -> String {
+    let raw = to_path_string(p)
+    path_file_name(raw) match {
+        _? => path_parent(raw) match {
+            par? => path_join(par, name),
+            _ => name,
+        },
+        _ => {
+            if raw.is_empty() or raw == "." {
+                name
+            } else {
+                path_join(raw, name)
+            }
+        },
+    }
+}
+
+pub fn with_file_name(p: Any, name: String) -> String = path_with_file_name(p, name)
+
+impl Path {
+    pub fn new(raw: String) -> Path = Path { raw: raw }
+
+    pub fn from(value: Any) -> Path = Path { raw: to_path_string(value) }
+
+    pub fn as_str(self) -> String = self.raw
+
+    pub fn is_empty(self) -> bool = self.raw.is_empty()
+
+    pub fn is_absolute(self) -> bool = path_is_absolute(self.raw)
+
+    pub fn normalize(self) -> Path = Path { raw: path_normalize(self.raw) }
+
+    pub fn join(self, child: Any) -> Path = Path { raw: path_join(self.raw, child) }
+
+    pub fn concat(self, child: Any) -> Path = self.join(child)
+
+    pub fn join_all(self, ...parts: List) -> Path {
+        var acc = self.raw
+        var idx: usize = 0
+        while idx < parts.len() {
+            acc = path_join(acc, parts.get(idx))
+            idx += 1
+        }
+        Path { raw: acc }
+    }
+
+    pub fn parent(self) -> ?Path {
+        let par? = path_parent(self.raw) else { return null }
+        Path { raw: par }
+    }
+
+    pub fn file_name(self) -> ?String = path_file_name(self.raw)
+
+    pub fn stem(self) -> ?String = path_stem(self.raw)
+
+    pub fn extension(self) -> ?String = path_extension(self.raw)
+
+    pub fn with_extension(self, ext: String) -> Path = Path { raw: path_with_extension(self.raw, ext) }
+
+    pub fn with_file_name(self, name: String) -> Path = Path { raw: path_with_file_name(self.raw, name) }
+
+    pub fn components(self) -> List = path_components(self.raw)
 }

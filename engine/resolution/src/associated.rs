@@ -279,6 +279,9 @@ pub(crate) fn attach(r: &mut Resolver<'_>, ast: &Ast) -> bool {
                 r.node_type_values.insert(target, ty);
             }
             r.scopes[scope.0 as usize].assoc_type = Some(ty);
+            if r.options.builtin_access || r.options.privileged_nodes.contains(&node) {
+                crate::iterator_defaults::bind_bootstrap_assoc_types(r, scope);
+            }
             changed = true;
         }
     }

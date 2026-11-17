@@ -1,123 +1,174 @@
--- std.fs — filesystem queries, directory management, and convenience file I/O.
+-- std.fs — filesystem queries, nominal metadata, directory iteration, and convenience file I/O.
 
 use .builtin.*
-use .io.{File, IoError, io_error_from_code}
+use .collections.*
+use .io.{File, IoError, OpenMode, io_error_from_code}
+use .path.{Path, to_path_string}
+use .traits.*
 
-private const _fs_exists: fn(String) -> bool = .__fs_exists'builtin
-private const _fs_is_file: fn(String) -> bool = .__fs_is_file'builtin
-private const _fs_is_dir: fn(String) -> bool = .__fs_is_dir'builtin
-private const _fs_metadata: fn(String) -> (i64, i64, bool, bool, bool, i64, String) = .__fs_metadata'builtin
-private const _fs_create_dir: fn(String, bool) -> (i64, String) = .__fs_create_dir'builtin
-private const _fs_remove: fn(String, bool) -> (i64, String) = .__fs_remove'builtin
-private const _fs_rename: fn(String, String) -> (i64, String) = .__fs_rename'builtin
-private const _fs_copy: fn(String, String) -> (i64, i64, String) = .__fs_copy'builtin
-private const _fs_read_dir: fn(String) -> (i64, List, String) = .__fs_read_dir'builtin
-private const _fs_read_dir_entries: fn(String) -> (i64, List, String) = .__fs_read_dir_entries'builtin
-private const _fs_walk_dir: fn(String, i64, bool) -> (i64, List, String) = .__fs_walk_dir'builtin
-private const _fs_canonicalize: fn(String) -> (i64, String) = .__fs_canonicalize'builtin
-private const _fs_temp_path: fn(String) -> (i64, String) = .__fs_temp_path'builtin
-private const _list_len: fn(List) -> i64 = .__list_len'builtin
-private const _bytes_new: fn(usize) -> Bytes = .__bytes_new'builtin
-private const _bytes_len: fn(Bytes) -> usize = .__bytes_len'builtin
-private const _bytes_slice: fn(Bytes, usize, usize) -> Bytes = .__bytes_slice'builtin
-private const _bytes_extend: fn(Bytes, Any) -> Unit = .__bytes_extend'builtin
-private const _bytes_from_list: fn(List) -> Bytes = .__bytes_from_list'builtin
-private const _bytes_to_list: fn(Bytes) -> List = .__bytes_to_list'builtin
+private const native_fs_exists: fn(String) -> bool = .__fs_exists'builtin
+private const native_fs_is_file: fn(String) -> bool = .__fs_is_file'builtin
+private const native_fs_is_dir: fn(String) -> bool = .__fs_is_dir'builtin
+private const native_fs_metadata: fn(String) -> (i64, i64, bool, bool, bool, i64, String) = .__fs_metadata'builtin
+private const native_fs_create_dir: fn(String, bool) -> (i64, String) = .__fs_create_dir'builtin
+private const native_fs_remove: fn(String, bool) -> (i64, String) = .__fs_remove'builtin
+private const native_fs_rename: fn(String, String) -> (i64, String) = .__fs_rename'builtin
+private const native_fs_copy: fn(String, String) -> (i64, i64, String) = .__fs_copy'builtin
+private const native_fs_read_dir: fn(String) -> (i64, List, String) = .__fs_read_dir'builtin
+private const native_fs_read_dir_entries: fn(String) -> (i64, List, String) = .__fs_read_dir_entries'builtin
+private const native_fs_walk_dir: fn(String, i64, bool) -> (i64, List, String) = .__fs_walk_dir'builtin
+private const native_fs_canonicalize: fn(String) -> (i64, String) = .__fs_canonicalize'builtin
+private const native_fs_temp_path: fn(String) -> (i64, String) = .__fs_temp_path'builtin
+private const native_list_len: fn(List) -> i64 = .__list_len'builtin
+private const native_bytes_new: fn(usize) -> Bytes = .__bytes_new'builtin
+private const native_bytes_len: fn(Bytes) -> usize = .__bytes_len'builtin
+private const native_bytes_slice: fn(Bytes, usize, usize) -> Bytes = .__bytes_slice'builtin
+private const native_bytes_extend: fn(Bytes, Any) -> Unit = .__bytes_extend'builtin
+private const native_bytes_from_list: fn(List) -> Bytes = .__bytes_from_list'builtin
+private const native_bytes_to_list: fn(Bytes) -> List = .__bytes_to_list'builtin
+
+pub enum FileKind {
+    pub file,
+    pub directory,
+    pub symlink,
+    pub other,
+}
+derive Eq, PartialEq, Display for FileKind
+
+private fn classify_file_kind(file_flag: bool, dir_flag: bool, symlink_flag: bool) -> FileKind {
+    when {
+        symlink_flag => FileKind.symlink
+        dir_flag => FileKind.directory
+        file_flag => FileKind.file
+        else => FileKind.other
+    }
+}
 
 pub struct FileMetadata {
+    pub kind: FileKind,
     pub size: i64,
-    pub is_file: bool,
-    pub is_dir: bool,
-    pub is_symlink: bool,
     pub modified_unix_secs: i64,
 }
 derive Eq, PartialEq, Display for FileMetadata
 
+impl FileMetadata {
+    pub fn is_file(self) -> bool = self.kind == FileKind.file
+    pub fn is_dir(self) -> bool = self.kind == FileKind.directory
+    pub fn is_symlink(self) -> bool = self.kind == FileKind.symlink
+}
+
 pub struct DirEntry {
     pub name: String,
     pub path: String,
-    pub is_file: bool,
-    pub is_dir: bool,
-    pub is_symlink: bool,
+    pub kind: FileKind,
     pub size: i64,
     pub modified_unix_secs: i64,
 }
 derive Eq, PartialEq, Display for DirEntry
 
-pub fn read_to_string(path: String) -> !IoError String {
-    let file = File.open(path, mode = "r")!
+impl DirEntry {
+    pub fn is_file(self) -> bool = self.kind == FileKind.file
+    pub fn is_dir(self) -> bool = self.kind == FileKind.directory
+    pub fn is_symlink(self) -> bool = self.kind == FileKind.symlink
+    pub fn to_path(self) -> Path = Path.new(self.path)
+}
+
+pub struct DirIter {
+    entries: List,
+    index: usize,
+}
+
+impl Iterator for DirIter {
+    assoc Item: Type = DirEntry
+    pub fn next(self) -> IterationStep(DirEntry) {
+        if self.index < self.entries.len() {
+            let entry = self.entries.get(self.index).as(DirEntry)
+            self.index += 1
+            IterationStep(DirEntry).yielded(entry)
+        } else {
+            IterationStep(DirEntry).done
+        }
+    }
+}
+
+impl IntoIterator for DirIter {
+    assoc Iter: Type = DirIter
+    pub fn into_iter(self) -> DirIter = self
+}
+
+pub fn read_to_string(path: Any) -> !IoError String {
+    let file = File.open(path, mode = OpenMode.read)!
     defer { let _ = file.close() }
     file.read_to_string()!
 }
 
-pub fn read_bytes(path: String) -> !IoError List {
-    let file = File.open(path, mode = "rb")!
+pub fn read_bytes(path: Any) -> !IoError List {
+    let file = File.open(path, mode = OpenMode.read)!
     defer { let _ = file.close() }
     file.read_bytes(max_bytes = -1)!
 }
 
-pub fn read_raw_bytes(path: String) -> !IoError Bytes {
-    let file = File.open(path, mode = "rb")!
+pub fn read_raw_bytes(path: Any) -> !IoError Bytes {
+    let file = File.open(path, mode = OpenMode.read)!
     defer { let _ = file.close() }
-    let out = _bytes_new(0)
+    let out = native_bytes_new(0)
     while true {
         let chunk = file.read_bytes(max_bytes = 16384)!
-        if _list_len(chunk) == 0 {
+        if native_list_len(chunk) == 0 {
             break
         }
-        _bytes_extend(out, _bytes_from_list(chunk))
+        native_bytes_extend(out, native_bytes_from_list(chunk))
     }
     out
 }
 
-pub fn write_string(path: String, content: String) -> !IoError Unit {
-    let file = File.open(path, mode = "w")!
+pub fn write_string(path: Any, content: String) -> !IoError Unit {
+    let file = File.open(path, mode = OpenMode.write)!
     defer { let _ = file.close() }
     file.write(content)!
     file.close()!
 }
 
-pub fn write_bytes(path: String, data: List) -> !IoError Unit {
-    let file = File.open(path, mode = "wb")!
+pub fn write_bytes(path: Any, data: List) -> !IoError Unit {
+    let file = File.open(path, mode = OpenMode.write)!
     defer { let _ = file.close() }
     file.write_bytes(data)!
     file.close()!
 }
 
-pub fn write_raw_bytes(path: String, data: Bytes) -> !IoError Unit {
-    let file = File.open(path, mode = "wb")!
+pub fn write_raw_bytes(path: Any, data: Bytes) -> !IoError Unit {
+    let file = File.open(path, mode = OpenMode.write)!
     defer { let _ = file.close() }
-    let total = _bytes_len(data)
+    let total = native_bytes_len(data)
     var offset: usize = 0
     while offset < total {
         let rem = total - offset
         let step: usize = if rem > 16384 { 16384 } else { rem }
         let next = offset + step
-        file.write_bytes(_bytes_to_list(_bytes_slice(data, offset, next)))!
+        file.write_bytes(native_bytes_to_list(native_bytes_slice(data, offset, next)))!
         offset = next
     }
     file.close()!
 }
 
-pub fn append_string(path: String, content: String) -> !IoError Unit {
-    let file = File.open(path, mode = "a")!
+pub fn append_string(path: Any, content: String) -> !IoError Unit {
+    let file = File.open(path, mode = OpenMode.append)!
     defer { let _ = file.close() }
     file.write(content)!
     file.close()!
 }
 
-pub fn exists(path: String) -> bool = _fs_exists(path)
-pub fn is_file(path: String) -> bool = _fs_is_file(path)
-pub fn is_dir(path: String) -> bool = _fs_is_dir(path)
+pub fn exists(path: Any) -> bool = native_fs_exists(to_path_string(path))
+pub fn is_file(path: Any) -> bool = native_fs_is_file(to_path_string(path))
+pub fn is_dir(path: Any) -> bool = native_fs_is_dir(to_path_string(path))
 
-pub fn metadata(path: String) -> !IoError FileMetadata {
-    let (code, size, file_flag, dir_flag, symlink_flag, mtime, msg) = _fs_metadata(path)
+pub fn metadata(path: Any) -> !IoError FileMetadata {
+    let raw = to_path_string(path)
+    let (code, size, file_flag, dir_flag, symlink_flag, mtime, msg) = native_fs_metadata(raw)
     if code == 0 {
         FileMetadata {
+            kind: classify_file_kind(file_flag, dir_flag, symlink_flag),
             size: size,
-            is_file: file_flag,
-            is_dir: dir_flag,
-            is_symlink: symlink_flag,
             modified_unix_secs: mtime,
         }
     } else {
@@ -125,62 +176,53 @@ pub fn metadata(path: String) -> !IoError FileMetadata {
     }
 }
 
-pub fn create_dir(path: String) -> !IoError Unit {
-    let (code, msg) = _fs_create_dir(path, false)
+pub fn create_dir(path: Any, .parents: bool = false) -> !IoError Unit {
+    let raw = to_path_string(path)
+    let (code, msg) = native_fs_create_dir(raw, parents)
     if code == 0 { () } else { error io_error_from_code(code, msg) }
 }
 
-pub fn create_dir_all(path: String) -> !IoError Unit {
-    let (code, msg) = _fs_create_dir(path, true)
-    if code == 0 { () } else { error io_error_from_code(code, msg) }
-}
-
-pub fn remove_file(path: String) -> !IoError Unit {
-    if _fs_is_dir(path) {
-        return error IoError.InvalidInput("path is a directory: " ++ path)
+pub fn remove_file(path: Any) -> !IoError Unit {
+    let raw = to_path_string(path)
+    if native_fs_is_dir(raw) {
+        return error IoError.InvalidInput("path is a directory: " ++ raw)
     }
-    let (code, msg) = _fs_remove(path, false)
+    let (code, msg) = native_fs_remove(raw, false)
     if code == 0 { () } else { error io_error_from_code(code, msg) }
 }
 
-pub fn remove_dir(path: String) -> !IoError Unit {
-    if _fs_exists(path) and (not _fs_is_dir(path)) {
-        return error IoError.InvalidInput("path is not a directory: " ++ path)
+pub fn remove_dir(path: Any, .recursive: bool = false) -> !IoError Unit {
+    let raw = to_path_string(path)
+    if native_fs_exists(raw) and (not native_fs_is_dir(raw)) {
+        return error IoError.InvalidInput("path is not a directory: " ++ raw)
     }
-    let (code, msg) = _fs_remove(path, false)
+    let (code, msg) = native_fs_remove(raw, recursive)
     if code == 0 { () } else { error io_error_from_code(code, msg) }
 }
 
-pub fn remove_dir_all(path: String) -> !IoError Unit {
-    if _fs_exists(path) and (not _fs_is_dir(path)) {
-        return error IoError.InvalidInput("path is not a directory: " ++ path)
-    }
-    let (code, msg) = _fs_remove(path, true)
+pub fn remove(path: Any, .recursive: bool = false) -> !IoError Unit {
+    let raw = to_path_string(path)
+    let (code, msg) = native_fs_remove(raw, recursive)
     if code == 0 { () } else { error io_error_from_code(code, msg) }
 }
 
-pub fn remove(path: String) -> !IoError Unit {
-    let (code, msg) = _fs_remove(path, false)
+pub fn rename(from_path: Any, to_path: Any) -> !IoError Unit {
+    let (code, msg) = native_fs_rename(to_path_string(from_path), to_path_string(to_path))
     if code == 0 { () } else { error io_error_from_code(code, msg) }
 }
 
-pub fn rename(from_path: String, to_path: String) -> !IoError Unit {
-    let (code, msg) = _fs_rename(from_path, to_path)
-    if code == 0 { () } else { error io_error_from_code(code, msg) }
-}
-
-pub fn copy(from_path: String, to_path: String) -> !IoError i64 {
-    let (code, copied, msg) = _fs_copy(from_path, to_path)
+pub fn copy(from_path: Any, to_path: Any) -> !IoError i64 {
+    let (code, copied, msg) = native_fs_copy(to_path_string(from_path), to_path_string(to_path))
     if code == 0 { copied } else { error io_error_from_code(code, msg) }
 }
 
-pub fn read_dir(path: String) -> !IoError List {
-    let (code, entries, msg) = _fs_read_dir(path)
+pub fn read_dir(path: Any) -> !IoError List {
+    let (code, entries, msg) = native_fs_read_dir(to_path_string(path))
     if code == 0 { entries } else { error io_error_from_code(code, msg) }
 }
 
-pub fn read_dir_entries(path: String) -> !IoError List {
-    let (code, raw_entries, msg) = _fs_read_dir_entries(path)
+pub fn read_dir_entries(path: Any) -> !IoError List {
+    let (code, raw_entries, msg) = native_fs_read_dir_entries(to_path_string(path))
     if code != 0 {
         return error io_error_from_code(code, msg)
     }
@@ -188,12 +230,13 @@ pub fn read_dir_entries(path: String) -> !IoError List {
     let n = raw_entries.len()
     for i in 0..n {
         let row = raw_entries.get(i.as(usize)).as(List)
+        let file_flag = row.get(2).as(bool)
+        let dir_flag = row.get(3).as(bool)
+        let symlink_flag = row.get(4).as(bool)
         out.push(DirEntry {
             name: row.get(0).as(String),
             path: row.get(1).as(String),
-            is_file: row.get(2).as(bool),
-            is_dir: row.get(3).as(bool),
-            is_symlink: row.get(4).as(bool),
+            kind: classify_file_kind(file_flag, dir_flag, symlink_flag),
             size: row.get(5).as(i64),
             modified_unix_secs: row.get(6).as(i64),
         })
@@ -201,21 +244,26 @@ pub fn read_dir_entries(path: String) -> !IoError List {
     out
 }
 
+pub fn iter_dir(path: Any) -> !IoError DirIter {
+    let entries = read_dir_entries(path)!
+    DirIter { entries: entries, index: 0 }
+}
+
 pub fn walk_dir(
-    root: String,
+    root: Any,
     .max_depth: i64 = 16,
     .include_hidden: bool = false,
 ) -> !IoError List {
-    let (code, files, msg) = _fs_walk_dir(root, max_depth, include_hidden)
+    let (code, files, msg) = native_fs_walk_dir(to_path_string(root), max_depth, include_hidden)
     if code == 0 { files } else { error io_error_from_code(code, msg) }
 }
 
-pub fn canonicalize(path: String) -> !IoError String {
-    let (code, resolved) = _fs_canonicalize(path)
+pub fn canonicalize(path: Any) -> !IoError String {
+    let (code, resolved) = native_fs_canonicalize(to_path_string(path))
     if code == 0 { resolved } else { error io_error_from_code(code, resolved) }
 }
 
 pub fn temp_file_path(.prefix: String = "nessa_") -> !IoError String {
-    let (code, generated) = _fs_temp_path(prefix)
+    let (code, generated) = native_fs_temp_path(prefix)
     if code == 0 { generated } else { error io_error_from_code(code, generated) }
 }

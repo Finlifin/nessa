@@ -495,6 +495,9 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
         let Some(implementor) = target_ti else {
             continue;
         };
+        if crate::iterator_defaults::is_iterator_trait(r, implementor) {
+            continue;
+        }
 
         if ast.node(node_idx).kind == NodeKind::ImplDef
             && !r.options.builtin_access
@@ -730,6 +733,7 @@ pub(crate) fn resolve_traits(r: &mut Resolver, ast: &Ast) {
     crate::comparison_derivation::register(r, ast);
     crate::ordering::complete_records(r, ast);
     crate::json_derivation::complete_records(r, ast);
+    crate::iterator_defaults::complete_records(r, ast);
 
     for (node, implementor, trait_type, parent, visible_scope) in parent_checks {
         let available = match visible_scope {

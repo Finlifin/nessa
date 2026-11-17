@@ -370,6 +370,9 @@ impl NirLowering {
                 }
             }
             NodeKind::FunctionDef => {
+                if resolved.iterator_template_nodes.contains(&node_idx) {
+                    return;
+                }
                 let children = ast.fixed_children(node_idx);
                 let name_node = children[0];
                 let func_id = FuncId(self.next_func_id);
@@ -674,6 +677,7 @@ impl NirLowering {
                 _ => None,
             });
         if default.is_some()
+            && !resolved.iterator_template_nodes.contains(&node_idx)
             && (source_return != Some(builder.return_type)
                 || !builder.specialized_node_types.is_empty())
         {

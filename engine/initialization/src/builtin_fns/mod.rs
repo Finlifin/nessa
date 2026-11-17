@@ -40,6 +40,9 @@ pub fn register_all(vm: &mut Vm) {
     vm.register_builtin(ids::NATIVE_EQUAL, convert::native_equal);
     vm.register_builtin(ids::TUPLE_LEN, convert::tuple_len);
     vm.register_builtin(ids::TUPLE_GET, convert::tuple_get);
+    vm.register_builtin(ids::IS_ERROR_VALUE, convert::is_error_value);
+    vm.register_builtin(ids::UNWRAP_OK_VALUE, convert::unwrap_ok_value);
+    vm.register_builtin(ids::FORWARD_ERROR_VALUE, convert::forward_error_value);
 
     vm.register_builtin(ids::ABS, math::abs);
     vm.register_builtin(ids::SIN, math::sin);
@@ -691,6 +694,7 @@ pub fn register_all(vm: &mut Vm) {
     vm.register_builtin(ids::FFI_CALL, ffi::ffi_call);
     vm.register_builtin(ids::FFI_CALL4, ffi::ffi_call4);
     vm.register_builtin(ids::FFI_CALL6, ffi::ffi_call6);
+    vm.register_builtin(ids::FFI_READ_CSTR, ffi::ffi_read_cstr);
 
     // ── High-performance JSON kernel (670..=687) ───────────────────
     vm.register_builtin(ids::JSON_PARSE_DYNAMIC, json::json_parse_dynamic);

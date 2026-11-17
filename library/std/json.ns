@@ -1,22 +1,30 @@
--- std.json — native RFC 8259 JSON parser, serializer, and typed `Json` trait support.
+-- std.json — native RFC 8259 JSON parser, serializer, `object { ... }` builder, and typed `Json` / `decode` support.
 
 use .builtin.*
 use .traits.*
 
-private const _to_string_raw: fn(Any) -> String = .to_string'builtin
-private const _parse_dynamic: fn(String) -> (i64, i64, String, Any) = .__json_parse_dynamic'builtin
-private const _stringify_dynamic: fn(Any, bool) -> (i64, String, String) = .__json_stringify_dynamic'builtin
-private const _tape_open: fn(String) -> (i64, i64, String) = .__json_tape_open'builtin
-private const _tape_close: fn(i64) -> Unit = .__json_tape_close'builtin
-private const _tape_kind: fn(i64, i64) -> i64 = .__json_tape_kind'builtin
-private const _tape_read_bool: fn(i64, i64) -> (i64, bool, String) = .__json_tape_read_bool'builtin
-private const _tape_read_int: fn(i64, i64, i64) -> (i64, Any, String) = .__json_tape_read_int'builtin
-private const _tape_read_float: fn(i64, i64, bool) -> (i64, Any, String) = .__json_tape_read_float'builtin
-private const _tape_read_str: fn(i64, i64, bool) -> (i64, Any, String) = .__json_tape_read_str'builtin
-private const _writer_new: fn(i64) -> i64 = .__json_writer_new'builtin
-private const _writer_op: fn(i64, i64, Any) -> i64 = .__json_writer_op'builtin
-private const _writer_finish: fn(i64) -> (i64, String, String) = .__json_writer_finish'builtin
-private const _writer_close: fn(i64) -> Unit = .__json_writer_close'builtin
+private const native_to_string: fn(Any) -> String = .to_string'builtin
+private const native_type_of: fn(Any) -> Type = .type_of'builtin
+private const native_list_is_empty: fn(List) -> bool = .list_is_empty'builtin
+private const native_list_len: fn(List) -> i64 = .__list_len'builtin
+private const native_list_get: fn(List, usize) -> Any = .__list_get'builtin
+private const native_map_init: fn() -> Map = .__map_init'builtin
+private const native_map_set: fn(Map, String, Any) -> Unit = .__map_set'builtin
+private const native_map_merge: fn(Map, Map) -> Unit = .map_merge'builtin
+
+private const native_parse_dynamic: fn(String) -> (i64, i64, String, Any) = .__json_parse_dynamic'builtin
+private const native_stringify_dynamic: fn(Any, bool) -> (i64, String, String) = .__json_stringify_dynamic'builtin
+private const native_tape_open: fn(String) -> (i64, i64, String) = .__json_tape_open'builtin
+private const native_tape_close: fn(i64) -> Unit = .__json_tape_close'builtin
+private const native_tape_kind: fn(i64, i64) -> i64 = .__json_tape_kind'builtin
+private const native_tape_read_bool: fn(i64, i64) -> (i64, bool, String) = .__json_tape_read_bool'builtin
+private const native_tape_read_int: fn(i64, i64, i64) -> (i64, Any, String) = .__json_tape_read_int'builtin
+private const native_tape_read_float: fn(i64, i64, bool) -> (i64, Any, String) = .__json_tape_read_float'builtin
+private const native_tape_read_str: fn(i64, i64, bool) -> (i64, Any, String) = .__json_tape_read_str'builtin
+private const native_writer_new: fn(i64) -> i64 = .__json_writer_new'builtin
+private const native_writer_op: fn(i64, i64, Any) -> i64 = .__json_writer_op'builtin
+private const native_writer_finish: fn(i64) -> (i64, String, String) = .__json_writer_finish'builtin
+private const native_writer_close: fn(i64) -> Unit = .__json_writer_close'builtin
 
 pub enum JsonError {
     pub UnexpectedEof(offset: i64),
@@ -39,12 +47,12 @@ derive Eq, PartialEq for JsonError
 impl Display for JsonError {
     pub fn to_string(self) -> String {
         self match {
-            JsonError.UnexpectedEof(offset) => "UnexpectedEof at byte " ++ _to_string_raw(offset),
-            JsonError.UnexpectedToken(offset, message) => "UnexpectedToken at byte " ++ _to_string_raw(offset) ++ ": " ++ message,
-            JsonError.InvalidNumber(offset, message) => "InvalidNumber at byte " ++ _to_string_raw(offset) ++ ": " ++ message,
-            JsonError.InvalidString(offset, message) => "InvalidString at byte " ++ _to_string_raw(offset) ++ ": " ++ message,
-            JsonError.InvalidEscape(offset, message) => "InvalidEscape at byte " ++ _to_string_raw(offset) ++ ": " ++ message,
-            JsonError.TrailingCharacters(offset) => "TrailingCharacters at byte " ++ _to_string_raw(offset),
+            JsonError.UnexpectedEof(offset) => "UnexpectedEof at byte " ++ native_to_string(offset),
+            JsonError.UnexpectedToken(offset, message) => "UnexpectedToken at byte " ++ native_to_string(offset) ++ ": " ++ message,
+            JsonError.InvalidNumber(offset, message) => "InvalidNumber at byte " ++ native_to_string(offset) ++ ": " ++ message,
+            JsonError.InvalidString(offset, message) => "InvalidString at byte " ++ native_to_string(offset) ++ ": " ++ message,
+            JsonError.InvalidEscape(offset, message) => "InvalidEscape at byte " ++ native_to_string(offset) ++ ": " ++ message,
+            JsonError.TrailingCharacters(offset) => "TrailingCharacters at byte " ++ native_to_string(offset),
             JsonError.UnsupportedValue(message) => "UnsupportedValue: " ++ message,
             JsonError.DepthLimitExceeded => "DepthLimitExceeded",
             JsonError.TypeMismatch(path, expected, actual) => "TypeMismatch at " ++ path ++ ": expected " ++ expected ++ ", found " ++ actual,
@@ -57,7 +65,7 @@ impl Display for JsonError {
     }
 }
 
-private fn _decode_syntax_error(code: i64, offset: i64, msg: String) -> JsonError {
+private fn decode_syntax_error(code: i64, offset: i64, msg: String) -> JsonError {
     when {
         code == 1 => JsonError.UnexpectedEof(offset)
         code == 2 => JsonError.UnexpectedToken(offset, msg)
@@ -70,7 +78,7 @@ private fn _decode_syntax_error(code: i64, offset: i64, msg: String) -> JsonErro
     }
 }
 
-private fn _kind_tag_name(kind: i64) -> String {
+private fn kind_tag_name(kind: i64) -> String {
     when {
         kind == 1 => "null"
         kind == 2 => "bool"
@@ -83,16 +91,32 @@ private fn _kind_tag_name(kind: i64) -> String {
     }
 }
 
-pub fn parse(text: String) -> !JsonError Any {
-    let (code, offset, msg, val) = _parse_dynamic(text)
-    if code == 0 {
-        return val
+private fn dynamic_value_kind(val: Any) -> String {
+    if val == null {
+        return "null"
     }
-    error _decode_syntax_error(code, offset, msg)
+    let ty = native_type_of(val)
+    when {
+        ty == bool => "bool"
+        ty == i8 or ty == i16 or ty == i32 or ty == i64 or ty == i128 or ty == isize => "integer"
+        ty == u8 or ty == u16 or ty == u32 or ty == u64 or ty == u128 or ty == usize => "integer"
+        ty == f32 or ty == f64 => "float"
+        ty == String or ty == char => "string"
+        ty == List => "array"
+        ty == Map => "object"
+        ty == Unit => "null"
+        else => native_to_string(ty)
+    }
 }
 
-pub fn stringify(value: Any, .pretty: bool = false) -> !JsonError String {
-    let (code, msg, out) = _stringify_dynamic(value, pretty)
+private fn reformat_pretty(raw: String, indent: i64) -> !JsonError String {
+    if indent <= 0 {
+        return raw
+    }
+    let w = native_writer_new(indent)
+    let _ = native_writer_op(w, 10, raw)
+    let (code, msg, out) = native_writer_finish(w)
+    native_writer_close(w)
     if code == 0 {
         return out
     }
@@ -105,11 +129,109 @@ pub fn stringify(value: Any, .pretty: bool = false) -> !JsonError String {
     error JsonError.UnsupportedValue(msg)
 }
 
-pub fn encode(value: Json, .indent: i64 = 0) -> !JsonError String {
+pub fn parse(text: String) -> !JsonError Any {
+    let (code, offset, msg, val) = native_parse_dynamic(text)
+    if code == 0 {
+        return val
+    }
+    error decode_syntax_error(code, offset, msg)
+}
+
+pub fn stringify(value: Any, .indent: i64 = 0) -> !JsonError String {
+    let (code, msg, out) = native_stringify_dynamic(value, false)
+    if code != 0 {
+        if code == 8 {
+            return error JsonError.DepthLimitExceeded
+        }
+        if code == 14 {
+            return error JsonError.CycleDetected
+        }
+        return error JsonError.UnsupportedValue(msg)
+    }
     if indent <= 0 {
-        value.to_json()
+        out
     } else {
-        value.to_json_pretty(indent = indent)
+        reformat_pretty(out, indent)
+    }
+}
+
+pub fn encode(value: Json, .indent: i64 = 0) -> !JsonError String {
+    value.to_json_string(indent = indent)
+}
+
+impl Json {
+    pub fn to_json_string(self, .indent: i64 = 0) -> !JsonError String {
+        let raw = self.to_json()!
+        if indent <= 0 {
+            raw
+        } else {
+            reformat_pretty(raw, indent)
+        }
+    }
+
+    pub fn to_json_pretty(self, .indent: i64 = 2) -> !JsonError String =
+        self.to_json_string(indent = indent)
+}
+
+-- Build a JSON-ready `Map` using dual-variadic brace syntax:
+-- `json.object { name: "nessa", tags: ["fast", "safe"] }`.
+-- Positional `(String, Any)` pairs may also be mixed in for non-identifier keys.
+pub fn object(...items: List, ...fields: Map) -> Map {
+    if native_list_is_empty(items) {
+        return fields
+    }
+    let out = native_map_init()
+    let n = native_list_len(items)
+    var i: usize = 0
+    while i < n {
+        let pair = native_list_get(items, i).as((String, Any))
+        native_map_set(out, pair.0, pair.1)
+        i += 1
+    }
+    native_map_merge(out, fields)
+    out
+}
+
+-- Decode `input` into `target` (`Json`, `Any`, `Map`, `List`, builtin scalars, or statically
+-- dispatched `derive Json` / custom `from_json` types rewritten by compiler resolution).
+pub fn decode(target: Type, input: String, .allow_unknown_fields: bool = true) -> !JsonError Any {
+    when {
+        target == Json or target == Any => parse(input)
+        target == Map => {
+            let v = parse(input)!
+            v match {
+                m: Map => m,
+                _ => error JsonError.TypeMismatch("$", "object", dynamic_value_kind(v)),
+            }
+        }
+        target == List => {
+            let v = parse(input)!
+            v match {
+                xs: List => xs,
+                _ => error JsonError.TypeMismatch("$", "array", dynamic_value_kind(v)),
+            }
+        }
+        target == String => String.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == char => char.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == bool => bool.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == Unit => Unit.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == i8 => i8.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == i16 => i16.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == i32 => i32.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == i64 => i64.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == i128 => i128.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == isize => isize.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == u8 => u8.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == u16 => u16.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == u32 => u32.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == u64 => u64.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == u128 => u128.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == usize => usize.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == f32 => f32.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        target == f64 => f64.from_json(input, allow_unknown_fields = allow_unknown_fields)
+        else => error JsonError.UnsupportedValue(
+            "json.decode requires a static `Json` type or builtin JSON target, got " ++ native_to_string(target),
+        )
     }
 }
 
@@ -119,14 +241,11 @@ private fn __derived_from_json_sig(input: String, .allow_unknown_fields: bool = 
     let _ = allow_unknown_fields
 }
 
-private fn _reformat_pretty(raw: String, indent: i64) -> !JsonError String {
-    if indent <= 0 {
-        return raw
-    }
-    let w = _writer_new(indent)
-    let _ = _writer_op(w, 10, raw)
-    let (code, msg, out) = _writer_finish(w)
-    _writer_close(w)
+private fn scalar_to_json(v: Any) -> !JsonError String {
+    let w = native_writer_new(0)
+    let _ = native_writer_op(w, 6, v)
+    let (code, msg, out) = native_writer_finish(w)
+    native_writer_close(w)
     if code == 0 {
         return out
     }
@@ -139,41 +258,18 @@ private fn _reformat_pretty(raw: String, indent: i64) -> !JsonError String {
     error JsonError.UnsupportedValue(msg)
 }
 
-impl Json {
-    pub fn to_json_pretty(self, .indent: i64 = 2) -> !JsonError String {
-        _reformat_pretty(self.to_json()!, indent)
-    }
-}
-
-private fn _scalar_to_json(v: Any) -> !JsonError String {
-    let w = _writer_new(0)
-    let _ = _writer_op(w, 6, v)
-    let (code, msg, out) = _writer_finish(w)
-    _writer_close(w)
-    if code == 0 {
-        return out
-    }
-    if code == 8 {
-        return error JsonError.DepthLimitExceeded
-    }
-    if code == 14 {
-        return error JsonError.CycleDetected
-    }
-    error JsonError.UnsupportedValue(msg)
-}
-
-private fn _open_tape(input: String) -> !JsonError i64 {
-    let (code, handle_or_off, msg) = _tape_open(input)
+private fn open_tape(input: String) -> !JsonError i64 {
+    let (code, handle_or_off, msg) = native_tape_open(input)
     if code == 0 {
         return handle_or_off
     }
-    error _decode_syntax_error(code, handle_or_off, msg)
+    error decode_syntax_error(code, handle_or_off, msg)
 }
 
-private fn _read_int_root(input: String, width_tag: i64, type_name: String) -> !JsonError Any {
-    let tape = _open_tape(input)!
-    let (code, val, info) = _tape_read_int(tape, 0, width_tag)
-    _tape_close(tape)
+private fn read_int_root(input: String, width_tag: i64, type_name: String) -> !JsonError Any {
+    let tape = open_tape(input)!
+    let (code, val, info) = native_tape_read_int(tape, 0, width_tag)
+    native_tape_close(tape)
     if code == 0 {
         return val
     }
@@ -183,10 +279,10 @@ private fn _read_int_root(input: String, width_tag: i64, type_name: String) -> !
     error JsonError.TypeMismatch("$", type_name, info)
 }
 
-private fn _read_float_root(input: String, is_f32: bool, type_name: String) -> !JsonError Any {
-    let tape = _open_tape(input)!
-    let (code, val, info) = _tape_read_float(tape, 0, is_f32)
-    _tape_close(tape)
+private fn read_float_root(input: String, is_f32: bool, type_name: String) -> !JsonError Any {
+    let tape = open_tape(input)!
+    let (code, val, info) = native_tape_read_float(tape, 0, is_f32)
+    native_tape_close(tape)
     if code == 0 {
         return val
     }
@@ -199,154 +295,154 @@ private fn _read_float_root(input: String, is_f32: bool, type_name: String) -> !
 -- ── Builtin scalar `Json` implementations & `from_json` decoders ───────────
 
 impl Json for i8 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl i8 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError i8 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 0, "i8")!.as(i8)
+        read_int_root(input, 0, "i8")!.as(i8)
     }
 }
 
 impl Json for i16 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl i16 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError i16 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 1, "i16")!.as(i16)
+        read_int_root(input, 1, "i16")!.as(i16)
     }
 }
 
 impl Json for i32 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl i32 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError i32 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 2, "i32")!.as(i32)
+        read_int_root(input, 2, "i32")!.as(i32)
     }
 }
 
 impl Json for i64 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl i64 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError i64 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 3, "i64")!.as(i64)
+        read_int_root(input, 3, "i64")!.as(i64)
     }
 }
 
 impl Json for i128 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl i128 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError i128 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 4, "i128")!.as(i128)
+        read_int_root(input, 4, "i128")!.as(i128)
     }
 }
 
 impl Json for isize {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl isize {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError isize {
         let _ = allow_unknown_fields
-        _read_int_root(input, 5, "isize")!.as(isize)
+        read_int_root(input, 5, "isize")!.as(isize)
     }
 }
 
 impl Json for u8 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl u8 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError u8 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 6, "u8")!.as(u8)
+        read_int_root(input, 6, "u8")!.as(u8)
     }
 }
 
 impl Json for u16 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl u16 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError u16 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 7, "u16")!.as(u16)
+        read_int_root(input, 7, "u16")!.as(u16)
     }
 }
 
 impl Json for u32 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl u32 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError u32 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 8, "u32")!.as(u32)
+        read_int_root(input, 8, "u32")!.as(u32)
     }
 }
 
 impl Json for u64 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl u64 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError u64 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 9, "u64")!.as(u64)
+        read_int_root(input, 9, "u64")!.as(u64)
     }
 }
 
 impl Json for u128 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl u128 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError u128 {
         let _ = allow_unknown_fields
-        _read_int_root(input, 10, "u128")!.as(u128)
+        read_int_root(input, 10, "u128")!.as(u128)
     }
 }
 
 impl Json for usize {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl usize {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError usize {
         let _ = allow_unknown_fields
-        _read_int_root(input, 11, "usize")!.as(usize)
+        read_int_root(input, 11, "usize")!.as(usize)
     }
 }
 
 impl Json for f32 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl f32 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError f32 {
         let _ = allow_unknown_fields
-        _read_float_root(input, true, "f32")!.as(f32)
+        read_float_root(input, true, "f32")!.as(f32)
     }
 }
 
 impl Json for f64 {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl f64 {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError f64 {
         let _ = allow_unknown_fields
-        _read_float_root(input, false, "f64")!.as(f64)
+        read_float_root(input, false, "f64")!.as(f64)
     }
 }
 
 impl Json for bool {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl bool {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError bool {
         let _ = allow_unknown_fields
-        let tape = _open_tape(input)!
-        let (code, val, info) = _tape_read_bool(tape, 0)
-        _tape_close(tape)
+        let tape = open_tape(input)!
+        let (code, val, info) = native_tape_read_bool(tape, 0)
+        native_tape_close(tape)
         if code == 0 {
             return val
         }
@@ -355,14 +451,14 @@ impl bool {
 }
 
 impl Json for char {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl char {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError char {
         let _ = allow_unknown_fields
-        let tape = _open_tape(input)!
-        let (code, val, info) = _tape_read_str(tape, 0, true)
-        _tape_close(tape)
+        let tape = open_tape(input)!
+        let (code, val, info) = native_tape_read_str(tape, 0, true)
+        native_tape_close(tape)
         if code == 0 {
             return val.as(char)
         }
@@ -371,14 +467,14 @@ impl char {
 }
 
 impl Json for String {
-    pub fn to_json(self) -> !JsonError String { _scalar_to_json(self) }
+    pub fn to_json(self) -> !JsonError String { scalar_to_json(self) }
 }
 impl String {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError String {
         let _ = allow_unknown_fields
-        let tape = _open_tape(input)!
-        let (code, val, info) = _tape_read_str(tape, 0, false)
-        _tape_close(tape)
+        let tape = open_tape(input)!
+        let (code, val, info) = native_tape_read_str(tape, 0, false)
+        native_tape_close(tape)
         if code == 0 {
             return val.as(String)
         }
@@ -395,12 +491,12 @@ impl Json for Unit {
 impl Unit {
     pub fn from_json(input: String, .allow_unknown_fields: bool = true) -> !JsonError Unit {
         let _ = allow_unknown_fields
-        let tape = _open_tape(input)!
-        let kind = _tape_kind(tape, 0)
-        _tape_close(tape)
+        let tape = open_tape(input)!
+        let kind = native_tape_kind(tape, 0)
+        native_tape_close(tape)
         if kind == 1 {
             return ()
         }
-        error JsonError.TypeMismatch("$", "null", _kind_tag_name(kind))
+        error JsonError.TypeMismatch("$", "null", kind_tag_name(kind))
     }
 }

@@ -14,6 +14,9 @@ const MODULES: &[(&str, &str)] = &[
     ("builtin", include_str!("../../../library/std/builtin.ns")),
     ("ordering", include_str!("../../../library/std/ordering.ns")),
     ("traits", include_str!("../../../library/std/traits.ns")),
+    ("conv", include_str!("../../../library/std/conv.ns")),
+    ("iter", include_str!("../../../library/std/iter.ns")),
+    ("stream", include_str!("../../../library/std/stream.ns")),
     ("io", include_str!("../../../library/std/io.ns")),
     ("fs", include_str!("../../../library/std/fs.ns")),
     ("path", include_str!("../../../library/std/path.ns")),
@@ -42,6 +45,7 @@ const MODULES: &[(&str, &str)] = &[
     ("sync", include_str!("../../../library/std/sync.ns")),
     ("net", include_str!("../../../library/std/net.ns")),
     ("wasm", include_str!("../../../library/std/wasm.ns")),
+    ("ffi", include_str!("../../../library/std/ffi.ns")),
     ("prelude", include_str!("../../../library/std/prelude.ns")),
 ];
 

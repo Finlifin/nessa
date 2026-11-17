@@ -1,37 +1,50 @@
--- std.io — input / output streams, file handles, warnings, and conversions.
+-- std.io — input / output streams, nominal file handles, RAII scoping, and console capability effects.
 
-use .builtin.*
+use .builtin.{
+    Any,
+    Display,
+    Eq,
+    IntoIterator,
+    IterationStep,
+    Iterator,
+    List,
+    NoReturn,
+    PartialEq,
+    String,
+    Type,
+    Unit,
+    bool,
+    f64,
+    i64,
+}
+use .path.to_path_string
+use .traits.*
 
-const print_native: fn(Any) -> Unit = .print'builtin
-const println_native: fn(Any) -> Unit = .println'builtin
-const eprint_native: fn(Any) -> Unit = .eprint'builtin
-const eprintln_native: fn(Any) -> Unit = .eprintln'builtin
+private const print_native: fn(Any) -> Unit = .print'builtin
+private const println_native: fn(Any) -> Unit = .println'builtin
+private const eprint_native: fn(Any) -> Unit = .eprint'builtin
+private const eprintln_native: fn(Any) -> Unit = .eprintln'builtin
 
-private const _io_flush_stdout: fn() -> (i64, String) = .__io_flush_stdout'builtin
-private const _io_flush_stderr: fn() -> (i64, String) = .__io_flush_stderr'builtin
-private const _file_open: fn(String, String) -> (i64, i64, String) = .__file_open'builtin
-private const _file_temp: fn() -> (i64, i64, String) = .__file_temp'builtin
-private const _file_close: fn(i64) -> (i64, String) = .__file_close'builtin
-private const _file_is_open: fn(i64) -> bool = .__file_is_open'builtin
-private const _file_flush: fn(i64) -> (i64, String) = .__file_flush'builtin
-private const _file_read_all: fn(i64) -> (i64, String) = .__file_read_all'builtin
-private const _file_read_line: fn(i64, bool) -> (i64, ?String, String) = .__file_read_line'builtin
-private const _file_read_chars: fn(i64, i64) -> (i64, ?String, String) = .__file_read_chars'builtin
-private const _file_read_bytes: fn(i64, i64) -> (i64, List, String) = .__file_read_bytes'builtin
-private const _file_read_number: fn(i64) -> (i64, ?f64, String) = .__file_read_number'builtin
-private const _file_write_str: fn(i64, String) -> (i64, String) = .__file_write_str'builtin
-private const _file_write_bytes: fn(i64, List) -> (i64, String) = .__file_write_bytes'builtin
-private const _file_seek: fn(i64, i64, i64) -> (i64, i64, String) = .__file_seek'builtin
+private const native_io_flush_stdout: fn() -> (i64, String) = .__io_flush_stdout'builtin
+private const native_io_flush_stderr: fn() -> (i64, String) = .__io_flush_stderr'builtin
+private const native_file_open: fn(String, String) -> (i64, i64, String) = .__file_open'builtin
+private const native_file_temp: fn() -> (i64, i64, String) = .__file_temp'builtin
+private const native_file_close: fn(i64) -> (i64, String) = .__file_close'builtin
+private const native_file_is_open: fn(i64) -> bool = .__file_is_open'builtin
+private const native_file_flush: fn(i64) -> (i64, String) = .__file_flush'builtin
+private const native_file_read_all: fn(i64) -> (i64, String) = .__file_read_all'builtin
+private const native_file_read_line: fn(i64, bool) -> (i64, ?String, String) = .__file_read_line'builtin
+private const native_file_read_chars: fn(i64, i64) -> (i64, ?String, String) = .__file_read_chars'builtin
+private const native_file_read_bytes: fn(i64, i64) -> (i64, List, String) = .__file_read_bytes'builtin
+private const native_file_write_str: fn(i64, String) -> (i64, String) = .__file_write_str'builtin
+private const native_file_write_bytes: fn(i64, List) -> (i64, String) = .__file_write_bytes'builtin
+private const native_file_seek: fn(i64, i64, i64) -> (i64, i64, String) = .__file_seek'builtin
 
-private const _parse_int_radix: fn(String, i64) -> ?i64 = .__str_parse_int_radix'builtin
-private const _parse_f64: fn(String) -> ?f64 = .str_parse_f64'builtin
-private const _trim_ascii: fn(String) -> String = .str_trim_ascii'builtin
-private const _str_is_empty: fn(String) -> bool = .str_is_empty'builtin
-private const _str_len: fn(String) -> i64 = .str_len'builtin
-private const _str_byte_at: fn(String, i64) -> i64 = .str_byte_at'builtin
-private const _list_len: fn(List) -> i64 = .__list_len'builtin
-private const _list_get: fn(List, usize) -> Any = .__list_get'builtin
-private const _panic: fn(Any) -> NoReturn = .panic'builtin
+private const native_panic: fn(Any) -> NoReturn = .panic'builtin
+private const native_to_string: fn(Any) -> String = .to_string'builtin
+private const native_is_error_value: fn(Any) -> bool = .__is_error_value'builtin
+private const native_unwrap_ok_value: fn(Any) -> Any = .__unwrap_ok_value'builtin
+private const native_forward_error_value: fn(Any) -> NoReturn = .__forward_error_value'builtin
 
 -- Values with a Display implementation visible here print their Display
 -- text; all other values keep the native representation.
@@ -67,175 +80,42 @@ pub const type_of: fn(Any) -> Type = .type_of'builtin
 pub const to_i64: fn(Any) -> i64 = .to_i64'builtin
 pub const to_f64: fn(Any) -> f64 = .to_f64'builtin
 pub const to_string: fn(Any) -> String = .to_string'builtin
-private const _to_string_raw: fn(Any) -> String = .to_string'builtin
 
-private fn _format_any(value: Any) -> String {
-    value match {
-        shown: Display => shown.to_string(),
-        _ => to_string(value),
+-- Console capability effects and handler scopes.
+pub effect console_print(text: String) -> Unit
+pub effect console_println(text: String) -> Unit
+pub effect console_read_line() -> !IoError ?String
+
+pub fn with_stdio(thunk: fn() -> #console_print #console_println #console_read_line Any) -> Any {
+    let result = thunk()# {
+        console_print(text) => print_native(text),
+        console_println(text) => println_native(text),
+        console_read_line() => File.stdin().read_line(),
     }
+    if native_is_error_value(result) {
+        return result
+    }
+    native_unwrap_ok_value(result)
 }
 
-pub fn warn(...messages: List) -> Unit {
-    var out = "warning: "
-    let count = _list_len(messages)
-    var index: usize = 0
-    while index < count {
-        out = out ++ _format_any(_list_get(messages, index))
-        index += 1
-    }
-    eprintln_native(out)
+private struct CaptureBuffer {
+    text: String,
 }
 
--- Checks whether an ASCII float string fits within finite IEEE-754 f64 range
--- before calling `_parse_f64` (which raises `NumericOverflow` on `+-Inf`).
-private fn _f64_text_within_range(text: String) -> bool {
-    let n = _str_len(text)
-    if n == 0 { return false }
-    var i = 0
-    let b0 = _str_byte_at(text, 0)
-    if b0 == 43 or b0 == 45 {
-        i += 1
-        if i >= n { return false }
+pub fn capture_output(thunk: fn() -> #console_print #console_println Any) -> (String, Any) {
+    let state = CaptureBuffer { text: "" }
+    let result = thunk()# {
+        console_print(text) => {
+            state.text = state.text ++ text
+        },
+        console_println(text) => {
+            state.text = state.text ++ text ++ "\n"
+        },
     }
-    var first_nz_pos = -1
-    var digit_pos = 0
-    var dot_pos = -1
-    var saw_digit = false
-    while i < n {
-        let b = _str_byte_at(text, i)
-        if b >= 48 and b <= 57 {
-            saw_digit = true
-            if b != 48 and first_nz_pos < 0 {
-                first_nz_pos = digit_pos
-            }
-            digit_pos += 1
-            i += 1
-        } else if b == 46 and dot_pos < 0 {
-            if not saw_digit { return false }
-            dot_pos = digit_pos
-            i += 1
-            if i >= n { return false }
-            let after_dot = _str_byte_at(text, i)
-            if after_dot < 48 or after_dot > 57 { return false }
-        } else {
-            break
-        }
+    if native_is_error_value(result) {
+        return native_forward_error_value(result)
     }
-    if not saw_digit { return false }
-    if dot_pos < 0 { dot_pos = digit_pos }
-
-    var exp_val = 0
-    if i < n {
-        let eb = _str_byte_at(text, i)
-        if eb != 101 and eb != 69 { return false }
-        i += 1
-        if i >= n { return false }
-        var exp_neg = false
-        let es = _str_byte_at(text, i)
-        if es == 43 or es == 45 {
-            exp_neg = es == 45
-            i += 1
-            if i >= n { return false }
-        }
-        var exp_digits = 0
-        while i < n {
-            let db = _str_byte_at(text, i)
-            if db < 48 or db > 57 { return false }
-            exp_digits += 1
-            if exp_val < 1000000 {
-                exp_val = exp_val * 10 + (db - 48)
-            }
-            i += 1
-        }
-        if exp_digits == 0 { return false }
-        if exp_neg { exp_val = -exp_val }
-    }
-    if first_nz_pos < 0 {
-        return true
-    }
-    let sci_exp = (dot_pos - 1 - first_nz_pos) + exp_val
-    if sci_exp > 308 { return false }
-    if sci_exp < 308 { return true }
-    -- When sci_exp == 308, compare first 17 significant digits against DBL_MAX
-    -- ("17976931348623157...").
-    let max_digits = "17976931348623157"
-    var sig_idx = 0
-    var scan = 0
-    let start_b = _str_byte_at(text, 0)
-    if start_b == 43 or start_b == 45 { scan = 1 }
-    var started = false
-    while scan < n and sig_idx < 17 {
-        let b = _str_byte_at(text, scan)
-        if b == 101 or b == 69 { break }
-        if b == 46 {
-            scan += 1
-        } else if (not started) and b == 48 {
-            scan += 1
-        } else if b >= 48 and b <= 57 {
-            started = true
-            let mb = _str_byte_at(max_digits, sig_idx)
-            if b < mb { return true }
-            if b > mb { return false }
-            sig_idx += 1
-            scan += 1
-        } else {
-            break
-        }
-    }
-    while sig_idx < 17 {
-        let mb = _str_byte_at(max_digits, sig_idx)
-        if 48 < mb { return true }
-        sig_idx += 1
-    }
-    true
-}
-
-pub fn tonumber(value: Any, .base: i64 = 0) -> Any {
-    if base == 0 {
-        value match {
-            v: i64 => v,
-            v: i32 => v,
-            v: i16 => v,
-            v: i8 => v,
-            v: i128 => v,
-            v: isize => v,
-            v: u64 => v,
-            v: u32 => v,
-            v: u16 => v,
-            v: u8 => v,
-            v: u128 => v,
-            v: usize => v,
-            v: f64 => v,
-            v: f32 => v,
-            s: String => {
-                let trimmed = _trim_ascii(s)
-                if _str_is_empty(trimmed) { return null }
-                _parse_int_radix(trimmed, 0) match {
-                    n? => n,
-                    _ => {
-                        if _f64_text_within_range(trimmed) {
-                            _parse_f64(trimmed)
-                        } else {
-                            null
-                        }
-                    },
-                }
-            },
-            _ => null,
-        }
-    } else {
-        if base < 2 or base > 36 {
-            _panic("tonumber: base out of range (expected 2..=36)")
-        }
-        value match {
-            s: String => {
-                let trimmed = _trim_ascii(s)
-                if _str_is_empty(trimmed) { null } else { _parse_int_radix(trimmed, base) }
-            },
-            _ => null,
-        }
-    }
+    (state.text, native_unwrap_ok_value(result))
 }
 
 pub enum IoError {
@@ -278,6 +158,25 @@ pub fn io_error_from_code(code: i64, message: String) -> IoError {
     }
 }
 
+pub enum OpenMode {
+    pub read,
+    pub write,
+    pub append,
+    pub read_write,
+    pub create_new,
+}
+derive Eq, PartialEq, Display for OpenMode
+
+private fn open_mode_flag(mode: OpenMode) -> String {
+    mode match {
+        OpenMode.read => "rb",
+        OpenMode.write => "wb",
+        OpenMode.append => "ab",
+        OpenMode.read_write => "r+",
+        OpenMode.create_new => "w+x",
+    }
+}
+
 pub enum SeekFrom {
     pub start(offset: i64),
     pub current(offset: i64),
@@ -288,20 +187,20 @@ derive Eq, PartialEq for SeekFrom
 impl Display for SeekFrom {
     pub fn to_string(self) -> String {
         self match {
-            SeekFrom.start(offset) => "SeekFrom.start(" ++ _to_string_raw(offset) ++ ")",
-            SeekFrom.current(offset) => "SeekFrom.current(" ++ _to_string_raw(offset) ++ ")",
-            SeekFrom.end(offset) => "SeekFrom.end(" ++ _to_string_raw(offset) ++ ")",
+            SeekFrom.start(offset) => "SeekFrom.start(" ++ native_to_string(offset) ++ ")",
+            SeekFrom.current(offset) => "SeekFrom.current(" ++ native_to_string(offset) ++ ")",
+            SeekFrom.end(offset) => "SeekFrom.end(" ++ native_to_string(offset) ++ ")",
         }
     }
 }
 
 pub fn flush_stdout() -> !IoError Unit {
-    let (code, msg) = _io_flush_stdout()
+    let (code, msg) = native_io_flush_stdout()
     if code == 0 { () } else { error io_error_from_code(code, msg) }
 }
 
 pub fn flush_stderr() -> !IoError Unit {
-    let (code, msg) = _io_flush_stderr()
+    let (code, msg) = native_io_flush_stderr()
     if code == 0 { () } else { error io_error_from_code(code, msg) }
 }
 
@@ -312,7 +211,7 @@ derive Eq, PartialEq for File
 
 impl Display for File {
     pub fn to_string(self) -> String {
-        if _file_is_open(self.handle_id) {
+        if native_file_is_open(self.handle_id) {
             "file (open)"
         } else {
             "file (closed)"
@@ -325,8 +224,9 @@ impl File {
     pub fn stdout() -> File = File { handle_id: 1 }
     pub fn stderr() -> File = File { handle_id: 2 }
 
-    pub fn open(path: String, .mode: String = "r") -> !IoError File {
-        let (code, id, msg) = _file_open(path, mode)
+    pub fn open(path: Any, .mode: OpenMode = OpenMode.read) -> !IoError File {
+        let raw_path = to_path_string(path)
+        let (code, id, msg) = native_file_open(raw_path, open_mode_flag(mode))
         if code == 0 {
             File { handle_id: id }
         } else {
@@ -334,16 +234,37 @@ impl File {
         }
     }
 
-    pub fn create(path: String) -> !IoError File {
-        File.open(path, mode = "w")
+    pub fn create(path: Any) -> !IoError File = File.open(path, mode = OpenMode.write)
+
+    pub fn append(path: Any) -> !IoError File = File.open(path, mode = OpenMode.append)
+
+    pub fn create_new(path: Any) -> !IoError File = File.open(path, mode = OpenMode.create_new)
+
+    private fn open_raw_any(path: Any, mode: OpenMode) -> Any {
+        let opened: !IoError File = File.open(path, mode = mode)
+        opened
     }
 
-    pub fn append(path: String) -> !IoError File {
-        File.open(path, mode = "a")
+    pub fn with_open(
+        path: Any,
+        .mode: OpenMode = OpenMode.read,
+        body: fn(File) -> Any,
+    ) -> Any {
+        let opened = File.open_raw_any(path, mode)
+        if native_is_error_value(opened) {
+            return opened
+        }
+        let f = native_unwrap_ok_value(opened).as(File)
+        defer { let _ = f.close() }
+        let res = body(f)
+        if native_is_error_value(res) {
+            return res
+        }
+        native_unwrap_ok_value(res)
     }
 
     pub fn temp() -> !IoError File {
-        let (code, id, msg) = _file_temp()
+        let (code, id, msg) = native_file_temp()
         if code == 0 {
             File { handle_id: id }
         } else {
@@ -352,44 +273,39 @@ impl File {
     }
 
     pub fn close(self) -> !IoError Unit {
-        let (code, msg) = _file_close(self.handle_id)
+        let (code, msg) = native_file_close(self.handle_id)
         if code == 0 { () } else { error io_error_from_code(code, msg) }
     }
 
-    pub fn is_open(self) -> bool = _file_is_open(self.handle_id)
+    pub fn is_open(self) -> bool = native_file_is_open(self.handle_id)
 
     pub fn flush(self) -> !IoError Unit {
-        let (code, msg) = _file_flush(self.handle_id)
+        let (code, msg) = native_file_flush(self.handle_id)
         if code == 0 { () } else { error io_error_from_code(code, msg) }
     }
 
     pub fn read_to_string(self) -> !IoError String {
-        let (code, content) = _file_read_all(self.handle_id)
+        let (code, content) = native_file_read_all(self.handle_id)
         if code == 0 { content } else { error io_error_from_code(code, content) }
     }
 
     pub fn read_line(self, .keep_newline: bool = false) -> !IoError ?String {
-        let (code, line, msg) = _file_read_line(self.handle_id, keep_newline)
+        let (code, line, msg) = native_file_read_line(self.handle_id, keep_newline)
         if code == 0 { line } else { error io_error_from_code(code, msg) }
     }
 
     pub fn read_chars(self, count: i64) -> !IoError ?String {
-        let (code, chunk, msg) = _file_read_chars(self.handle_id, count)
+        let (code, chunk, msg) = native_file_read_chars(self.handle_id, count)
         if code == 0 { chunk } else { error io_error_from_code(code, msg) }
     }
 
     pub fn read_bytes(self, .max_bytes: i64 = -1) -> !IoError List {
-        let (code, bytes, msg) = _file_read_bytes(self.handle_id, max_bytes)
+        let (code, bytes, msg) = native_file_read_bytes(self.handle_id, max_bytes)
         if code == 0 { bytes } else { error io_error_from_code(code, msg) }
     }
 
-    pub fn read_number(self) -> !IoError ?f64 {
-        let (code, num, msg) = _file_read_number(self.handle_id)
-        if code == 0 { num } else { error io_error_from_code(code, msg) }
-    }
-
     pub fn write(self, text: String) -> !IoError Unit {
-        let (code, msg) = _file_write_str(self.handle_id, text)
+        let (code, msg) = native_file_write_str(self.handle_id, text)
         if code == 0 { () } else { error io_error_from_code(code, msg) }
     }
 
@@ -398,7 +314,7 @@ impl File {
     }
 
     pub fn write_bytes(self, data: List) -> !IoError Unit {
-        let (code, msg) = _file_write_bytes(self.handle_id, data)
+        let (code, msg) = native_file_write_bytes(self.handle_id, data)
         if code == 0 { () } else { error io_error_from_code(code, msg) }
     }
 
@@ -408,7 +324,7 @@ impl File {
             SeekFrom.current(off) => (1, off),
             SeekFrom.end(off) => (2, off),
         }
-        let (code, new_pos, msg) = _file_seek(self.handle_id, whence, offset)
+        let (code, new_pos, msg) = native_file_seek(self.handle_id, whence, offset)
         if code == 0 { new_pos } else { error io_error_from_code(code, msg) }
     }
 
@@ -416,8 +332,8 @@ impl File {
         self.seek(SeekFrom.current(0))
     }
 
-    pub fn lines(self, .keep_newline: bool = false, .close_on_eof: bool = false) -> FileLinesIter {
-        FileLinesIter {
+    pub fn lines(self, .keep_newline: bool = false, .close_on_eof: bool = false) -> FileLines {
+        FileLines {
             file: self,
             keep_newline: keep_newline,
             close_on_eof: close_on_eof,
@@ -426,14 +342,14 @@ impl File {
     }
 }
 
-pub struct FileLinesIter {
+pub struct FileLines {
     file: File,
     keep_newline: bool,
     close_on_eof: bool,
     finished: bool,
 }
 
-impl Iterator for FileLinesIter {
+impl Iterator for FileLines {
     assoc Item: Type = String
     pub fn next(self) -> IterationStep(String) {
         if self.finished {
@@ -455,26 +371,22 @@ impl Iterator for FileLinesIter {
                 if self.close_on_eof {
                     let _ = self.file.close()
                 }
-                _panic(err.to_string())
+                native_panic(err.to_string())
             },
         }
     }
 }
 
-impl IntoIterator for FileLinesIter {
-    assoc Iter: Type = FileLinesIter
-    pub fn into_iter(self) -> FileLinesIter = self
+impl IntoIterator for FileLines {
+    assoc Iter: Type = FileLines
+    pub fn into_iter(self) -> FileLines = self
 }
 
 pub fn stdin() -> File = File.stdin()
 pub fn stdout() -> File = File.stdout()
 pub fn stderr() -> File = File.stderr()
 
-pub fn open_file(path: String, .mode: String = "r") -> !IoError File {
-    File.open(path, mode = mode)
-}
-
-pub fn read_lines(path: String, .keep_newline: bool = false) -> !IoError FileLinesIter {
-    let file = File.open(path, mode = "r")!
+pub fn read_lines(path: Any, .keep_newline: bool = false) -> !IoError FileLines {
+    let file = File.open(path, mode = OpenMode.read)!
     file.lines(keep_newline = keep_newline, close_on_eof = true)
 }

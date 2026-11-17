@@ -1,52 +1,72 @@
--- std.time — clocks, durations, instants, calendar broken-down time, and strftime.
+-- std.time — clocks, durations, instants, calendar date-times, weekdays, and mockable clock effects.
 
 use .builtin.*
 use .io.IoError
 use .ordering.*
-use .string.*
+use .scalar.*
 use .traits.*
 
-private const _time_unix_secs: fn() -> i64 = .__time_unix_secs'builtin
-private const _time_unix_millis: fn() -> i64 = .__time_unix_millis'builtin
-private const _time_monotonic_nanos: fn() -> i64 = .__time_monotonic_nanos'builtin
-private const _time_cpu_secs: fn() -> f64 = .__time_cpu_secs'builtin
-private const _time_sleep_ms: fn(i64) -> Unit = .__time_sleep_ms'builtin
-private const _time_breakdown: fn(i64, bool) -> (i64, i64, i64, i64, i64, i64, i64, i64, bool) = .__time_breakdown'builtin
-private const _time_make_unix: fn(i64, i64, i64, i64, i64, i64, i64, bool) -> ?i64 = .__time_make_unix'builtin
-private const _time_strftime: fn(String, i64, bool) -> (i64, String) = .__time_strftime'builtin
+private const native_time_unix_secs: fn() -> i64 = .__time_unix_secs'builtin
+private const native_time_unix_millis: fn() -> i64 = .__time_unix_millis'builtin
+private const native_time_monotonic_nanos: fn() -> i64 = .__time_monotonic_nanos'builtin
+private const native_time_cpu_secs: fn() -> f64 = .__time_cpu_secs'builtin
+private const native_time_sleep_ms: fn(i64) -> Unit = .__time_sleep_ms'builtin
+private const native_time_breakdown: fn(i64, bool) -> (i64, i64, i64, i64, i64, i64, i64, i64, bool) = .__time_breakdown'builtin
+private const native_time_make_unix: fn(i64, i64, i64, i64, i64, i64, i64, bool) -> ?i64 = .__time_make_unix'builtin
+private const native_time_strftime: fn(String, i64, bool) -> (i64, String) = .__time_strftime'builtin
+private const native_is_error_value: fn(Any) -> bool = .__is_error_value'builtin
+private const native_unwrap_ok_value: fn(Any) -> Any = .__unwrap_ok_value'builtin
+private const native_forward_error_value: fn(Any) -> NoReturn = .__forward_error_value'builtin
 
-pub fn unix_secs() -> i64 = _time_unix_secs()
-pub fn unix_millis() -> i64 = _time_unix_millis()
-pub fn difftime(t2: i64, t1: i64) -> f64 = (t2 - t1).as(f64)
-pub fn monotonic_nanos() -> i64 = _time_monotonic_nanos()
-pub fn cpu_secs() -> f64 = _time_cpu_secs()
-pub fn sleep_ms(ms: i64) -> Unit = _time_sleep_ms(ms)
-pub fn sleep(dur: Duration) -> Unit = _time_sleep_ms(dur.as_millis())
+pub fn unix_secs() -> i64 = native_time_unix_secs()
+pub fn unix_millis() -> i64 = native_time_unix_millis()
+pub fn monotonic_nanos() -> i64 = native_time_monotonic_nanos()
+pub fn cpu_secs() -> f64 = native_time_cpu_secs()
+pub fn sleep_ms(ms: i64) -> Unit = native_time_sleep_ms(ms)
+pub fn sleep(dur: Duration) -> Unit = native_time_sleep_ms(dur.as_millis())
 
 pub struct Duration {
     pub nanos: i64,
 }
-derive Eq, PartialEq, Ord, PartialOrd, Display for Duration
+derive Eq, PartialEq, Ord, PartialOrd, Hash, Display for Duration
 
 impl Duration {
+    pub fn zero() -> Duration = Duration { nanos: 0 }
     pub fn from_nanos(nanos: i64) -> Duration = Duration { nanos: nanos }
-    pub fn from_millis(millis: i64) -> Duration = Duration { nanos: millis * 1000000 }
-    pub fn from_secs(secs: i64) -> Duration = Duration { nanos: secs * 1000000000 }
+    pub fn from_micros(micros: i64) -> Duration = Duration { nanos: micros.saturating_mul(1000) }
+    pub fn from_millis(millis: i64) -> Duration = Duration { nanos: millis.saturating_mul(1000000) }
+    pub fn from_secs(secs: i64) -> Duration = Duration { nanos: secs.saturating_mul(1000000000) }
+    pub fn from_mins(mins: i64) -> Duration = Duration.from_secs(mins.saturating_mul(60))
+    pub fn from_hours(hours: i64) -> Duration = Duration.from_secs(hours.saturating_mul(3600))
+
     pub fn as_nanos(self) -> i64 = self.nanos
+    pub fn as_micros(self) -> i64 = self.nanos / 1000
     pub fn as_millis(self) -> i64 = self.nanos / 1000000
+    pub fn as_secs(self) -> i64 = self.nanos / 1000000000
     pub fn as_secs_f64(self) -> f64 = self.nanos.as(f64) / 1000000000.0
+
+    pub fn is_zero(self) -> bool = self.nanos == 0
+
+    pub fn add(self, other: Duration) -> Duration {
+        Duration { nanos: self.nanos.saturating_add(other.nanos) }
+    }
+
+    pub fn saturating_sub(self, other: Duration) -> Duration {
+        let diff = self.nanos.saturating_sub(other.nanos)
+        Duration { nanos: if diff < 0 { 0 } else { diff } }
+    }
 }
 
 pub struct Instant {
     pub nanos: i64,
 }
-derive Eq, PartialEq, Ord, PartialOrd, Display for Instant
+derive Eq, PartialEq, Ord, PartialOrd, Hash, Display for Instant
 
 impl Instant {
-    pub fn now() -> Instant = Instant { nanos: _time_monotonic_nanos() }
+    pub fn now() -> Instant = Instant { nanos: native_time_monotonic_nanos() }
 
     pub fn duration_since(self, earlier: Instant) -> Duration {
-        let diff = self.nanos - earlier.nanos
+        let diff = self.nanos.saturating_sub(earlier.nanos)
         Duration { nanos: if diff < 0 { 0 } else { diff } }
     }
 
@@ -55,11 +75,53 @@ impl Instant {
     }
 }
 
+pub enum Weekday {
+    pub sunday,
+    pub monday,
+    pub tuesday,
+    pub wednesday,
+    pub thursday,
+    pub friday,
+    pub saturday,
+}
+derive Eq, PartialEq, Display for Weekday
+
+impl Weekday {
+    pub fn number_from_monday(self) -> i64 {
+        self match {
+            Weekday.monday => 1,
+            Weekday.tuesday => 2,
+            Weekday.wednesday => 3,
+            Weekday.thursday => 4,
+            Weekday.friday => 5,
+            Weekday.saturday => 6,
+            Weekday.sunday => 7,
+        }
+    }
+
+    pub fn is_weekend(self) -> bool {
+        self == Weekday.saturday or self == Weekday.sunday
+    }
+}
+
+private fn weekday_from_sun1(wday: i64) -> ?Weekday {
+    when {
+        wday == 1 => Weekday.sunday
+        wday == 2 => Weekday.monday
+        wday == 3 => Weekday.tuesday
+        wday == 4 => Weekday.wednesday
+        wday == 5 => Weekday.thursday
+        wday == 6 => Weekday.friday
+        wday == 7 => Weekday.saturday
+        else => null
+    }
+}
+
 pub struct DateTime {
     pub year: i64,
     pub month: i64,
     pub day: i64,
-    pub hour: i64 = 12,
+    pub hour: i64 = 0,
     pub min: i64 = 0,
     pub sec: i64 = 0,
     pub wday: i64 = 0,
@@ -73,12 +135,12 @@ impl DateTime {
         year: i64,
         month: i64,
         day: i64,
-        .hour: i64 = 12,
+        .hour: i64 = 0,
         .min: i64 = 0,
         .sec: i64 = 0,
         .wday: i64 = 0,
         .yday: i64 = 0,
-        .is_dst: bool = false
+        .is_dst: bool = false,
     ) -> DateTime {
         DateTime {
             year: year,
@@ -93,8 +155,8 @@ impl DateTime {
         }
     }
 
-    pub fn from_unix_utc(ts: i64) -> DateTime {
-        let (year, month, day, hour, min, sec, wday, yday, is_dst) = _time_breakdown(ts, true)
+    pub fn from_unix(secs: i64, .utc: bool = true) -> DateTime {
+        let (year, month, day, hour, min, sec, wday, yday, is_dst) = native_time_breakdown(secs, utc)
         DateTime {
             year: year,
             month: month,
@@ -108,49 +170,94 @@ impl DateTime {
         }
     }
 
-    pub fn from_unix_local(ts: i64) -> DateTime {
-        let (year, month, day, hour, min, sec, wday, yday, is_dst) = _time_breakdown(ts, false)
-        DateTime {
-            year: year,
-            month: month,
-            day: day,
-            hour: hour,
-            min: min,
-            sec: sec,
-            wday: wday,
-            yday: yday,
-            is_dst: is_dst,
+    pub fn now(.utc: bool = true) -> DateTime {
+        DateTime.from_unix(native_time_unix_secs(), utc = utc)
+    }
+
+    pub fn to_unix(self, .utc: bool = true) -> ?i64 {
+        if utc {
+            native_time_make_unix(self.year, self.month, self.day, self.hour, self.min, self.sec, 0, true)
+        } else {
+            let dst_flag = if self.is_dst { 1 } else { -1 }
+            native_time_make_unix(self.year, self.month, self.day, self.hour, self.min, self.sec, dst_flag, false)
         }
     }
 
-    pub fn now_utc() -> DateTime = DateTime.from_unix_utc(_time_unix_secs())
-    pub fn now_local() -> DateTime = DateTime.from_unix_local(_time_unix_secs())
-
-    pub fn to_unix_utc(self) -> ?i64 {
-        _time_make_unix(self.year, self.month, self.day, self.hour, self.min, self.sec, 0, true)
+    pub fn weekday(self) -> ?Weekday {
+        if self.wday >= 1 and self.wday <= 7 {
+            return weekday_from_sun1(self.wday)
+        }
+        let ts? = self.to_unix(utc = true) else { return null }
+        let (_, _, _, _, _, _, wday_sun1, _, _) = native_time_breakdown(ts, true)
+        weekday_from_sun1(wday_sun1)
     }
 
-    pub fn to_unix_local(self) -> ?i64 {
-        let dst_flag = if self.is_dst { 1 } else { -1 }
-        _time_make_unix(self.year, self.month, self.day, self.hour, self.min, self.sec, dst_flag, false)
+    pub fn format(self, .fmt: String = "%Y-%m-%dT%H:%M:%S", .utc: bool = true) -> !IoError String {
+        let ts? = self.to_unix(utc = utc) else {
+            return error IoError.InvalidInput("invalid calendar DateTime")
+        }
+        let (code, text) = native_time_strftime(fmt, ts, utc)
+        if code == 0 {
+            text
+        } else {
+            error IoError.InvalidInput(text)
+        }
     }
 }
 
-pub fn format_date(.fmt: String = "%c", .timestamp: ?i64 = null, .utc: bool = false) -> !IoError String {
+pub fn format_date(
+    .fmt: String = "%Y-%m-%dT%H:%M:%S",
+    .timestamp: ?i64 = null,
+    .utc: bool = true,
+) -> !IoError String {
     let ts = timestamp match {
         val? => val,
-        _ => _time_unix_secs(),
+        _ => native_time_unix_secs(),
     }
-    var use_utc = utc
-    var actual_fmt = fmt
-    if actual_fmt.starts_with("!") {
-        use_utc = true
-        actual_fmt = actual_fmt.drop(1)
-    }
-    let (code, text) = _time_strftime(actual_fmt, ts, use_utc)
+    let (code, text) = native_time_strftime(fmt, ts, utc)
     if code == 0 {
         text
     } else {
         error IoError.InvalidInput(text)
     }
+}
+
+-- Clock capability effects and deterministic virtual clock handler.
+pub effect clock_now_ms() -> i64
+pub effect clock_sleep(duration: Duration) -> Unit
+
+pub fn with_system_clock(thunk: fn() -> #clock_now_ms #clock_sleep Any) -> Any {
+    thunk()# {
+        clock_now_ms() => native_time_unix_millis(),
+        clock_sleep(duration) => {
+            let ms = duration.as_millis()
+            if ms > 0 {
+                native_time_sleep_ms(ms)
+            }
+        },
+    }
+}
+
+private struct MockClockState {
+    ms: i64,
+}
+
+pub fn with_mock_clock(
+    .initial_ms: i64 = 0,
+    thunk: fn() -> #clock_now_ms #clock_sleep Any,
+) -> (i64, Any) {
+    let state = MockClockState { ms: initial_ms }
+    let result = thunk()# {
+        clock_now_ms() => state.ms,
+        clock_sleep(duration) => {
+            let delta = duration.as_millis()
+            if delta > 0 {
+                state.ms = state.ms + delta
+            }
+        },
+    }
+    if native_is_error_value(result) {
+        return native_forward_error_value(result)
+    }
+    (state.ms, native_unwrap_ok_value(result))
 }

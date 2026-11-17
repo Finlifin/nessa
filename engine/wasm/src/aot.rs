@@ -251,6 +251,9 @@ fn is_supported_builtin_name(name: &str, _target: WasmTarget) -> bool {
             | "__native_equal"
             | "__tuple_len"
             | "__tuple_get"
+            | "__is_error_value"
+            | "__unwrap_ok_value"
+            | "__forward_error_value"
             | "__display_quote"
             | "__display_enter_tuple"
             | "__display_exit_tuple"
@@ -3215,6 +3218,114 @@ fn emit_builtin_call(
                 .i32_add()
                 .i64_load(mem(0, 3))
                 .local_set(r0);
+        }
+        "__is_error_value" => {
+            s.local_get(r0)
+                .i64_const(TAG_MASK)
+                .i64_and()
+                .i64_eqz()
+                .local_get(r0)
+                .i64_const(0)
+                .i64_ne()
+                .i32_and()
+                .if_(BlockType::Result(ValType::I64))
+                .local_get(r0)
+                .i32_wrap_i64()
+                .local_tee(L_T0)
+                .i32_const(12)
+                .i32_sub()
+                .i32_load(mem(0, 2))
+                .i32_const(ROLE_ERROR_ENVELOPE)
+                .i32_eq()
+                .if_(BlockType::Result(ValType::I64))
+                .local_get(L_T0)
+                .i64_load(mem(0, 3))
+                .local_get(L_T0)
+                .i64_load(mem(8, 3))
+                .i64_or()
+                .i64_const(0)
+                .i64_ne()
+                .if_(BlockType::Result(ValType::I64))
+                .i64_const(VAL_TRUE)
+                .else_()
+                .i64_const(VAL_FALSE)
+                .end()
+                .else_()
+                .i64_const(VAL_FALSE)
+                .end()
+                .else_()
+                .i64_const(VAL_FALSE)
+                .end()
+                .local_set(r0);
+        }
+        "__unwrap_ok_value" => {
+            s.local_get(r0)
+                .i64_const(TAG_MASK)
+                .i64_and()
+                .i64_eqz()
+                .local_get(r0)
+                .i64_const(0)
+                .i64_ne()
+                .i32_and()
+                .if_(BlockType::Empty)
+                .local_get(r0)
+                .i32_wrap_i64()
+                .local_tee(L_T0)
+                .i32_const(12)
+                .i32_sub()
+                .i32_load(mem(0, 2))
+                .i32_const(ROLE_ERROR_ENVELOPE)
+                .i32_eq()
+                .if_(BlockType::Empty)
+                .local_get(L_T0)
+                .i64_load(mem(0, 3))
+                .local_get(L_T0)
+                .i64_load(mem(8, 3))
+                .i64_or()
+                .i64_eqz()
+                .if_(BlockType::Empty)
+                .local_get(L_T0)
+                .i64_load(mem(16, 3))
+                .local_set(r0)
+                .end()
+                .end()
+                .end();
+        }
+        "__forward_error_value" => {
+            // `r0` is already in place; trap if `r0` is not a heap `Err` `ErrorEnvelope`.
+            s.local_get(r0)
+                .i64_const(TAG_MASK)
+                .i64_and()
+                .i64_eqz()
+                .local_get(r0)
+                .i64_const(0)
+                .i64_ne()
+                .i32_and()
+                .if_(BlockType::Empty)
+                .local_get(r0)
+                .i32_wrap_i64()
+                .local_tee(L_T0)
+                .i32_const(12)
+                .i32_sub()
+                .i32_load(mem(0, 2))
+                .i32_const(ROLE_ERROR_ENVELOPE)
+                .i32_eq()
+                .if_(BlockType::Empty)
+                .local_get(L_T0)
+                .i64_load(mem(0, 3))
+                .local_get(L_T0)
+                .i64_load(mem(8, 3))
+                .i64_or()
+                .i64_eqz()
+                .if_(BlockType::Empty)
+                .unreachable()
+                .end()
+                .else_()
+                .unreachable()
+                .end()
+                .else_()
+                .unreachable()
+                .end();
         }
         "__scalar_hash" => {
             // Coherent 64-bit hash across String (FNV-1a), Unit/null/bool/char, and numbers (canonicalized via f64).

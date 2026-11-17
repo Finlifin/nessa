@@ -2,6 +2,9 @@
 pub mod builtin
 pub mod ordering
 pub mod traits
+pub mod conv
+pub mod iter
+pub mod stream
 pub mod io
 pub mod fs
 pub mod path
@@ -23,5 +26,6 @@ pub mod rand
 pub mod sync
 pub mod net
 pub mod wasm
+pub mod ffi
 pub mod task
 pub mod prelude

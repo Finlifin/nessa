@@ -1,11 +1,12 @@
--- std.coroutine — asymmetric stateful coroutines and generators built on algebraic effects.
+-- std.coroutine — asymmetric stateful coroutines and generators built on delimited continuations.
 
 use .builtin.*
 use .collections.*
+use .traits.*
 
-private const _panic: fn(Any) -> NoReturn = .panic'builtin
-private const _to_string_raw: fn(Any) -> String = .to_string'builtin
-private const _task_current_id: fn() -> i64 = .__task_current_id'builtin
+private const native_panic: fn(Any) -> NoReturn = .panic'builtin
+private const native_to_string: fn(Any) -> String = .to_string'builtin
+private const native_task_current_id: fn() -> i64 = .__task_current_id'builtin
 
 private effect co_yield(value: Any, catch k) -> Any
 
@@ -14,24 +15,74 @@ private enum CoOutcome {
     finished(value: Any),
 }
 
-pub enum CoroutineStatus {
-    pub suspended,
-    pub running,
-    pub normal,
-    pub dead,
+private fn format_step_payload(val: Any) -> String {
+    val match {
+        shown: Display => shown.to_string(),
+        _ => native_to_string(val),
+    }
 }
-derive Eq, PartialEq for CoroutineStatus
 
-impl Display for CoroutineStatus {
-    pub fn to_string(self) -> String {
+pub enum CoroutineStep {
+    pub yielded(value: Any),
+    pub finished(value: Any),
+
+    pub fn is_yielded(self) -> bool = self matches CoroutineStep.yielded(_)
+
+    pub fn is_finished(self) -> bool = self matches CoroutineStep.finished(_)
+
+    pub fn value(self) -> Any {
         self match {
-            CoroutineStatus.suspended => "suspended",
-            CoroutineStatus.running => "running",
-            CoroutineStatus.normal => "normal",
-            CoroutineStatus.dead => "dead",
+            CoroutineStep.yielded(v) => v,
+            CoroutineStep.finished(v) => v,
         }
     }
 }
+
+impl Eq for CoroutineStep {
+    pub fn eq(self, other: Self) -> bool {
+        self match {
+            CoroutineStep.yielded(a) => other match {
+                CoroutineStep.yielded(b) => a == b,
+                CoroutineStep.finished(_) => false,
+            },
+            CoroutineStep.finished(a) => other match {
+                CoroutineStep.finished(b) => a == b,
+                CoroutineStep.yielded(_) => false,
+            },
+        }
+    }
+}
+
+impl PartialEq for CoroutineStep {
+    pub fn eq(self, other: Self) -> bool {
+        self match {
+            CoroutineStep.yielded(a) => other match {
+                CoroutineStep.yielded(b) => a == b,
+                CoroutineStep.finished(_) => false,
+            },
+            CoroutineStep.finished(a) => other match {
+                CoroutineStep.finished(b) => a == b,
+                CoroutineStep.yielded(_) => false,
+            },
+        }
+    }
+}
+
+impl Display for CoroutineStep {
+    pub fn to_string(self) -> String {
+        self match {
+            CoroutineStep.yielded(v) => "CoroutineStep.yielded(" ++ format_step_payload(v) ++ ")",
+            CoroutineStep.finished(v) => "CoroutineStep.finished(" ++ format_step_payload(v) ++ ")",
+        }
+    }
+}
+
+pub enum CoroutineStatus {
+    pub suspended,
+    pub running,
+    pub dead,
+}
+derive Eq, PartialEq, Display for CoroutineStatus
 
 pub enum CoroutineError {
     pub DeadCoroutine,
@@ -43,45 +94,45 @@ derive Eq, PartialEq for CoroutineError
 impl Display for CoroutineError {
     pub fn to_string(self) -> String {
         self match {
-            CoroutineError.DeadCoroutine => "cannot resume dead coroutine",
-            CoroutineError.AlreadyRunning => "cannot resume non-suspended coroutine",
+            CoroutineError.DeadCoroutine => "cannot step dead coroutine",
+            CoroutineError.AlreadyRunning => "cannot step active coroutine",
             CoroutineError.UncaughtPanic(message) => "coroutine panic: " ++ message,
         }
     }
 }
 
-private global _running_stacks: Map = Map()
+private global running_stacks: Map = Map()
 
-private fn _current_task_key() -> String = _to_string_raw(_task_current_id())
+private fn current_task_key() -> String = native_to_string(native_task_current_id())
 
-private fn _current_running_stack() -> ?List {
-    let key = _current_task_key()
-    if _running_stacks.contains(key) {
-        _running_stacks.get(key).as(List)
+private fn current_running_stack() -> ?List {
+    let key = current_task_key()
+    if running_stacks.contains(key) {
+        running_stacks.get(key).as(List)
     } else {
         null
     }
 }
 
-private fn _ensure_running_stack() -> List {
-    let key = _current_task_key()
-    if _running_stacks.contains(key) {
-        _running_stacks.get(key).as(List)
+private fn ensure_running_stack() -> List {
+    let key = current_task_key()
+    if running_stacks.contains(key) {
+        running_stacks.get(key).as(List)
     } else {
         let fresh = List()
-        _running_stacks.set(key, fresh)
+        running_stacks.set(key, fresh)
         fresh
     }
 }
 
 pub struct Coroutine {
     status_field: CoroutineStatus,
-    body: ?(fn(Any) -> Any),
+    body: Any,
     cont: ?Continuation,
 }
 
 impl Coroutine {
-    pub fn create(body: fn(Any) -> Any) -> Coroutine {
+    pub fn new(body: fn(Any) -> Any) -> Coroutine {
         Coroutine {
             status_field: CoroutineStatus.suspended,
             body: body,
@@ -89,9 +140,20 @@ impl Coroutine {
         }
     }
 
+    pub fn create(body: fn(Any) -> Any) -> Coroutine = Coroutine.new(body)
+
+    pub fn yield_val(.value: Any = null) -> Any {
+        if not is_yieldable() {
+            native_panic("attempt to yield from outside a coroutine")
+        }
+        co_yield(value)#
+    }
+
     pub fn status(self) -> CoroutineStatus = self.status_field
 
-    pub fn try_resume(self, .arg: Any = null) -> !CoroutineError Any {
+    pub fn is_alive(self) -> bool = self.status_field != CoroutineStatus.dead
+
+    pub fn step(self, .arg: Any = null) -> !CoroutineError CoroutineStep {
         if self.status_field == CoroutineStatus.dead {
             return error CoroutineError.DeadCoroutine
         }
@@ -99,22 +161,15 @@ impl Coroutine {
             return error CoroutineError.AlreadyRunning
         }
 
-        let task_key = _current_task_key()
-        let running_stack = _ensure_running_stack()
-        if not running_stack.is_empty() {
-            let caller = running_stack.last().as(Coroutine)
-            caller.status_field = CoroutineStatus.normal
-        }
+        let task_key = current_task_key()
+        let running_stack = ensure_running_stack()
         running_stack.push(self)
         self.status_field = CoroutineStatus.running
 
         defer {
             let _ = running_stack.pop()
             if running_stack.is_empty() {
-                let _ = _running_stacks.remove(task_key)
-            } else {
-                let caller = running_stack.last().as(Coroutine)
-                caller.status_field = CoroutineStatus.running
+                let _ = running_stacks.remove(task_key)
             }
             if self.status_field == CoroutineStatus.running {
                 self.cont = null
@@ -124,7 +179,7 @@ impl Coroutine {
         }
 
         let outcome: CoOutcome = if self.cont == null {
-            let entry_fn = self.body.as(fn(Any) -> Any)
+            let entry_fn = self.body
             self.body = null
             (CoOutcome.finished(entry_fn(arg)))# {
                 co_yield(val, k) => CoOutcome.yielded(val, k),
@@ -139,84 +194,54 @@ impl Coroutine {
             CoOutcome.yielded(val, next_k) => {
                 self.cont = next_k
                 self.status_field = CoroutineStatus.suspended
-                val
+                CoroutineStep.yielded(val)
             },
             CoOutcome.finished(val) => {
                 self.cont = null
                 self.status_field = CoroutineStatus.dead
-                val
+                CoroutineStep.finished(val)
             },
         }
     }
 
-    pub fn `resume`(self, .arg: Any = null) -> !CoroutineError Any {
-        self.try_resume(arg = arg)
+    pub fn try_resume(self, .arg: Any = null) -> !CoroutineError Any {
+        let s = self.step(arg = arg)!
+        s.value()
     }
 
-    pub fn resume_with(self, .arg: Any = null) -> !CoroutineError Any {
-        self.try_resume(arg = arg)
-    }
-
-    pub fn try_step(self, .arg: Any = null) -> !CoroutineError (bool, Any) {
-        let value = self.try_resume(arg = arg)!
-        (true, value)
-    }
-
-    pub fn step(self, .arg: Any = null) -> Any {
-        self.try_resume(arg = arg) match {
-            val! => val,
-            error err => _panic(err.to_string()),
-        }
-    }
-
-    pub fn close(self) -> !CoroutineError Unit {
-        if self.status_field == CoroutineStatus.running or self.status_field == CoroutineStatus.normal {
-            return error CoroutineError.AlreadyRunning
+    pub fn close(self) -> bool {
+        if self.status_field != CoroutineStatus.suspended {
+            return false
         }
         self.cont = null
         self.body = null
         self.status_field = CoroutineStatus.dead
-        ()
+        true
+    }
+
+    pub fn generator(body: fn() -> Any) -> GeneratorIter {
+        let co = Coroutine.new(|_: Any| -> Any {
+            body()
+        })
+        GeneratorIter { co: co }
     }
 }
 
-pub fn create(body: fn(Any) -> Any) -> Coroutine = Coroutine.create(body)
+pub fn create(body: fn(Any) -> Any) -> Coroutine = Coroutine.new(body)
 
-pub fn status(co: Coroutine) -> CoroutineStatus = co.status()
+pub fn step(co: Coroutine, .arg: Any = null) -> !CoroutineError CoroutineStep = co.step(arg = arg)
 
-pub fn try_resume(co: Coroutine, .arg: Any = null) -> !CoroutineError Any {
-    co.try_resume(arg = arg)
-}
-
-pub fn `resume`(co: Coroutine, .arg: Any = null) -> !CoroutineError Any {
-    co.try_resume(arg = arg)
-}
-
-pub fn resume_with(co: Coroutine, .arg: Any = null) -> !CoroutineError Any {
-    co.try_resume(arg = arg)
-}
-
-pub fn try_step(co: Coroutine, .arg: Any = null) -> !CoroutineError (bool, Any) {
-    co.try_step(arg = arg)
-}
-
-pub fn step(co: Coroutine, .arg: Any = null) -> Any {
-    co.step(arg = arg)
-}
-
-pub fn close(co: Coroutine) -> !CoroutineError Unit {
-    co.close()
-}
+pub fn try_resume(co: Coroutine, .arg: Any = null) -> !CoroutineError Any = co.try_resume(arg = arg)
 
 pub fn running() -> ?Coroutine {
-    _current_running_stack() match {
+    current_running_stack() match {
         stack? => if stack.is_empty() { null } else { stack.last().as(Coroutine) },
         null => null,
     }
 }
 
 pub fn is_yieldable() -> bool {
-    _current_running_stack() match {
+    current_running_stack() match {
         stack? => not stack.is_empty(),
         null => false,
     }
@@ -224,44 +249,32 @@ pub fn is_yieldable() -> bool {
 
 pub fn yield_val(.value: Any = null) -> Any {
     if not is_yieldable() {
-        _panic("attempt to yield from outside a coroutine")
+        native_panic("attempt to yield from outside a coroutine")
     }
     co_yield(value)#
 }
 
-pub fn wrap(body: fn(Any) -> Any) -> fn(Any) -> Any {
-    let co = Coroutine.create(body)
-    return |arg: Any| -> Any { co.step(arg = arg) }
-}
-
-pub struct Generator {
+pub struct GeneratorIter {
     co: Coroutine,
 }
 
-impl Iterator for Generator {
+impl Iterator for GeneratorIter {
     assoc Item: Type = Any
     pub fn next(self) -> IterationStep(Any) {
-        if self.co.status() == CoroutineStatus.dead {
+        if not self.co.is_alive() {
             return IterationStep(Any).done
         }
-        let val = self.co.step(arg = null)
-        if self.co.status() == CoroutineStatus.dead {
-            IterationStep(Any).done
-        } else {
-            IterationStep(Any).yielded(val)
+        self.co.step() match {
+            CoroutineStep.yielded(val)! => IterationStep(Any).yielded(val),
+            CoroutineStep.finished(_)! => IterationStep(Any).done,
+            error err => native_panic(err.to_string()),
         }
     }
 }
 
-impl IntoIterator for Generator {
-    assoc Iter: Type = Generator
-    pub fn into_iter(self) -> Generator = self
+impl IntoIterator for GeneratorIter {
+    assoc Iter: Type = GeneratorIter
+    pub fn into_iter(self) -> GeneratorIter = self
 }
 
-pub fn generator(body: fn() -> Unit) -> Generator {
-    let co = Coroutine.create(|_: Any| -> Any {
-        body()
-        null
-    })
-    Generator { co: co }
-}
+pub fn generator(body: fn() -> Any) -> GeneratorIter = Coroutine.generator(body)

@@ -22,6 +22,84 @@ pub(crate) fn resolve(r: &mut Resolver<'_>, ast: &Ast, node: NodeIndex) -> Optio
             })
         })
         .and_then(|ty| r.type_pool.canonical_type(ty));
+    if constructor.is_none()
+        && let Some(&callee_ty) = r.node_types.get(&callee)
+        && crate::applications::is_instance(r, callee_ty)
+    {
+        let scope = r.node_scopes.get(&node).copied().unwrap_or(r.current_scope);
+        let apply_name = str_interner::intern("apply");
+        if crate::associated::member_from(r, callee_ty, apply_name, scope).is_ok() {
+            let Some(method) = crate::methods::checked_method(r, ast, node, callee_ty, apply_name)
+            else {
+                for &argument in ast.multi_children(node) {
+                    let value = crate::argument_value_node(ast, argument);
+                    let expected = Intrinsic::Any.type_index();
+                    crate::typing::resolve_types_expected(r, ast, value, Some(expected));
+                    crate::typing::check_expected_type(
+                        r,
+                        ast,
+                        value,
+                        expected,
+                        "extended argument",
+                    );
+                }
+                return None;
+            };
+            let declaration = r.symbols[method.function.0 as usize].def_node;
+            let parameters = crate::arguments::caller_parameters(ast, declaration);
+            if crate::arguments::validate_variadic_parameters(r, ast, declaration, &parameters)
+                == Some(crate::variadics::Layout::ListMap)
+            {
+                let mut children = Vec::new();
+                let mut properties = Vec::new();
+                for (index, &argument) in ast.multi_children(node).iter().enumerate() {
+                    if ast.node(argument).kind == NodeKind::Property {
+                        properties.push((ast.node(ast.fixed_children(argument)[0]).str_id, index));
+                    } else {
+                        children.push(index);
+                    }
+                }
+                r.call_arguments.insert(
+                    node,
+                    CallArgumentPlan {
+                        declaration,
+                        parameters: parameters
+                            .iter()
+                            .zip([
+                                CallArgumentValue::Variadic {
+                                    source_indices: children,
+                                },
+                                CallArgumentValue::MapVariadic {
+                                    source_properties: properties,
+                                },
+                            ])
+                            .map(|(&parameter, value)| CallParameterBinding {
+                                parameter,
+                                symbols: crate::arguments::parameter_symbols(r, ast, parameter),
+                                value,
+                            })
+                            .collect(),
+                        spread_pack: None,
+                    },
+                );
+                r.application_calls.insert(node, method.function);
+                for &argument in ast.multi_children(node) {
+                    let value = crate::argument_value_node(ast, argument);
+                    let expected = Intrinsic::Any.type_index();
+                    crate::typing::resolve_types_expected(r, ast, value, Some(expected));
+                    crate::typing::check_expected_type(
+                        r,
+                        ast,
+                        value,
+                        expected,
+                        "extended argument",
+                    );
+                }
+                crate::ffi_bindings::check_extended_load(r, ast, node, method.function);
+                return Some(method.result);
+            }
+        }
+    }
     let struct_instance = r
         .node_types
         .get(&callee)

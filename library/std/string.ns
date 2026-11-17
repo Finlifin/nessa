@@ -1,8 +1,10 @@
--- std.string — string builtins
+-- std.string — UTF-8 String and Unicode scalar (`char`) operations and iterators.
 
 use .builtin.*
 use .collections.*
-use .fmt.try_sprintf_list
+use .conv
+use .conv.ParseError
+use .fmt.sprintf_list
 
 pub const str_len: fn(String) -> i64 = .str_len'builtin
 pub const str_concat: fn(String, String) -> String = .str_concat'builtin
@@ -118,10 +120,121 @@ const native_parse_u128: fn(String) -> ?u128 = .str_parse_u128'builtin
 const native_parse_f64: fn(String) -> ?f64 = .str_parse_f64'builtin
 const native_parse_int_radix: fn(String, i64) -> ?i64 = .__str_parse_int_radix'builtin
 const native_from_codes: fn(List) -> ?String = .str_from_codes'builtin
-const native_utf8_offset: fn(String, i64, i64) -> ?i64 = .str_utf8_offset'builtin
-const native_panic: fn(Any) -> NoReturn = .panic'builtin
+const native_bytes_from_str: fn(String) -> Bytes = .__bytes_from_str'builtin
+
+-- ============================================================================
+-- First-class String Iterators
+-- ============================================================================
+
+pub struct CharsIter {
+    source: String,
+    byte_offset: i64,
+    byte_len: i64,
+}
+
+impl Iterator for CharsIter {
+    assoc Item: Type = char
+    pub fn next(self) -> IterationStep(char) {
+        if self.byte_offset >= self.byte_len {
+            return IterationStep(char).done
+        }
+        let ch = native_char_at_byte(self.source, self.byte_offset).as(char)
+        self.byte_offset += native_utf8_len(ch)
+        IterationStep(char).yielded(ch)
+    }
+}
+
+impl IntoIterator for CharsIter {
+    assoc Iter: Type = CharsIter
+    pub fn into_iter(self) -> CharsIter = self
+}
+
+pub struct CharIndicesIter {
+    source: String,
+    byte_offset: i64,
+    byte_len: i64,
+}
+
+impl Iterator for CharIndicesIter {
+    assoc Item: Type = (usize, char)
+    pub fn next(self) -> IterationStep((usize, char)) {
+        if self.byte_offset >= self.byte_len {
+            return IterationStep((usize, char)).done
+        }
+        let offset = self.byte_offset.as(usize)
+        let ch = native_char_at_byte(self.source, self.byte_offset).as(char)
+        self.byte_offset += native_utf8_len(ch)
+        IterationStep((usize, char)).yielded((offset, ch))
+    }
+}
+
+impl IntoIterator for CharIndicesIter {
+    assoc Iter: Type = CharIndicesIter
+    pub fn into_iter(self) -> CharIndicesIter = self
+}
+
+pub struct StringBytesIter {
+    source: String,
+    byte_offset: i64,
+    byte_len: i64,
+}
+
+impl Iterator for StringBytesIter {
+    assoc Item: Type = u8
+    pub fn next(self) -> IterationStep(u8) {
+        if self.byte_offset >= self.byte_len {
+            return IterationStep(u8).done
+        }
+        let b = native_byte_at(self.source, self.byte_offset).as(u8)
+        self.byte_offset += 1
+        IterationStep(u8).yielded(b)
+    }
+}
+
+impl IntoIterator for StringBytesIter {
+    assoc Iter: Type = StringBytesIter
+    pub fn into_iter(self) -> StringBytesIter = self
+}
+
+pub struct StrLinesIter {
+    lines_list: List,
+    index: usize,
+}
+
+impl Iterator for StrLinesIter {
+    assoc Item: Type = String
+    pub fn next(self) -> IterationStep(String) {
+        if self.index < self.lines_list.len() {
+            let line = self.lines_list.get(self.index).as(String)
+            self.index += 1
+            IterationStep(String).yielded(line)
+        } else {
+            IterationStep(String).done
+        }
+    }
+}
+
+impl IntoIterator for StrLinesIter {
+    assoc Iter: Type = StrLinesIter
+    pub fn into_iter(self) -> StrLinesIter = self
+}
+
+-- ============================================================================
+-- String Methods
+-- ============================================================================
 
 impl String {
+    -- Build a UTF-8 String from a List of `char` values.
+    pub fn from_chars(chars: List) -> String {
+        let pieces = List()
+        var idx: usize = 0
+        while idx < chars.len() {
+            pieces.push(native_into_string(chars.get(idx).as(char)))
+            idx += 1
+        }
+        pieces.join("")
+    }
+
     pub fn concat(self, other: String) -> String { str_concat(self, other) }
     -- Length follows str_len and counts UTF-8 bytes.
     pub fn len(self) -> i64 { str_len(self) }
@@ -144,13 +257,28 @@ impl String {
     -- Case mapping is full Unicode mapping and may change the byte length.
     pub fn to_upper(self) -> String { native_to_upper(self) }
     pub fn to_lower(self) -> String { native_to_lower(self) }
+    pub fn to_uppercase(self) -> String { native_to_upper(self) }
+    pub fn to_lowercase(self) -> String { native_to_lower(self) }
     -- ASCII letters only. `é` and every other non-ASCII scalar stay unchanged,
     -- and the byte length does not change.
     pub fn to_ascii_uppercase(self) -> String { native_str_to_ascii_uppercase(self) }
     pub fn to_ascii_lowercase(self) -> String { native_str_to_ascii_lowercase(self) }
 
-    -- A negative count is a runtime error.
-    pub fn repeat(self, count: i64) -> String { native_repeat(self, count) }
+    -- Repeat `self` `count` times, optionally separated by `sep`.
+    -- A negative count raises a runtime domain error.
+    pub fn repeat(self, count: i64, .sep: String = "") -> String {
+        if count <= 1 or native_str_is_empty(sep) {
+            return native_repeat(self, count)
+        }
+        let pieces = List()
+        var idx: i64 = 0
+        while idx < count {
+            pieces.push(self)
+            idx += 1
+        }
+        pieces.join(sep)
+    }
+
     -- `width` counts Unicode scalars. A string that is already long enough is
     -- returned unchanged. `fill` is repeated and cut to the missing width.
     -- A negative width, or an empty fill when padding is required, is a runtime error.
@@ -194,12 +322,41 @@ impl String {
     pub fn split_whitespace(self) -> List { native_split_whitespace(self) }
     -- ASCII whitespace only. Empty pieces are omitted.
     pub fn split_ascii_whitespace(self) -> List { native_split_ascii_whitespace(self) }
+
     -- Returns a List of the char values (Unicode scalar values) in order.
     pub fn chars(self) -> List { native_chars(self) }
     -- UTF-8 bytes as i64 values in `0..=255`, the same payload as `encode_utf8`.
     pub fn bytes(self) -> List { native_str_bytes(self) }
     -- Byte offsets of each Unicode scalar, in order. Empty strings return `[]`.
     pub fn char_indices(self) -> List { native_str_char_indices(self) }
+    -- Splits on `\n`, `\r\n`, and `\r`, dropping the endings.
+    pub fn lines(self) -> List { native_str_lines(self) }
+
+    -- Lazy iterator over Unicode scalar values (`char`).
+    pub fn chars_iter(self) -> CharsIter {
+        CharsIter { source: self, byte_offset: 0, byte_len: str_len(self) }
+    }
+
+    -- Lazy iterator over `(byte_offset, char)` pairs.
+    pub fn char_indices_iter(self) -> CharIndicesIter {
+        CharIndicesIter { source: self, byte_offset: 0, byte_len: str_len(self) }
+    }
+
+    -- Lazy iterator over raw UTF-8 `u8` bytes.
+    pub fn bytes_iter(self) -> StringBytesIter {
+        StringBytesIter { source: self, byte_offset: 0, byte_len: str_len(self) }
+    }
+
+    -- Lazy iterator over lines split on `\n`, `\r\n`, and `\r`.
+    pub fn lines_iter(self) -> StrLinesIter {
+        StrLinesIter { lines_list: native_str_lines(self), index: 0 }
+    }
+
+    -- Copy UTF-8 bytes into a compact `Bytes` buffer.
+    pub fn to_bytes(self) -> Bytes {
+        native_bytes_from_str(self)
+    }
+
     -- The first `count` Unicode scalars. A larger count returns the whole string.
     -- A negative count is a runtime error.
     pub fn take(self, count: i64) -> String { native_str_take(self, count) }
@@ -215,8 +372,8 @@ impl String {
     pub fn contains_char(self, value: char) -> bool { native_contains_char(self, value) }
     pub fn replace_char(self, from: char, to: char) -> String { native_replace_char(self, from, to) }
 
-    -- Indexes below count Unicode scalar values, the same unit as `chars`.
-    -- `len` stays a UTF-8 byte count and is not a valid index here.
+    -- Unicode scalar count. `len` remains a UTF-8 byte count.
+    pub fn char_count(self) -> usize { native_char_len(self).as(usize) }
     pub fn char_len(self) -> i64 { native_char_len(self) }
     -- A negative or past-the-end index returns null.
     pub fn char_at(self, index: i64) -> ?char { native_char_at(self, index) }
@@ -262,15 +419,46 @@ impl String {
     pub fn trim_suffix(self, suffix: String) -> String { native_trim_suffix(self, suffix) }
     pub fn strip_circumfix(self, prefix: String, suffix: String) -> ?String { optional_string(native_strip_circumfix(self, prefix, suffix)) }
     pub fn strip_suffix(self, suffix: String) -> ?String { optional_string(native_strip_suffix(self, suffix)) }
+
     -- `end` is exclusive. A negative index, reversed range, or index past
     -- `char_len` is a runtime error.
     pub fn slice(self, start: i64, end: i64) -> String { native_slice(self, start, end) }
 
+    -- 0-based half-open `[start, end)` UTF-8 byte slice; returns `null` if out of bounds
+    -- or not aligned to UTF-8 character boundaries.
+    pub fn byte_slice(self, start: usize, .end: ?usize = null) -> ?String {
+        let total = str_len(self).as(usize)
+        let hi = end match {
+            e? => e,
+            _ => total,
+        }
+        if start > hi or hi > total {
+            return null
+        }
+        let sub = native_str_get(self, start.as(i64), hi.as(i64))
+        if sub == null { null } else { sub.as(String) }
+    }
+
+    -- 0-based half-open `[start, end)` Unicode scalar slice with optional `end`.
+    pub fn char_slice(self, start: usize, .end: ?usize = null) -> String {
+        let hi = end match {
+            e? => e.as(i64),
+            _ => native_char_len(self),
+        }
+        native_slice(self, start.as(i64), hi)
+    }
+
+    -- Type-directed checked scalar parsing (`i8..i128`, `isize`, `u8..u128`, `usize`, `f32`, `f64`, `bool`, `char`).
+    pub fn parse(self, target: Type, .radix: i64 = 10) -> !ParseError Any {
+        conv.parse(target, self, radix = radix)
+    }
+
+    -- Type-directed optional scalar parsing returning `null` on failure.
+    pub fn try_parse(self, target: Type, .radix: i64 = 10) -> ?Any {
+        conv.try_parse(target, self, radix = radix)
+    }
+
     -- The whole string must be a number. Whitespace is not skipped.
-    -- `parse_i64` accepts an optional sign and decimal, `0b`, `0o`, or `0x` digits.
-    -- `parse_f64` accepts an optional sign, a decimal or dotted form with digits
-    -- on both sides of `.`, and an exponent. A malformed string is null.
-    -- A value outside `i64`, or a non-finite float, is a runtime overflow.
     pub fn parse_i64(self) -> ?i64 { native_parse_i64(self) }
     pub fn parse_u64(self) -> ?u64 { native_parse_u64(self) }
     pub fn parse_i128(self) -> ?i128 { native_parse_i128(self) }
@@ -278,10 +466,7 @@ impl String {
     pub fn parse_isize(self) -> ?isize { optional_isize(native_parse_i64(self)) }
     pub fn parse_usize(self) -> ?usize { optional_usize(native_parse_u64(self)) }
     pub fn parse_f64(self) -> ?f64 { native_parse_f64(self) }
-
-    -- Splits on `\n`, `\r\n` and `\r`, dropping the endings. A trailing ending
-    -- does not add an empty line; an empty string has no lines.
-    pub fn lines(self) -> List { native_str_lines(self) }
+    pub fn parse_int_radix(self, radix: i64) -> ?i64 { native_parse_int_radix(self, radix) }
 
     -- Splits at the first match. The separator is not part of either piece.
     -- An empty separator is the same runtime error as `split`.
@@ -324,12 +509,9 @@ impl String {
         if value == null { null } else { value.as(List) }
     }
 
-    -- Format `args` using `self` as a printf / Lua `string.format` specification.
+    -- Format `args` using `self` as a printf-style specification.
     pub fn format(self, ...args: List) -> String {
-        try_sprintf_list(self, args) match {
-            formatted! => formatted,
-            error err => native_panic(err.to_string()),
-        }
+        sprintf_list(self, args)
     }
 
     -- Reverse Unicode scalar values cleanly, preserving valid UTF-8.
@@ -347,159 +529,6 @@ impl String {
     -- Reverse raw UTF-8 bytes as a List of i64 byte values.
     pub fn reverse_bytes(self) -> List {
         native_str_bytes(self).reverse()
-    }
-
-    -- Repeat `self` `count` times separated by `sep` (Lua `string.rep(s, n, sep)`).
-    -- Counts <= 0 return `""`, and `1` returns `self` without `sep`.
-    pub fn repeat_sep(self, count: i64, sep: String) -> String {
-        if count <= 0 {
-            return ""
-        }
-        if count == 1 {
-            return self
-        }
-        let pieces = List()
-        var idx: i64 = 0
-        while idx < count {
-            pieces.push(self)
-            idx += 1
-        }
-        pieces.join(sep)
-    }
-
-    -- Clamped 0-based `[start, end)` slice of UTF-8 byte values in `0..=255`.
-    pub fn bytes_range(self, start: i64, end: i64) -> List {
-        let raw = native_str_bytes(self)
-        let total = raw.len()
-        let lo = if start < 0 { 0 } else if start > total { total } else { start }
-        let hi = if end < lo { lo } else if end > total { total } else { end }
-        let out = List()
-        var idx = lo
-        while idx < hi {
-            out.push(raw.get(idx.as(usize)))
-            idx += 1
-        }
-        out
-    }
-
-    -- Clamped 1-based inclusive `[start, end]` character substring supporting negative indices
-    -- counting from the end (`-1` is the last character), matching Lua `string.sub(s, i [, j])`.
-    pub fn sub(self, start: i64, .end: ?i64 = null) -> String {
-        let total = native_char_len(self)
-        var s_idx = if start < 0 { total + start + 1 } else { start }
-        if s_idx < 1 {
-            s_idx = 1
-        }
-        let raw_end = end match {
-            e? => e,
-            _ => -1,
-        }
-        var e_idx = if raw_end < 0 { total + raw_end + 1 } else { raw_end }
-        if e_idx > total {
-            e_idx = total
-        }
-        if s_idx > e_idx {
-            return ""
-        }
-        native_slice(self, s_idx - 1, e_idx)
-    }
-
-    -- Clamped 1-based inclusive `[start, end]` slice of UTF-8 byte values in `0..=255`
-    -- supporting negative indices (`end` defaults to `start`, matching Lua `string.byte(s, i [, j])`).
-    pub fn byte_slice(self, start: i64, .end: ?i64 = null) -> List {
-        let raw = native_str_bytes(self)
-        let total = raw.len()
-        var s_idx = if start < 0 { total + start + 1 } else { start }
-        if s_idx < 1 {
-            s_idx = 1
-        }
-        let raw_end = end match {
-            e? => e,
-            _ => start,
-        }
-        var e_idx = if raw_end < 0 { total + raw_end + 1 } else { raw_end }
-        if e_idx > total {
-            e_idx = total
-        }
-        let out = List()
-        var idx = s_idx - 1
-        while idx < e_idx {
-            out.push(raw.get(idx.as(usize)))
-            idx += 1
-        }
-        out
-    }
-
-    -- 0-based byte offset of the `n`-th UTF-8 character from `byte_pos` (Lua `utf8.offset`).
-    -- When `byte_pos` is omitted (`null`), starts at `0` for `n >= 0` and `self.len()` for `n < 0`.
-    -- Negative `byte_pos` counts from the end of `self` (`-1` addresses the last byte).
-    pub fn utf8_offset(self, n: i64, .byte_pos: ?i64 = null) -> ?i64 {
-        let init_pos = byte_pos match {
-            pos? => pos,
-            _ => if n >= 0 { 0 } else { str_len(self) },
-        }
-        native_utf8_offset(self, n, init_pos)
-    }
-
-    -- List of `(byte_offset, codepoint)` `(i64, i64)` pairs for each Unicode scalar (Lua `utf8.codes`).
-    pub fn codepoints(self) -> List {
-        let offsets = native_str_char_indices(self)
-        let chars = native_chars(self)
-        let out = List()
-        var idx: usize = 0
-        while idx < offsets.len() {
-            let offset = offsets.get(idx).as(i64)
-            let code = native_to_code(chars.get(idx).as(char))
-            out.push((offset, code))
-            idx += 1
-        }
-        out
-    }
-
-    -- Alias for `codepoints` returning `(byte_offset, codepoint)` pairs (Lua `utf8.codes`).
-    pub fn utf8_codes(self) -> List {
-        self.codepoints()
-    }
-
-    -- Unicode scalar codepoints starting in 0-based inclusive byte range `[start, end]`
-    -- (`end` defaults to `start`; negative offsets count from `self.len()`; Lua `utf8.codepoint`).
-    -- Returns `null` if `start` or `end` is out of bounds or `start` is not on a UTF-8 char boundary.
-    pub fn utf8_codepoint(self, .start: i64 = 0, .end: ?i64 = null) -> ?List {
-        let total = str_len(self)
-        let lo = if start < 0 { total + start } else { start }
-        let hi_incl = end match {
-            e? => if e < 0 { total + e } else { e },
-            _ => lo,
-        }
-        if lo >= 0 and lo <= total and lo > hi_incl and hi_incl >= -1 {
-            return List()
-        }
-        if lo < 0 or lo >= total or hi_incl < 0 or hi_incl >= total {
-            return null
-        }
-        if not native_is_char_boundary(self, lo) {
-            return null
-        }
-        let out = List()
-        var pos = lo
-        while pos <= hi_incl {
-            let ch? = native_char_at_byte(self, pos) else {
-                return null
-            }
-            out.push(native_to_code(ch))
-            pos += native_utf8_len(ch)
-        }
-        out
-    }
-
-    -- Validate UTF-8 bytes in `[start, end)` and return `(char_count, null)` or `(null, bad_byte_offset)`.
-    pub fn utf8_len(self, .start: i64 = 0, .end: ?i64 = null) -> (?i64, ?i64) {
-        utf8_len_bytes(native_str_bytes(self), start = start, end = end)
-    }
-
-    -- Parse integer in `radix` (`0` auto-detects `0x`/`0b`/`0o`/decimal; `2..=36` explicit radix, trimming whitespace).
-    pub fn parse_int_radix(self, radix: i64) -> ?i64 {
-        native_parse_int_radix(self, radix)
     }
 }
 
@@ -525,143 +554,11 @@ pub fn string_from_utf16_lossy(units: List) -> String { native_from_utf16_lossy(
 
 -- Build a UTF-8 String from a List of `char` values.
 pub fn from_chars(chars: List) -> String {
-    let pieces = List()
-    var idx: usize = 0
-    while idx < chars.len() {
-        pieces.push(native_into_string(chars.get(idx).as(char)))
-        idx += 1
-    }
-    pieces.join("")
+    String.from_chars(chars)
 }
 
 -- Build a UTF-8 String from a List of Unicode scalar codepoints (`0..=0x10FFFF` excluding surrogates).
 pub fn from_codes(codes: List) -> ?String { native_from_codes(codes) }
-
--- Variadic wrapper around `from_codes` (Lua `utf8.char(...)`).
-pub fn from_char_codes(...codes: List) -> ?String { native_from_codes(codes) }
-
--- List of `(byte_offset, codepoint)` `(i64, i64)` pairs for each Unicode scalar (Lua `utf8.codes`).
-pub fn utf8_codes(s: String) -> List { s.codepoints() }
-
--- Unicode scalar codepoints in 0-based inclusive byte range `[start, end]` (Lua `utf8.codepoint`).
-pub fn utf8_codepoint(s: String, .start: i64 = 0, .end: ?i64 = null) -> ?List {
-    s.utf8_codepoint(start = start, end = end)
-}
-
-fn checked_utf8_byte_at(bytes: List, idx: i64) -> i64 {
-    let b = bytes.get(idx.as(usize)).as(i64)
-    if b < 0 or b > 255 {
-        native_panic("utf8_len: byte value out of 0..=255 range")
-    }
-    b
-}
-
--- Strict RFC 3629 UTF-8 validator and character counter over raw `0..=255` bytes in `[start, end)`
--- (negative `start` counts from `bytes.len()`; negative `end` counts inclusively from the end so `-1` is the last byte).
--- Rejects overlong 2/3/4-byte encodings, UTF-16 surrogates (`0xD800..=0xDFFF`), codepoints `> 0x10FFFF`,
--- stray continuations, and truncated sequences, returning `(count, null)` or `(null, invalid_byte_offset)`.
-pub fn utf8_len_bytes(bytes: List, .start: i64 = 0, .end: ?i64 = null) -> (?i64, ?i64) {
-    let total = bytes.len()
-    let lo = if start < 0 { total + start } else { start }
-    let hi_excl = end match {
-        e? => if e < 0 { total + e + 1 } else { e },
-        _ => total,
-    }
-    if lo < 0 or lo > total or hi_excl < 0 or hi_excl > total {
-        native_panic("utf8_len: byte index out of bounds")
-    }
-    var check_idx = lo
-    while check_idx < hi_excl {
-        let _ = checked_utf8_byte_at(bytes, check_idx)
-        check_idx += 1
-    }
-    var pos = lo
-    var count: i64 = 0
-    let null_i64: ?i64 = null
-    while pos < hi_excl {
-        let b0 = checked_utf8_byte_at(bytes, pos)
-        if b0 <= 0x7F {
-            pos += 1
-            count += 1
-        } else if b0 >= 0xC2 and b0 <= 0xDF {
-            if pos + 1 >= hi_excl {
-                let err_pos: ?i64 = pos
-                return (null_i64, err_pos)
-            }
-            let b1 = checked_utf8_byte_at(bytes, pos + 1)
-            if b1 < 0x80 or b1 > 0xBF {
-                let err_pos: ?i64 = pos
-                return (null_i64, err_pos)
-            }
-            pos += 2
-            count += 1
-        } else if b0 >= 0xE0 and b0 <= 0xEF {
-            if pos + 2 >= hi_excl {
-                let err_pos: ?i64 = pos
-                return (null_i64, err_pos)
-            }
-            let b1 = checked_utf8_byte_at(bytes, pos + 1)
-            let b2 = checked_utf8_byte_at(bytes, pos + 2)
-            let b1_ok = if b0 == 0xE0 {
-                b1 >= 0xA0 and b1 <= 0xBF
-            } else if b0 == 0xED {
-                b1 >= 0x80 and b1 <= 0x9F
-            } else {
-                b1 >= 0x80 and b1 <= 0xBF
-            }
-            if not b1_ok or b2 < 0x80 or b2 > 0xBF {
-                let err_pos: ?i64 = pos
-                return (null_i64, err_pos)
-            }
-            pos += 3
-            count += 1
-        } else if b0 >= 0xF0 and b0 <= 0xF4 {
-            if pos + 3 >= hi_excl {
-                let err_pos: ?i64 = pos
-                return (null_i64, err_pos)
-            }
-            let b1 = checked_utf8_byte_at(bytes, pos + 1)
-            let b2 = checked_utf8_byte_at(bytes, pos + 2)
-            let b3 = checked_utf8_byte_at(bytes, pos + 3)
-            let b1_ok = if b0 == 0xF0 {
-                b1 >= 0x90 and b1 <= 0xBF
-            } else if b0 == 0xF4 {
-                b1 >= 0x80 and b1 <= 0x8F
-            } else {
-                b1 >= 0x80 and b1 <= 0xBF
-            }
-            if not b1_ok or b2 < 0x80 or b2 > 0xBF or b3 < 0x80 or b3 > 0xBF {
-                let err_pos: ?i64 = pos
-                return (null_i64, err_pos)
-            }
-            pos += 4
-            count += 1
-        } else {
-            let err_pos: ?i64 = pos
-            return (null_i64, err_pos)
-        }
-    }
-    let ok_count: ?i64 = count
-    (ok_count, null_i64)
-}
-
--- Count UTF-8 scalars in `data` (`String` or `List` of `0..=255` bytes; Lua `utf8.len`),
--- returning `(count, null)` on valid UTF-8 or `(null, invalid_byte_offset)` on invalid sequences.
-pub fn utf8_len(data: Any, .start: i64 = 0, .end: ?i64 = null) -> (?i64, ?i64) {
-    let raw_bytes = data match {
-        s: String => native_str_bytes(s),
-        bytes: List => bytes,
-        _ => native_panic("utf8_len expects a String or byte List"),
-    }
-    utf8_len_bytes(raw_bytes, start = start, end = end)
-}
-
--- Pattern matching a single UTF-8 byte sequence in `std.pattern` (Lua 5.4 `utf8.charpattern`:
--- `[\0-\x7F\xC2-\xFD][\x80-\xBF]*`, encoded with `%BHH` raw hex-byte escapes).
--- Defined as zero-arg functions so `std.string` (re-exported by `std.prelude`) introduces
--- no runtime global startup initializers; `std.pattern.UTF8_CHARPATTERN` provides the `const` form.
-pub fn utf8_charpattern() -> String = "[%B00-%B7F%BC2-%BFD][%B80-%BBF]*"
-pub fn UTF8_CHARPATTERN() -> String = "[%B00-%B7F%BC2-%BFD][%B80-%BBF]*"
 
 -- Character classes follow Unicode for the general predicates and ASCII for
 -- the `ascii` predicates. Whitespace is Unicode White_Space, the same set

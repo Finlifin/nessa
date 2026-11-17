@@ -351,7 +351,7 @@ fn main() -> i64 {
             var cycle: i64 = 0
             while cycle < 3 {
                 pc.fetch_add(1)
-                if b.wait() {
+                if (b.wait() ! { _ => false }) {
                     ldr.fetch_add(1)
                 }
                 cycle += 1
