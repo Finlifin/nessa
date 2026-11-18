@@ -12,7 +12,7 @@ use crate::{CompileResult, Driver, RunResult, compilation_error};
 pub(crate) struct SourceUnit<'a> {
     pub(crate) file: &'a SourceFile,
     pub(crate) path: &'a [String],
-    parent: Option<usize>,
+    pub(crate) parent: Option<usize>,
 }
 
 impl Driver {
@@ -565,14 +565,14 @@ fn verify_workspace_lockfile(
     }
 }
 
-fn unwrap_visibility(ast: &Ast, item: NodeIndex) -> NodeIndex {
+pub(crate) fn unwrap_visibility(ast: &Ast, item: NodeIndex) -> NodeIndex {
     match ast.node(item).kind {
         NodeKind::PubDef | NodeKind::PrivateDef => ast.fixed_children(item)[0],
         _ => item,
     }
 }
 
-fn binding_name(ast: &Ast, item: NodeIndex) -> Option<str_interner::StrId> {
+pub(crate) fn binding_name(ast: &Ast, item: NodeIndex) -> Option<str_interner::StrId> {
     let mut definition = unwrap_visibility(ast, item);
     if matches!(
         ast.node(definition).kind,

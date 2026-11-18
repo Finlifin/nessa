@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::Driver;
 
-const MODULES: &[(&str, &str)] = &[
+pub(crate) const STD_ROOT_SOURCE: &str = include_str!("../../../library/std/mod.ns");
+
+pub(crate) const MODULES: &[(&str, &str)] = &[
     ("builtin", include_str!("../../../library/std/builtin.ns")),
     ("ordering", include_str!("../../../library/std/ordering.ns")),
     ("traits", include_str!("../../../library/std/traits.ns")),

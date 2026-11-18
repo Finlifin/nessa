@@ -1,0 +1,272 @@
+================================================================================
+Module, visibility, and use declarations
+================================================================================
+
+pub mod network_tools
+
+use std.collections.{List, Map as Dict}
+pub use @http_client.Request
+private use .internal.*
+
+mod helpers {
+    pub const max_retries: u32 = 3
+    private global active_count: i64 = 0
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (mod_definition
+    (visibility)
+    name: (identifier))
+  (use_declaration
+    path: (use_list_path
+      path: (scoped_use_path
+        path: (identifier)
+        name: (identifier))
+      (identifier)
+      (use_as_clause
+        path: (identifier)
+        alias: (identifier))))
+  (use_declaration
+    (visibility)
+    path: (package_use_path
+      (scoped_use_path
+        path: (identifier)
+        name: (identifier))))
+  (use_declaration
+    (visibility)
+    path: (super_use_path
+      (use_wildcard_path
+        path: (identifier))))
+  (mod_definition
+    name: (identifier)
+    body: (declaration_body
+      (const_declaration
+        (visibility)
+        pattern: (identifier)
+        type: (identifier)
+        value: (integer_literal))
+      (global_definition
+        (visibility)
+        name: (identifier)
+        type: (identifier)
+        value: (integer_literal)))))
+
+================================================================================
+Struct, ordinary enum, error enum, newtype, typealias, and derive
+================================================================================
+
+pub struct Point {
+    pub x: f64 = 0.0,
+    private y: f64 = 0.0,
+}
+
+pub enum Shape {
+    circle(radius: f64),
+    rect(width: f64, height: f64),
+    point,
+}
+
+pub enum IoError {
+    NotFound,
+    Timeout(ms: u64),
+}
+
+newtype UserId = u64
+typealias PointPair = (Point, Point)
+derive Eq, PartialEq, Display for Shape
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (struct_definition
+    (visibility)
+    name: (identifier)
+    body: (struct_body
+      (struct_field
+        (visibility)
+        name: (identifier)
+        type: (identifier)
+        default: (float_literal))
+      (struct_field
+        (visibility)
+        name: (identifier)
+        type: (identifier)
+        default: (float_literal))))
+  (enum_definition
+    (visibility)
+    name: (identifier)
+    body: (enum_body
+      (enum_variant
+        name: (identifier)
+        parameters: (parameter_list
+          (parameter
+            pattern: (identifier)
+            type: (identifier))))
+      (enum_variant
+        name: (identifier)
+        parameters: (parameter_list
+          (parameter
+            pattern: (identifier)
+            type: (identifier))
+          (parameter
+            pattern: (identifier)
+            type: (identifier))))
+      (enum_variant
+        name: (identifier))))
+  (enum_definition
+    (visibility)
+    name: (identifier)
+    body: (enum_body
+      (enum_variant
+        name: (identifier))
+      (enum_variant
+        name: (identifier)
+        parameters: (parameter_list
+          (parameter
+            pattern: (identifier)
+            type: (identifier))))))
+  (newtype_definition
+    name: (identifier)
+    type: (identifier))
+  (typealias_definition
+    name: (identifier)
+    type: (tuple_expression
+      (identifier)
+      (identifier)))
+  (derive_definition
+    trait: (identifier)
+    trait: (identifier)
+    trait: (identifier)
+    target: (identifier)))
+
+================================================================================
+Trait, assoc, impl, extend, and function parameters
+================================================================================
+
+pub trait Container(Eq) {
+    assoc Item: Type = i64
+    def fn len(self) -> usize
+    derive fn is_empty(self) -> bool = self.len() == 0
+}
+
+impl Container for List {
+    assoc Item = Any
+    pub fn len(self) -> usize {
+        0
+    }
+}
+
+extend List {
+    fn push_all(self, .prefix: i64 = 0, ...items: List) -> Unit {
+        ()
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (trait_definition
+    (visibility)
+    name: (identifier)
+    bounds: (trait_bounds
+      (identifier))
+    body: (trait_body
+      (assoc_declaration
+        name: (identifier)
+        type: (identifier)
+        value: (identifier))
+      (trait_method_signature
+        name: (identifier)
+        parameters: (parameter_list
+          (self_parameter
+            (self_literal)))
+        return_type: (identifier))
+      (trait_default_method
+        name: (identifier)
+        parameters: (parameter_list
+          (self_parameter
+            (self_literal)))
+        return_type: (identifier)
+        value: (binary_expression
+          left: (call_expression
+            function: (member_expression
+              object: (self_literal)
+              member: (identifier)))
+          right: (integer_literal)))))
+  (impl_definition
+    subject: (identifier)
+    target: (identifier)
+    body: (declaration_body
+      (assoc_declaration
+        name: (identifier)
+        value: (identifier))
+      (function_definition
+        (visibility)
+        name: (identifier)
+        parameters: (parameter_list
+          (self_parameter
+            (self_literal)))
+        return_type: (identifier)
+        body: (block
+          (expression_statement
+            (integer_literal))))))
+  (extend_definition
+    subject: (identifier)
+    body: (declaration_body
+      (function_definition
+        name: (identifier)
+        parameters: (parameter_list
+          (self_parameter
+            (self_literal))
+          (optional_parameter
+            name: (identifier)
+            type: (identifier)
+            default: (integer_literal))
+          (varargs_parameter
+            name: (identifier)
+            type: (identifier)))
+        return_type: (identifier)
+        body: (block
+          (expression_statement
+            (unit_literal)))))))
+
+================================================================================
+Indented suite blocks and let-else bindings
+================================================================================
+
+fn compute(v: ?i64) -> i64:
+    let x? = v else {
+        return 0
+    }
+    defer cleanup()
+    x + 1
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (unary_expression
+          operand: (identifier))))
+    return_type: (identifier)
+    body: (block
+      (let_statement
+        pattern: (postfix_pattern
+          pattern: (identifier))
+        value: (identifier)
+        else_branch: (block
+          (return_statement
+            value: (integer_literal))))
+      (defer_statement
+        body: (expression_statement
+          (call_expression
+            function: (identifier))))
+      (expression_statement
+        (binary_expression
+          left: (identifier)
+          right: (integer_literal))))))

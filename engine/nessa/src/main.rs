@@ -17,6 +17,8 @@ fn main() {
         "build" => cmd_build(&args[2..]),
         "check" => cmd_check(&args[2..]),
         "disasm" => cmd_disasm(&args[2..]),
+        "fmt" => process::exit(nessa_fmt::run_cli(&args[2..])),
+        "lsp" => process::exit(nessa_lsp::run_cli(&args[2..])),
         "version" | "--version" | "-V" => {
             println!("nessa {}", env!("CARGO_PKG_VERSION"));
         }
@@ -38,6 +40,8 @@ fn print_usage() {
          \x20 build <file.ns|directory> [--target <...>] [-o <path>]      Compile to .nsbc archive or .wasm\n\
          \x20 check <file.ns|directory>                                   Type-check without running\n\
          \x20 disasm <file.ns|file.nsbc|file.wasm|directory>              Disassemble bytecode or .wasm\n\
+         \x20 fmt [options] [file.ns|directory|- ...]                     Format Nessa source files (`nessa-fmt`)\n\
+         \x20 lsp [options]                                               Start Nessa Language Server (`nessa-lsp`)\n\
          \x20 version                                                     Print version\n\
          \x20 help                                                        Print this help\n\
          \n\

@@ -1,0 +1,214 @@
+================================================================================
+Interpolated strings, escaped braces, and nested expressions
+================================================================================
+
+fn greet(name: String, items: List) -> String {
+    "hello {{literal}} {name}, count={"inner {items.len()}"}"
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (identifier))
+      (parameter
+        pattern: (identifier)
+        type: (identifier)))
+    return_type: (identifier)
+    body: (block
+      (expression_statement
+        (string_literal
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (string_interpolation
+            (identifier))
+          (string_content)
+          (string_interpolation
+            (string_literal
+              (string_content)
+              (string_interpolation
+                (call_expression
+                  function: (member_expression
+                    object: (identifier)
+                    member: (identifier)))))))))))
+
+================================================================================
+Single quotes: char literals, postfix views, and loop labels
+================================================================================
+
+const panic_fn: fn(Any) -> NoReturn = .panic'builtin
+
+fn inspect_quotes(obj: Any) -> char {
+    let ch_a = 'a'
+    let ch_tick = '`'
+    let ch_esc = '\x7f'
+    let ch_uni = '\u{1F600}'
+    let raw_ptr = obj'view
+    let special = obj'`raw-view`
+    'outer: while true {
+        for :inner item in 0..10 {
+            continue inner if item < 2
+            break 'outer
+        }
+    }
+    ch_a
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (const_declaration
+    pattern: (identifier)
+    type: (function_type
+      (parameter_type
+        (identifier))
+      return_type: (identifier))
+    value: (view_expression
+      object: (symbol_literal
+        name: (identifier))
+      view: (identifier)))
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (identifier)))
+    return_type: (identifier)
+    body: (block
+      (let_statement
+        pattern: (identifier)
+        value: (char_literal))
+      (let_statement
+        pattern: (identifier)
+        value: (char_literal))
+      (let_statement
+        pattern: (identifier)
+        value: (char_literal))
+      (let_statement
+        pattern: (identifier)
+        value: (char_literal))
+      (let_statement
+        pattern: (identifier)
+        value: (view_expression
+          object: (identifier)
+          view: (identifier)))
+      (let_statement
+        pattern: (identifier)
+        value: (view_expression
+          object: (identifier)
+          view: (arbitrary_identifier)))
+      (while_statement
+        (loop_label
+          name: (identifier))
+        condition: (boolean_literal)
+        body: (block
+          (for_statement
+            label: (loop_label
+              name: (identifier))
+            pattern: (identifier)
+            iterator: (range_expression
+              start: (integer_literal)
+              end: (integer_literal))
+            body: (block
+              (continue_statement
+                label: (identifier)
+                condition: (binary_expression
+                  left: (identifier)
+                  right: (integer_literal)))
+              (break_statement
+                label: (loop_label
+                  name: (identifier)))))))
+      (expression_statement
+        (identifier)))))
+
+================================================================================
+Ranges, tuple projections, backtick infix calls, pipelines, when, and post-do
+================================================================================
+
+fn transform(nested: ((i64, i64), f64)) -> i64 {
+    let r1 = 0..=10
+    let elem = nested.0.1
+    let scaled = 1.5e-3
+    let combined = (elem `plus-weighted` 4) |> double
+    let mapped = with_resource(combined) do |res| {
+        res + 1
+    }
+    when {
+        mapped < 0 => -1,
+        else => mapped,
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (tuple_expression
+          (tuple_expression
+            (identifier)
+            (identifier))
+          (identifier))))
+    return_type: (identifier)
+    body: (block
+      (let_statement
+        pattern: (identifier)
+        value: (range_expression
+          start: (integer_literal)
+          end: (integer_literal)))
+      (let_statement
+        pattern: (identifier)
+        value: (member_expression
+          object: (member_expression
+            object: (identifier)
+            member: (tuple_index))
+          member: (tuple_index)))
+      (let_statement
+        pattern: (identifier)
+        value: (float_literal))
+      (let_statement
+        pattern: (identifier)
+        value: (binary_expression
+          left: (parenthesized_expression
+            (infix_call_expression
+              left: (identifier)
+              function: (arbitrary_identifier)
+              right: (integer_literal)))
+          right: (identifier)))
+      (let_statement
+        pattern: (identifier)
+        value: (post_do_expression
+          receiver: (call_expression
+            function: (identifier)
+            (argument
+              (identifier)))
+          handler: (lambda_expression
+            (parameter
+              pattern: (identifier))
+            body: (block
+              (expression_statement
+                (binary_expression
+                  left: (identifier)
+                  right: (integer_literal)))))))
+      (expression_statement
+        (when_expression
+          (condition_arm
+            condition: (binary_expression
+              left: (identifier)
+              right: (integer_literal))
+            body: (expression_statement
+              (unary_expression
+                operand: (integer_literal))))
+          (else_arm
+            body: (expression_statement
+              (identifier))))))))

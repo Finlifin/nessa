@@ -415,6 +415,7 @@ dependencies = [
  "runtime",
  "rustc_span",
  "sha2",
+ "source_span",
  "str_interner",
  "type_pool",
  "wasm",
@@ -1066,9 +1067,42 @@ name = "nessa"
 version = "0.1.0"
 dependencies = [
  "driver",
+ "nessa-fmt",
+ "nessa-lsp",
  "nsbc",
  "nsbc_io",
  "pkg_manager",
+ "str_interner",
+ "type_pool",
+]
+
+[[package]]
+name = "nessa-fmt"
+version = "0.1.0"
+dependencies = [
+ "ast",
+ "diagnostic",
+ "lexer",
+ "parser",
+ "rustc_span",
+ "source_span",
+ "str_interner",
+]
+
+[[package]]
+name = "nessa-lsp"
+version = "0.1.0"
+dependencies = [
+ "ast",
+ "diagnostic",
+ "driver",
+ "lexer",
+ "nessa-fmt",
+ "parser",
+ "pkg_manager",
+ "resolution",
+ "rustc_span",
+ "source_span",
  "str_interner",
  "type_pool",
 ]

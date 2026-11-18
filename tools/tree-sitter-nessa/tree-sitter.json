@@ -1,0 +1,44 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "nessa",
+      "camelcase": "Nessa",
+      "title": "Nessa",
+      "scope": "source.nessa",
+      "file-types": [
+        "ns"
+      ],
+      "injection-regex": "^nessa$",
+      "class-name": "TreeSitterNessa",
+      "highlights": "queries/highlights.scm",
+      "injections": "queries/injections.scm",
+      "locals": "queries/locals.scm",
+      "indents": "queries/indents.scm",
+      "folds": "queries/folds.scm",
+      "tags": "queries/tags.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for the Nessa programming language",
+    "authors": [
+      {
+        "name": "Nessa Contributors"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/nessa-lang/nessa"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": false,
+    "node": true,
+    "python": false,
+    "rust": false,
+    "swift": false,
+    "zig": false
+  }
+}

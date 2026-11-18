@@ -106,7 +106,7 @@ impl Ast {
             })
     }
 
-    pub(crate) fn raw_span_text(&self, span: Span) -> Option<&str> {
+    pub fn raw_span_text(&self, span: Span) -> Option<&str> {
         if span.is_dummy() {
             return None;
         }
@@ -121,7 +121,31 @@ impl Ast {
             .get(origin.range.start as usize..origin.range.end as usize)
     }
 
-    pub(crate) fn original_node_text(&self, index: NodeIndex) -> Option<&str> {
+    pub fn original_node_range(&self, index: NodeIndex) -> Option<RawByteRange> {
+        let node = self.nodes.get(index.0 as usize)?;
+        if let Some(origin) = self.original_spans.get(index.0 as usize).copied().flatten() {
+            let record = self.source_records.get(origin.source)?;
+            if record.mapping.map_range(origin.range).ok()?.span != node.span {
+                return None;
+            }
+            self.record_text(origin.source)?
+                .get(origin.range.start as usize..origin.range.end as usize)?;
+            return Some(origin.range);
+        }
+        if node.span.is_dummy() {
+            return None;
+        }
+        if self.source_records.is_empty() {
+            let start = node.span.lo().0;
+            let end = node.span.hi().0;
+            self.source.as_ref()?.get(start as usize..end as usize)?;
+            return Some(RawByteRange { start, end });
+        }
+        let origin = self.origin_for_span(node.span)?;
+        Some(origin.range)
+    }
+
+    pub fn original_node_text(&self, index: NodeIndex) -> Option<&str> {
         let node = self.nodes.get(index.0 as usize)?;
         if let Some(origin) = self.original_spans.get(index.0 as usize).copied().flatten() {
             let record = self.source_records.get(origin.source)?;

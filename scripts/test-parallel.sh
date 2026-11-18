@@ -33,7 +33,7 @@ trap 'rm -rf -- "$tmp_root"' EXIT
 
 json_log="$tmp_root/build.jsonl"
 echo "[test-parallel] Building nessa CLI & test targets ($*) with -j ${build_jobs}..." >&2
-bash "$workspace_dir/scripts/cargo.sh" build -j "$build_jobs" -p nessa --bin nessa >/dev/null
+bash "$workspace_dir/scripts/cargo.sh" build -j "$build_jobs" -p nessa --bin nessa -p nessa-fmt --bin nessa-fmt -p nessa-lsp --bin nessa-lsp >/dev/null
 bash "$workspace_dir/scripts/cargo.sh" test -j "$build_jobs" "$@" --no-run --message-format=json >"$json_log"
 
 python3 - "$json_log" "$tmp_root" "$test_jobs" "$test_threads" "$workspace_dir" <<'PY'
@@ -80,9 +80,11 @@ if not binaries:
     print("[test-parallel] No test binaries matched.", file=sys.stderr)
     sys.exit(0)
 
-# Resolve `CARGO_BIN_EXE_nessa` when present in target/debug so CLI integration tests work standalone.
+# Resolve `CARGO_BIN_EXE_*` when present in target/debug so CLI integration tests work standalone.
 target_dir = os.environ.get("CARGO_TARGET_DIR", os.path.join(workspace_dir, "target"))
 nessa_bin = os.path.join(target_dir, "debug", "nessa")
+nessa_fmt_bin = os.path.join(target_dir, "debug", "nessa-fmt")
+nessa_lsp_bin = os.path.join(target_dir, "debug", "nessa-lsp")
 
 print(
     f"[test-parallel] Running {len(binaries)} test binaries "
@@ -107,6 +109,10 @@ def run_one(index_and_item):
     env["NESSA_CACHE_DIR"] = cache_dir
     if os.path.isfile(nessa_bin):
         env.setdefault("CARGO_BIN_EXE_nessa", nessa_bin)
+    if os.path.isfile(nessa_fmt_bin):
+        env.setdefault("CARGO_BIN_EXE_nessa-fmt", nessa_fmt_bin)
+    if os.path.isfile(nessa_lsp_bin):
+        env.setdefault("CARGO_BIN_EXE_nessa-lsp", nessa_lsp_bin)
     threads = 1 if is_exclusive_timing_suite(label) else test_threads
     t0 = time.monotonic()
     proc = subprocess.run(

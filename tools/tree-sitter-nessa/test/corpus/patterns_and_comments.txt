@@ -1,0 +1,153 @@
+================================================================================
+Comments, doc comments, format directives, and nested block comments
+================================================================================
+
+--% format: width = 100
+--- Compute surface metric for a value.
+-- Internal implementation note.
+{-
+    Outer block comment
+    {- Nested inner block comment -}
+    Still inside outer block comment
+-}
+fn metric(v: i64) -> Set {
+    { -1, v }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (format_directive)
+  (doc_comment)
+  (line_comment)
+  (block_comment)
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (identifier)))
+    return_type: (identifier)
+    body: (block
+      (expression_statement
+        (object_expression
+          (unary_expression
+            operand: (integer_literal))
+          (identifier))))))
+
+================================================================================
+Composite patterns: typed, guard, and-is, or, not, list rest, record, and error
+================================================================================
+
+fn classify_value(input: Any) -> i64 {
+    let is_circle = input matches Shape.circle(r) if r > 0.0
+    input match {
+        [first: i64, ...middle, last: i64] if first < last => first + last,
+        n: i64 and n + 1 is next_val as bound => bound,
+        Shape.point or not Shape.rect(_, _) => 0,
+        { tag: .ok, count } => count,
+        ok! => ok,
+        error IoError.* as err => -1,
+        _ => 1,
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (identifier)))
+    return_type: (identifier)
+    body: (block
+      (let_statement
+        pattern: (identifier)
+        value: (matches_expression
+          value: (identifier)
+          pattern: (guard_pattern
+            pattern: (application_pattern
+              constructor: (member_pattern
+                object: (identifier)
+                member: (identifier))
+              (identifier))
+            condition: (binary_expression
+              left: (identifier)
+              right: (float_literal)))))
+      (expression_statement
+        (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (guard_pattern
+              pattern: (list_pattern
+                (typed_pattern
+                  pattern: (identifier)
+                  type: (identifier))
+                (rest_pattern
+                  (identifier))
+                (typed_pattern
+                  pattern: (identifier)
+                  type: (identifier)))
+              condition: (binary_expression
+                left: (identifier)
+                right: (identifier)))
+            body: (expression_statement
+              (binary_expression
+                left: (identifier)
+                right: (identifier))))
+          (match_arm
+            pattern: (and_is_pattern
+              pattern: (typed_pattern
+                pattern: (identifier)
+                type: (identifier))
+              value: (binary_expression
+                left: (identifier)
+                right: (integer_literal))
+              subpattern: (as_pattern
+                pattern: (identifier)
+                name: (identifier)))
+            body: (expression_statement
+              (identifier)))
+          (match_arm
+            pattern: (or_pattern
+              left: (member_pattern
+                object: (identifier)
+                member: (identifier))
+              right: (prefix_pattern
+                pattern: (application_pattern
+                  constructor: (member_pattern
+                    object: (identifier)
+                    member: (identifier))
+                  (wildcard)
+                  (wildcard))))
+            body: (expression_statement
+              (integer_literal)))
+          (match_arm
+            pattern: (record_pattern
+              (property_pattern
+                name: (identifier)
+                pattern: (symbol_literal
+                  name: (identifier)))
+              (identifier))
+            body: (expression_statement
+              (identifier)))
+          (match_arm
+            pattern: (postfix_pattern
+              pattern: (identifier))
+            body: (expression_statement
+              (identifier)))
+          (match_arm
+            pattern: (as_pattern
+              pattern: (prefix_pattern
+                pattern: (member_pattern
+                  object: (identifier)))
+              name: (identifier))
+            body: (expression_statement
+              (unary_expression
+                operand: (integer_literal))))
+          (match_arm
+            pattern: (wildcard)
+            body: (expression_statement
+              (integer_literal))))))))

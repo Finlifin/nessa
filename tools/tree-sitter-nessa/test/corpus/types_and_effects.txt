@@ -1,0 +1,197 @@
+================================================================================
+Effect declarations, continuation catch parameter, and qualified types
+================================================================================
+
+effect read_line(prompt: String, catch k: Continuation) -> String
+async effect fetch_bytes(url: String) -> !IoError Bytes
+
+typealias PureAction = fn(i64) -> #[] ![] ?String
+typealias CombinedAction = #[read_line, fetch_bytes] ![IoError, ParseError] Unit
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (effect_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (identifier))
+      (catch_parameter
+        name: (identifier)
+        type: (identifier)))
+    return_type: (identifier))
+  (effect_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (identifier)))
+    return_type: (qualified_type
+      qualifier: (identifier)
+      type: (identifier)))
+  (typealias_definition
+    name: (identifier)
+    type: (function_type
+      (parameter_type
+        (identifier))
+      return_type: (qualified_type
+        qualifier: (list_expression)
+        type: (qualified_type
+          qualifier: (list_expression)
+          type: (unary_expression
+            operand: (identifier))))))
+  (typealias_definition
+    name: (identifier)
+    type: (qualified_type
+      qualifier: (list_expression
+        (identifier)
+        (identifier))
+      type: (qualified_type
+        qualifier: (list_expression
+          (identifier)
+          (identifier))
+        type: (identifier)))))
+
+================================================================================
+Capabilities, handles statements, and effect/error elimination
+================================================================================
+
+fn run_with_log() -> i64 handles(read_line) {
+    handles(read_line) let cap = make_logger()
+    handles read_line(prompt) -> String => {
+        resume "ok"
+    }
+    let text = ask()# ! {
+        error IoError.NotFound => "missing",
+        catch other => "fallback",
+    }
+    let applied = work.use(cap).as(i64)
+    applied
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (identifier)
+    capability: (handles_clause
+      effect: (parenthesized_expression
+        (identifier)))
+    body: (block
+      (let_handler
+        effect: (identifier)
+        pattern: (identifier)
+        value: (call_expression
+          function: (identifier)))
+      (handles_statement
+        effect: (handles_target
+          (identifier))
+        parameters: (parameter_list
+          (parameter
+            pattern: (identifier)))
+        return_type: (identifier)
+        body: (block
+          (resume_statement
+            value: (string_literal
+              (string_content)))))
+      (let_statement
+        pattern: (identifier)
+        value: (error_handling_expression
+          value: (postfix_expression
+            operand: (call_expression
+              function: (identifier)))
+          (match_arm
+            pattern: (prefix_pattern
+              pattern: (member_pattern
+                object: (identifier)
+                member: (identifier)))
+            body: (expression_statement
+              (string_literal
+                (string_content))))
+          (catch_arm
+            name: (identifier)
+            body: (expression_statement
+              (string_literal
+                (string_content))))))
+      (let_statement
+        pattern: (identifier)
+        value: (cast_expression
+          value: (cast_expression
+            value: (identifier)
+            target: (identifier))
+          target: (identifier)))
+      (expression_statement
+        (identifier)))))
+
+================================================================================
+Effect elimination block, await, and delimited continuations
+================================================================================
+
+fn handle_stream(fut: Task) -> i64 {
+    let v = producer() # {
+        emit_item(item, k) => k(item + 1),
+    }
+    let done = fut.await!
+    let r = reset tag {
+        shift tag, cont {
+            cont(v + done)
+        }
+    }
+    r
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_definition
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        pattern: (identifier)
+        type: (identifier)))
+    return_type: (identifier)
+    body: (block
+      (let_statement
+        pattern: (identifier)
+        value: (effect_handling_expression
+          value: (call_expression
+            function: (identifier))
+          (match_arm
+            pattern: (application_pattern
+              constructor: (identifier)
+              (identifier)
+              (identifier))
+            body: (expression_statement
+              (call_expression
+                function: (identifier)
+                (argument
+                  (binary_expression
+                    left: (identifier)
+                    right: (integer_literal))))))))
+      (let_statement
+        pattern: (identifier)
+        value: (postfix_expression
+          operand: (await_expression
+            value: (identifier))))
+      (let_statement
+        pattern: (identifier)
+        value: (reset_expression
+          prompt: (identifier)
+          body: (block
+            (expression_statement
+              (shift_expression
+                prompt: (identifier)
+                continuation: (identifier)
+                body: (block
+                  (expression_statement
+                    (call_expression
+                      function: (identifier)
+                      (argument
+                        (binary_expression
+                          left: (identifier)
+                          right: (identifier)))))))))))
+      (expression_statement
+        (identifier)))))

@@ -223,6 +223,7 @@ pub struct DiagnosticContext<'a> {
     emitted_diagnostics: RefCell<Vec<Diagnostic>>,
     error_count: Cell<usize>,
     warning_count: Cell<usize>,
+    emit_to_stderr: bool,
 }
 
 impl<'a> DiagnosticContext<'a> {
@@ -232,6 +233,18 @@ impl<'a> DiagnosticContext<'a> {
             emitted_diagnostics: RefCell::new(Vec::new()),
             error_count: Cell::new(0),
             warning_count: Cell::new(0),
+            emit_to_stderr: true,
+        }
+    }
+
+    /// Create a diagnostic context that records diagnostics in memory without printing to stderr.
+    pub fn new_silent(source_map: &'a SourceMap) -> Self {
+        Self {
+            source_map,
+            emitted_diagnostics: RefCell::new(Vec::new()),
+            error_count: Cell::new(0),
+            warning_count: Cell::new(0),
+            emit_to_stderr: false,
         }
     }
 
@@ -246,8 +259,9 @@ impl<'a> DiagnosticContext<'a> {
             _ => {}
         }
 
-        // Emit to ariadne
-        self.emit_to_ariadne(&diagnostic);
+        if self.emit_to_stderr {
+            self.emit_to_ariadne(&diagnostic);
+        }
 
         // Store for later analysis
         self.emitted_diagnostics.borrow_mut().push(diagnostic);

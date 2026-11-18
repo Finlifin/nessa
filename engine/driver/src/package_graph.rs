@@ -471,7 +471,7 @@ fn same_sources(left: &PackageSources, right: &PackageSources) -> Result<bool, S
             .all(|(l, r)| l.path == r.path && l.file.source == r.file.source))
 }
 
-fn select_sources<'a>(
+pub(crate) fn select_sources<'a>(
     root: &'a PackageSources,
     catalog: &'a [PackageSources],
 ) -> Result<(pkg_manager::ResolvedPackageGraph, Vec<&'a PackageSources>), String> {

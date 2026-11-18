@@ -3,7 +3,9 @@
 
 mod artifact_cache;
 mod execution;
+mod ide;
 mod identity;
+pub use ide::{CheckedSourceUnit, IdeCheckResult, standard_library_sources};
 pub use identity::CompilationIdentityContext;
 pub use nsbc_io::{disassemble_artifact, disassemble_bytes};
 pub use pkg_manager::ManifestDocument;

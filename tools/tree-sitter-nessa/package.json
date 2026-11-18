@@ -1,0 +1,22 @@
+{
+  "name": "tree-sitter-nessa",
+  "version": "0.1.0",
+  "description": "Nessa grammar for tree-sitter",
+  "main": "bindings/node",
+  "keywords": [
+    "incremental",
+    "parsing",
+    "tree-sitter",
+    "nessa"
+  ],
+  "files": [
+    "grammar.js",
+    "tree-sitter.json",
+    "queries/*",
+    "src/*"
+  ],
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test"
+  }
+}

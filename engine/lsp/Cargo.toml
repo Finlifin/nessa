@@ -1,0 +1,26 @@
+[package]
+name = "nessa-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "nessa_lsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nessa-lsp"
+path = "src/main.rs"
+
+[dependencies]
+ast = { path = "../ast" }
+diagnostic = { path = "../diagnostic" }
+driver = { path = "../driver" }
+lexer = { path = "../lexer" }
+nessa-fmt = { path = "../fmt" }
+parser = { path = "../parser" }
+pkg_manager = { path = "../pkg_manager" }
+resolution = { path = "../resolution" }
+rustc_span.workspace = true
+source_span = { path = "../source_span" }
+str_interner = { path = "../str_interner" }
+type_pool = { path = "../type_pool" }
