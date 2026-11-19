@@ -375,6 +375,8 @@ impl<'a> Resolver<'a> {
             json_decode_calls: self.json_decode_calls,
             iterator_template_nodes,
             erased_callback_lambdas: self.erased_callback_lambdas,
+            external_stub_nodes: self.options.external_stub_nodes,
+            external_package_roots: self.options.external_package_roots,
         }
     }
 

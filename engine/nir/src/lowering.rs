@@ -26,15 +26,15 @@ use crate::{NirExpr, NirModule, NirParam, NirStmt, NirValue, Terminator};
 
 /// Lowers a resolved AST into NIR basic-block form.
 pub(crate) struct NirLowering {
-    functions: Vec<crate::NirFunction>,
-    next_func_id: u32,
+    pub(crate) functions: Vec<crate::NirFunction>,
+    pub(crate) next_func_id: u32,
     /// Maps function SymbolId → FuncId (populated in pass 1, used in pass 2).
-    func_map: HashMap<SymbolId, FuncId>,
+    pub(crate) func_map: HashMap<SymbolId, FuncId>,
     /// Function definitions to lower in pass 2: (node_idx, func_id).
     pending: Vec<(NodeIndex, FuncId)>,
-    derived_functions: HashMap<(TypeIndex, TypeIndex, str_interner::StrId), FuncId>,
-    global_map: HashMap<SymbolId, nsbc::GlobalId>,
-    default_function_maps: HashMap<SymbolId, HashMap<SymbolId, FuncId>>,
+    pub(crate) derived_functions: HashMap<(TypeIndex, TypeIndex, str_interner::StrId), FuncId>,
+    pub(crate) global_map: HashMap<SymbolId, nsbc::GlobalId>,
+    pub(crate) default_function_maps: HashMap<SymbolId, HashMap<SymbolId, FuncId>>,
 }
 
 impl NirLowering {
@@ -412,7 +412,7 @@ impl NirLowering {
     ///
     /// FunctionDef children: [0] name  [1] return_type  [2] body  [3] capability
     /// multi = params
-    fn lower_function_def(
+    pub(crate) fn lower_function_def(
         &mut self,
         resolved: &ResolvedAst,
         node_idx: NodeIndex,

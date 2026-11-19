@@ -9,9 +9,13 @@ pub struct EncodingError {
     pub message: String,
 }
 
-pub(crate) fn validate(module: &NirModule) -> Vec<EncodingError> {
+pub(crate) fn validate_with_imported_globals(
+    module: &NirModule,
+    imported_global_count: usize,
+) -> Vec<EncodingError> {
     let mut errors = Vec::new();
-    if module.globals.len() > (1 << 17) {
+    let total_globals = module.globals.len().saturating_add(imported_global_count);
+    if total_globals > (1 << 17) {
         errors.push(EncodingError {
             function: module.entry.unwrap_or(FuncId(0)),
             message: "an artifact currently supports at most 131072 global bindings".into(),
@@ -146,7 +150,7 @@ pub(crate) fn validate(module: &NirModule) -> Vec<EncodingError> {
                     .iter()
                     .any(|value| invalid_local(**value, function.local_count)),
                 NirStmt::StoreGlobal(global, value) => {
-                    if global.0 >= (1 << 17) || global.0 as usize >= module.globals.len() {
+                    if global.0 >= (1 << 17) || global.0 as usize >= total_globals {
                         report(
                             "NIR global store references an index outside its schema or encoding capacity",
                         );
@@ -182,7 +186,7 @@ pub(crate) fn validate(module: &NirModule) -> Vec<EncodingError> {
                     report("a list allocation instruction supports only 12-bit initial lengths")
                 }
                 NirExpr::LoadGlobal(global)
-                    if global.0 >= (1 << 17) || global.0 as usize >= module.globals.len() =>
+                    if global.0 >= (1 << 17) || global.0 as usize >= total_globals =>
                 {
                     report(
                         "NIR global load references an index outside its schema or encoding capacity",

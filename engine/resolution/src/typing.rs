@@ -1958,6 +1958,35 @@ pub(crate) fn resolve_function_def_types(r: &mut Resolver, ast: &Ast, node_idx: 
                 .then_some(Intrinsic::Unit.type_index())
         });
 
+    if r.options.external_stub_nodes.contains(&node_idx) {
+        let effective_ret = ret_type.unwrap_or(Intrinsic::Unit.type_index());
+        if ret_type.is_none() {
+            if let Some(&symbol) = r.node_symbols.get(&name_node) {
+                let signature = r.symbols[symbol.0 as usize].type_index;
+                if let TypeKind::Function { params, .. } = r.type_pool.get(signature).kind.clone() {
+                    let updated = r.register_type(TypeKind::Function {
+                        params,
+                        ret: effective_ret,
+                    });
+                    r.symbols[symbol.0 as usize].type_index = updated;
+                }
+            }
+            if let Some(decl) = r.capabilities.iter_mut().find(|c| c.def_node == node_idx) {
+                decl.return_type = effective_ret;
+            }
+        }
+        let target = match r.type_pool.get(effective_ret).kind {
+            TypeKind::EffectQualified { inner, .. } => inner,
+            _ => effective_ret,
+        };
+        crate::errors::finish_callable(r, node_idx, target);
+        resolve_types(r, ast, children[3]);
+        r.function_inference
+            .bodies
+            .insert(node_idx, crate::inference::BodyState::Ready);
+        return;
+    }
+
     // Resolve body with expected return type for bidirectional inference.
     let body_return_type = ret_type.map(|ty| match r.type_pool.get(ty).kind {
         TypeKind::EffectQualified { inner, .. } => inner,
@@ -2479,6 +2508,13 @@ pub(crate) fn resolve_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     } else {
         None
     };
+
+    if r.options.external_stub_nodes.contains(&node_idx) {
+        let effective_ti = annotation_ti.unwrap_or(Intrinsic::Any.type_index());
+        resolve_pattern_literals(r, ast, children[0], Some(effective_ti));
+        r.function_inference.values.insert(node_idx);
+        return;
+    }
 
     // Pass the declared type into bidirectional inference (or record local call-site
     // inferred lambda parameter types out-of-band without polluting `TypePool`).

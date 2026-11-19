@@ -33,6 +33,31 @@ impl Vm {
         })
     }
 
+    /// Incrementally append new module globals during per-`mod` dynamic loading.
+    /// Returns the starting global index (`global_base`) assigned to `schema[0]`.
+    pub fn extend_globals(&mut self, schema: &[GlobalInfo]) -> Result<u32, VmError> {
+        let _operation = self.execution_operation()?;
+        let cur_len = self.roots().globals.len();
+        if cur_len.saturating_add(schema.len()) > (1 << 17) {
+            return Err(VmError::ObjectTooLarge);
+        }
+        {
+            let tp = self.type_pool_read();
+            for global in schema {
+                if tp.canonical_type(global.type_index).is_none() {
+                    return Err(VmError::InvalidType(global.type_index));
+                }
+            }
+        }
+        self.with_exclusive_shared_mut(|shared| {
+            shared
+                .roots
+                .globals
+                .extend_schema(schema)
+                .map_err(VmError::from)
+        })
+    }
+
     pub(super) fn store_global(&mut self, index: u32, value: TaggedValue) -> Result<(), VmError> {
         let info = self.roots().globals.check_store(index)?;
         let value = self.assert_value_type(value, info.type_index)?;

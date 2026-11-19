@@ -204,9 +204,25 @@ impl Opcode {
         }
     }
 
+    /// Whether this A-type opcode encodes a `TypeIndex` operand (either 12-bit `AddrMode::Imm`
+    /// or 12-bit constant-pool index `AddrMode::Const` pointing to `Constant::Type`).
+    pub const fn is_type_operand_op(self) -> bool {
+        matches!(
+            self,
+            Opcode::TypeCheck
+                | Opcode::TypeCast
+                | Opcode::TypeCastSafe
+                | Opcode::TypeAssert
+                | Opcode::NewObject
+                | Opcode::TraitProof
+                | Opcode::TraitAssert
+                | Opcode::TraitProject
+        )
+    }
+
     /// Whether this A-type opcode interprets the addressing-mode field.
     pub const fn uses_amode(self) -> bool {
-        matches!(self, Opcode::Load)
+        matches!(self, Opcode::Load) || self.is_type_operand_op()
     }
 
     pub const fn from_u8(v: u8) -> Option<Self> {

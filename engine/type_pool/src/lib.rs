@@ -13,6 +13,7 @@ mod identity_encoding;
 #[cfg(test)]
 mod identity_tests;
 mod iteration_step;
+mod merge;
 mod numeric;
 mod signatures;
 mod snapshot;
@@ -32,6 +33,7 @@ pub use identity::{
     TypeIdentityInput,
 };
 pub use iteration_step::{ITERATION_DONE_TAG, ITERATION_YIELDED_TAG};
+pub use merge::{MergedDispatchState, MergedPoolMapping};
 pub use signatures::{
     TraitAssociatedPath, TraitMethodSignature, TraitParameterKind, TraitSignatureError,
     TraitTypeStep,
@@ -125,7 +127,7 @@ impl std::fmt::Debug for TypeIndex {
 /// 128-bit stable type identifier computed from package identity, version,
 /// layout, and symbol path.  Used at runtime for error-qualified-type tags,
 /// `Any` downcasts, and serialization.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(pub u64, pub u64);
 
 impl TypeId {

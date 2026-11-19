@@ -5,17 +5,134 @@ use std::fmt::Write;
 use std::io;
 
 use nsbc::{
-    AddrMode, CaptureAbi, CompiledArtifact, CompiledFunction, Constant, Instruction,
-    InstructionData, Opcode, ParameterAbi,
+    AddrMode, CaptureAbi, CompiledArtifact, CompiledFunction, Constant, ExportTarget, Instruction,
+    InstructionData, ModularArtifact, Opcode, ParameterAbi,
 };
 use type_pool::{TypeIndex, TypeKind, TypePool};
 
-use crate::read_artifact;
+use crate::{is_modular_archive, read_artifact, read_modular_artifact};
 
-/// Decode and validate an `.nsbc` archive byte slice, then render its disassembly.
+/// Decode and validate an `.nsbc` archive byte slice (standalone or modular), then render its disassembly.
 pub fn disassemble_bytes(bytes: &[u8]) -> io::Result<String> {
+    if is_modular_archive(bytes) {
+        let modular = read_modular_artifact(bytes)?;
+        return Ok(disassemble_modular_artifact(&modular));
+    }
     let artifact = read_artifact(bytes)?;
     Ok(disassemble_artifact(&artifact))
+}
+
+/// Format a [`ModularArtifact`] into a deterministic, human-readable text disassembly
+/// including `.imports`, `.exports`, `.modules`, and local `.code` / `.metadata`.
+pub fn disassemble_modular_artifact(artifact: &ModularArtifact) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "; NSBC Modular Disassembly");
+    let _ = writeln!(
+        out,
+        "package: {}@{}",
+        artifact.exports.qualified_name, artifact.exports.version
+    );
+    let _ = writeln!(
+        out,
+        "modules: {}, imported_packages: {}, imported_functions: {}, imported_globals: {}, exported_symbols: {}",
+        artifact.exports.modules.len(),
+        artifact.imports.packages.len(),
+        artifact.imports.functions.len(),
+        artifact.imports.globals.len(),
+        artifact.exports.symbols.len(),
+    );
+    let _ = writeln!(
+        out,
+        "\nsection .imports.packages ({}):",
+        artifact.imports.packages.len()
+    );
+    for (idx, pkg) in artifact.imports.packages.iter().enumerate() {
+        let _ = writeln!(out, "  [{idx}] {}@{}", pkg.qualified_name, pkg.version);
+    }
+    let _ = writeln!(
+        out,
+        "\nsection .imports.functions ({}):",
+        artifact.imports.functions.len()
+    );
+    let local_fn_base = artifact.codegen_output.functions.len();
+    for (idx, imp_fn) in artifact.imports.functions.iter().enumerate() {
+        let fid = local_fn_base + idx;
+        let sig = format_type(&artifact.type_pool, imp_fn.function_type);
+        let _ = writeln!(
+            out,
+            "  [fn #{fid}] pkg[{}] {:?} : {sig}",
+            imp_fn.package_index, imp_fn.selector
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nsection .exports.modules ({}):",
+        artifact.exports.modules.len()
+    );
+    for (idx, m) in artifact.exports.modules.iter().enumerate() {
+        let path_str = if m.module_path.is_empty() {
+            "<root>".to_owned()
+        } else {
+            m.module_path.join(".")
+        };
+        let _ = writeln!(
+            out,
+            "  [mod #{idx}] {path_str}: {} fn(s), {} global(s), {} init(s)",
+            m.owned_functions.len(),
+            m.owned_globals.len(),
+            m.scope_initializers.len()
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nsection .exports.symbols ({}):",
+        artifact.exports.symbols.len()
+    );
+    for (idx, s) in artifact.exports.symbols.iter().enumerate() {
+        let target_desc = match &s.target {
+            ExportTarget::Function { func_id, .. } => format!("fn #{}", func_id.0),
+            ExportTarget::Global { global_id, .. } => format!("global #{}", global_id.0),
+            ExportTarget::Type { type_index, .. } => format!("type #{}", type_index.as_u32()),
+        };
+        let _ = writeln!(
+            out,
+            "  [{idx}] mod #{} {:?} -> {target_desc}",
+            s.owner_module_index, s.selector
+        );
+    }
+    let _ = writeln!(out);
+    let view = CompiledArtifact {
+        codegen_output: nsbc::CodegenOutput {
+            functions: artifact
+                .codegen_output
+                .functions
+                .iter()
+                .map(|f| CompiledFunction {
+                    display_owner: f.display_owner,
+                    func_id: f.func_id,
+                    name: f.name,
+                    instructions: f.instructions.clone(),
+                    register_count: f.register_count,
+                    param_count: f.param_count,
+                    is_closure: f.is_closure,
+                    function_type: f.function_type,
+                    abi: f.abi.clone(),
+                    safepoint_pcs: f.safepoint_pcs.clone(),
+                })
+                .collect(),
+            constants: artifact.codegen_output.constants.clone(),
+            globals: artifact.codegen_output.globals.clone(),
+            method_call_scopes: artifact.codegen_output.method_call_scopes.clone(),
+        },
+        type_pool: TypePool::restore(artifact.type_pool.snapshot())
+            .unwrap_or_else(|_| TypePool::with_intrinsics()),
+        entry: artifact.exports.modules.iter().find_map(|m| m.main_func),
+        builtin_abi_version: artifact.builtin_abi_version,
+        builtins: artifact.builtins.clone(),
+        wasm_modules: artifact.wasm_modules.clone(),
+    };
+    out.push_str(&disassemble_artifact(&view));
+    out
 }
 
 /// Format a [`CompiledArtifact`] into a deterministic, human-readable text disassembly.
@@ -324,6 +441,13 @@ fn format_const_ref(ctx: &DisasmContext<'_>, idx: u32) -> String {
     }
 }
 
+fn format_type_operand(ctx: &DisasmContext<'_>, amode: AddrMode, idx: u32) -> String {
+    match amode {
+        AddrMode::Imm => format_type(ctx.pool, TypeIndex::from_raw(idx)),
+        AddrMode::Const => format_const_ref(ctx, idx),
+    }
+}
+
 fn format_fn_target(ctx: &DisasmContext<'_>, func_id: u32) -> String {
     match ctx.func_names.get(&func_id) {
         Some(name) => format!("fn #{func_id} ({name})"),
@@ -373,7 +497,7 @@ fn format_instruction(pc: usize, word: u32, ctx: &DisasmContext<'_>) -> String {
                         "{op} r{}, r{}, {}",
                         dst.0,
                         base.0,
-                        format_type(ctx.pool, TypeIndex::from_raw(idx))
+                        format_type_operand(ctx, instr.amode, idx)
                     )
                 }
                 Opcode::TraitProof | Opcode::TraitProject => {
@@ -381,7 +505,7 @@ fn format_instruction(pc: usize, word: u32, ctx: &DisasmContext<'_>) -> String {
                         "{op} r{}, r{}, {}",
                         dst.0,
                         base.0,
-                        format_type(ctx.pool, TypeIndex::from_raw(idx))
+                        format_type_operand(ctx, instr.amode, idx)
                     )
                 }
                 Opcode::TraitAssert => {
@@ -389,7 +513,7 @@ fn format_instruction(pc: usize, word: u32, ctx: &DisasmContext<'_>) -> String {
                         "{op} data=r{}, proof=r{}, {}",
                         dst.0,
                         base.0,
-                        format_type(ctx.pool, TypeIndex::from_raw(idx))
+                        format_type_operand(ctx, instr.amode, idx)
                     )
                 }
                 Opcode::ErrorOk | Opcode::ErrorErr => {
@@ -437,7 +561,7 @@ fn format_instruction(pc: usize, word: u32, ctx: &DisasmContext<'_>) -> String {
                     format!(
                         "{op} r{}, {}",
                         dst.0,
-                        format_type(ctx.pool, TypeIndex::from_raw(idx))
+                        format_type_operand(ctx, instr.amode, idx)
                     )
                 }
                 Opcode::NewList | Opcode::NewMap => {

@@ -137,6 +137,10 @@ pub struct ResolveOptions {
     pub ffi_nodes: HashSet<NodeIndex>,
     /// Restricted `[ffi] libraries = [...]` allowlist per AST node when non-empty.
     pub ffi_library_allowlists: HashMap<NodeIndex, HashSet<String>>,
+    /// Bodyless declaration stub nodes imported from precompiled `.nsbc` `EXPORTS`.
+    pub external_stub_nodes: HashSet<NodeIndex>,
+    /// Package-root module nodes backed by precompiled `.nsbc` dependency archives.
+    pub external_package_roots: HashSet<NodeIndex>,
 }
 
 impl Default for ResolveOptions {
@@ -154,6 +158,8 @@ impl Default for ResolveOptions {
             package_dependencies: HashMap::new(),
             ffi_nodes: HashSet::new(),
             ffi_library_allowlists: HashMap::new(),
+            external_stub_nodes: HashSet::new(),
+            external_package_roots: HashSet::new(),
         }
     }
 }
@@ -399,6 +405,10 @@ pub struct ResolvedAst {
     /// Inline callback `NodeKind::Lambda` nodes passed to statically refined stdlib combinators,
     /// mapped to the callee's erased runtime parameter `Function` descriptor.
     pub erased_callback_lambdas: HashMap<NodeIndex, TypeIndex>,
+    /// Bodyless declaration stub nodes imported from precompiled `.nsbc` `EXPORTS`.
+    pub external_stub_nodes: HashSet<NodeIndex>,
+    /// Package-root module nodes backed by precompiled `.nsbc` dependency archives.
+    pub external_package_roots: HashSet<NodeIndex>,
 }
 
 /// Flatten a `CaseAlternative` / `CaseMap` tree left-to-right into `CaseMap` arm nodes.

@@ -2,10 +2,12 @@
 
 use std::collections::HashSet;
 
-use crate::{ArtifactError, CompiledArtifact, Instruction, instruction_requires_scope};
+use crate::{ArtifactError, Instruction, instruction_requires_scope};
 
-pub(crate) fn validate_method_contexts(artifact: &CompiledArtifact) -> Result<(), ArtifactError> {
-    let output = &artifact.codegen_output;
+pub(crate) fn validate_method_contexts_parts(
+    output: &crate::CodegenOutput,
+    type_pool: &type_pool::TypePool,
+) -> Result<(), ArtifactError> {
     let mut covered = HashSet::with_capacity(output.method_call_scopes.len());
     for function in &output.functions {
         for (pc, &word) in function.instructions.iter().enumerate() {
@@ -31,7 +33,7 @@ pub(crate) fn validate_method_contexts(artifact: &CompiledArtifact) -> Result<()
                 context.func_id.0, context.pc
             )
         };
-        if artifact.type_pool.scope_context(context.scope).is_none() {
+        if type_pool.scope_context(context.scope).is_none() {
             return Err(ArtifactError::new(
                 location(),
                 "method scope is out of range",
@@ -78,11 +80,10 @@ pub(crate) fn validate_method_contexts(artifact: &CompiledArtifact) -> Result<()
 #[cfg(test)]
 mod tests {
     use crate::{
-        CodegenOutput, CompiledFunction, FuncId, FunctionAbi, MethodCallScope, Opcode, Reg,
+        CodegenOutput, CompiledArtifact, CompiledFunction, FuncId, FunctionAbi, Instruction,
+        MethodCallScope, Opcode, Reg,
     };
     use type_pool::{ScopeContext, TypeIndex, TypePool};
-
-    use super::*;
 
     #[test]
     fn call_and_type_instructions_require_complete_checked_scope_coverage() {

@@ -207,6 +207,23 @@ impl ManifestDocument {
         crate::identity::identity(self, &BTreeMap::new())
     }
 
+    /// Serialize this manifest into canonical TOML with bound dependency domains and constraints
+    /// so precompiled `.nsbc` archives can reconstruct the exact [`ManifestDocument`] offline.
+    pub fn to_toml_string(&self) -> String {
+        let mut table = self.metadata.clone();
+        if !self.manifest.dependencies.is_empty() {
+            let mut deps_table = toml::Table::new();
+            for dep in &self.manifest.dependencies {
+                deps_table.insert(
+                    format!("{}/{}", dep.domain, dep.name),
+                    toml::Value::String(dep.constraint.to_string()),
+                );
+            }
+            table.insert("dependencies".into(), toml::Value::Table(deps_table));
+        }
+        toml::to_string(&table).unwrap_or_default()
+    }
+
     /// Bind an unqualified (or wildcard-versioned) local path dependency to the
     /// actual `domain` and `version` discovered from its target `package.toml`.
     pub(crate) fn bind_path_dependency(

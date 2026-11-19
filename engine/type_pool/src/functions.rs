@@ -272,6 +272,29 @@ impl TypePool {
         ids.dedup();
         ids
     }
+
+    /// Prune external or unreferenced method slots, trait implementation records,
+    /// and vtables when finalizing a separately compiled modular package archive.
+    pub fn retain_dispatch_tables(
+        &mut self,
+        mut keep_method: impl FnMut(TypeIndex, &crate::MethodSlot) -> bool,
+        mut keep_trait_impl: impl FnMut(&crate::TraitImplRecord) -> bool,
+        mut keep_vtable: impl FnMut(&crate::VTable) -> bool,
+    ) {
+        for (idx, slots) in self.methods.iter_mut().enumerate() {
+            let owner = TypeIndex(idx as u32);
+            slots.retain(|slot| keep_method(owner, slot));
+        }
+        self.trait_impls.retain(|record| keep_trait_impl(record));
+        let kept_impl_keys: std::collections::HashSet<_> = self
+            .trait_impls
+            .iter()
+            .map(|r| (r.implementor, r.trait_type, r.visible_scope))
+            .collect();
+        self.associated_bindings
+            .retain(|b| kept_impl_keys.contains(&(b.implementor, b.trait_type, b.visible_scope)));
+        self.vtables.retain(|table| keep_vtable(table));
+    }
 }
 
 #[cfg(test)]

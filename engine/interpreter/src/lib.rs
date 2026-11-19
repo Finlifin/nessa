@@ -989,6 +989,16 @@ impl Vm {
             .ok_or(VmError::InvalidConstant(index))
     }
 
+    pub(crate) fn a_type_operand(&self, amode: AddrMode, imm12: u16) -> Result<TypeIndex, VmError> {
+        match amode {
+            AddrMode::Imm => Ok(TypeIndex::from_raw(u32::from(imm12))),
+            AddrMode::Const => self
+                .constant_value(u32::from(imm12))?
+                .as_type()
+                .ok_or(VmError::TypeError),
+        }
+    }
+
     pub(crate) fn constant_u32(&self, index: u32) -> Result<u32, VmError> {
         let value = self.constant_value(index)?;
         if let Some(raw) = value.as_u64() {
@@ -1031,24 +1041,104 @@ impl Vm {
         self.invalidate_jit();
     }
 
-    /// Allocate, initialize and publish a constant in one operation.
-    pub fn push_constant(&mut self, constant: &nsbc::Constant) -> Result<u32, VmError> {
-        let _operation = self.execution_operation()?;
-        let value = match constant {
-            nsbc::Constant::Int(value) => self.number_value(Number::I64(*value))?,
-            nsbc::Constant::UInt(value) => self.number_value(Number::U64(*value))?,
-            nsbc::Constant::Int128(value) => self.number_value(Number::I128(*value))?,
-            nsbc::Constant::UInt128(value) => self.number_value(Number::U128(*value))?,
-            nsbc::Constant::Float(value) => self.number_value(Number::F64(*value))?,
-            nsbc::Constant::Str(value) => self.alloc_string(value)?,
-            nsbc::Constant::Char(value) => TaggedValue::from_char(*value),
-            nsbc::Constant::Type(ty) => self.type_value(*ty)?,
+    /// Incrementally merge passive type definitions, scopes, trait schemas, and associated
+    /// bindings/defaults from `src` into the VM's live [`TypePool`].
+    pub fn merge_type_pool(
+        &mut self,
+        src: &TypePool,
+    ) -> Result<type_pool::MergedPoolMapping, type_pool::SnapshotError> {
+        let _operation = self.operation();
+        self.worker.type_query_scope = None;
+        let mapping = self.with_exclusive_shared_mut(|shared| {
+            let res = shared.type_pool.write().merge_types_and_scopes(src)?;
+            shared.metadata_epoch.fetch_add(1, Ordering::Release);
+            Ok(res)
+        });
+        if mapping.is_ok() {
+            self.invalidate_jit();
+        }
+        mapping
+    }
+
+    /// Incrementally publish method slots, trait implementations, and vtables for newly loaded
+    /// module functions into the VM's live [`TypePool`].
+    pub fn install_merged_type_dispatch(
+        &mut self,
+        src: &TypePool,
+        mapping: &type_pool::MergedPoolMapping,
+        func_map: &std::collections::HashMap<u32, u32>,
+        state: &mut type_pool::MergedDispatchState,
+    ) -> Result<bool, type_pool::SnapshotError> {
+        let _operation = self.operation();
+        let changed = self.with_exclusive_shared_mut(|shared| {
+            let changed = shared
+                .type_pool
+                .write()
+                .install_merged_dispatch(src, mapping, func_map, state)?;
+            if changed {
+                let mut reg = shared.trait_registry.write();
+                reg.cache.clear();
+                drop(reg);
+                shared.metadata_epoch.fetch_add(1, Ordering::Release);
+            }
+            Ok(changed)
+        })?;
+        if changed {
+            self.invalidate_jit();
+        }
+        Ok(changed)
+    }
+
+    /// Current number of compiled functions installed in the VM's [`BytecodeStore`].
+    pub fn function_count(&self) -> usize {
+        self.shared.bytecode.function_count()
+    }
+
+    /// Current number of constants installed in the VM's [`ConstantPool`].
+    pub fn constant_count(&self) -> usize {
+        self.constants_read().len()
+    }
+
+    /// Pre-size the VM's [`ConstantPool`] to at least `min_len` (`Unit`-initialized).
+    pub fn ensure_constant_len(&mut self, min_len: usize) {
+        let _operation = self.operation();
+        self.shared.roots.constants.write().ensure_len(min_len);
+    }
+
+    fn materialize_constant(&mut self, constant: &nsbc::Constant) -> Result<TaggedValue, VmError> {
+        match constant {
+            nsbc::Constant::Int(value) => self.number_value(Number::I64(*value)),
+            nsbc::Constant::UInt(value) => self.number_value(Number::U64(*value)),
+            nsbc::Constant::Int128(value) => self.number_value(Number::I128(*value)),
+            nsbc::Constant::UInt128(value) => self.number_value(Number::U128(*value)),
+            nsbc::Constant::Float(value) => self.number_value(Number::F64(*value)),
+            nsbc::Constant::Str(value) => self.alloc_string(value),
+            nsbc::Constant::Char(value) => Ok(TaggedValue::from_char(*value)),
+            nsbc::Constant::Type(ty) => self.type_value(*ty),
             nsbc::Constant::Enum {
                 type_index,
                 variant,
-            } => self.enum_constant(*type_index, *variant)?,
-        };
+            } => self.enum_constant(*type_index, *variant),
+        }
+    }
+
+    /// Allocate, initialize and publish a constant in one operation.
+    pub fn push_constant(&mut self, constant: &nsbc::Constant) -> Result<u32, VmError> {
+        let _operation = self.execution_operation()?;
+        let value = self.materialize_constant(constant)?;
         Ok(self.shared.roots.constants.write().push(value))
+    }
+
+    /// Allocate, initialize and write a constant into a reserved [`ConstantPool`] slot `index`.
+    pub fn set_constant_at(
+        &mut self,
+        index: u32,
+        constant: &nsbc::Constant,
+    ) -> Result<(), VmError> {
+        let _operation = self.execution_operation()?;
+        let value = self.materialize_constant(constant)?;
+        self.shared.roots.constants.write().set(index, value);
+        Ok(())
     }
 
     /// Return an owned scalar snapshot; no borrowed task or heap value escapes.
@@ -2380,10 +2470,13 @@ impl Vm {
             // ── Object creation (A-type) ──────────────────────────
             Opcode::NewObject => {
                 let (dst, _, imm12) = a_fields(&instr);
+                let raw_ty = match self.a_type_operand(instr.amode, imm12) {
+                    Ok(ty) => ty,
+                    Err(error) => return DispatchResult::Error(error),
+                };
                 let (type_idx, words) = {
                     let tp = self.type_pool_read();
-                    let Some(type_idx) = tp.canonical_type(TypeIndex::from_raw(imm12 as u32))
-                    else {
+                    let Some(type_idx) = tp.canonical_type(raw_ty) else {
                         return DispatchResult::Error(VmError::TypeError);
                     };
                     if tp.is_reserved_collection_role(type_idx) {
@@ -2746,7 +2839,10 @@ impl Vm {
 
             Opcode::TraitProof | Opcode::TraitAssert | Opcode::TraitProject => {
                 let (dst, base, view) = a_fields(&instr);
-                let view = TypeIndex::from_raw(view as u32);
+                let view = match self.a_type_operand(instr.amode, view) {
+                    Ok(ty) => ty,
+                    Err(error) => return DispatchResult::Error(error),
+                };
                 let source = task!().registers.get(base);
                 let result = match instr.opcode {
                     Opcode::TraitProof => self.acquire_trait_proof(source, view),

@@ -768,7 +768,10 @@ impl Vm {
             return DispatchResult::Error(VmError::InvalidTask);
         };
         let value = task_ref.registers.get(source);
-        let target = TypeIndex::from_raw(index as u32);
+        let target = match self.a_type_operand(instruction.amode, index) {
+            Ok(ty) => ty,
+            Err(error) => return DispatchResult::Error(error),
+        };
         let result = if instruction.opcode == nsbc::Opcode::TypeCheck {
             self.value_matches_type(value, target, 0)
                 .map(TaggedValue::from_bool)

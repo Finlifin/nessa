@@ -51,7 +51,9 @@ fn method_name(instruction: &Instruction, constants: &[Constant]) -> io::Result<
 pub(crate) fn constant_reference(instruction: &Instruction) -> Option<u32> {
     match instruction.data {
         InstructionData::A { imm12, .. }
-            if instruction.opcode == Opcode::Load && instruction.amode == AddrMode::Const
+            if (instruction.opcode == Opcode::Load && instruction.amode == AddrMode::Const)
+                || (instruction.opcode.is_type_operand_op()
+                    && instruction.amode == AddrMode::Const)
                 || matches!(
                     instruction.opcode,
                     Opcode::NewClosureWide
@@ -125,14 +127,16 @@ pub(super) fn encode(output: &CodegenOutput) -> io::Result<RelocatedCode> {
         }
         match instruction.data {
             InstructionData::A { imm12, .. }
-                if matches!(
-                    instruction.opcode,
-                    Opcode::NewClosureWide
-                        | Opcode::NewEnum
-                        | Opcode::EnumIs
-                        | Opcode::ErrorOk
-                        | Opcode::ErrorErr
-                ) =>
+                if (instruction.opcode.is_type_operand_op()
+                    && instruction.amode == AddrMode::Const)
+                    || matches!(
+                        instruction.opcode,
+                        Opcode::NewClosureWide
+                            | Opcode::NewEnum
+                            | Opcode::EnumIs
+                            | Opcode::ErrorOk
+                            | Opcode::ErrorErr
+                    ) =>
             {
                 narrow.insert(imm12 as usize);
             }
@@ -232,29 +236,35 @@ pub(super) fn encode(output: &CodegenOutput) -> io::Result<RelocatedCode> {
                         };
                     }
                     InstructionData::A { dst, base, imm12 }
-                        if matches!(
-                            instruction.opcode,
-                            Opcode::NewClosureWide
-                                | Opcode::NewEnum
-                                | Opcode::EnumIs
-                                | Opcode::ErrorOk
-                                | Opcode::ErrorErr
-                        ) =>
+                        if (instruction.opcode.is_type_operand_op()
+                            && instruction.amode == AddrMode::Const)
+                            || matches!(
+                                instruction.opcode,
+                                Opcode::NewClosureWide
+                                    | Opcode::NewEnum
+                                    | Opcode::EnumIs
+                                    | Opcode::ErrorOk
+                                    | Opcode::ErrorErr
+                            ) =>
                     {
                         let new = relocated_index(imm12 as u32)? as u16;
-                        instruction = match instruction.opcode {
-                            Opcode::NewClosureWide => {
-                                Instruction::new_closure_wide(dst, new, base.0)
+                        instruction = if instruction.opcode.is_type_operand_op() {
+                            Instruction::a_type(instruction.opcode, AddrMode::Const, dst, base, new)
+                        } else {
+                            match instruction.opcode {
+                                Opcode::NewClosureWide => {
+                                    Instruction::new_closure_wide(dst, new, base.0)
+                                }
+                                Opcode::NewEnum => Instruction::new_enum(dst, base, new),
+                                Opcode::ErrorOk | Opcode::ErrorErr => Instruction::a_type(
+                                    instruction.opcode,
+                                    AddrMode::Imm,
+                                    dst,
+                                    base,
+                                    new,
+                                ),
+                                _ => Instruction::enum_is(dst, base, new),
                             }
-                            Opcode::NewEnum => Instruction::new_enum(dst, base, new),
-                            Opcode::ErrorOk | Opcode::ErrorErr => Instruction::a_type(
-                                instruction.opcode,
-                                AddrMode::Imm,
-                                dst,
-                                base,
-                                new,
-                            ),
-                            _ => Instruction::enum_is(dst, base, new),
                         };
                     }
                     InstructionData::C { payload } if instruction.opcode == Opcode::CallFar => {

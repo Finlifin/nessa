@@ -7,6 +7,7 @@ mod artifact;
 mod constants;
 mod container;
 mod disassemble;
+mod modular;
 mod relocation;
 mod type_metadata;
 
@@ -16,7 +17,10 @@ use nsbc::{Constant, FileHeader, SectionEntry, SectionKind};
 
 pub use artifact::{read_artifact, write_artifact};
 pub use container::MAX_ARCHIVE_SIZE;
-pub use disassemble::{disassemble_artifact, disassemble_bytes};
+pub use disassemble::{disassemble_artifact, disassemble_bytes, disassemble_modular_artifact};
+pub use modular::{
+    is_modular_archive, read_modular_artifact, read_modular_exports_only, write_modular_artifact,
+};
 
 // ---------------------------------------------------------------------------
 // Archive writer

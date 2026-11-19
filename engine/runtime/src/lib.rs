@@ -1112,6 +1112,34 @@ impl GlobalTable {
         Ok(())
     }
 
+    /// Incrementally append module globals during per-module dynamic loading outside `Vm::run()`.
+    /// Returns the starting global index (`global_base`) assigned to `schema[0]`.
+    pub fn extend_schema(&mut self, schema: &[GlobalInfo]) -> Result<u32, GlobalError> {
+        let base = u32::try_from(self.values.len()).map_err(|_| GlobalError::OutOfMemory)?;
+        if schema.is_empty() {
+            return Ok(base);
+        }
+        self.values
+            .try_reserve(schema.len())
+            .map_err(|_| GlobalError::OutOfMemory)?;
+        self.slots
+            .try_reserve(schema.len())
+            .map_err(|_| GlobalError::OutOfMemory)?;
+        self.values.extend(
+            (0..schema.len()).map(|_| std::sync::atomic::AtomicU64::new(TaggedValue::UNIT.raw())),
+        );
+        self.slots.extend(schema.iter().map(|&info| GlobalSlot {
+            info,
+            state: std::sync::atomic::AtomicU8::new(GLOBAL_STATE_UNINIT),
+        }));
+        self.schema_initialized = true;
+        Ok(base)
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
     pub fn alloc(&mut self, init: TaggedValue) -> u32 {
         let idx = self.values.len() as u32;
         self.values
@@ -1296,6 +1324,28 @@ impl ConstantPool {
         let idx = self.values.len() as u32;
         self.values.push(val);
         idx
+    }
+
+    pub fn ensure_len(&mut self, min_len: usize) {
+        if self.values.len() < min_len {
+            self.values.resize(min_len, TaggedValue::UNIT);
+        }
+    }
+
+    pub fn set(&mut self, idx: u32, val: TaggedValue) {
+        let pos = idx as usize;
+        if self.values.len() <= pos {
+            self.values.resize(pos + 1, TaggedValue::UNIT);
+        }
+        self.values[pos] = val;
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 
     pub fn get(&self, idx: u32) -> TaggedValue {

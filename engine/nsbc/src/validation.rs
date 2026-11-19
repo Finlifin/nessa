@@ -7,8 +7,9 @@ use std::fmt;
 use type_pool::{TypeIndex, TypeKind, TypePool};
 
 use crate::{
-    AddrMode, CaptureAbi, CodegenOutput, CompiledArtifact, CompiledFunction, Constant, Instruction,
-    InstructionData, Opcode, ParameterAbi, Reg,
+    AddrMode, CaptureAbi, CodegenOutput, CompiledArtifact, CompiledFunction, Constant,
+    ExportTarget, FuncId, Instruction, InstructionData, ModularArtifact, Opcode, ParameterAbi, Reg,
+    WasmModuleDef,
 };
 
 /// A malformed or unsupported artifact, with the offending metadata or PC.
@@ -88,14 +89,292 @@ pub fn builtin_references(output: &CodegenOutput) -> Result<BTreeSet<u32>, Artif
 
 /// Check cross-pool references, executable operands and bounded frame layouts.
 pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactError> {
-    let output = &artifact.codegen_output;
-    if output.functions.len() > MAX_FUNCTIONS || output.constants.len() > MAX_CONSTANTS {
+    validate_core_parts(
+        &artifact.codegen_output,
+        &artifact.type_pool,
+        &artifact.builtins,
+        &artifact.wasm_modules,
+        artifact.entry,
+        &[],
+        &[],
+    )
+}
+
+/// Validate a [`ModularArtifact`], including its `IMPORTS`, `EXPORTS`, per-`mod` ownership
+/// partitions, and all bytecode instructions referencing local or imported `FuncId`s/`GlobalId`s.
+pub fn validate_modular_artifact(artifact: &ModularArtifact) -> Result<(), ArtifactError> {
+    let local_fn_count = artifact.codegen_output.functions.len();
+    let local_global_count = artifact.codegen_output.globals.len();
+    let imp = &artifact.imports;
+    let exp = &artifact.exports;
+
+    if exp.qualified_name.is_empty() || exp.version.is_empty() {
+        return Err(ArtifactError::new(
+            "exports",
+            "package qualified_name and version must be non-empty",
+        ));
+    }
+    if exp.modules.is_empty() {
+        return Err(ArtifactError::new(
+            "exports",
+            "modular artifact must contain at least one module descriptor",
+        ));
+    }
+
+    let mut seen_pkg = BTreeSet::new();
+    for pkg in &imp.packages {
+        if pkg.qualified_name.is_empty()
+            || pkg.version.is_empty()
+            || !seen_pkg.insert((pkg.qualified_name.as_str(), pkg.version.as_str()))
+        {
+            return Err(ArtifactError::new(
+                "imports",
+                "empty or duplicate imported package entry",
+            ));
+        }
+    }
+
+    for imp_fn in &imp.functions {
+        if imp_fn.package_index as usize >= imp.packages.len() {
+            return Err(ArtifactError::new(
+                "imports",
+                "imported function package_index out of range",
+            ));
+        }
+        if imp_fn.abi.capture_count() != 0 {
+            return Err(ArtifactError::new(
+                "imports",
+                "imported function cannot require closure captures",
+            ));
+        }
+    }
+
+    for imp_glob in &imp.globals {
+        if imp_glob.package_index as usize >= imp.packages.len() || imp_glob.name.is_empty() {
+            return Err(ArtifactError::new(
+                "imports",
+                "imported global has out-of-range package_index or empty name",
+            ));
+        }
+    }
+
+    for mdep in &imp.module_dependencies {
+        if mdep.package_index as usize >= imp.packages.len() {
+            return Err(ArtifactError::new(
+                "imports",
+                "imported module dependency package_index out of range",
+            ));
+        }
+    }
+
+    let mut owned_fns = vec![false; local_fn_count];
+    let mut owned_globals = vec![false; local_global_count];
+    let mut seen_mod_paths = BTreeSet::new();
+    let mod_count = exp.modules.len();
+
+    for (midx, module) in exp.modules.iter().enumerate() {
+        if !seen_mod_paths.insert(&module.module_path) {
+            return Err(ArtifactError::new(
+                "exports",
+                "duplicate module_path in module table",
+            ));
+        }
+        for &fid in &module.owned_functions {
+            let Some(slot) = owned_fns.get_mut(fid.0 as usize) else {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "module owned_functions references out-of-range local FuncId",
+                ));
+            };
+            if *slot {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "local FuncId is claimed by multiple module descriptors",
+                ));
+            }
+            *slot = true;
+        }
+        for &gid in &module.owned_globals {
+            let Some(slot) = owned_globals.get_mut(gid.0 as usize) else {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "module owned_globals references out-of-range local GlobalId",
+                ));
+            };
+            if *slot {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "local GlobalId is claimed by multiple module descriptors",
+                ));
+            }
+            *slot = true;
+        }
+        for &init_fid in &module.scope_initializers {
+            if !module.owned_functions.contains(&init_fid) {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "scope_initializer must belong to the same module's owned_functions",
+                ));
+            }
+            let Some(init_fn) = artifact
+                .codegen_output
+                .functions
+                .iter()
+                .find(|f| f.func_id == init_fid)
+            else {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "missing scope_initializer function",
+                ));
+            };
+            if init_fn.is_closure || init_fn.param_count != 0 {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "scope_initializer must be a zero-parameter non-closure",
+                ));
+            }
+        }
+        if let Some(main_fid) = module.main_func
+            && !module.owned_functions.contains(&main_fid)
+        {
+            return Err(ArtifactError::new(
+                "exports",
+                "main_func must belong to the module's owned_functions",
+            ));
+        }
+        for &dep in module
+            .local_module_deps
+            .iter()
+            .chain(&module.local_init_prereqs)
+        {
+            if dep as usize >= mod_count || dep as usize == midx {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "invalid or self-referential local module dependency index",
+                ));
+            }
+        }
+        for &edep in module
+            .external_module_deps
+            .iter()
+            .chain(&module.external_init_prereqs)
+        {
+            if edep as usize >= imp.module_dependencies.len() {
+                return Err(ArtifactError::new(
+                    "exports",
+                    "external module dependency index out of range",
+                ));
+            }
+        }
+    }
+
+    if owned_fns.iter().any(|&claimed| !claimed) {
+        return Err(ArtifactError::new(
+            "exports",
+            "every local function must belong to a module descriptor",
+        ));
+    }
+    if owned_globals.iter().any(|&claimed| !claimed) {
+        return Err(ArtifactError::new(
+            "exports",
+            "every local global must belong to a module descriptor",
+        ));
+    }
+
+    let total_fns = local_fn_count
+        .checked_add(imp.functions.len())
+        .ok_or_else(|| ArtifactError::new("imports", "total function count overflow"))?;
+    let total_globals = local_global_count
+        .checked_add(imp.globals.len())
+        .ok_or_else(|| ArtifactError::new("imports", "total global count overflow"))?;
+
+    for sym in &exp.symbols {
+        if sym.owner_module_index as usize >= mod_count {
+            return Err(ArtifactError::new(
+                "exports",
+                "exported symbol owner_module_index out of range",
+            ));
+        }
+        match &sym.target {
+            ExportTarget::Function { func_id, .. } => {
+                if (func_id.0 as usize) >= total_fns {
+                    return Err(ArtifactError::new(
+                        "exports",
+                        "exported function target FuncId out of range",
+                    ));
+                }
+            }
+            ExportTarget::Global { global_id, .. } => {
+                if (global_id.0 as usize) >= total_globals {
+                    return Err(ArtifactError::new(
+                        "exports",
+                        "exported global target GlobalId out of range",
+                    ));
+                }
+            }
+            ExportTarget::Type { type_index, .. } => {
+                if artifact.type_pool.canonical_type(*type_index).is_none() {
+                    return Err(ArtifactError::new(
+                        "exports",
+                        "exported type target TypeIndex out of range",
+                    ));
+                }
+            }
+        }
+    }
+
+    let synth_name = str_interner::intern("__imported_stub");
+    let synth_imported_fns: Vec<CompiledFunction> = imp
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| CompiledFunction {
+            display_owner: f.display_owner,
+            func_id: FuncId((local_fn_count + idx) as u32),
+            name: synth_name,
+            instructions: vec![Instruction::unreachable().encode()],
+            register_count: f.param_count,
+            param_count: f.param_count,
+            is_closure: false,
+            function_type: f.function_type,
+            abi: f.abi.clone(),
+            safepoint_pcs: Vec::new(),
+        })
+        .collect();
+
+    let main_entry = exp.modules.iter().find_map(|m| m.main_func);
+    validate_core_parts(
+        &artifact.codegen_output,
+        &artifact.type_pool,
+        &artifact.builtins,
+        &artifact.wasm_modules,
+        main_entry,
+        &synth_imported_fns,
+        &imp.globals,
+    )
+}
+
+fn validate_core_parts(
+    output: &CodegenOutput,
+    type_pool: &TypePool,
+    declared_builtins: &[crate::BuiltinImport],
+    wasm_modules: &[WasmModuleDef],
+    entry: Option<FuncId>,
+    imported_functions: &[CompiledFunction],
+    imported_globals: &[crate::ImportedGlobal],
+) -> Result<(), ArtifactError> {
+    let total_fn_count = output
+        .functions
+        .len()
+        .checked_add(imported_functions.len())
+        .ok_or_else(|| ArtifactError::new("artifact", "function limit exceeded"))?;
+    if total_fn_count > MAX_FUNCTIONS || output.constants.len() > MAX_CONSTANTS {
         return Err(ArtifactError::new(
             "artifact",
             "function or constant limit exceeded",
         ));
     }
-    let mut dense_functions = vec![None; output.functions.len()];
+    let mut dense_functions = vec![None; total_fn_count];
     let mut seen_ids = BTreeSet::new();
     let mut words = 0usize;
     for function in &output.functions {
@@ -103,6 +382,12 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
             .checked_add(function.instructions.len())
             .filter(|&count| count <= MAX_INSTRUCTIONS)
             .ok_or_else(|| ArtifactError::new("artifact", "instruction limit exceeded"))?;
+        if (function.func_id.0 as usize) >= output.functions.len() {
+            return Err(ArtifactError::new(
+                "functions",
+                "function IDs must be dense from zero",
+            ));
+        }
         if !seen_ids.insert(function.func_id.0) {
             return Err(ArtifactError::new("functions", "duplicate function ID"));
         }
@@ -110,7 +395,15 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
             *slot = Some(function);
         }
     }
-    let mut functions = Vec::with_capacity(output.functions.len());
+    for function in imported_functions {
+        if !seen_ids.insert(function.func_id.0) {
+            return Err(ArtifactError::new("functions", "duplicate function ID"));
+        }
+        if let Some(slot) = dense_functions.get_mut(function.func_id.0 as usize) {
+            *slot = Some(function);
+        }
+    }
+    let mut functions = Vec::with_capacity(total_fn_count);
     for slot in dense_functions {
         let Some(function) = slot else {
             return Err(ArtifactError::new(
@@ -120,36 +413,41 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
         };
         functions.push(function);
     }
-    artifact
-        .type_pool
+    type_pool
         .validate()
         .map_err(|error| ArtifactError::new("type pool", error.to_string()))?;
-    if artifact.type_pool.has_unresolved_derived_methods() {
+    if type_pool.has_unresolved_derived_methods() {
         return Err(ArtifactError::new(
             "type pool",
             "unresolved derived method sentinel in executable artifact",
         ));
     }
-    let pool_len = artifact.type_pool.len();
-    let max_trait_slots = artifact
-        .type_pool
+    let pool_len = type_pool.len();
+    let max_trait_slots = type_pool
         .trait_schemas_snapshot()
         .iter()
         .map(|schema| schema.slots.len())
         .max()
         .unwrap_or(0);
-    let wasm_binding_arities = validate_wasm_modules(artifact)?;
+    let wasm_binding_arities = validate_wasm_modules(wasm_modules, type_pool)?;
+    let total_global_count = output
+        .globals
+        .len()
+        .checked_add(imported_globals.len())
+        .ok_or_else(|| ArtifactError::new("globals", "global slot limit exceeded"))?;
+    if total_global_count > MAX_SLOTS as usize {
+        return Err(ArtifactError::new("globals", "global slot limit exceeded"));
+    }
     let func_len = functions.len();
     let validator = Validator {
-        artifact,
-        pool: &artifact.type_pool,
+        output,
+        total_global_count,
+        pool: type_pool,
         functions,
         max_trait_slots,
         wasm_binding_arities,
-        has_list_roles: artifact.type_pool.list_type().is_some()
-            && artifact.type_pool.list_buffer_type().is_some(),
-        has_map_roles: artifact.type_pool.map_type().is_some()
-            && artifact.type_pool.map_buffer_type().is_some(),
+        has_list_roles: type_pool.list_type().is_some() && type_pool.list_buffer_type().is_some(),
+        has_map_roles: type_pool.map_type().is_some() && type_pool.map_buffer_type().is_some(),
         validated_runtime_types: RefCell::new(vec![None; pool_len]),
         validated_error_ctors: RefCell::new(vec![false; pool_len]),
         validated_captures: RefCell::new(vec![None; func_len]),
@@ -159,7 +457,7 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
     };
     let mut names = BTreeSet::new();
     let mut builtins = BTreeSet::new();
-    for builtin in &artifact.builtins {
+    for builtin in declared_builtins {
         if builtin.id >= 1 << 14
             || builtin.name.is_empty()
             || !builtins.insert(builtin.id)
@@ -180,8 +478,11 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
     for (index, global) in output.globals.iter().enumerate() {
         validator.runtime_type(global.type_index, VContext::Global(index))?;
     }
-    if output.globals.len() > MAX_SLOTS as usize {
-        return Err(ArtifactError::new("globals", "global slot limit exceeded"));
+    for (idx, global) in imported_globals.iter().enumerate() {
+        validator.runtime_type(
+            global.type_index,
+            VContext::Global(output.globals.len() + idx),
+        )?;
     }
     for (index, constant) in output.constants.iter().enumerate() {
         match constant {
@@ -197,10 +498,13 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
             _ => {}
         }
     }
+    for function in imported_functions {
+        validator.captures(function, VContext::Function(function.func_id.0))?;
+    }
     for function in &output.functions {
         validator.function(function)?;
     }
-    if let Some(entry) = artifact.entry {
+    if let Some(entry) = entry {
         let entry = validator.target(entry.0, VContext::Static("entry"))?;
         if entry.is_closure || entry.param_count != 0 {
             return Err(ArtifactError::new(
@@ -210,11 +514,14 @@ pub fn validate_artifact(artifact: &CompiledArtifact) -> Result<(), ArtifactErro
         }
     }
     validator.methods()?;
-    crate::method_context::validate_method_contexts(artifact)?;
+    crate::method_context::validate_method_contexts_parts(output, type_pool)?;
     Ok(())
 }
 
-fn validate_wasm_modules(artifact: &CompiledArtifact) -> Result<Vec<u8>, ArtifactError> {
+fn validate_wasm_modules(
+    wasm_modules: &[WasmModuleDef],
+    pool: &TypePool,
+) -> Result<Vec<u8>, ArtifactError> {
     use type_pool::{CollectionRole, Intrinsic};
     use wasmparser::{
         ExternalKind, Parser, Payload, TypeRef, ValType, Validator as WpValidator, WasmFeatures,
@@ -223,18 +530,17 @@ fn validate_wasm_modules(artifact: &CompiledArtifact) -> Result<Vec<u8>, Artifac
     const MAX_WASM_MODULES: usize = 4096;
     const MAX_WASM_BINDINGS: usize = 1 << 14;
 
-    if artifact.wasm_modules.len() > MAX_WASM_MODULES {
+    if wasm_modules.len() > MAX_WASM_MODULES {
         return Err(ArtifactError::new(
             "wasm section",
             "embedded wasm module limit exceeded",
         ));
     }
 
-    let pool = &artifact.type_pool;
     let mut mod_names = BTreeSet::new();
     let mut arities = Vec::new();
 
-    for (midx, wmod) in artifact.wasm_modules.iter().enumerate() {
+    for (midx, wmod) in wasm_modules.iter().enumerate() {
         let ctx = format!("wasm module {midx}");
         if wmod.name.is_empty() || !mod_names.insert(wmod.name.as_str()) {
             return Err(ArtifactError::new(
@@ -486,7 +792,8 @@ fn decode(word: u32, context: VContext) -> Result<Instruction, ArtifactError> {
 }
 
 struct Validator<'a> {
-    artifact: &'a CompiledArtifact,
+    output: &'a CodegenOutput,
+    total_global_count: usize,
     pool: &'a TypePool,
     functions: Vec<&'a CompiledFunction>,
     max_trait_slots: usize,
@@ -504,6 +811,26 @@ struct Validator<'a> {
 impl Validator<'_> {
     fn pool(&self) -> &TypePool {
         self.pool
+    }
+
+    fn type_operand(
+        &self,
+        amode: AddrMode,
+        index: u32,
+        context: VContext,
+    ) -> Result<TypeIndex, ArtifactError> {
+        match amode {
+            AddrMode::Imm => self.runtime_type(TypeIndex::from_raw(index), context),
+            AddrMode::Const => {
+                let Constant::Type(ty) = self.constant(index, context)? else {
+                    return Err(ctx_err(
+                        context,
+                        "Const-mode type operand requires a Type constant",
+                    ));
+                };
+                self.runtime_type(*ty, context)
+            }
+        }
     }
 
     fn type_index(&self, index: TypeIndex, context: VContext) -> Result<TypeIndex, ArtifactError> {
@@ -698,8 +1025,7 @@ impl Validator<'_> {
     }
 
     fn constant(&self, index: u32, context: VContext) -> Result<&Constant, ArtifactError> {
-        self.artifact
-            .codegen_output
+        self.output
             .constants
             .get(index as usize)
             .ok_or_else(|| ctx_err(context, format!("invalid constant index {index}")))
@@ -1166,12 +1492,12 @@ impl Validator<'_> {
                     TypeCheck | TypeCast | TypeCastSafe | TypeAssert => {
                         register(dst)?;
                         register(base)?;
-                        self.runtime_type(TypeIndex::from_raw(index), context)?;
+                        self.type_operand(instruction.amode, index, context)?;
                     }
                     TraitProof | TraitAssert | TraitProject => {
                         register(dst)?;
                         register(base)?;
-                        let view = self.runtime_type(TypeIndex::from_raw(index), context)?;
+                        let view = self.type_operand(instruction.amode, index, context)?;
                         if !matches!(self.pool().get(view).kind, TypeKind::Trait { .. }) {
                             return Err(fail("trait proof operand must name a trait view"));
                         }
@@ -1258,7 +1584,7 @@ impl Validator<'_> {
                                 }
                                 index
                             };
-                        if index as usize >= self.artifact.codegen_output.globals.len() {
+                        if index as usize >= self.total_global_count {
                             return Err(fail("global slot outside schema"));
                         }
                     }
@@ -1270,7 +1596,7 @@ impl Validator<'_> {
                     }
                     NewObject => {
                         register(dst)?;
-                        let ty = self.runtime_type(TypeIndex::from_raw(index), context)?;
+                        let ty = self.type_operand(instruction.amode, index, context)?;
                         if self.pool().is_reserved_collection_role(ty) {
                             return Err(fail(
                                 "reserved collection roles require collection allocation",

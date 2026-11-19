@@ -456,7 +456,9 @@ fn collect_pre_loop_slot_hints(
                     reg_hints[dst.0 as usize] = Some(ScalarType::Bool);
                 }
             }
-            Opcode::TypeAssert | Opcode::TypeCast if (input.has_scope)(pc) => {
+            Opcode::TypeAssert | Opcode::TypeCast
+                if (input.has_scope)(pc) && instr.amode == AddrMode::Imm =>
+            {
                 if let InstructionData::A { dst, imm12, .. } = instr.data {
                     let ty = TypeIndex::from_raw(imm12 as u32);
                     reg_hints[dst.0 as usize] = match input

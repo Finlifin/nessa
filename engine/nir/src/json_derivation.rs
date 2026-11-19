@@ -72,62 +72,89 @@ pub(crate) fn lower_all(
     out_derived_methods: &mut Vec<DerivedMethod>,
 ) {
     for plan in &resolved.json_derivations {
-        let to_json_fn = derived_functions[&(plan.implementor, plan.trait_type, plan.method_name)];
-        let write_fn = write_helpers[&plan.implementor];
-        let read_fn = read_helpers[&plan.implementor];
-
-        out_functions.push(lower_write_helper(
+        lower_plan(
             resolved,
             plan,
-            write_fn,
-            func_map,
-            derived_functions,
-            global_map,
-            write_helpers,
-        ));
-        out_functions.push(lower_to_json(
-            resolved,
-            plan,
-            to_json_fn,
-            write_fn,
-            func_map,
-            derived_functions,
-            global_map,
-        ));
-
-        let (read_nir, mut lambdas) = lower_read_helper(
-            resolved,
-            plan,
-            read_fn,
             next_func_id,
             func_map,
             derived_functions,
             global_map,
+            write_helpers,
             read_helpers,
+            out_functions,
+            out_derived_methods,
         );
-        out_functions.append(&mut lambdas);
-        out_functions.push(read_nir);
-
-        if let Some(sym) = plan.from_json_symbol {
-            let from_json_fn = func_map[&sym];
-            out_functions.push(lower_from_json(
-                resolved,
-                plan,
-                from_json_fn,
-                read_fn,
-                func_map,
-                derived_functions,
-                global_map,
-            ));
-        }
-
-        out_derived_methods.push(DerivedMethod {
-            implementor: plan.implementor,
-            trait_type: plan.trait_type,
-            method_name: plan.method_name,
-            func_id: to_json_fn,
-        });
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_plan(
+    resolved: &ResolvedAst,
+    plan: &DerivedJsonPlan,
+    next_func_id: &mut u32,
+    func_map: &HashMap<SymbolId, FuncId>,
+    derived_functions: &HashMap<(TypeIndex, TypeIndex, StrId), FuncId>,
+    global_map: &HashMap<SymbolId, GlobalId>,
+    write_helpers: &HashMap<TypeIndex, FuncId>,
+    read_helpers: &HashMap<TypeIndex, FuncId>,
+    out_functions: &mut Vec<NirFunction>,
+    out_derived_methods: &mut Vec<DerivedMethod>,
+) {
+    let to_json_fn = derived_functions[&(plan.implementor, plan.trait_type, plan.method_name)];
+    let write_fn = write_helpers[&plan.implementor];
+    let read_fn = read_helpers[&plan.implementor];
+
+    out_functions.push(lower_write_helper(
+        resolved,
+        plan,
+        write_fn,
+        func_map,
+        derived_functions,
+        global_map,
+        write_helpers,
+    ));
+    out_functions.push(lower_to_json(
+        resolved,
+        plan,
+        to_json_fn,
+        write_fn,
+        func_map,
+        derived_functions,
+        global_map,
+    ));
+
+    let (read_nir, mut lambdas) = lower_read_helper(
+        resolved,
+        plan,
+        read_fn,
+        next_func_id,
+        func_map,
+        derived_functions,
+        global_map,
+        read_helpers,
+    );
+    out_functions.append(&mut lambdas);
+    out_functions.push(read_nir);
+
+    if let Some(sym) = plan.from_json_symbol {
+        let from_json_fn = func_map[&sym];
+        out_functions.push(lower_from_json(
+            resolved,
+            plan,
+            from_json_fn,
+            read_fn,
+            func_map,
+            derived_functions,
+            global_map,
+        ));
+    }
+
+    out_derived_methods.push(DerivedMethod {
+        implementor: plan.implementor,
+        trait_type: plan.trait_type,
+        method_name: plan.method_name,
+        func_id: to_json_fn,
+    });
 }
 
 fn lower_write_helper(

@@ -13,7 +13,7 @@ use str_interner::StrId;
 // ---------------------------------------------------------------------------
 
 /// Index of a node in the AST.  `NodeIndex(0)` is the "null" sentinel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeIndex(pub u32);
 
 impl NodeIndex {

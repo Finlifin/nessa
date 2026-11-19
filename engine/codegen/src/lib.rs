@@ -1147,7 +1147,17 @@ pub fn try_codegen_with_opt(
     module: &NirModule,
     opt_level: OptLevel,
 ) -> Result<CodegenOutput, Vec<EncodingError>> {
-    let errors = validation::validate(module);
+    try_codegen_with_imported_globals(module, 0, opt_level)
+}
+
+/// Validate and compile a modular [`NirModule`] that references `imported_global_count`
+/// external globals at indices `module.globals.len() .. module.globals.len() + imported_global_count`.
+pub fn try_codegen_with_imported_globals(
+    module: &NirModule,
+    imported_global_count: usize,
+    opt_level: OptLevel,
+) -> Result<CodegenOutput, Vec<EncodingError>> {
+    let errors = validation::validate_with_imported_globals(module, imported_global_count);
     if !errors.is_empty() {
         return Err(errors);
     }

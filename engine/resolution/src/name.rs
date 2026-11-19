@@ -793,7 +793,8 @@ fn resolve_let_or_const(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex, kind: 
     let children = ast.fixed_children(node_idx);
     // [0] pattern  [1] type  [2] value  [3] else
     // Resolve value, type, and else branch BEFORE binding the pattern.
-    if children.len() > 2 {
+    let is_external_stub = r.options.external_stub_nodes.contains(&node_idx);
+    if !is_external_stub && children.len() > 2 {
         resolve_names(r, ast, children[2]);
     }
     if children.len() > 1 {
@@ -836,7 +837,8 @@ fn resolve_let_or_const(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex, kind: 
 fn resolve_var_decl(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     let children = ast.fixed_children(node_idx);
     // [0] pattern  [1] type  [2] value  [3] else
-    if children.len() > 2 {
+    let is_external_stub = r.options.external_stub_nodes.contains(&node_idx);
+    if !is_external_stub && children.len() > 2 {
         resolve_names(r, ast, children[2]);
     }
     if children.len() > 1 {
@@ -935,8 +937,10 @@ fn resolve_function_def(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     crate::arguments::resolve_default_names(r, ast, node_idx);
     // Resolve return type.
     resolve_names(r, ast, children[1]);
-    // Resolve body.
-    resolve_names(r, ast, children[2]);
+    // Resolve body unless this declaration is a precompiled external stub.
+    if !r.options.external_stub_nodes.contains(&node_idx) {
+        resolve_names(r, ast, children[2]);
+    }
     // Resolve capability / handles expr.
     resolve_names(r, ast, children[3]);
 
@@ -1561,11 +1565,24 @@ fn resolve_pub_def(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
         .copied()
         .or_else(|| name.and_then(|name| r.node_symbols.get(&name).copied()))
     {
-        r.symbol_mut(symbol).visibility = if ast.node(node_idx).kind == NodeKind::PrivateDef {
+        let vis = if ast.node(node_idx).kind == NodeKind::PrivateDef {
             Visibility::Private
         } else {
             Visibility::Public
         };
+        r.symbol_mut(symbol).visibility = vis;
+        if ast.node(inner).kind == NodeKind::TraitDef
+            && let Some(trait_scope_id) = r.scopes.iter().find(|s| s.node == inner).map(|s| s.id)
+        {
+            let member_syms: Vec<_> = r.scopes[trait_scope_id.0 as usize]
+                .bindings
+                .values()
+                .copied()
+                .collect();
+            for msym in member_syms {
+                r.symbol_mut(msym).visibility = vis;
+            }
+        }
     }
 }
 
@@ -1868,7 +1885,8 @@ fn resolve_let_handler_names(r: &mut Resolver, ast: &Ast, node_idx: NodeIndex) {
     let children = ast.fixed_children(node_idx);
     // [0] effect_node  [1] pat  [2] type_ann  [3] value
     resolve_names(r, ast, children[0]);
-    if children.len() > 2 {
+    let is_external_stub = r.options.external_stub_nodes.contains(&node_idx);
+    if !is_external_stub && children.len() > 2 {
         resolve_names(r, ast, children[2]);
     }
     if children.len() > 3 {

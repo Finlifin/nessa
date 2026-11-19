@@ -12,11 +12,19 @@ mod display_metadata;
 mod function_abi;
 pub mod instruction;
 mod method_context;
+pub mod modular;
 pub mod validation;
 
 pub use display_metadata::validate_display_owner;
 pub use function_abi::{CaptureAbi, FunctionAbi, ParameterAbi};
-pub use validation::{ArtifactError, builtin_references, validate_artifact};
+pub use modular::{
+    ArtifactExports, ArtifactImports, ExportTarget, ExportedRuntimeSymbol, ImportedFunction,
+    ImportedGlobal, ImportedModuleRef, ImportedPackageRef, InterfaceModuleStub, ModularArtifact,
+    ModuleDescriptor, SymbolLinkSelector,
+};
+pub use validation::{
+    ArtifactError, builtin_references, validate_artifact, validate_modular_artifact,
+};
 
 // Re-export instruction-level types at crate root for convenience.
 pub use crate::instruction::{

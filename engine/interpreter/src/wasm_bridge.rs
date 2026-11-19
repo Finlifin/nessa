@@ -216,9 +216,26 @@ impl Vm {
     /// Validate, instantiate, and install embedded WebAssembly modules from a [`nsbc::CompiledArtifact`].
     pub fn install_wasm_modules(&mut self, modules: &[WasmModuleDef]) -> Result<(), VmError> {
         let _operation = self.operation();
+        self.shared.embedded_wasm.write().bindings.clear();
         if modules.is_empty() {
-            self.shared.embedded_wasm.write().bindings.clear();
             return Ok(());
+        }
+        let _ = self.append_wasm_modules(modules)?;
+        Ok(())
+    }
+
+    /// Incrementally instantiate and append embedded WebAssembly modules during dynamic module loading,
+    /// returning the starting binding index (`wasm_binding_base`) assigned to `modules[0]`.
+    pub fn append_wasm_modules(&mut self, modules: &[WasmModuleDef]) -> Result<u32, VmError> {
+        let _operation = self.operation();
+        let current_base = self
+            .shared
+            .embedded_wasm
+            .read(self.worker.worker_id)
+            .bindings
+            .len() as u32;
+        if modules.is_empty() {
+            return Ok(current_base);
         }
 
         let mut resolved_bindings = Vec::new();
@@ -319,8 +336,12 @@ impl Vm {
             }
         }
 
-        self.shared.embedded_wasm.write().bindings = resolved_bindings;
-        Ok(())
+        self.shared
+            .embedded_wasm
+            .write()
+            .bindings
+            .extend(resolved_bindings);
+        Ok(current_base)
     }
 
     pub(crate) fn exec_call_wasm(

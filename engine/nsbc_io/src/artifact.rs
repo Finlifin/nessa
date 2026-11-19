@@ -15,16 +15,16 @@ use crate::{Archive, ArchiveWriter, MAX_ARCHIVE_SIZE, relocation, type_metadata}
 const METADATA_MAGIC: &[u8; 4] = b"NSAM";
 const METADATA_REVISION: u32 = 6;
 const TAGGED_ROOT_SCAN: u32 = 0;
-const MAX_ITEMS: usize = 1_000_000;
+pub(super) const MAX_ITEMS: usize = 1_000_000;
 
-fn invalid(message: impl Into<String>) -> io::Error {
+pub(super) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-struct Writer(Vec<u8>);
+pub(super) struct Writer(pub(super) Vec<u8>);
 
 impl Writer {
-    fn data(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub(super) fn data(&mut self, bytes: &[u8]) -> io::Result<()> {
         if self
             .0
             .len()
@@ -39,32 +39,32 @@ impl Writer {
         self.0.extend_from_slice(bytes);
         Ok(())
     }
-    fn u32(&mut self, value: u32) -> io::Result<()> {
+    pub(super) fn u32(&mut self, value: u32) -> io::Result<()> {
         self.data(&value.to_le_bytes())
     }
-    fn u64(&mut self, value: u64) -> io::Result<()> {
+    pub(super) fn u64(&mut self, value: u64) -> io::Result<()> {
         self.data(&value.to_le_bytes())
     }
-    fn count(&mut self, count: usize) -> io::Result<()> {
+    pub(super) fn count(&mut self, count: usize) -> io::Result<()> {
         let count = u32::try_from(count)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "artifact count overflow"))?;
         self.u32(count)
     }
-    fn blob(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub(super) fn blob(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.count(bytes.len())?;
         self.data(bytes)
     }
-    fn string(&mut self, value: &str) -> io::Result<()> {
+    pub(super) fn string(&mut self, value: &str) -> io::Result<()> {
         self.blob(value.as_bytes())
     }
 }
 
-struct Reader<'a> {
-    remaining: &'a [u8],
+pub(super) struct Reader<'a> {
+    pub(super) remaining: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
+    pub(super) fn take(&mut self, length: usize) -> io::Result<&'a [u8]> {
         if length > self.remaining.len() {
             return Err(invalid("truncated artifact section"));
         }
@@ -72,49 +72,49 @@ impl<'a> Reader<'a> {
         self.remaining = remaining;
         Ok(bytes)
     }
-    fn u32(&mut self) -> io::Result<u32> {
+    pub(super) fn u32(&mut self) -> io::Result<u32> {
         let mut bytes = [0; 4];
         bytes.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(bytes))
     }
-    fn u64(&mut self) -> io::Result<u64> {
+    pub(super) fn u64(&mut self) -> io::Result<u64> {
         let mut bytes = [0; 8];
         bytes.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(bytes))
     }
-    fn count(&mut self, minimum_size: usize) -> io::Result<usize> {
+    pub(super) fn count(&mut self, minimum_size: usize) -> io::Result<usize> {
         let count = self.u32()? as usize;
-        if count > MAX_ITEMS || count > self.remaining.len() / minimum_size {
+        if count > MAX_ITEMS || count > self.remaining.len() / minimum_size.max(1) {
             return Err(invalid(
                 "artifact count exceeds section data or resource limit",
             ));
         }
         Ok(count)
     }
-    fn presence(&mut self, context: &str) -> io::Result<bool> {
+    pub(super) fn presence(&mut self, context: &str) -> io::Result<bool> {
         match self.take(1)?[0] {
             0 => Ok(false),
             1 => Ok(true),
             _ => Err(invalid(format!("invalid {context} presence tag"))),
         }
     }
-    fn abi_count(&mut self, minimum: usize, budget: &mut usize) -> io::Result<usize> {
+    pub(super) fn abi_count(&mut self, minimum: usize, budget: &mut usize) -> io::Result<usize> {
         let count = self.count(minimum)?;
         *budget = budget
             .checked_sub(count)
             .ok_or_else(|| invalid("function ABI cumulative item limit exceeded"))?;
         Ok(count)
     }
-    fn blob(&mut self) -> io::Result<&'a [u8]> {
+    pub(super) fn blob(&mut self) -> io::Result<&'a [u8]> {
         let count = self.u32()? as usize;
         self.take(count)
     }
-    fn string(&mut self) -> io::Result<String> {
+    pub(super) fn string(&mut self) -> io::Result<String> {
         std::str::from_utf8(self.blob()?)
             .map(str::to_owned)
             .map_err(|_| invalid("invalid UTF-8 in artifact name"))
     }
-    fn finish(&self) -> io::Result<()> {
+    pub(super) fn finish(&self) -> io::Result<()> {
         if !self.remaining.is_empty() {
             return Err(invalid("trailing bytes in artifact section"));
         }
@@ -129,21 +129,62 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     validate_artifact(artifact)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let relocated = relocation::encode(&artifact.codegen_output)?;
+    let writer = encode_core_sections_with_pool_bytes(
+        &artifact.codegen_output,
+        &pool_bytes,
+        artifact.entry,
+        artifact.builtin_abi_version,
+        &artifact.builtins,
+        &artifact.wasm_modules,
+    )?;
+    let mut bytes = Vec::new();
+    writer.write_to(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn encode_core_sections(
+    codegen_output: &CodegenOutput,
+    type_pool: &type_pool::TypePool,
+    entry: Option<FuncId>,
+    builtin_abi_version: u32,
+    builtins: &[BuiltinImport],
+    wasm_modules: &[WasmModuleDef],
+) -> io::Result<ArchiveWriter> {
+    let pool_bytes = type_metadata::encode_pool(type_pool)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    encode_core_sections_with_pool_bytes(
+        codegen_output,
+        &pool_bytes,
+        entry,
+        builtin_abi_version,
+        builtins,
+        wasm_modules,
+    )
+}
+
+fn encode_core_sections_with_pool_bytes(
+    codegen_output: &CodegenOutput,
+    pool_bytes: &[u8],
+    entry: Option<FuncId>,
+    builtin_abi_version: u32,
+    builtins: &[BuiltinImport],
+    wasm_modules: &[WasmModuleDef],
+) -> io::Result<ArchiveWriter> {
+    let relocated = relocation::encode(codegen_output)?;
     let mut metadata = Writer(Vec::new());
     metadata.data(METADATA_MAGIC)?;
     metadata.u32(METADATA_REVISION)?;
     metadata.u32(TAGGED_ROOT_SCAN)?;
-    metadata.u32(artifact.builtin_abi_version)?;
-    metadata.u32(artifact.entry.map_or(u32::MAX, |entry| entry.0))?;
-    metadata.blob(&pool_bytes)?;
-    metadata.count(artifact.codegen_output.globals.len())?;
-    for global in &artifact.codegen_output.globals {
+    metadata.u32(builtin_abi_version)?;
+    metadata.u32(entry.map_or(u32::MAX, |entry| entry.0))?;
+    metadata.blob(pool_bytes)?;
+    metadata.count(codegen_output.globals.len())?;
+    for global in &codegen_output.globals {
         metadata.u32(global.type_index.as_u32())?;
         metadata.data(&[u8::from(global.is_mutable)])?;
     }
-    metadata.count(artifact.codegen_output.functions.len())?;
-    for function in &artifact.codegen_output.functions {
+    metadata.count(codegen_output.functions.len())?;
+    for function in &codegen_output.functions {
         metadata.u32(function.func_id.0)?;
         let name = str_interner::try_get(function.name).ok_or_else(|| {
             io::Error::new(
@@ -159,13 +200,13 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
         metadata.u32(*slot)?;
         metadata.string(name)?;
     }
-    metadata.count(artifact.builtins.len())?;
-    for builtin in &artifact.builtins {
+    metadata.count(builtins.len())?;
+    for builtin in builtins {
         metadata.u32(builtin.id)?;
         metadata.string(&builtin.name)?;
     }
 
-    let scopes = &artifact.codegen_output.method_call_scopes;
+    let scopes = &codegen_output.method_call_scopes;
     metadata.count(scopes.len())?;
     for callsite in scopes {
         metadata.u32(callsite.func_id.0)?;
@@ -173,8 +214,8 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
         metadata.u32(callsite.scope)?;
     }
 
-    let mut items = artifact.codegen_output.functions.len();
-    for function in &artifact.codegen_output.functions {
+    let mut items = codegen_output.functions.len();
+    for function in &codegen_output.functions {
         let abi = &function.abi;
         items = items
             .checked_add(abi.captures.len())
@@ -187,8 +228,8 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
                 )
             })?;
     }
-    metadata.count(artifact.codegen_output.functions.len())?;
-    for function in &artifact.codegen_output.functions {
+    metadata.count(codegen_output.functions.len())?;
+    for function in &codegen_output.functions {
         metadata.u32(function.func_id.0)?;
         let abi = &function.abi;
         metadata.count(abi.captures.len())?;
@@ -217,8 +258,8 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
         }
     }
 
-    metadata.count(artifact.codegen_output.functions.len())?;
-    for function in &artifact.codegen_output.functions {
+    metadata.count(codegen_output.functions.len())?;
+    for function in &codegen_output.functions {
         metadata.u32(function.func_id.0)?;
         metadata.data(&[u8::from(function.display_owner.is_some())])?;
         if let Some(owner) = function.display_owner {
@@ -227,23 +268,17 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
     }
 
     let mut code = Writer(Vec::new());
-    code.count(artifact.codegen_output.functions.len())?;
+    code.count(codegen_output.functions.len())?;
     let mut offset = 4usize
         .checked_add(
-            artifact
-                .codegen_output
+            codegen_output
                 .functions
                 .len()
                 .checked_mul(16)
                 .ok_or_else(|| invalid("CODE table overflow"))?,
         )
         .ok_or_else(|| invalid("CODE table overflow"))?;
-    for (function, words) in artifact
-        .codegen_output
-        .functions
-        .iter()
-        .zip(&relocated.instructions)
-    {
+    for (function, words) in codegen_output.functions.iter().zip(&relocated.instructions) {
         let size = words
             .len()
             .checked_mul(4)
@@ -265,8 +300,8 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
         }
     }
     let mut stack_maps = Writer(Vec::new());
-    stack_maps.count(artifact.codegen_output.functions.len())?;
-    for function in &artifact.codegen_output.functions {
+    stack_maps.count(codegen_output.functions.len())?;
+    for function in &codegen_output.functions {
         stack_maps.u32(function.func_id.0)?;
         stack_maps.count(function.safepoint_pcs.len())?;
         for &pc in &function.safepoint_pcs {
@@ -278,15 +313,10 @@ pub fn write_artifact(artifact: &CompiledArtifact) -> io::Result<Vec<u8>> {
     writer.add_raw_section(SectionKind::Code, code.0);
     writer.add_constants_section(&relocated.constants)?;
     writer.add_raw_section(SectionKind::StackMaps, stack_maps.0);
-    if !artifact.wasm_modules.is_empty() {
-        writer.add_raw_section(
-            SectionKind::Wasm,
-            encode_wasm_section(&artifact.wasm_modules)?,
-        );
+    if !wasm_modules.is_empty() {
+        writer.add_raw_section(SectionKind::Wasm, encode_wasm_section(wasm_modules)?);
     }
-    let mut bytes = Vec::new();
-    writer.write_to(&mut bytes)?;
-    Ok(bytes)
+    Ok(writer)
 }
 
 fn encode_wasm_section(modules: &[WasmModuleDef]) -> io::Result<Vec<u8>> {
@@ -771,6 +801,12 @@ pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
             return Err(invalid("unsupported section in complete artifact"));
         }
     }
+    let artifact = decode_core_sections(&archive)?;
+    validate_artifact(&artifact).map_err(|error| invalid(error.to_string()))?;
+    Ok(artifact)
+}
+
+pub(super) fn decode_core_sections(archive: &Archive) -> io::Result<CompiledArtifact> {
     let wasm_section_count = archive
         .sections
         .iter()
@@ -802,16 +838,14 @@ pub fn read_artifact(bytes: &[u8]) -> io::Result<CompiledArtifact> {
         globals: metadata.globals,
     };
     relocation::restore(&mut output, &metadata.methods)?;
-    let artifact = CompiledArtifact {
+    Ok(CompiledArtifact {
         codegen_output: output,
         type_pool: metadata.type_pool,
         entry: metadata.entry,
         builtin_abi_version: metadata.builtin_abi_version,
         builtins: metadata.builtins,
         wasm_modules,
-    };
-    validate_artifact(&artifact).map_err(|error| invalid(error.to_string()))?;
-    Ok(artifact)
+    })
 }
 
 #[cfg(test)]

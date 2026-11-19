@@ -23,6 +23,7 @@ mod list_patterns;
 mod lists;
 mod literal;
 mod lowering;
+pub mod modular;
 mod named_functions;
 pub mod opt;
 mod optional;
@@ -35,6 +36,11 @@ mod trait_dispatch;
 mod trait_parameters;
 mod tuples;
 
+pub use modular::{
+    ExternalFunctionOrigin, LocalExportOrigin, ModularImportedFunction, ModularImportedGlobal,
+    ModularLocalExport, ModularNirOutput, ModularScopeUnit, finalize_modular_nir,
+    try_lower_modular,
+};
 use nsbc::{FuncId, GlobalId, GlobalInfo};
 pub use opt::{OptLevel, optimize_module};
 use resolution::ResolvedAst;

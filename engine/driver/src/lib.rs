@@ -5,9 +5,17 @@ mod artifact_cache;
 mod execution;
 mod ide;
 mod identity;
+pub mod modular;
 pub use ide::{CheckedSourceUnit, IdeCheckResult, standard_library_sources};
 pub use identity::CompilationIdentityContext;
-pub use nsbc_io::{disassemble_artifact, disassemble_bytes};
+pub use modular::{
+    ModularCompilationOutput, ModuleLoadState, ModuleLoader, PreparedModuleLoad,
+    load_cached_modular_artifact,
+};
+pub use nsbc_io::{
+    disassemble_artifact, disassemble_bytes, disassemble_modular_artifact, is_modular_archive,
+    read_modular_artifact, read_modular_exports_only, write_modular_artifact,
+};
 pub use pkg_manager::ManifestDocument;
 pub use pkg_manager::{
     LockedPackage, Lockfile, ModuleSources, PackageLoadError, PackageSources, PackageWorkspace,
@@ -18,6 +26,7 @@ mod package_graph;
 mod source_units;
 mod standard_library;
 
+pub use diagnostic::Diagnostic;
 pub use execution::{ArtifactLoadError, install_artifact};
 pub use initialization::{EngineConfig, JitConfig, JitMode, JitStats};
 pub use nir::OptLevel;
@@ -26,7 +35,7 @@ pub use wasm::{
 };
 
 use ast::dump::dump_ast_to_string_pretty;
-use diagnostic::{Diagnostic, DiagnosticContext, Level, NessaError};
+use diagnostic::{DiagnosticContext, Level, NessaError};
 use initialization::Engine;
 use nsbc::CodegenOutput;
 use rustc_span::{FileName, SourceMap, source_map::FilePathMapping};
@@ -714,6 +723,32 @@ impl Driver {
         };
         if let Some(entry) = entry {
             engine.vm_mut().spawn_root(entry);
+            if let interpreter::VmResult::Error(error) = engine.vm_mut().run() {
+                return RunResult::RuntimeError(format!("{error:?}"));
+            }
+        }
+        RunResult::Ok
+    }
+
+    /// Load and execute a modular compilation graph on a fresh VM via [`ModuleLoader`],
+    /// loading ONLY the root module and its reachable `mod` dependencies.
+    pub fn run_modular_graph(&self, output: &ModularCompilationOutput) -> RunResult {
+        let mut engine_cfg = EngineConfig::default();
+        if let Some(jit_cfg) = self.jit_config {
+            engine_cfg.jit = jit_cfg;
+        }
+        let mut engine = Engine::new(engine_cfg);
+        engine.vm_mut().set_script_args(self.script_args.clone());
+        let mut loader = ModuleLoader::new();
+        if let Err(err) = loader.register_artifacts(&output.artifacts) {
+            return RunResult::RuntimeError(err.to_string());
+        }
+        let prepared = match loader.load_module(engine.vm_mut(), &output.root_qualified_name, &[]) {
+            Ok(p) => p,
+            Err(err) => return RunResult::RuntimeError(err.to_string()),
+        };
+        if let Some(main_fid) = prepared.main_func {
+            engine.vm_mut().spawn_root(main_fid);
             if let interpreter::VmResult::Error(error) = engine.vm_mut().run() {
                 return RunResult::RuntimeError(format!("{error:?}"));
             }

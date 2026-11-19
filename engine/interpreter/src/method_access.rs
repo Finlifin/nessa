@@ -64,6 +64,70 @@ impl Vm {
         Ok(())
     }
 
+    /// Incrementally validate and register `MethodCallScope` entries for newly loaded functions
+    /// (`new_func_range`) without discarding previously installed module call contexts.
+    pub fn append_method_call_scopes(
+        &mut self,
+        contexts: Vec<MethodCallScope>,
+        new_func_range: std::ops::Range<u32>,
+    ) -> Result<(), VmError> {
+        let _operation = self.operation();
+        let mut batch = FastHashMap::default();
+        batch.reserve(contexts.len());
+        {
+            let tp = self.type_pool_read();
+            for context in contexts {
+                if !new_func_range.contains(&context.func_id.0) {
+                    return Err(VmError::InvalidFunction(context.func_id));
+                }
+                if tp.scope_context(context.scope).is_none() {
+                    return Err(VmError::MethodAccess(MethodAccessError::InvalidCaller(
+                        context.scope,
+                    )));
+                }
+                let function = self
+                    .shared
+                    .bytecode
+                    .try_get_function(context.func_id)
+                    .ok_or(VmError::InvalidFunction(context.func_id))?;
+                function
+                    .instructions
+                    .get(context.pc as usize)
+                    .and_then(|&word| Instruction::decode(word))
+                    .filter(|instruction| nsbc::instruction_requires_scope(instruction.opcode))
+                    .ok_or(VmError::MissingMethodContext)?;
+                if batch
+                    .insert((context.func_id, context.pc as usize), context.scope)
+                    .is_some()
+                {
+                    return Err(VmError::MissingMethodContext);
+                }
+            }
+            for raw_fid in new_func_range {
+                let func_id = nsbc::FuncId(raw_fid);
+                let function = self
+                    .shared
+                    .bytecode
+                    .try_get_function(func_id)
+                    .ok_or(VmError::InvalidFunction(func_id))?;
+                for (pc, &word) in function.instructions.iter().enumerate() {
+                    if Instruction::decode(word).is_some_and(|instruction| {
+                        nsbc::instruction_requires_scope(instruction.opcode)
+                    }) && !batch.contains_key(&(func_id, pc))
+                    {
+                        return Err(VmError::MissingMethodContext);
+                    }
+                }
+            }
+        }
+        self.with_exclusive_shared_mut(|shared| {
+            shared.method_call_scopes.extend(batch);
+        });
+        self.bump_metadata_epoch();
+        self.invalidate_jit();
+        Ok(())
+    }
+
     pub(crate) fn selected_method(
         &self,
         task_id: TaskId,

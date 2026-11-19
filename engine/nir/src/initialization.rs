@@ -27,6 +27,33 @@ pub(crate) struct InitializationPlan {
     pub ordered: Vec<ScopeInitialization>,
 }
 
+pub(crate) struct ExternalGlobalRecord {
+    pub global_id: GlobalId,
+    pub package_root: NodeIndex,
+    pub module_path: Vec<String>,
+    pub symbol: SymbolId,
+    pub info: GlobalInfo,
+}
+
+pub(crate) struct ModularModulePlan {
+    pub module_path: Vec<String>,
+    pub scope_node: NodeIndex,
+    pub scope_id: ScopeId,
+    pub owned_globals: Vec<(GlobalId, SymbolId)>,
+    pub ordered_initializers: Vec<ScopeInitialization>,
+    pub local_module_deps: BTreeSet<usize>,
+    pub local_init_prereqs: BTreeSet<usize>,
+    pub external_module_deps: BTreeSet<(NodeIndex, Vec<String>)>,
+    pub external_init_prereqs: BTreeSet<(NodeIndex, Vec<String>)>,
+}
+
+pub(crate) struct ModularInitPlan {
+    pub local_globals: Vec<GlobalInfo>,
+    pub slots: HashMap<SymbolId, GlobalId>,
+    pub modules: Vec<ModularModulePlan>,
+    pub external_globals: Vec<ExternalGlobalRecord>,
+}
+
 #[derive(Clone, Copy)]
 struct DefaultScan<'a> {
     body: &'a resolution::DefaultMethodPlan,
@@ -53,6 +80,14 @@ struct Planner<'a> {
 impl InitializationPlan {
     pub fn build(resolved: &ResolvedAst) -> Result<Self, Vec<LoweringError>> {
         Planner::new(resolved).build()
+    }
+
+    pub fn build_modular(
+        resolved: &ResolvedAst,
+        target_root: NodeIndex,
+        ext_global_base: u32,
+    ) -> Result<ModularInitPlan, Vec<LoweringError>> {
+        Planner::new(resolved).build_modular(target_root, ext_global_base)
     }
 }
 
@@ -1483,6 +1518,406 @@ impl<'a> Planner<'a> {
             globals: self.globals,
             slots: self.slots,
             ordered,
+        })
+    }
+
+    fn collect_local_modules(
+        &self,
+        scope_node: NodeIndex,
+        current_path: &[String],
+        target_pkg_id: Option<u32>,
+        out: &mut Vec<(Vec<String>, NodeIndex, ScopeId)>,
+    ) {
+        if scope_node.is_null() {
+            return;
+        }
+        let Some(sc) = self.resolved.scopes.iter().find(|s| s.node == scope_node) else {
+            return;
+        };
+        if self
+            .resolved
+            .type_pool
+            .scope_context(sc.id.0)
+            .map(|c| c.package)
+            != target_pkg_id
+        {
+            return;
+        }
+        out.push((current_path.to_vec(), scope_node, sc.id));
+        let ast = &self.resolved.ast;
+        for &item in ast.multi_children(scope_node) {
+            let decl = self.unwrap(item);
+            if !decl.is_null()
+                && ast.node(decl).kind == NodeKind::ModuleDef
+                && !self.resolved.external_package_roots.contains(&decl)
+            {
+                let name_node = ast.fixed_children(decl)[0];
+                if !name_node.is_null() {
+                    let seg = str_interner::get(ast.node(name_node).str_id);
+                    let mut sub_path = current_path.to_vec();
+                    sub_path.push(seg);
+                    self.collect_local_modules(decl, &sub_path, target_pkg_id, out);
+                }
+            }
+        }
+    }
+
+    fn resolve_external_mod_path(&self, mut scope: ScopeId) -> Option<(NodeIndex, Vec<String>)> {
+        let mut segments = Vec::new();
+        loop {
+            let sc = &self.resolved.scopes[scope.0 as usize];
+            if !sc.node.is_null() && self.resolved.external_package_roots.contains(&sc.node) {
+                segments.reverse();
+                return Some((sc.node, segments));
+            }
+            if !sc.node.is_null() && self.resolved.ast.node(sc.node).kind == NodeKind::ModuleDef {
+                let name_node = self.resolved.ast.fixed_children(sc.node)[0];
+                if !name_node.is_null() {
+                    segments.push(str_interner::get(self.resolved.ast.node(name_node).str_id));
+                }
+            }
+            scope = sc.parent?;
+        }
+    }
+
+    fn build_modular(
+        mut self,
+        target_root: NodeIndex,
+        ext_global_base: u32,
+    ) -> Result<ModularInitPlan, Vec<LoweringError>> {
+        self.mark_owners(self.resolved.ast.root, None);
+        let target_pkg_id = self
+            .resolved
+            .scopes
+            .iter()
+            .find(|s| s.node == target_root)
+            .and_then(|s| self.resolved.type_pool.scope_context(s.id.0))
+            .map(|c| c.package);
+
+        let mut raw_mods = Vec::new();
+        self.collect_local_modules(target_root, &[], target_pkg_id, &mut raw_mods);
+        let mut local_mod_by_scope: HashMap<ScopeId, usize> = HashMap::new();
+        let mut modules: Vec<ModularModulePlan> = raw_mods
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (module_path, scope_node, scope_id))| {
+                local_mod_by_scope.insert(scope_id, idx);
+                ModularModulePlan {
+                    module_path,
+                    scope_node,
+                    scope_id,
+                    owned_globals: Vec::new(),
+                    ordered_initializers: Vec::new(),
+                    local_module_deps: BTreeSet::new(),
+                    local_init_prereqs: BTreeSet::new(),
+                    external_module_deps: BTreeSet::new(),
+                    external_init_prereqs: BTreeSet::new(),
+                }
+            })
+            .collect();
+
+        #[derive(Clone)]
+        enum OwnerLoc {
+            Local(usize),
+            External(NodeIndex, Vec<String>),
+            Ignore,
+        }
+
+        let mut owner_locs = Vec::with_capacity(self.scopes.len());
+        for owner in 0..self.scopes.len() {
+            if let Some((pkg_root, mpath)) = self.resolve_external_mod_path(self.scopes[owner]) {
+                owner_locs.push(OwnerLoc::External(pkg_root, mpath));
+                continue;
+            }
+            let mut cur = Some(self.scopes[owner]);
+            let mut found_local = None;
+            while let Some(sid) = cur {
+                let sc = &self.resolved.scopes[sid.0 as usize];
+                if !sc.node.is_null() && self.resolved.external_package_roots.contains(&sc.node) {
+                    break;
+                }
+                if let Some(&midx) = local_mod_by_scope.get(&sid) {
+                    found_local = Some(midx);
+                    break;
+                }
+                cur = sc.parent;
+            }
+            if let Some(midx) = found_local {
+                owner_locs.push(OwnerLoc::Local(midx));
+            } else {
+                owner_locs.push(OwnerLoc::Ignore);
+            }
+        }
+
+        let mut external_globals = Vec::new();
+        let mut next_ext_gid = ext_global_base;
+
+        for owner in 0..self.scopes.len() {
+            let scope = &self.resolved.scopes[self.scopes[owner].0 as usize];
+            match &owner_locs[owner] {
+                OwnerLoc::Local(midx) => {
+                    let hook = scope
+                        .bindings
+                        .get(&str_interner::intern("__init__"))
+                        .copied();
+                    self.hooks[owner] = hook.filter(|symbol| {
+                        let symbol = &self.resolved.symbols[symbol.0 as usize];
+                        symbol.kind == SymbolKind::Function && symbol.scope == scope.id
+                    });
+                    for &item in self.resolved.ast.multi_children(scope.node) {
+                        let declaration = self.unwrap(item);
+                        let kind = self.resolved.ast.node(declaration).kind;
+                        match kind {
+                            NodeKind::ConstDecl | NodeKind::LetDecl | NodeKind::VarDecl => {
+                                let bound: Vec<_> = self
+                                    .resolved
+                                    .symbols
+                                    .iter()
+                                    .filter(|definition| {
+                                        definition.scope == scope.id
+                                            && definition.def_node == declaration
+                                            && matches!(
+                                                definition.kind,
+                                                SymbolKind::Variable | SymbolKind::Constant
+                                            )
+                                    })
+                                    .map(|definition| (definition.id, definition.type_index))
+                                    .collect();
+                                for (symbol, type_index) in &bound {
+                                    let global = GlobalId(self.globals.len() as u32);
+                                    self.slots.insert(*symbol, global);
+                                    self.globals.push(GlobalInfo {
+                                        type_index: if *type_index == TypeIndex::INVALID {
+                                            Intrinsic::Any.type_index()
+                                        } else {
+                                            *type_index
+                                        },
+                                        is_mutable: kind != NodeKind::ConstDecl,
+                                    });
+                                    modules[*midx].owned_globals.push((global, *symbol));
+                                }
+                                if !bound.is_empty()
+                                    || matches!(
+                                        self.resolved
+                                            .ast
+                                            .node(self.resolved.ast.fixed_children(declaration)[0])
+                                            .kind,
+                                        NodeKind::Underscore
+                                            | NodeKind::PatternTuple
+                                            | NodeKind::PatternExtendedCall
+                                            | NodeKind::PatternTyped
+                                            | NodeKind::PatternCall
+                                    )
+                                {
+                                    self.statements[owner].push(declaration);
+                                }
+                            }
+                            NodeKind::FunctionDef
+                            | NodeKind::ModuleDef
+                            | NodeKind::StructDef
+                            | NodeKind::EnumDef
+                            | NodeKind::TraitDef
+                            | NodeKind::TraitDefFn
+                            | NodeKind::TraitDeriveFn
+                            | NodeKind::EffectDef
+                            | NodeKind::AsyncEffectDef
+                            | NodeKind::ImplDef
+                            | NodeKind::ImplTraitDef
+                            | NodeKind::ExtendDef
+                            | NodeKind::ExtendTraitDef
+                            | NodeKind::DeriveDef
+                            | NodeKind::Typealias
+                            | NodeKind::Newtype
+                            | NodeKind::UseStatement
+                            | NodeKind::AssocDecl
+                            | NodeKind::StructField
+                            | NodeKind::EnumVariant => {}
+                            _ => self.statements[owner].push(declaration),
+                        }
+                    }
+                }
+                OwnerLoc::External(pkg_root, mpath) => {
+                    for &item in self.resolved.ast.multi_children(scope.node) {
+                        let declaration = self.unwrap(item);
+                        let kind = self.resolved.ast.node(declaration).kind;
+                        if matches!(
+                            kind,
+                            NodeKind::ConstDecl | NodeKind::LetDecl | NodeKind::VarDecl
+                        ) {
+                            for definition in &self.resolved.symbols {
+                                if definition.scope == scope.id
+                                    && definition.def_node == declaration
+                                    && matches!(
+                                        definition.kind,
+                                        SymbolKind::Variable | SymbolKind::Constant
+                                    )
+                                {
+                                    let global = GlobalId(next_ext_gid);
+                                    next_ext_gid += 1;
+                                    let info = GlobalInfo {
+                                        type_index: if definition.type_index == TypeIndex::INVALID {
+                                            Intrinsic::Any.type_index()
+                                        } else {
+                                            definition.type_index
+                                        },
+                                        is_mutable: kind != NodeKind::ConstDecl,
+                                    };
+                                    self.slots.insert(definition.id, global);
+                                    external_globals.push(ExternalGlobalRecord {
+                                        global_id: global,
+                                        package_root: *pkg_root,
+                                        module_path: mpath.clone(),
+                                        symbol: definition.id,
+                                        info,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                OwnerLoc::Ignore => {}
+            }
+        }
+
+        let errors = self.validate_shared_initializers();
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        self.collect_load_dependencies();
+
+        for owner in 0..self.scopes.len() {
+            if !matches!(owner_locs[owner], OwnerLoc::Local(_)) {
+                continue;
+            }
+            let mut dependencies = BTreeSet::new();
+            let mut visited = HashSet::new();
+            for &statement in &self.statements[owner] {
+                self.scan_initializer(statement, &mut dependencies, &mut visited);
+            }
+            if let Some(hook) = self.hooks[owner] {
+                self.scan_called_symbol(hook, &mut dependencies, &mut visited);
+            }
+            dependencies.remove(&owner);
+            self.prerequisites[owner] = dependencies;
+        }
+
+        let mut mod_owners: Vec<Vec<usize>> = vec![Vec::new(); modules.len()];
+        for (owner, loc) in owner_locs.iter().enumerate() {
+            if let OwnerLoc::Local(midx) = loc {
+                mod_owners[*midx].push(owner);
+            }
+        }
+
+        for (midx, owners) in mod_owners.iter().enumerate() {
+            for &owner in owners {
+                for &dep_owner in self.imports[owner]
+                    .iter()
+                    .chain(&self.references[owner])
+                    .chain(&self.prerequisites[owner])
+                {
+                    match &owner_locs[dep_owner] {
+                        OwnerLoc::Local(target_midx) if *target_midx != midx => {
+                            modules[midx].local_module_deps.insert(*target_midx);
+                        }
+                        OwnerLoc::External(pkg_root, mpath) => {
+                            modules[midx]
+                                .external_module_deps
+                                .insert((*pkg_root, mpath.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                for &prereq_owner in &self.prerequisites[owner] {
+                    match &owner_locs[prereq_owner] {
+                        OwnerLoc::Local(target_midx) if *target_midx != midx => {
+                            modules[midx].local_init_prereqs.insert(*target_midx);
+                        }
+                        OwnerLoc::External(pkg_root, mpath) => {
+                            modules[midx]
+                                .external_init_prereqs
+                                .insert((*pkg_root, mpath.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut remaining: BTreeSet<usize> = owners
+                .iter()
+                .copied()
+                .filter(|&o| !self.statements[o].is_empty() || self.hooks[o].is_some())
+                .collect();
+            let mut intra_order = Vec::new();
+            while !remaining.is_empty() {
+                let ready: Vec<_> = remaining
+                    .iter()
+                    .copied()
+                    .filter(|&o| !self.prerequisites[o].iter().any(|t| remaining.contains(t)))
+                    .collect();
+                if ready.is_empty() {
+                    return Err(remaining
+                        .iter()
+                        .map(|&o| {
+                            LoweringError::new(
+                                self.resolved.scopes[self.scopes[o].0 as usize].node,
+                                "cyclic module value initialization dependency",
+                            )
+                        })
+                        .collect());
+                }
+                let next = ready
+                    .iter()
+                    .copied()
+                    .find(|&o| !self.imports[o].iter().any(|t| remaining.contains(t)))
+                    .unwrap_or(ready[0]);
+                remaining.remove(&next);
+                intra_order.push(next);
+            }
+            modules[midx].ordered_initializers = intra_order
+                .into_iter()
+                .map(|o| ScopeInitialization {
+                    node: self.resolved.scopes[self.scopes[o].0 as usize].node,
+                    statements: std::mem::take(&mut self.statements[o]),
+                    hook: self.hooks[o],
+                })
+                .collect();
+        }
+
+        // Propagate intra-package initializer prerequisites through intermediate local modules
+        // and reject hard cyclic value initialization dependencies across local modules.
+        let mut active_mods: BTreeSet<usize> = (0..modules.len()).collect();
+        while !active_mods.is_empty() {
+            let ready: Vec<_> = active_mods
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    !modules[m]
+                        .local_init_prereqs
+                        .iter()
+                        .any(|t| active_mods.contains(t))
+                })
+                .collect();
+            if ready.is_empty() {
+                return Err(active_mods
+                    .iter()
+                    .map(|&m| {
+                        LoweringError::new(
+                            modules[m].scope_node,
+                            "cyclic module value initialization dependency",
+                        )
+                    })
+                    .collect());
+            }
+            for m in ready {
+                active_mods.remove(&m);
+            }
+        }
+
+        Ok(ModularInitPlan {
+            local_globals: self.globals,
+            slots: self.slots,
+            modules,
+            external_globals,
         })
     }
 }

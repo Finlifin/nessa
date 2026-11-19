@@ -751,10 +751,9 @@ pub(crate) fn emit_baseline_instruction(
                 unreachable!()
             };
             let has_scope = (input.has_scope)(pc);
-            let canon_ty = if has_scope && instr.amode == AddrMode::Imm {
-                input
-                    .type_pool
-                    .canonical_type(TypeIndex::from_raw(imm12 as u32))
+            let canon_ty = if has_scope {
+                resolve_type_operand(input, instr.amode, imm12)
+                    .and_then(|ty| input.type_pool.canonical_type(ty))
             } else {
                 None
             };
@@ -1344,9 +1343,8 @@ pub(crate) fn emit_baseline_instruction(
             let InstructionData::A { dst, imm12, .. } = instr.data else {
                 unreachable!()
             };
-            let fast_obj = input
-                .type_pool
-                .canonical_type(TypeIndex::from_raw(imm12 as u32))
+            let fast_obj = resolve_type_operand(input, instr.amode, imm12)
+                .and_then(|ty| input.type_pool.canonical_type(ty))
                 .filter(|&ct| !input.type_pool.is_reserved_collection_role(ct))
                 .and_then(|ct| {
                     let words = match &input.type_pool.get(ct).kind {
@@ -1398,6 +1396,22 @@ pub(crate) fn emit_baseline_instruction(
     }
 
     Ok(())
+}
+
+fn resolve_type_operand(
+    input: &CompilationInput<'_>,
+    amode: AddrMode,
+    imm12: u16,
+) -> Option<TypeIndex> {
+    match amode {
+        AddrMode::Imm => Some(TypeIndex::from_raw(u32::from(imm12))),
+        AddrMode::Const => match input.constants.get(usize::from(imm12)).copied()? {
+            CompileConstant::ImmediateValidated { raw, .. } => {
+                runtime::TaggedValue::from_raw(raw).as_type()
+            }
+            _ => None,
+        },
+    }
 }
 
 #[derive(Clone, Copy)]
