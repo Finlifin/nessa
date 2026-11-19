@@ -1,8 +1,10 @@
 //! LSP 3.17 JSON-RPC 2.0 server state machine and request dispatcher for `nessa-lsp`.
 
-use std::collections::HashSet;
-use std::io::{self, BufRead, Write};
+use std::collections::{HashSet, VecDeque};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use crate::analysis::{LspDiagnostic, ServerConfig, WorkspaceAnalyzer, normalize_path};
 use crate::index::{semantic_token_modifier, semantic_token_type};
@@ -23,7 +25,10 @@ pub struct LanguageServer {
     shutdown_requested: bool,
     cancelled_ids: HashSet<RequestId>,
     published_files: HashSet<PathBuf>,
+    dirty_files: Vec<PathBuf>,
 }
+
+const STDIO_DIAG_DEBOUNCE_MS: u64 = 450;
 
 impl Default for LanguageServer {
     fn default() -> Self {
@@ -40,19 +45,21 @@ impl LanguageServer {
             shutdown_requested: false,
             cancelled_ids: HashSet::new(),
             published_files: HashSet::new(),
+            dirty_files: Vec::new(),
         }
     }
 
-    /// Run the main JSON-RPC message loop until `exit` or EOF.
+    /// Run the main JSON-RPC message loop synchronously over `reader` until `exit` or EOF.
     /// Returns the process exit code (`0` after clean `shutdown`, `1` if `exit` arrived without `shutdown`).
     pub fn run<R: BufRead, W: Write>(&mut self, reader: &mut R, writer: &mut W) -> io::Result<i32> {
         while let Some(msg) = read_rpc_message(reader)? {
             match msg {
                 RpcMessage::Notification { method, params } => {
                     if method == "exit" {
+                        self.flush_dirty_diagnostics(writer)?;
                         return Ok(if self.shutdown_requested { 0 } else { 1 });
                     }
-                    self.handle_notification(&method, &params, writer)?;
+                    self.handle_notification(&method, &params, writer, false)?;
                 }
                 RpcMessage::Request { id, method, params } => {
                     if self.cancelled_ids.remove(&id) {
@@ -72,12 +79,168 @@ impl LanguageServer {
                         )?;
                         continue;
                     }
-                    self.handle_request(id, &method, &params, writer)?;
+                    self.handle_request(id, &method, &params, writer, false)?;
                 }
                 RpcMessage::Response { .. } => {}
             }
         }
+        self.flush_dirty_diagnostics(writer)?;
         Ok(0)
+    }
+
+    /// Run the live `--stdio` JSON-RPC loop with `textDocument/didChange` coalescing and
+    /// non-blocking interactive completion / signatureHelp during rapid typing bursts.
+    pub fn run_stdio<W: Write>(&mut self, writer: &mut W) -> io::Result<i32> {
+        let (tx, rx) = mpsc::channel::<io::Result<RpcMessage>>();
+        std::thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            loop {
+                match read_rpc_message(&mut reader) {
+                    Ok(Some(msg)) => {
+                        let is_exit = matches!(&msg, RpcMessage::Notification { method, .. } if method == "exit");
+                        if tx.send(Ok(msg)).is_err() || is_exit {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
+                        break;
+                    }
+                }
+            }
+        });
+        self.run_coalesced_channel(rx, writer, Duration::from_millis(STDIO_DIAG_DEBOUNCE_MS))
+    }
+
+    pub fn run_coalesced_channel<W: Write>(
+        &mut self,
+        rx: mpsc::Receiver<io::Result<RpcMessage>>,
+        writer: &mut W,
+        debounce: Duration,
+    ) -> io::Result<i32> {
+        let mut queue: VecDeque<RpcMessage> = VecDeque::new();
+        loop {
+            if queue.is_empty() {
+                if self.dirty_files.is_empty() {
+                    match rx.recv() {
+                        Ok(item) => queue.push_back(item?),
+                        Err(_) => break,
+                    }
+                } else {
+                    match rx.recv_timeout(debounce) {
+                        Ok(item) => queue.push_back(item?),
+                        Err(RecvTimeoutError::Timeout) => {
+                            self.flush_dirty_diagnostics(writer)?;
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            self.flush_dirty_diagnostics(writer)?;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Drain any additional messages already queued in the pipe so typing bursts coalesce!
+            while let Ok(item) = rx.try_recv() {
+                queue.push_back(item?);
+            }
+
+            // Pre-scan queued `$/cancelRequest` notifications so cancelled requests are skipped before work!
+            for msg in &queue {
+                if let RpcMessage::Notification { method, params } = msg
+                    && method == "$/cancelRequest"
+                    && let Some(id_val) = params.get("id")
+                    && let Some(id) = RequestId::from_json(id_val)
+                {
+                    self.cancelled_ids.insert(id);
+                }
+            }
+
+            while let Some(msg) = queue.pop_front() {
+                match msg {
+                    RpcMessage::Notification { method, params } => {
+                        if method == "exit" {
+                            return Ok(if self.shutdown_requested { 0 } else { 1 });
+                        }
+                        if method == "$/cancelRequest" {
+                            continue;
+                        }
+                        self.handle_notification(&method, &params, writer, true)?;
+                    }
+                    RpcMessage::Request { id, method, params } => {
+                        if self.cancelled_ids.remove(&id) {
+                            send_error(writer, id, REQUEST_CANCELLED, "request cancelled")?;
+                            continue;
+                        }
+                        if self.shutdown_requested {
+                            send_error(writer, id, ERR_INVALID_REQUEST, "server is shutting down")?;
+                            continue;
+                        }
+                        if !self.initialize_received && method != "initialize" {
+                            send_error(
+                                writer,
+                                id,
+                                SERVER_NOT_INITIALIZED,
+                                "server has not received `initialize` request",
+                            )?;
+                            continue;
+                        }
+                        let prefer_fast = !self.dirty_files.is_empty()
+                            && matches!(
+                                method.as_str(),
+                                "textDocument/completion"
+                                    | "textDocument/signatureHelp"
+                                    | "textDocument/hover"
+                                    | "textDocument/definition"
+                                    | "textDocument/declaration"
+                                    | "textDocument/typeDefinition"
+                                    | "textDocument/implementation"
+                                    | "textDocument/documentSymbol"
+                                    | "textDocument/foldingRange"
+                            );
+                        if !prefer_fast && method != "shutdown" && method != "initialize" {
+                            self.flush_dirty_diagnostics(writer)?;
+                        }
+                        self.handle_request(id, &method, &params, writer, prefer_fast)?;
+                    }
+                    RpcMessage::Response { .. } => {}
+                }
+                // Check for newly arrived burst messages before processing remaining items.
+                while let Ok(item) = rx.try_recv() {
+                    let next_msg = item?;
+                    if let RpcMessage::Notification {
+                        ref method,
+                        ref params,
+                    } = next_msg
+                        && method == "$/cancelRequest"
+                        && let Some(id_val) = params.get("id")
+                        && let Some(id) = RequestId::from_json(id_val)
+                    {
+                        self.cancelled_ids.insert(id);
+                    }
+                    queue.push_back(next_msg);
+                }
+            }
+        }
+        self.flush_dirty_diagnostics(writer)?;
+        Ok(0)
+    }
+
+    fn flush_dirty_diagnostics<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        if self.dirty_files.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.dirty_files);
+        let mut seen = HashSet::new();
+        for path in pending {
+            if seen.insert(path.clone()) {
+                self.publish_package_diagnostics(&path, writer)?;
+            }
+        }
+        Ok(())
     }
 
     fn handle_notification<W: Write>(
@@ -85,6 +248,7 @@ impl LanguageServer {
         method: &str,
         params: &JsonValue,
         writer: &mut W,
+        defer_change_reanalysis: bool,
     ) -> io::Result<()> {
         match method {
             "initialized" => {
@@ -167,6 +331,7 @@ impl LanguageServer {
                 {
                     let version = td.get_i64("version").unwrap_or(0);
                     if let Some(path) = self.analyzer.open_document(uri, version, text.to_owned()) {
+                        self.dirty_files.retain(|p| p != &path);
                         self.publish_package_diagnostics(&path, writer)?;
                     }
                 }
@@ -177,7 +342,15 @@ impl LanguageServer {
                     && let Some(changes) = params.get_array("contentChanges")
                 {
                     let version = td.get_i64("version").unwrap_or(0);
-                    if let Some(path) = self.analyzer.change_document(uri, version, changes) {
+                    if defer_change_reanalysis {
+                        if let Some(path) =
+                            self.analyzer.stage_document_change(uri, version, changes)
+                            && !self.dirty_files.contains(&path)
+                        {
+                            self.dirty_files.push(path);
+                        }
+                    } else if let Some(path) = self.analyzer.change_document(uri, version, changes)
+                    {
                         self.publish_package_diagnostics(&path, writer)?;
                     }
                 }
@@ -188,6 +361,7 @@ impl LanguageServer {
                 {
                     let text = params.get_str("text").map(str::to_owned);
                     if let Some(path) = self.analyzer.save_document(uri, text) {
+                        self.dirty_files.retain(|p| p != &path);
                         self.publish_package_diagnostics(&path, writer)?;
                     }
                 }
@@ -197,6 +371,7 @@ impl LanguageServer {
                     && let Some(uri) = td.get_str("uri")
                     && let Some(path) = self.analyzer.close_document(uri)
                 {
+                    self.dirty_files.retain(|p| p != &path);
                     if path.exists() {
                         self.publish_package_diagnostics(&path, writer)?;
                     } else {
@@ -216,6 +391,7 @@ impl LanguageServer {
         method: &str,
         params: &JsonValue,
         writer: &mut W,
+        prefer_fast_interactive: bool,
     ) -> io::Result<()> {
         match method {
             "initialize" => {
@@ -237,7 +413,12 @@ impl LanguageServer {
                         "invalid textDocumentPosition",
                     );
                 };
-                let hover = self.analyzer.hover(&path, pos).unwrap_or(JsonValue::Null);
+                let hover = if prefer_fast_interactive {
+                    self.analyzer.hover_interactive(&path, pos)
+                } else {
+                    self.analyzer.hover(&path, pos)
+                }
+                .unwrap_or(JsonValue::Null);
                 send_response(writer, id, hover)?;
             }
             "textDocument/definition" | "textDocument/declaration" => {
@@ -249,7 +430,11 @@ impl LanguageServer {
                         "invalid textDocumentPosition",
                     );
                 };
-                let locs = self.analyzer.goto_definition(&path, pos);
+                let locs = if prefer_fast_interactive {
+                    self.analyzer.goto_definition_interactive(&path, pos)
+                } else {
+                    self.analyzer.goto_definition(&path, pos)
+                };
                 let resp = if locs.is_empty() {
                     JsonValue::Null
                 } else {
@@ -266,7 +451,11 @@ impl LanguageServer {
                         "invalid textDocumentPosition",
                     );
                 };
-                let locs = self.analyzer.goto_type_definition(&path, pos);
+                let locs = if prefer_fast_interactive {
+                    self.analyzer.goto_type_definition_interactive(&path, pos)
+                } else {
+                    self.analyzer.goto_type_definition(&path, pos)
+                };
                 let resp = if locs.is_empty() {
                     JsonValue::Null
                 } else {
@@ -283,7 +472,11 @@ impl LanguageServer {
                         "invalid textDocumentPosition",
                     );
                 };
-                let locs = self.analyzer.find_implementations(&path, pos);
+                let locs = if prefer_fast_interactive {
+                    self.analyzer.find_implementations_interactive(&path, pos)
+                } else {
+                    self.analyzer.find_implementations(&path, pos)
+                };
                 send_response(writer, id, JsonValue::Array(locs))?;
             }
             "textDocument/references" => {
@@ -355,7 +548,11 @@ impl LanguageServer {
                         "invalid textDocumentPosition",
                     );
                 };
-                let items = self.analyzer.complete(&path, pos);
+                let items = if prefer_fast_interactive {
+                    self.analyzer.complete_interactive(&path, pos)
+                } else {
+                    self.analyzer.complete(&path, pos)
+                };
                 let result = JsonValue::object([
                     ("isIncomplete", JsonValue::Bool(false)),
                     ("items", JsonValue::Array(items)),
@@ -371,17 +568,23 @@ impl LanguageServer {
                         "invalid textDocumentPosition",
                     );
                 };
-                let sh = self
-                    .analyzer
-                    .signature_help(&path, pos)
-                    .unwrap_or(JsonValue::Null);
+                let sh = if prefer_fast_interactive {
+                    self.analyzer.signature_help_interactive(&path, pos)
+                } else {
+                    self.analyzer.signature_help(&path, pos)
+                }
+                .unwrap_or(JsonValue::Null);
                 send_response(writer, id, sh)?;
             }
             "textDocument/documentSymbol" => {
                 let Some(path) = extract_doc_path(params) else {
                     return send_error(writer, id, ERR_INVALID_PARAMS, "invalid textDocument");
                 };
-                let syms = self.analyzer.document_symbols(&path);
+                let syms = if prefer_fast_interactive {
+                    self.analyzer.document_symbols_interactive(&path)
+                } else {
+                    self.analyzer.document_symbols(&path)
+                };
                 send_response(writer, id, JsonValue::Array(syms))?;
             }
             "workspace/symbol" => {

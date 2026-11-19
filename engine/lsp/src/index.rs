@@ -248,8 +248,10 @@ impl SemanticIndex {
 
     pub fn occurrence_at(&self, file: &Path, offset: usize) -> Option<&Occurrence> {
         let occs = self.file_occurrences.get(file)?;
+        let end = occs.partition_point(|o| o.span.0 <= offset);
+        let start = end.saturating_sub(32);
         let mut best: Option<&Occurrence> = None;
-        for occ in occs {
+        for occ in &occs[start..end] {
             let (lo, hi) = occ.span;
             if lo <= offset && offset <= hi && hi > lo {
                 match best {
@@ -269,6 +271,12 @@ impl SemanticIndex {
             }
         }
         best
+    }
+
+    pub fn exact_occurrence_at(&self, file: &Path, span: (usize, usize)) -> Option<&Occurrence> {
+        let occs = self.file_occurrences.get(file)?;
+        let idx = occs.partition_point(|o| o.span < span);
+        occs.get(idx).filter(|o| o.span == span)
     }
 
     pub fn references_to(
@@ -561,7 +569,10 @@ where
         }
     }
 
-    // Pass 1: Register all symbols in `resolved.symbols` and populate `type_defs`.
+    // Pre-build O(1) lookup tables for associated scopes, fields/variants, and enum tags.
+    let assoc_lookup = AssocSymbolLookup::new(resolved);
+
+    // Pass 1: Register symbols in `resolved.symbols` and populate `type_defs`.
     for sym in &resolved.symbols {
         let key = SymbolKey::Sym(sym.id);
         let name = str_interner::get(sym.name);
@@ -582,6 +593,20 @@ where
         let Some((_, unit, mapped, raw_full_span)) = located_full else {
             continue;
         };
+        // Skip function-local variables, parameters, and labels inside external `std` / bundled bodies:
+        // external function bodies are never indexed into `file_occurrences` or `file_scopes`.
+        if mapped.is_external
+            && matches!(
+                sym.kind,
+                SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::Label
+            )
+            && resolved
+                .scopes
+                .get(sym.scope.0 as usize)
+                .is_some_and(|sc| sc.assoc_type.is_none() && sc.node != ast.root)
+        {
+            continue;
+        }
         let full_span = if is_synth_mod {
             raw_full_span
         } else {
@@ -644,8 +669,14 @@ where
             decl_parent.get(&def_node).map(|(_, k)| *k),
         );
 
+        // Local variables, parameters, and labels inside blocks do not carry doc comments;
+        // extract doc comments only for top-level / member / type declarations.
         let doc = if is_synth_mod {
             extract_file_header_doc(&unit.source)
+        } else if matches!(sym.kind, SymbolKind::Parameter | SymbolKind::Label) {
+            None
+        } else if selection_span.0 == full_span.0 {
+            extract_leading_doc(&unit.source, selection_span.0)
         } else {
             extract_leading_doc(&unit.source, selection_span.0)
                 .or_else(|| extract_leading_doc(&unit.source, full_span.0))
@@ -801,7 +832,7 @@ where
     }
 
     // Build `type_members` table (struct fields, enum variants, module exports, inherent methods, trait methods, derived methods).
-    build_type_members(resolved, &effects_by_ty, &mut index);
+    build_type_members(resolved, &effects_by_ty, &assoc_lookup, &mut index);
 
     // Build per-file `file_scopes` for lexical completions.
     for scope in &resolved.scopes {
@@ -834,6 +865,7 @@ where
         &locate,
         &effects_by_ty,
         &write_nodes,
+        &assoc_lookup,
         &mut index,
     );
 
@@ -1868,6 +1900,7 @@ fn push_member_unique(list: &mut Vec<MemberEntry>, entry: MemberEntry) {
 fn build_type_members(
     resolved: &ResolvedAst,
     effects_by_ty: &HashMap<TypeIndex, (String, bool)>,
+    assoc_lookup: &AssocSymbolLookup,
     index: &mut SemanticIndex,
 ) {
     let pool = &resolved.type_pool;
@@ -1885,7 +1918,8 @@ fn build_type_members(
             TypeKind::Struct { fields, .. } if !pool.is_reserved_collection_role(canon) => {
                 for f in fields {
                     let fname = str_interner::get(f.name);
-                    let fkey = find_assoc_symbol(resolved, canon, f.name, SymbolKind::Field);
+                    let fkey =
+                        assoc_lookup.find_assoc_symbol(resolved, canon, f.name, SymbolKind::Field);
                     let sym_info = fkey.and_then(|k| index.symbols.get(&k));
                     let detail = sym_info.map(|s| s.detail.clone()).unwrap_or_else(|| {
                         format!("{fname}: {}", format_type(pool, effects_by_ty, f.ty))
@@ -1910,7 +1944,12 @@ fn build_type_members(
                 let enum_name = str_interner::get(*name);
                 for v in variants {
                     let vname = str_interner::get(v.name);
-                    let vkey = find_assoc_symbol(resolved, canon, v.name, SymbolKind::EnumVariant);
+                    let vkey = assoc_lookup.find_assoc_symbol(
+                        resolved,
+                        canon,
+                        v.name,
+                        SymbolKind::EnumVariant,
+                    );
                     let sym_info = vkey.and_then(|k| index.symbols.get(&k));
                     let detail = sym_info.map(|s| s.detail.clone()).unwrap_or_else(|| {
                         if v.fields.is_empty() {
@@ -2069,47 +2108,99 @@ fn build_type_members(
     }
 }
 
-fn find_assoc_symbol(
-    resolved: &ResolvedAst,
-    canon_ty: TypeIndex,
-    name: StrId,
-    expected_kind: SymbolKind,
-) -> Option<SymbolKey> {
-    for scope in &resolved.scopes {
-        if scope
-            .assoc_type
-            .and_then(|t| resolved.type_pool.canonical_type(t))
-            == Some(canon_ty)
-            && let Some(&sym_id) = scope.bindings.get(&name)
-            && resolved.symbols[sym_id.0 as usize].kind == expected_kind
-        {
-            return Some(SymbolKey::Sym(sym_id));
-        }
-    }
-    resolved
-        .symbols
-        .iter()
-        .find(|s| {
-            s.name == name
-                && s.kind == expected_kind
-                && resolved.type_pool.canonical_type(s.type_index) == Some(canon_ty)
-        })
-        .map(|s| SymbolKey::Sym(s.id))
+struct AssocSymbolLookup {
+    scopes_by_type: HashMap<TypeIndex, Vec<usize>>,
+    fields_by_type: HashMap<(TypeIndex, StrId), SymbolKey>,
+    variants_by_type: HashMap<(TypeIndex, StrId), SymbolKey>,
+    variants_by_tag: HashMap<(TypeIndex, u32), SymbolKey>,
 }
 
-fn find_enum_variant_symbol_by_tag(
-    resolved: &ResolvedAst,
-    enum_ty: TypeIndex,
-    tag: u32,
-) -> Option<SymbolKey> {
-    let canon = resolved.type_pool.canonical_type(enum_ty)?;
-    for (&sym_id, &vtag) in &resolved.enum_variant_indices {
-        let sym = &resolved.symbols[sym_id.0 as usize];
-        if vtag == tag && resolved.type_pool.canonical_type(sym.type_index) == Some(canon) {
-            return Some(SymbolKey::Sym(sym_id));
+impl AssocSymbolLookup {
+    fn new(resolved: &ResolvedAst) -> Self {
+        let pool = &resolved.type_pool;
+        let mut scopes_by_type: HashMap<TypeIndex, Vec<usize>> = HashMap::new();
+        for (idx, scope) in resolved.scopes.iter().enumerate() {
+            if let Some(canon) = scope.assoc_type.and_then(|t| pool.canonical_type(t)) {
+                scopes_by_type.entry(canon).or_default().push(idx);
+            }
+        }
+
+        let mut fields_by_type = HashMap::new();
+        let mut variants_by_type = HashMap::new();
+        for sym in &resolved.symbols {
+            if matches!(sym.kind, SymbolKind::Field | SymbolKind::EnumVariant)
+                && sym.type_index != TypeIndex::INVALID
+                && let Some(canon) = pool.canonical_type(sym.type_index)
+            {
+                let key = SymbolKey::Sym(sym.id);
+                if sym.kind == SymbolKind::Field {
+                    fields_by_type.entry((canon, sym.name)).or_insert(key);
+                } else {
+                    variants_by_type.entry((canon, sym.name)).or_insert(key);
+                }
+            }
+        }
+
+        let mut variants_by_tag = HashMap::new();
+        for (&sym_id, &vtag) in &resolved.enum_variant_indices {
+            if let Some(sym) = resolved.symbols.get(sym_id.0 as usize)
+                && sym.type_index != TypeIndex::INVALID
+                && let Some(canon) = pool.canonical_type(sym.type_index)
+            {
+                variants_by_tag
+                    .entry((canon, vtag))
+                    .or_insert(SymbolKey::Sym(sym_id));
+            }
+        }
+
+        Self {
+            scopes_by_type,
+            fields_by_type,
+            variants_by_type,
+            variants_by_tag,
         }
     }
-    None
+
+    fn find_assoc_symbol(
+        &self,
+        resolved: &ResolvedAst,
+        canon_ty: TypeIndex,
+        name: StrId,
+        expected_kind: SymbolKind,
+    ) -> Option<SymbolKey> {
+        if let Some(scope_indices) = self.scopes_by_type.get(&canon_ty) {
+            for &sc_idx in scope_indices {
+                if let Some(&sym_id) = resolved.scopes[sc_idx].bindings.get(&name)
+                    && resolved.symbols[sym_id.0 as usize].kind == expected_kind
+                {
+                    return Some(SymbolKey::Sym(sym_id));
+                }
+            }
+        }
+        match expected_kind {
+            SymbolKind::Field => self.fields_by_type.get(&(canon_ty, name)).copied(),
+            SymbolKind::EnumVariant => self.variants_by_type.get(&(canon_ty, name)).copied(),
+            _ => resolved
+                .symbols
+                .iter()
+                .find(|s| {
+                    s.name == name
+                        && s.kind == expected_kind
+                        && resolved.type_pool.canonical_type(s.type_index) == Some(canon_ty)
+                })
+                .map(|s| SymbolKey::Sym(s.id)),
+        }
+    }
+
+    fn find_enum_variant_by_tag(
+        &self,
+        resolved: &ResolvedAst,
+        enum_ty: TypeIndex,
+        tag: u32,
+    ) -> Option<SymbolKey> {
+        let canon = resolved.type_pool.canonical_type(enum_ty)?;
+        self.variants_by_tag.get(&(canon, tag)).copied()
+    }
 }
 
 fn collect_occurrences_and_projections<'a, L>(
@@ -2117,6 +2208,7 @@ fn collect_occurrences_and_projections<'a, L>(
     locate: &L,
     effects_by_ty: &HashMap<TypeIndex, (String, bool)>,
     write_nodes: &HashSet<NodeIndex>,
+    assoc_lookup: &AssocSymbolLookup,
     index: &mut SemanticIndex,
 ) where
     L: Fn(Span) -> Option<(usize, &'a CheckedSourceUnit, &'a UnitMapped, (usize, usize))>,
@@ -2245,9 +2337,11 @@ fn collect_occurrences_and_projections<'a, L>(
                 if let Some(&method_sym) = resolved.instance_methods.get(&node) {
                     push_occ(member, SymbolKey::Sym(method_sym), false);
                 } else if let Some(ev) = resolved.enum_variants.get(&node) {
-                    if let Some(vkey) =
-                        find_enum_variant_symbol_by_tag(resolved, ev.type_index, ev.variant_tag)
-                    {
+                    if let Some(vkey) = assoc_lookup.find_enum_variant_by_tag(
+                        resolved,
+                        ev.type_index,
+                        ev.variant_tag,
+                    ) {
                         push_occ(member, vkey, false);
                     }
                 } else if let Some(&field_idx) = resolved.node_field_indices.get(&node) {
@@ -2255,8 +2349,12 @@ fn collect_occurrences_and_projections<'a, L>(
                         && let Some(canon) = pool.canonical_type(lhs_ty)
                         && let TypeKind::Struct { fields, .. } = &pool.get(canon).kind
                         && let Some(finfo) = fields.get(field_idx as usize)
-                        && let Some(fkey) =
-                            find_assoc_symbol(resolved, canon, finfo.name, SymbolKind::Field)
+                        && let Some(fkey) = assoc_lookup.find_assoc_symbol(
+                            resolved,
+                            canon,
+                            finfo.name,
+                            SymbolKind::Field,
+                        )
                     {
                         push_occ(member, fkey, false);
                     }
@@ -2282,8 +2380,11 @@ fn collect_occurrences_and_projections<'a, L>(
                     && ast.node(member).kind == NodeKind::Id
                     && !resolved.node_symbols.contains_key(&member)
                     && let Some(ev) = resolved.enum_variants.get(&node)
-                    && let Some(vkey) =
-                        find_enum_variant_symbol_by_tag(resolved, ev.type_index, ev.variant_tag)
+                    && let Some(vkey) = assoc_lookup.find_enum_variant_by_tag(
+                        resolved,
+                        ev.type_index,
+                        ev.variant_tag,
+                    )
                 {
                     push_occ(member, vkey, false);
                 }
@@ -2303,7 +2404,7 @@ fn collect_occurrences_and_projections<'a, L>(
                         if !arg.is_null() && ast.node(arg).kind == NodeKind::Property {
                             let field_id_node = ast.fixed_children(arg)[0];
                             if !field_id_node.is_null()
-                                && let Some(fkey) = find_assoc_symbol(
+                                && let Some(fkey) = assoc_lookup.find_assoc_symbol(
                                     resolved,
                                     canon,
                                     ast.node(field_id_node).str_id,
@@ -2336,7 +2437,7 @@ fn collect_occurrences_and_projections<'a, L>(
                         {
                             let field_id_node = ast.fixed_children(entry)[0];
                             if !field_id_node.is_null()
-                                && let Some(fkey) = find_assoc_symbol(
+                                && let Some(fkey) = assoc_lookup.find_assoc_symbol(
                                     resolved,
                                     canon,
                                     ast.node(field_id_node).str_id,
@@ -2358,8 +2459,11 @@ fn collect_occurrences_and_projections<'a, L>(
                 {
                     let member = ast.fixed_children(callee)[1];
                     if !member.is_null()
-                        && let Some(vkey) =
-                            find_enum_variant_symbol_by_tag(resolved, ec.type_index, ec.variant_tag)
+                        && let Some(vkey) = assoc_lookup.find_enum_variant_by_tag(
+                            resolved,
+                            ec.type_index,
+                            ec.variant_tag,
+                        )
                     {
                         push_occ(member, vkey, false);
                     }
@@ -2387,7 +2491,7 @@ fn collect_occurrences_and_projections<'a, L>(
                     && let Some(&ety) = resolved.node_types.get(&node)
                     && let Some(canon) = pool.canonical_type(ety)
                     && matches!(pool.get(canon).kind, TypeKind::Enum { .. })
-                    && let Some(vkey) = find_assoc_symbol(
+                    && let Some(vkey) = assoc_lookup.find_assoc_symbol(
                         resolved,
                         canon,
                         ast.node(id_node).str_id,
@@ -2412,7 +2516,14 @@ fn collect_occurrences_and_projections<'a, L>(
             NodeKind::UseStatement => {
                 let path_root = ast.fixed_children(node)[0];
                 let encl_scope = resolved.node_scopes.get(&node).copied();
-                record_use_path_occurrences(resolved, encl_scope, path_root, None, &mut push_occ);
+                record_use_path_occurrences(
+                    resolved,
+                    assoc_lookup,
+                    encl_scope,
+                    path_root,
+                    None,
+                    &mut push_occ,
+                );
             }
             _ => {}
         }
@@ -2426,6 +2537,7 @@ fn collect_occurrences_and_projections<'a, L>(
 
 fn record_use_path_occurrences<F>(
     resolved: &ResolvedAst,
+    assoc_lookup: &AssocSymbolLookup,
     encl_scope: Option<ScopeId>,
     path_node: NodeIndex,
     base_module_ty: Option<TypeIndex>,
@@ -2449,11 +2561,11 @@ where
                     .flatten();
             }
             let name_id = ast.node(path_node).str_id;
-            if let Some(mty) = base_module_ty {
-                for scope in &resolved.scopes {
-                    if scope.assoc_type.and_then(|t| pool.canonical_type(t)) == Some(mty)
-                        && let Some(&sym_id) = scope.bindings.get(&name_id)
-                    {
+            if let Some(mty) = base_module_ty
+                && let Some(scope_indices) = assoc_lookup.scopes_by_type.get(&mty)
+            {
+                for &sc_idx in scope_indices {
+                    if let Some(&sym_id) = resolved.scopes[sc_idx].bindings.get(&name_id) {
                         push_occ(path_node, SymbolKey::Sym(sym_id), false);
                         let ty = resolved.symbols[sym_id.0 as usize].type_index;
                         return (ty != TypeIndex::INVALID)
@@ -2475,25 +2587,53 @@ where
         }
         NodeKind::SuperPath | NodeKind::PackagePath | NodeKind::PathProjectionAll => {
             let inner = ast.fixed_children(path_node)[0];
-            record_use_path_occurrences(resolved, encl_scope, inner, base_module_ty, push_occ)
+            record_use_path_occurrences(
+                resolved,
+                assoc_lookup,
+                encl_scope,
+                inner,
+                base_module_ty,
+                push_occ,
+            )
         }
         NodeKind::PathProjection => {
             let children = ast.fixed_children(path_node);
             let lhs_ty = record_use_path_occurrences(
                 resolved,
+                assoc_lookup,
                 encl_scope,
                 children[0],
                 base_module_ty,
                 push_occ,
             );
-            record_use_path_occurrences(resolved, encl_scope, children[1], lhs_ty, push_occ)
+            record_use_path_occurrences(
+                resolved,
+                assoc_lookup,
+                encl_scope,
+                children[1],
+                lhs_ty,
+                push_occ,
+            )
         }
         NodeKind::PathProjectionMulti => {
             let base = ast.fixed_children(path_node)[0];
-            let lhs_ty =
-                record_use_path_occurrences(resolved, encl_scope, base, base_module_ty, push_occ);
+            let lhs_ty = record_use_path_occurrences(
+                resolved,
+                assoc_lookup,
+                encl_scope,
+                base,
+                base_module_ty,
+                push_occ,
+            );
             for &item in ast.multi_children(path_node) {
-                record_use_path_occurrences(resolved, encl_scope, item, lhs_ty, push_occ);
+                record_use_path_occurrences(
+                    resolved,
+                    assoc_lookup,
+                    encl_scope,
+                    item,
+                    lhs_ty,
+                    push_occ,
+                );
             }
             lhs_ty
         }
@@ -2501,6 +2641,7 @@ where
             let children = ast.fixed_children(path_node);
             let lhs_ty = record_use_path_occurrences(
                 resolved,
+                assoc_lookup,
                 encl_scope,
                 children[0],
                 base_module_ty,
@@ -2523,47 +2664,60 @@ where
 }
 
 fn trim_leading_trivia_offset(src: &str, lo: usize, hi: usize) -> usize {
-    let slice = match src.get(lo..hi) {
-        Some(s) => s,
-        None => return lo,
+    let Some(slice) = src.get(lo..hi) else {
+        return lo;
     };
-    let (tokens, _) = lexer::tokenize(slice);
-    for tok in tokens {
-        if matches!(
-            tok.kind,
-            TokenKind::Sof
-                | TokenKind::Newline
-                | TokenKind::Indent
-                | TokenKind::Outdent
-                | TokenKind::Comment
-        ) {
-            continue;
+    let bytes = slice.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                i += 1;
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'{' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                let mut depth = 1usize;
+                while i < len && depth > 0 {
+                    if i + 1 < len && bytes[i] == b'{' && bytes[i + 1] == b'-' {
+                        depth += 1;
+                        i += 2;
+                    } else if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'}' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            _ => return lo + i,
         }
-        return lo + tok.from as usize;
     }
     lo
 }
 
 /// Extract leading `---`, `--`, or `{- ... -}` documentation comments immediately preceding `item_lo`.
 /// Skips `--%` formatter directives and visibility/declaration modifiers.
+/// Walks backward lazily via `rsplit('\n')` so symbols without doc comments allocate nothing.
 pub fn extract_leading_doc(src: &str, item_lo: usize) -> Option<String> {
     if item_lo == 0 || item_lo > src.len() {
         return None;
     }
     let prefix = &src[..item_lo];
-    let lines: Vec<&str> = prefix.split('\n').collect();
-    if lines.is_empty() {
-        return None;
-    }
-    let mut idx = lines.len() - 1;
-    let tail_line = lines[idx].trim();
+    let mut rev_iter = prefix.rsplit('\n');
+    let tail_line = rev_iter.next()?.trim();
     if !tail_line.is_empty() && !is_modifier_only_line(tail_line) {
         return None;
     }
     let mut doc_lines = Vec::new();
-    while idx > 0 {
-        idx -= 1;
-        let trimmed = lines[idx].trim_end_matches('\r').trim();
+    while let Some(raw_line) = rev_iter.next() {
+        let trimmed = raw_line.trim_end_matches('\r').trim();
         if trimmed.is_empty() {
             if !doc_lines.is_empty() {
                 break;
@@ -2590,15 +2744,15 @@ pub fn extract_leading_doc(src: &str, item_lo: usize) -> Option<String> {
             continue;
         }
         if trimmed.ends_with("-}") {
-            let mut block_lines = Vec::new();
-            let mut cur_idx = idx;
-            loop {
-                let cur = lines[cur_idx].trim_end_matches('\r').trim();
-                block_lines.push(cur);
-                if cur.starts_with("{-") || cur_idx == 0 {
-                    break;
+            let mut block_lines = vec![trimmed];
+            if !trimmed.starts_with("{-") {
+                for blk_raw in rev_iter.by_ref() {
+                    let cur = blk_raw.trim_end_matches('\r').trim();
+                    block_lines.push(cur);
+                    if cur.starts_with("{-") {
+                        break;
+                    }
                 }
-                cur_idx -= 1;
             }
             block_lines.reverse();
             let joined = block_lines.join("\n");
@@ -2606,11 +2760,13 @@ pub fn extract_leading_doc(src: &str, item_lo: usize) -> Option<String> {
                 for bl in inner.lines().rev() {
                     doc_lines.push(bl.trim().to_owned());
                 }
-                idx = cur_idx;
                 continue;
             }
         }
         break;
+    }
+    if doc_lines.is_empty() {
+        return None;
     }
     doc_lines.reverse();
     while doc_lines.first().is_some_and(|l| l.is_empty()) {
@@ -2777,8 +2933,7 @@ fn classify_ident_semantic_token(
     index: Option<&SemanticIndex>,
 ) -> Option<(u32, u32)> {
     if let Some(idx) = index
-        && let Some(occ) = idx.occurrence_at(file, span.0)
-        && occ.span == span
+        && let Some(occ) = idx.exact_occurrence_at(file, span)
         && let Some(sym) = idx.symbol(occ.target)
     {
         let mut mods = 0u32;

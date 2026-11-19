@@ -2,7 +2,7 @@
 //! Stdout is reserved strictly for JSON-RPC frames in `--stdio` server mode.
 
 use std::ffi::OsString;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 
 use crate::analysis::{ServerConfig, WorkspaceAnalyzer, lsp_severity};
@@ -147,11 +147,9 @@ where
             if sysroot.is_some() {
                 config.sysroot_override = sysroot;
             }
-            let stdin = io::stdin();
             let stdout = io::stdout();
-            let mut reader = BufReader::new(stdin.lock());
             let mut writer = BufWriter::new(stdout.lock());
-            match LanguageServer::new(config).run(&mut reader, &mut writer) {
+            match LanguageServer::new(config).run_stdio(&mut writer) {
                 Ok(code) => code,
                 Err(err) => {
                     eprintln!("nessa-lsp: fatal I/O error: {err}");

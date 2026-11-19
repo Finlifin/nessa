@@ -270,6 +270,9 @@ pub struct WorkspaceAnalyzer {
     driver: Driver,
     snapshots: HashMap<AnalysisTarget, PackageSnapshot>,
     last_good_index: HashMap<AnalysisTarget, SemanticIndex>,
+    last_good_snapshots: HashMap<AnalysisTarget, PackageSnapshot>,
+    lib_dir_cache: HashMap<PathBuf, Option<PathBuf>>,
+    unit_path_cache: HashMap<(PathBuf, String), PathBuf>,
 }
 
 impl Default for WorkspaceAnalyzer {
@@ -287,16 +290,23 @@ impl WorkspaceAnalyzer {
             driver: Driver::new().without_cache(),
             snapshots: HashMap::new(),
             last_good_index: HashMap::new(),
+            last_good_snapshots: HashMap::new(),
+            lib_dir_cache: HashMap::new(),
+            unit_path_cache: HashMap::new(),
         }
     }
 
     pub fn set_workspace_roots(&mut self, roots: Vec<PathBuf>) {
         self.workspace_roots = roots.into_iter().map(|p| normalize_path(&p)).collect();
+        self.lib_dir_cache.clear();
+        self.unit_path_cache.clear();
     }
 
     pub fn set_sysroot_override(&mut self, sysroot: Option<PathBuf>) {
         self.config.sysroot_override = sysroot.map(|p| normalize_path(&p));
         self.snapshots.clear();
+        self.lib_dir_cache.clear();
+        self.unit_path_cache.clear();
     }
 
     pub fn open_document(&mut self, uri: &str, version: i64, text: String) -> Option<PathBuf> {
@@ -311,7 +321,9 @@ impl WorkspaceAnalyzer {
         Some(path)
     }
 
-    pub fn change_document(
+    /// Apply an incremental or full-document edit to `open_docs` and invalidate stale snapshots
+    /// in O(1) without running synchronous compilation yet (used to coalesce rapid `didChange` bursts).
+    pub fn stage_document_change(
         &mut self,
         uri: &str,
         version: i64,
@@ -328,6 +340,31 @@ impl WorkspaceAnalyzer {
                 DocumentState::new(canonical_uri, path.clone(), version, last_text.to_owned()),
             );
         }
+        let target = self.classify_target(&path);
+        if let Some(stale) = self.snapshots.remove(&target) {
+            self.last_good_snapshots.entry(target).or_insert(stale);
+        }
+        let dep_targets: Vec<AnalysisTarget> = self
+            .snapshots
+            .iter()
+            .filter(|(_, s)| s.member_files.contains(&path))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for dt in dep_targets {
+            if let Some(stale) = self.snapshots.remove(&dt) {
+                self.last_good_snapshots.entry(dt).or_insert(stale);
+            }
+        }
+        Some(path)
+    }
+
+    pub fn change_document(
+        &mut self,
+        uri: &str,
+        version: i64,
+        changes: &[JsonValue],
+    ) -> Option<PathBuf> {
+        let path = self.stage_document_change(uri, version, changes)?;
         self.reanalyze_for_file(&path);
         Some(path)
     }
@@ -354,12 +391,15 @@ impl WorkspaceAnalyzer {
         } else {
             let target = self.classify_target(&path);
             self.snapshots.remove(&target);
+            self.last_good_snapshots.remove(&target);
         }
         Some(path)
     }
 
     pub fn invalidate_all(&mut self) {
         self.snapshots.clear();
+        self.lib_dir_cache.clear();
+        self.unit_path_cache.clear();
         let open_paths: Vec<PathBuf> = self.open_docs.keys().cloned().collect();
         for p in open_paths {
             self.reanalyze_for_file(&p);
@@ -514,10 +554,22 @@ impl WorkspaceAnalyzer {
         None
     }
 
-    fn resolve_unit_path(&self, unit: &CheckedSourceUnit, from_dir: &Path) -> PathBuf {
+    fn resolve_unit_path_cached(&mut self, unit: &CheckedSourceUnit, from_dir: &Path) -> PathBuf {
         if !unit.is_std && !unit.is_bundled {
             return normalize_path(&unit.path);
         }
+        let cache_key = (from_dir.to_path_buf(), unit.logical_name.clone());
+        if let Some(cached) = self.unit_path_cache.get(&cache_key) {
+            return cached.clone();
+        }
+        let lib_dir = if let Some(cached_lib) = self.lib_dir_cache.get(from_dir) {
+            cached_lib.clone()
+        } else {
+            let discovered = self.discover_library_dir(from_dir);
+            self.lib_dir_cache
+                .insert(from_dir.to_path_buf(), discovered.clone());
+            discovered
+        };
         let rel_path = if unit.is_std {
             unit.logical_name.as_str()
         } else {
@@ -530,15 +582,18 @@ impl WorkspaceAnalyzer {
                 .map(|(_, rest)| rest)
                 .unwrap_or(stripped)
         };
-
-        if let Some(lib_dir) = self.discover_library_dir(from_dir) {
+        let resolved = if let Some(lib_dir) = lib_dir {
             let real_cand = lib_dir.join(rel_path);
             if real_cand.is_file() {
-                return normalize_path(&real_cand);
+                normalize_path(&real_cand)
+            } else {
+                materialize_stdlib_cache_file(rel_path, &unit.source)
             }
-        }
-
-        materialize_stdlib_cache_file(rel_path, &unit.source)
+        } else {
+            materialize_stdlib_cache_file(rel_path, &unit.source)
+        };
+        self.unit_path_cache.insert(cache_key, resolved.clone());
+        resolved
     }
 
     fn analyze_target(
@@ -699,7 +754,7 @@ impl WorkspaceAnalyzer {
     ) -> PackageSnapshot {
         let index = build_semantic_index(
             &check,
-            |unit| self.resolve_unit_path(unit, from_dir),
+            |unit| self.resolve_unit_path_cached(unit, from_dir),
             privileged_files,
         );
         let diagnostics = self.map_diagnostics(&check, &root_path, from_dir);
@@ -709,7 +764,7 @@ impl WorkspaceAnalyzer {
             self.last_good_index.insert(target.clone(), index.clone());
         }
 
-        PackageSnapshot {
+        let snap = PackageSnapshot {
             root_path,
             is_package,
             index,
@@ -717,7 +772,13 @@ impl WorkspaceAnalyzer {
             member_files,
             dependency_names,
             has_errors,
+        };
+        if update_last_good && (!snap.has_errors || !self.last_good_snapshots.contains_key(target))
+        {
+            self.last_good_snapshots
+                .insert(target.clone(), snap.clone());
         }
+        snap
     }
 
     fn overlay_package_sources(
@@ -763,22 +824,18 @@ impl WorkspaceAnalyzer {
     }
 
     fn map_diagnostics(
-        &self,
+        &mut self,
         check: &IdeCheckResult,
         default_root: &Path,
         from_dir: &Path,
     ) -> HashMap<PathBuf, Vec<LspDiagnostic>> {
         let mut out: HashMap<PathBuf, Vec<LspDiagnostic>> = HashMap::new();
-        let line_indices: Vec<(PathBuf, bool, LineIndex)> = check
-            .units
-            .iter()
-            .map(|u| {
-                let p = self.resolve_unit_path(u, from_dir);
-                (p, u.is_std || u.is_bundled, LineIndex::new(&u.source))
-            })
-            .collect();
+        if check.diagnostics.is_empty() {
+            return out;
+        }
+        let mut unit_meta: Vec<Option<(PathBuf, bool, LineIndex)>> = vec![None; check.units.len()];
 
-        let locate_diag_span = |span: rustc_span::Span| -> Option<(PathBuf, bool, LspRange)> {
+        let mut locate_diag_span = |span: rustc_span::Span| -> Option<(PathBuf, bool, LspRange)> {
             if span.is_dummy() {
                 return None;
             }
@@ -787,7 +844,15 @@ impl WorkspaceAnalyzer {
                 if let Some(unit) = check.units.get(cand)
                     && let Some(raw) = unit.original_range(span)
                 {
-                    let (ref path, is_ext, ref lidx) = line_indices[cand];
+                    if unit_meta[cand].is_none() {
+                        let p = self.resolve_unit_path_cached(unit, from_dir);
+                        unit_meta[cand] = Some((
+                            p,
+                            unit.is_std || unit.is_bundled,
+                            LineIndex::new(&unit.source),
+                        ));
+                    }
+                    let (ref path, is_ext, ref lidx) = *unit_meta[cand].as_ref().unwrap();
                     let range =
                         lidx.span_to_range(&unit.source, raw.start as usize, raw.end as usize);
                     return Some((path.clone(), is_ext, range));
@@ -810,23 +875,22 @@ impl WorkspaceAnalyzer {
         };
 
         for diag in &check.diagnostics {
-            self.push_mapped_diag(&mut out, diag, &locate_diag_span, &fallback_file);
+            Self::push_mapped_diag(&mut out, diag, &mut locate_diag_span, &fallback_file);
         }
         out
     }
 
     fn push_mapped_diag<L>(
-        &self,
         out: &mut HashMap<PathBuf, Vec<LspDiagnostic>>,
         diag: &Diagnostic,
-        locate: &L,
+        locate: &mut L,
         fallback_file: &Path,
     ) where
-        L: Fn(rustc_span::Span) -> Option<(PathBuf, bool, LspRange)>,
+        L: FnMut(rustc_span::Span) -> Option<(PathBuf, bool, LspRange)>,
     {
         let primary = diag
             .primary_span
-            .and_then(locate)
+            .and_then(&mut *locate)
             .or_else(|| diag.labels.iter().find_map(|l| locate(l.span)));
 
         let (file, is_ext, range) = match primary {
@@ -895,39 +959,85 @@ impl WorkspaceAnalyzer {
         file: &Path,
         offset: usize,
         text: &str,
+        is_stale_snap: bool,
     ) -> Option<(&'a SymbolInfo, Option<&'a Occurrence>, &'a SemanticIndex)> {
+        let occ_matches_text = |occ: &Occurrence, sym: &SymbolInfo| -> bool {
+            if !is_stale_snap {
+                return true;
+            }
+            text.get(occ.span.0..occ.span.1)
+                .map(|s| s.trim_matches('`'))
+                .is_some_and(|s| s == sym.name || s == "self" || s == "Self")
+        };
+
         if let Some(occ) = snap.index.occurrence_at(file, offset)
             && let Some(sym) = snap.index.symbol(occ.target)
+            && occ_matches_text(occ, sym)
         {
             return Some((sym, Some(occ), &snap.index));
         }
         if let Some(good) = self.last_good_for(file) {
             if let Some(occ) = good.occurrence_at(file, offset)
                 && let Some(sym) = good.symbol(occ.target)
+                && text
+                    .get(occ.span.0..occ.span.1)
+                    .map(|s| s.trim_matches('`'))
+                    .is_some_and(|s| s == sym.name || s == "self" || s == "Self")
             {
                 return Some((sym, Some(occ), good));
             }
-            if let Some((word, _)) = word_or_backtick_at(text, offset)
-                && let Some(sym) = good.lookup_named_symbol_in_file(file, &word, offset)
-            {
-                return Some((sym, None, good));
+            if let Some((word, (wlo, _))) = word_or_backtick_at(text, offset) {
+                if wlo > 0 && text.as_bytes().get(wlo - 1) == Some(&b'.') {
+                    let recv = extract_trailing_chain(&text[..wlo - 1]);
+                    if !recv.is_empty()
+                        && let Some(msym) =
+                            resolve_chain_member_symbol(good, file, wlo, &recv, &word)
+                    {
+                        return Some((msym, None, good));
+                    }
+                }
+                if let Some(sym) = good.lookup_named_symbol_in_file(file, &word, offset) {
+                    return Some((sym, None, good));
+                }
             }
         }
-        if let Some((word, _)) = word_or_backtick_at(text, offset)
-            && let Some(sym) = snap.index.lookup_named_symbol_in_file(file, &word, offset)
-        {
-            return Some((sym, None, &snap.index));
+        if let Some((word, (wlo, _))) = word_or_backtick_at(text, offset) {
+            if wlo > 0 && text.as_bytes().get(wlo - 1) == Some(&b'.') {
+                let recv = extract_trailing_chain(&text[..wlo - 1]);
+                if !recv.is_empty()
+                    && let Some(msym) =
+                        resolve_chain_member_symbol(&snap.index, file, wlo, &recv, &word)
+                {
+                    return Some((msym, None, &snap.index));
+                }
+            }
+            if let Some(sym) = snap.index.lookup_named_symbol_in_file(file, &word, offset) {
+                return Some((sym, None, &snap.index));
+            }
         }
         None
     }
 
     pub fn hover(&mut self, file: &Path, pos: LspPosition) -> Option<JsonValue> {
+        self.hover_with_mode(file, pos, false)
+    }
+
+    pub fn hover_interactive(&mut self, file: &Path, pos: LspPosition) -> Option<JsonValue> {
+        self.hover_with_mode(file, pos, true)
+    }
+
+    fn hover_with_mode(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+        prefer_cached: bool,
+    ) -> Option<JsonValue> {
         let norm = normalize_path(file);
         let (text, line_idx) = self.file_text(&norm)?;
         let offset = line_idx.position_to_offset(&text, pos);
-        let snap = self.ensure_snapshot(&norm).clone();
+        let (snap, is_stale_snap) = self.snapshot_for_interactive(&norm, prefer_cached);
 
-        let (sym, occ, _) = self.resolve_symbol_at(&snap, &norm, offset, &text)?;
+        let (sym, occ, _) = self.resolve_symbol_at(&snap, &norm, offset, &text, is_stale_snap)?;
         let range = occ
             .map(|o| line_idx.span_to_range(&text, o.span.0, o.span.1))
             .or_else(|| {
@@ -973,26 +1083,59 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn goto_definition(&mut self, file: &Path, pos: LspPosition) -> Vec<JsonValue> {
+        self.goto_definition_with_mode(file, pos, false)
+    }
+
+    pub fn goto_definition_interactive(&mut self, file: &Path, pos: LspPosition) -> Vec<JsonValue> {
+        self.goto_definition_with_mode(file, pos, true)
+    }
+
+    fn goto_definition_with_mode(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+        prefer_cached: bool,
+    ) -> Vec<JsonValue> {
         let norm = normalize_path(file);
         let Some((text, line_idx)) = self.file_text(&norm) else {
             return Vec::new();
         };
         let offset = line_idx.position_to_offset(&text, pos);
-        let snap = self.ensure_snapshot(&norm).clone();
-        let Some((sym, _, _)) = self.resolve_symbol_at(&snap, &norm, offset, &text) else {
+        let (snap, is_stale_snap) = self.snapshot_for_interactive(&norm, prefer_cached);
+        let Some((sym, _, _)) = self.resolve_symbol_at(&snap, &norm, offset, &text, is_stale_snap)
+        else {
             return Vec::new();
         };
         self.symbol_location_json(sym).into_iter().collect()
     }
 
     pub fn goto_type_definition(&mut self, file: &Path, pos: LspPosition) -> Vec<JsonValue> {
+        self.goto_type_definition_with_mode(file, pos, false)
+    }
+
+    pub fn goto_type_definition_interactive(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+    ) -> Vec<JsonValue> {
+        self.goto_type_definition_with_mode(file, pos, true)
+    }
+
+    fn goto_type_definition_with_mode(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+        prefer_cached: bool,
+    ) -> Vec<JsonValue> {
         let norm = normalize_path(file);
         let Some((text, line_idx)) = self.file_text(&norm) else {
             return Vec::new();
         };
         let offset = line_idx.position_to_offset(&text, pos);
-        let snap = self.ensure_snapshot(&norm).clone();
-        let Some((sym, occ, idx)) = self.resolve_symbol_at(&snap, &norm, offset, &text) else {
+        let (snap, is_stale_snap) = self.snapshot_for_interactive(&norm, prefer_cached);
+        let Some((sym, occ, idx)) =
+            self.resolve_symbol_at(&snap, &norm, offset, &text, is_stale_snap)
+        else {
             return Vec::new();
         };
         let target_key = occ
@@ -1006,13 +1149,32 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn find_implementations(&mut self, file: &Path, pos: LspPosition) -> Vec<JsonValue> {
+        self.find_implementations_with_mode(file, pos, false)
+    }
+
+    pub fn find_implementations_interactive(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+    ) -> Vec<JsonValue> {
+        self.find_implementations_with_mode(file, pos, true)
+    }
+
+    fn find_implementations_with_mode(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+        prefer_cached: bool,
+    ) -> Vec<JsonValue> {
         let norm = normalize_path(file);
         let Some((text, line_idx)) = self.file_text(&norm) else {
             return Vec::new();
         };
         let offset = line_idx.position_to_offset(&text, pos);
-        let snap = self.ensure_snapshot(&norm).clone();
-        let Some((sym, _, idx)) = self.resolve_symbol_at(&snap, &norm, offset, &text) else {
+        let (snap, is_stale_snap) = self.snapshot_for_interactive(&norm, prefer_cached);
+        let Some((sym, _, idx)) =
+            self.resolve_symbol_at(&snap, &norm, offset, &text, is_stale_snap)
+        else {
             return Vec::new();
         };
 
@@ -1066,7 +1228,7 @@ impl WorkspaceAnalyzer {
         };
         let offset = line_idx.position_to_offset(&text, pos);
         let snap = self.ensure_snapshot(&norm).clone();
-        let Some((sym, _, idx)) = self.resolve_symbol_at(&snap, &norm, offset, &text) else {
+        let Some((sym, _, idx)) = self.resolve_symbol_at(&snap, &norm, offset, &text, false) else {
             return Vec::new();
         };
         idx.references_to(sym.key, include_decl)
@@ -1082,7 +1244,7 @@ impl WorkspaceAnalyzer {
         };
         let offset = line_idx.position_to_offset(&text, pos);
         let snap = self.ensure_snapshot(&norm).clone();
-        let Some((sym, _, idx)) = self.resolve_symbol_at(&snap, &norm, offset, &text) else {
+        let Some((sym, _, idx)) = self.resolve_symbol_at(&snap, &norm, offset, &text, false) else {
             return Vec::new();
         };
         idx.highlights_in_file(&norm, sym.key)
@@ -1178,7 +1340,35 @@ impl WorkspaceAnalyzer {
         Ok(JsonValue::object([("changes", changes)]))
     }
 
+    fn snapshot_for_interactive(
+        &mut self,
+        norm: &Path,
+        prefer_cached: bool,
+    ) -> (PackageSnapshot, bool) {
+        let target = self.classify_target(norm);
+        if let Some(fresh) = self.snapshots.get(&target) {
+            return (fresh.clone(), false);
+        }
+        if prefer_cached && let Some(cached) = self.last_good_snapshots.get(&target) {
+            return (cached.clone(), true);
+        }
+        (self.ensure_snapshot(norm).clone(), false)
+    }
+
     pub fn complete(&mut self, file: &Path, pos: LspPosition) -> Vec<JsonValue> {
+        self.complete_with_mode(file, pos, false)
+    }
+
+    pub fn complete_interactive(&mut self, file: &Path, pos: LspPosition) -> Vec<JsonValue> {
+        self.complete_with_mode(file, pos, true)
+    }
+
+    fn complete_with_mode(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+        prefer_cached: bool,
+    ) -> Vec<JsonValue> {
         let norm = normalize_path(file);
         let Some((text, line_idx)) = self.file_text(&norm) else {
             return Vec::new();
@@ -1197,7 +1387,7 @@ impl WorkspaceAnalyzer {
             return Vec::new();
         }
 
-        let snap = self.ensure_snapshot(&norm).clone();
+        let (snap, is_stale_snap) = self.snapshot_for_interactive(&norm, prefer_cached);
 
         // 2. `'` view completions (`.print'builtin`, `expr'type`)!
         if let Some(partial) = quote_view_context(line_prefix) {
@@ -1218,7 +1408,15 @@ impl WorkspaceAnalyzer {
         // 5. Dot `.` completions (`expr.`, `expr.par`, `Enum.`, `std.`, `mod.`)!
         if let Some((dot_rel_in_line, partial)) = dot_completion_offset(line_prefix) {
             let dot_offset = line_start + dot_rel_in_line;
-            let items = self.complete_dot_member(&norm, &text, dot_offset, &partial, &snap);
+            let items = self.complete_dot_member(
+                &norm,
+                &text,
+                dot_offset,
+                &partial,
+                &snap,
+                is_stale_snap,
+                prefer_cached,
+            );
             if !items.is_empty() {
                 return items;
             }
@@ -1229,6 +1427,7 @@ impl WorkspaceAnalyzer {
         self.complete_lexical_scope(&norm, offset, partial, &snap)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn complete_dot_member(
         &mut self,
         file: &Path,
@@ -1236,14 +1435,13 @@ impl WorkspaceAnalyzer {
         dot_offset: usize,
         partial: &str,
         snap: &PackageSnapshot,
+        is_stale_snap: bool,
+        prefer_cached: bool,
     ) -> Vec<JsonValue> {
-        // Tier 1: Direct lookup in `snap.index.file_projections` (works when `expr.par` already has an identifier!).
-        if let Some(proj) = snap
-            .index
-            .file_projections
-            .iter()
-            .flat_map(|_| snap.index.file_projections.get(file).into_iter().flatten())
-            .find(|p| p.dot_offset == dot_offset)
+        // Tier 1: Direct O(N_file_projs) lookup in `snap.index.file_projections` when snapshot matches current text!
+        if !is_stale_snap
+            && let Some(projs) = snap.index.file_projections.get(file)
+            && let Some(proj) = projs.iter().find(|p| p.dot_offset == dot_offset)
         {
             let items = build_dot_items_from_projection(
                 &snap.index,
@@ -1257,7 +1455,26 @@ impl WorkspaceAnalyzer {
             }
         }
 
-        // Tier 2: Speculative probe! Replace `.partial` with `.__nessa_lsp_probe__` so `expr.` becomes valid Nessa syntax!
+        // Tier 2: Fast (< 0.1 ms) resilient chain walk across `snap.index` and `last_good_index`!
+        let recv_chain = extract_trailing_chain(&text[..dot_offset]);
+        if !recv_chain.is_empty() {
+            for candidate_idx in [Some(&snap.index), self.last_good_for(file)]
+                .into_iter()
+                .flatten()
+            {
+                let items =
+                    resolve_chain_dot_items(candidate_idx, file, dot_offset, &recv_chain, partial);
+                if !items.is_empty() {
+                    return items;
+                }
+            }
+        }
+
+        // Tier 3: Speculative probe! Replace `.partial` with `.__nessa_lsp_probe__` for non-chain expressions `(a + b).`.
+        // Skip during dirty bursts on large multi-file packages so interactive typing never stalls.
+        if prefer_cached && snap.member_files.len() > 3 {
+            return Vec::new();
+        }
         let replace_end = dot_offset + 1 + partial.len();
         if replace_end <= text.len() {
             let mut probed = String::with_capacity(text.len() + COMPLETION_PROBE_IDENT.len() + 1);
@@ -1277,21 +1494,6 @@ impl WorkspaceAnalyzer {
                     proj.is_type_or_module_receiver,
                     partial,
                 );
-                if !items.is_empty() {
-                    return items;
-                }
-            }
-        }
-
-        // Tier 3: Resilient chain walk across `snap.index` and `last_good_index`!
-        let recv_chain = extract_trailing_chain(&text[..dot_offset]);
-        if !recv_chain.is_empty() {
-            for candidate_idx in [Some(&snap.index), self.last_good_for(file)]
-                .into_iter()
-                .flatten()
-            {
-                let items =
-                    resolve_chain_dot_items(candidate_idx, file, dot_offset, &recv_chain, partial);
                 if !items.is_empty() {
                     return items;
                 }
@@ -1359,37 +1561,66 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn signature_help(&mut self, file: &Path, pos: LspPosition) -> Option<JsonValue> {
+        self.signature_help_with_mode(file, pos, false)
+    }
+
+    pub fn signature_help_interactive(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+    ) -> Option<JsonValue> {
+        self.signature_help_with_mode(file, pos, true)
+    }
+
+    fn signature_help_with_mode(
+        &mut self,
+        file: &Path,
+        pos: LspPosition,
+        prefer_cached: bool,
+    ) -> Option<JsonValue> {
         let norm = normalize_path(file);
         let (text, line_idx) = self.file_text(&norm)?;
         let offset = line_idx.position_to_offset(&text, pos);
         let call_ctx = enclosing_call_context(&text, offset)?;
-        let snap = self.ensure_snapshot(&norm).clone();
+        let (snap, is_stale_snap) = self.snapshot_for_interactive(&norm, prefer_cached);
 
         // Resolve callee at the end of `call_ctx.callee_span` (the identifier before `(`).
         let callee_probe = call_ctx.callee_ident_span.1.saturating_sub(1);
-        let sym_and_idx = self
-            .resolve_symbol_at(&snap, &norm, callee_probe, &text)
-            .or_else(|| {
-                // If unclosed `(` broke parsing of this call expression, resolve callee via dot chain or lexical name!
-                let callee_name = &text[call_ctx.callee_ident_span.0..call_ctx.callee_ident_span.1];
-                if let Some(recv) = call_ctx.receiver_chain.as_deref() {
-                    for idx in [Some(&snap.index), self.last_good_for(&norm)]
-                        .into_iter()
-                        .flatten()
-                    {
-                        if let Some(msym) = resolve_chain_member_symbol(
-                            idx,
-                            &norm,
-                            call_ctx.callee_ident_span.0,
-                            recv,
-                            callee_name,
-                        ) {
-                            return Some((msym, None, idx));
-                        }
+        let callee_name = &text[call_ctx.callee_ident_span.0..call_ctx.callee_ident_span.1];
+        let direct_hit = self.resolve_symbol_at(&snap, &norm, callee_probe, &text, is_stale_snap);
+        let sym_and_idx = direct_hit.or_else(|| {
+            // If unclosed `(` broke parsing or snapshot is pre-edit, resolve callee via dot chain or lexical name!
+            if let Some(recv) = call_ctx.receiver_chain.as_deref() {
+                for idx in [Some(&snap.index), self.last_good_for(&norm)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(msym) = resolve_chain_member_symbol(
+                        idx,
+                        &norm,
+                        call_ctx.callee_ident_span.0,
+                        recv,
+                        callee_name,
+                    ) {
+                        return Some((msym, None, idx));
                     }
                 }
-                None
-            })?;
+            } else {
+                for idx in [Some(&snap.index), self.last_good_for(&norm)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(fsym) = idx.lookup_named_symbol_in_file(
+                        &norm,
+                        callee_name,
+                        call_ctx.callee_ident_span.0,
+                    ) {
+                        return Some((fsym, None, idx));
+                    }
+                }
+            }
+            None
+        })?;
 
         let (sym, _, _) = sym_and_idx;
         if sym.params.is_empty()
@@ -1459,11 +1690,19 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn document_symbols(&mut self, file: &Path) -> Vec<JsonValue> {
+        self.document_symbols_with_mode(file, false)
+    }
+
+    pub fn document_symbols_interactive(&mut self, file: &Path) -> Vec<JsonValue> {
+        self.document_symbols_with_mode(file, true)
+    }
+
+    fn document_symbols_with_mode(&mut self, file: &Path, prefer_cached: bool) -> Vec<JsonValue> {
         let norm = normalize_path(file);
         let Some((text, line_idx)) = self.file_text(&norm) else {
             return Vec::new();
         };
-        let snap = self.ensure_snapshot(&norm).clone();
+        let (snap, _) = self.snapshot_for_interactive(&norm, prefer_cached);
         let idx = if snap
             .index
             .file_roots

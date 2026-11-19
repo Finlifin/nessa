@@ -1636,3 +1636,161 @@ doubled
         "fn second_unformatted(x: i64) -> i64 {\n    let doubled = x * 2\n    doubled\n}"
     ));
 }
+
+#[test]
+fn coalesced_stdio_burst_debounces_did_change_and_serves_instant_dot_completion() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let ws = TempWorkspace::new("coalesced-burst");
+    let (_, _, main_path) = setup_demo_package(&ws);
+    let main_uri = path_to_uri(&main_path);
+    let initial = "use @geometry.Point\nfn main() {\n    let pt = Point { x: 1, y: 2 }\n    let v = pt.x\n}\n";
+
+    let (tx, rx) = mpsc::channel();
+    tx.send(Ok(RpcMessage::Request {
+        id: RequestId::Int(1),
+        method: "initialize".to_owned(),
+        params: JsonValue::object([("rootUri", JsonValue::from(path_to_uri(ws.path())))]),
+    }))
+    .unwrap();
+    tx.send(Ok(RpcMessage::Notification {
+        method: "initialized".to_owned(),
+        params: JsonValue::empty_object(),
+    }))
+    .unwrap();
+    tx.send(Ok(RpcMessage::Notification {
+        method: "textDocument/didOpen".to_owned(),
+        params: JsonValue::object([(
+            "textDocument",
+            JsonValue::object([
+                ("uri", JsonValue::from(main_uri.as_str())),
+                ("languageId", JsonValue::from("nessa")),
+                ("version", JsonValue::from(1)),
+                ("text", JsonValue::from(initial)),
+            ]),
+        )]),
+    }))
+    .unwrap();
+
+    // Queue 15 rapid `didChange` notifications in a single burst ending with `pt.`!
+    for ver in 2..=16i64 {
+        let edited = if ver < 16 {
+            format!(
+                "use @geometry.Point\nfn main() {{\n    let pt = Point {{ x: {ver}, y: 2 }}\n    let v = pt.x\n}}\n"
+            )
+        } else {
+            "use @geometry.Point\nfn main() {\n    let pt = Point { x: 16, y: 2 }\n    pt.\n}\n"
+                .to_owned()
+        };
+        tx.send(Ok(RpcMessage::Notification {
+            method: "textDocument/didChange".to_owned(),
+            params: JsonValue::object([
+                (
+                    "textDocument",
+                    JsonValue::object([
+                        ("uri", JsonValue::from(main_uri.as_str())),
+                        ("version", JsonValue::from(ver)),
+                    ]),
+                ),
+                (
+                    "contentChanges",
+                    JsonValue::Array(vec![JsonValue::object([(
+                        "text",
+                        JsonValue::from(edited.as_str()),
+                    )])]),
+                ),
+            ]),
+        }))
+        .unwrap();
+    }
+
+    // Queue a cancelled request (#2) + active dot-completion request (#3) right after `pt.`!
+    tx.send(Ok(RpcMessage::Request {
+        id: RequestId::Int(2),
+        method: "textDocument/hover".to_owned(),
+        params: JsonValue::object([
+            (
+                "textDocument",
+                JsonValue::object([("uri", JsonValue::from(main_uri.as_str()))]),
+            ),
+            ("position", LspPosition::new(2, 8).to_json()),
+        ]),
+    }))
+    .unwrap();
+    tx.send(Ok(RpcMessage::Notification {
+        method: "$/cancelRequest".to_owned(),
+        params: JsonValue::object([("id", JsonValue::from(2))]),
+    }))
+    .unwrap();
+    tx.send(Ok(RpcMessage::Request {
+        id: RequestId::Int(3),
+        method: "textDocument/completion".to_owned(),
+        params: JsonValue::object([
+            (
+                "textDocument",
+                JsonValue::object([("uri", JsonValue::from(main_uri.as_str()))]),
+            ),
+            ("position", LspPosition::new(3, 7).to_json()),
+        ]),
+    }))
+    .unwrap();
+    drop(tx);
+
+    let mut server = LanguageServer::default();
+    let mut output = Vec::new();
+    let t0 = Instant::now();
+    let code = server
+        .run_coalesced_channel(rx, &mut output, Duration::from_millis(5))
+        .expect("coalesced channel run");
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(code, 0);
+
+    let mut out_reader = Cursor::new(output);
+    let mut msgs = Vec::new();
+    while let Some(msg) = read_rpc_message(&mut out_reader).unwrap() {
+        msgs.push(msg);
+    }
+
+    // Cancelled request #2 must return -32800 without running hover flush!
+    match find_response(&msgs, 2) {
+        RpcMessage::Response {
+            error: Some(err), ..
+        } => assert_eq!(err.code, -32800),
+        other => panic!("expected -32800 for cancelled request #2, got {other:?}"),
+    }
+
+    // Dot completion #3 on `pt.` must resolve `x` and `y` from `last_good_snapshots`!
+    let comp_items = find_ok_result(&msgs, 3)
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .expect("completion items");
+    let labels: Vec<&str> = comp_items
+        .iter()
+        .filter_map(|i| i.get_str("label"))
+        .collect();
+    assert!(
+        labels.contains(&"x") && labels.contains(&"y"),
+        "expected Point fields x & y in {labels:?} (elapsed={elapsed_ms:.1}ms)"
+    );
+
+    // 15 `didChange` notifications must have coalesced into ONLY 2 diagnostic publications total
+    // (1 for `didOpen` v1 + 1 final flush for `didChange` v16)!
+    let main_diag_versions: Vec<i64> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            RpcMessage::Notification { method, params }
+                if method == "textDocument/publishDiagnostics"
+                    && params.get_str("uri") == Some(main_uri.as_str()) =>
+            {
+                params.get_i64("version")
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        main_diag_versions,
+        vec![1, 16],
+        "expected 15 didChange events to coalesce into a single v16 diagnostic flush"
+    );
+}
